@@ -19,6 +19,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    const zspec = b.dependency("zspec", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Main executable
     const exe = b.addExecutable(.{
         .name = "labelle-gui",
         .root_module = b.createModule(.{
@@ -49,4 +55,21 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run the application");
     run_step.dependOn(&run_cmd.step);
+
+    // Tests with zspec
+    const tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zspec", .module = zspec.module("zspec") },
+            },
+        }),
+        .test_runner = .{ .path = zspec.path("src/runner.zig"), .mode = .simple },
+    });
+
+    const run_tests = b.addRunArtifact(tests);
+    const test_step = b.step("test", "Run tests");
+    test_step.dependOn(&run_tests.step);
 }

@@ -19,6 +19,10 @@
             .url = "https://github.com/fabioarnold/nfd-zig/archive/refs/heads/master.tar.gz",
             .hash = "nfdzig-0.1.0-11fxvN6IBgD5rvvfjrw1wPqibMsbUJ-h2ZcGR6FOEvrm",
         },
+        .zspec = .{
+            .url = "https://github.com/apotema/zspec/archive/refs/heads/main.tar.gz",
+            .hash = "zspec-0.3.0-jaKLbbqZAgAB-MBfy6M3HKB3jSTQ-TsNW9OxpLhLlav5",
+        },
     },
     .paths = .{
         "build.zig",
