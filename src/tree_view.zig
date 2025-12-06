@@ -1,17 +1,18 @@
 const std = @import("std");
 const zgui = @import("zgui");
 const project = @import("project.zig");
+const icons = @import("icons.zig");
 
-/// Icons for each folder type (ASCII-based for ImGui compatibility)
+/// Icons for each folder type (FontAwesome icons)
 pub const FolderIcons = struct {
-    pub const models = "[M]"; // 3D models
-    pub const fixtures = "[F]"; // Fixtures
-    pub const prefabs = "[P]"; // Prefabs
-    pub const scripts = "[S]"; // Scripts
-    pub const resources = "[R]"; // Resources
-    pub const file = " * "; // Document for files
-    pub const folder_open = "[+]"; // Open folder
-    pub const folder_closed = "[-]"; // Closed folder
+    pub const models = icons.FA_CUBE; // 3D cube for models
+    pub const fixtures = icons.FA_WRENCH; // Wrench for fixtures
+    pub const prefabs = icons.FA_BOX; // Box for prefabs
+    pub const scripts = icons.FA_SCROLL; // Scroll for scripts
+    pub const resources = icons.FA_DATABASE; // Database for resources
+    pub const file = icons.FA_FILE; // File icon
+    pub const folder_open = icons.FA_FOLDER_OPEN; // Open folder
+    pub const folder_closed = icons.FA_FOLDER; // Closed folder
 
     pub fn forFolder(name: []const u8) []const u8 {
         if (std.mem.eql(u8, name, project.ProjectFolders.models)) return models;

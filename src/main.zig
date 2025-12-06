@@ -5,6 +5,7 @@ const zgui = @import("zgui");
 const nfd = @import("nfd");
 const project = @import("project.zig");
 const tree_view = @import("tree_view.zig");
+const icons = @import("icons.zig");
 
 const gl = zopengl.bindings;
 
@@ -54,6 +55,23 @@ pub fn main() !void {
     defer zgui.deinit();
 
     const scale_factor = window.getContentScale()[0];
+    const font_size = 16.0 * scale_factor;
+
+    // Add default font
+    _ = zgui.io.addFontDefault(null);
+
+    // Add FontAwesome icons (merged into the default font)
+    var fa_config = zgui.FontConfig.init();
+    fa_config.merge_mode = true;
+    fa_config.pixel_snap_h = true;
+    fa_config.glyph_min_advance_x = font_size; // Fixed width for icons
+    _ = zgui.io.addFontFromFileWithConfig(
+        "assets/fonts/fa-solid-900.ttf",
+        font_size,
+        fa_config,
+        &icons.FA_ICON_RANGES,
+    );
+
     zgui.getStyle().scaleAllSizes(scale_factor);
 
     zgui.backend.init(window);
