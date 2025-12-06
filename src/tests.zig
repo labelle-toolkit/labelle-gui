@@ -3,6 +3,7 @@ const zspec = @import("zspec");
 const expect = zspec.expect;
 
 const project = @import("project.zig");
+const tree_view = @import("tree_view.zig");
 
 test {
     zspec.runAll(@This());
@@ -143,5 +144,66 @@ pub const ConstantsTests = struct {
 
     test "PROJECT_VERSION is 1" {
         try expect.equal(project.PROJECT_VERSION, 1);
+    }
+};
+
+pub const FolderIconsTests = struct {
+    test "models folder has theater mask icon" {
+        const icon = tree_view.FolderIcons.forFolder("models");
+        try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.models));
+    }
+
+    test "fixtures folder has wrench icon" {
+        const icon = tree_view.FolderIcons.forFolder("fixtures");
+        try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.fixtures));
+    }
+
+    test "prefabs folder has package icon" {
+        const icon = tree_view.FolderIcons.forFolder("prefabs");
+        try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.prefabs));
+    }
+
+    test "scripts folder has scroll icon" {
+        const icon = tree_view.FolderIcons.forFolder("scripts");
+        try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.scripts));
+    }
+
+    test "resources folder has folder icon" {
+        const icon = tree_view.FolderIcons.forFolder("resources");
+        try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.resources));
+    }
+
+    test "unknown folder returns default icon" {
+        const icon = tree_view.FolderIcons.forFolder("unknown");
+        try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.folder_closed));
+    }
+};
+
+pub const TreeViewTests = struct {
+    test "initializes with no selected path" {
+        const allocator = std.testing.allocator;
+        var tv = tree_view.TreeView.init(allocator);
+        defer tv.deinit();
+
+        try expect.toBeTrue(tv.getSelectedPath() == null);
+    }
+
+    test "initializes needing refresh" {
+        const allocator = std.testing.allocator;
+        var tv = tree_view.TreeView.init(allocator);
+        defer tv.deinit();
+
+        try expect.toBeTrue(tv.needs_refresh);
+    }
+
+    test "refresh sets needs_refresh flag" {
+        const allocator = std.testing.allocator;
+        var tv = tree_view.TreeView.init(allocator);
+        defer tv.deinit();
+
+        tv.needs_refresh = false;
+        tv.refresh();
+
+        try expect.toBeTrue(tv.needs_refresh);
     }
 };

@@ -4,11 +4,13 @@ const zopengl = @import("zopengl");
 const zgui = @import("zgui");
 const nfd = @import("nfd");
 const project = @import("project.zig");
+const tree_view = @import("tree_view.zig");
 
 const gl = zopengl.bindings;
 
 const AppState = struct {
     project_manager: project.ProjectManager,
+    tree_view: tree_view.TreeView,
     status_message: [256]u8 = [_]u8{0} ** 256,
     status_timer: f32 = 0,
 };
@@ -60,8 +62,10 @@ pub fn main() !void {
     // Initialize app state
     var state = AppState{
         .project_manager = project.ProjectManager.init(allocator),
+        .tree_view = tree_view.TreeView.init(allocator),
     };
     defer state.project_manager.deinit();
+    defer state.tree_view.deinit();
 
     std.debug.print("Labelle started!\n", .{});
 
@@ -102,6 +106,7 @@ pub fn main() !void {
                                 setStatus(&state, "Error saving project!");
                             };
                             setStatus(&state, "New project created!");
+                            state.tree_view.refresh();
                         }
                     } else |_| {
                         setStatus(&state, "Error opening folder dialog!");
@@ -117,6 +122,7 @@ pub fn main() !void {
                                 setStatus(&state, "Error loading project!");
                             };
                             setStatus(&state, "Project loaded!");
+                            state.tree_view.refresh();
                         }
                     } else |_| {
                         setStatus(&state, "Error opening file dialog!");
@@ -187,8 +193,39 @@ pub fn main() !void {
         const work_pos = viewport.getWorkPos();
         const work_size = viewport.getWorkSize();
 
+        const sidebar_width: f32 = 250;
+
+        // Left sidebar - Project Tree View
         zgui.setNextWindowPos(.{ .x = work_pos[0], .y = work_pos[1] });
-        zgui.setNextWindowSize(.{ .w = work_size[0], .h = work_size[1] });
+        zgui.setNextWindowSize(.{ .w = sidebar_width, .h = work_size[1] - 30 });
+
+        if (zgui.begin("Project", .{
+            .flags = .{
+                .no_resize = true,
+                .no_move = true,
+                .no_collapse = true,
+            },
+        })) {
+            if (state.project_manager.current_project) |proj| {
+                // Get project directory
+                const project_dir = proj.getProjectDir();
+
+                // Render tree view
+                if (state.tree_view.render(project_dir)) {
+                    // File was selected
+                    if (state.tree_view.getSelectedPath()) |selected| {
+                        std.debug.print("Selected: {s}\n", .{selected});
+                    }
+                }
+            } else {
+                zgui.textDisabled("No project open", .{});
+            }
+        }
+        zgui.end();
+
+        // Main content area
+        zgui.setNextWindowPos(.{ .x = work_pos[0] + sidebar_width, .y = work_pos[1] });
+        zgui.setNextWindowSize(.{ .w = work_size[0] - sidebar_width, .h = work_size[1] - 30 });
 
         if (zgui.begin("##main", .{
             .flags = .{
@@ -209,16 +246,11 @@ pub fn main() !void {
 
                 zgui.separator();
 
-                // Project folders panel
-                if (zgui.collapsingHeader("Project Structure", .{ .default_open = true })) {
-                    zgui.indent(.{});
-                    for (project.ProjectFolders.all) |folder| {
-                        zgui.bulletText("{s}/", .{folder});
-                    }
-                    zgui.unindent(.{});
+                // Show selected file info
+                if (state.tree_view.getSelectedPath()) |selected| {
+                    zgui.text("Selected: {s}", .{std.fs.path.basename(selected)});
+                    zgui.separator();
                 }
-
-                zgui.separator();
 
                 zgui.text("Ready to work!", .{});
             } else {
@@ -247,6 +279,7 @@ pub fn main() !void {
                                 setStatus(&state, "Error saving project!");
                             };
                             setStatus(&state, "New project created!");
+                            state.tree_view.refresh();
                         }
                     } else |_| {
                         setStatus(&state, "Error opening folder dialog!");
@@ -261,16 +294,29 @@ pub fn main() !void {
                                 setStatus(&state, "Error loading project!");
                             };
                             setStatus(&state, "Project loaded!");
+                            state.tree_view.refresh();
                         }
                     } else |_| {
                         setStatus(&state, "Error opening file dialog!");
                     }
                 }
             }
+        }
+        zgui.end();
 
-            // Status bar at bottom
-            zgui.setCursorPosY(work_size[1] - 30);
-            zgui.separator();
+        // Status bar at bottom
+        zgui.setNextWindowPos(.{ .x = work_pos[0], .y = work_pos[1] + work_size[1] - 30 });
+        zgui.setNextWindowSize(.{ .w = work_size[0], .h = 30 });
+
+        if (zgui.begin("##statusbar", .{
+            .flags = .{
+                .no_title_bar = true,
+                .no_resize = true,
+                .no_move = true,
+                .no_collapse = true,
+                .no_scrollbar = true,
+            },
+        })) {
             if (state.status_timer > 0) {
                 const status = std.mem.sliceTo(&state.status_message, 0);
                 zgui.text("{s}", .{status});
