@@ -2,7 +2,8 @@
 // Icon codes from https://fontawesome.com/icons
 
 /// FontAwesome icon range for ImGui font loading
-pub const FA_ICON_MIN: u16 = 0xe000;
+/// FontAwesome 6 Free Solid uses 0xf000-0xf8ff range
+pub const FA_ICON_MIN: u16 = 0xf000;
 pub const FA_ICON_MAX: u16 = 0xf8ff;
 
 /// Icon glyph ranges for font loading (null-terminated pairs)

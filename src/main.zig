@@ -72,6 +72,7 @@ pub fn main() !void {
         fa_config,
         &icons.FA_ICON_RANGES,
     );
+    // Note: Font loading errors are handled internally by zgui/ImGui
 
     zgui.getStyle().scaleAllSizes(scale_factor);
 

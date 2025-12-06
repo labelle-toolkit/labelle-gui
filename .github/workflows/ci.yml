@@ -40,7 +40,7 @@ jobs:
 
   gui-test:
     runs-on: ubuntu-latest
-    name: GUI Test (SikuliX)
+    name: GUI Smoke Test
     needs: build
 
     steps:
@@ -67,18 +67,10 @@ jobs:
             libxinerama1 \
             libxcursor1 \
             libxi6 \
-            openjdk-11-jre-headless \
-            wget \
             wmctrl \
-            xdotool \
             imagemagick
 
-      - name: Download SikuliX
-        run: |
-          mkdir -p tools
-          wget -q -O tools/sikulixide.jar "https://launchpad.net/sikuli/sikulix/2.0.5/+download/sikulixide-2.0.5.jar"
-
-      - name: Run GUI Test with Xvfb
+      - name: Run GUI Smoke Test
         run: |
           # Start Xvfb
           export DISPLAY=:99
