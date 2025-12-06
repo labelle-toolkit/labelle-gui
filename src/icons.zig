@@ -22,7 +22,7 @@ pub const FA_SCROLL = "\u{f70e}"; // scroll (for scripts)
 pub const FA_DATABASE = "\u{f1c0}"; // database (for resources)
 
 // Common UI icons
-pub const FA_PLUS = "\u{2b}"; // plus
+pub const FA_PLUS = "\u{f067}"; // plus
 pub const FA_MINUS = "\u{f068}"; // minus
 pub const FA_TIMES = "\u{f00d}"; // times/close
 pub const FA_CHECK = "\u{f00c}"; // check

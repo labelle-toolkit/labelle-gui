@@ -6,6 +6,7 @@ const nfd = @import("nfd");
 const project = @import("project.zig");
 const tree_view = @import("tree_view.zig");
 const icons = @import("icons.zig");
+const config = @import("config.zig");
 
 const gl = zopengl.bindings;
 
@@ -55,7 +56,7 @@ pub fn main() !void {
     defer zgui.deinit();
 
     const scale_factor = window.getContentScale()[0];
-    const font_size = 16.0 * scale_factor;
+    const font_size = config.ui.base_font_size * scale_factor;
 
     // Add default font
     _ = zgui.io.addFontDefault(null);
@@ -96,7 +97,7 @@ pub fn main() !void {
 
         // Update status timer
         if (state.status_timer > 0) {
-            state.status_timer -= 1.0 / 60.0;
+            state.status_timer -= 1.0 / 60.0; // Assuming 60fps
         }
 
         // Main menu bar
@@ -211,11 +212,9 @@ pub fn main() !void {
         const work_pos = viewport.getWorkPos();
         const work_size = viewport.getWorkSize();
 
-        const sidebar_width: f32 = 250;
-
         // Left sidebar - Project Tree View
         zgui.setNextWindowPos(.{ .x = work_pos[0], .y = work_pos[1] });
-        zgui.setNextWindowSize(.{ .w = sidebar_width, .h = work_size[1] - 30 });
+        zgui.setNextWindowSize(.{ .w = config.ui.sidebar_width, .h = work_size[1] - config.ui.status_bar_height });
 
         if (zgui.begin("Project", .{
             .flags = .{
@@ -242,8 +241,8 @@ pub fn main() !void {
         zgui.end();
 
         // Main content area
-        zgui.setNextWindowPos(.{ .x = work_pos[0] + sidebar_width, .y = work_pos[1] });
-        zgui.setNextWindowSize(.{ .w = work_size[0] - sidebar_width, .h = work_size[1] - 30 });
+        zgui.setNextWindowPos(.{ .x = work_pos[0] + config.ui.sidebar_width, .y = work_pos[1] });
+        zgui.setNextWindowSize(.{ .w = work_size[0] - config.ui.sidebar_width, .h = work_size[1] - config.ui.status_bar_height });
 
         if (zgui.begin("##main", .{
             .flags = .{
@@ -323,8 +322,8 @@ pub fn main() !void {
         zgui.end();
 
         // Status bar at bottom
-        zgui.setNextWindowPos(.{ .x = work_pos[0], .y = work_pos[1] + work_size[1] - 30 });
-        zgui.setNextWindowSize(.{ .w = work_size[0], .h = 30 });
+        zgui.setNextWindowPos(.{ .x = work_pos[0], .y = work_pos[1] + work_size[1] - config.ui.status_bar_height });
+        zgui.setNextWindowSize(.{ .w = work_size[0], .h = config.ui.status_bar_height });
 
         if (zgui.begin("##statusbar", .{
             .flags = .{
@@ -368,5 +367,5 @@ pub fn main() !void {
 fn setStatus(state: *AppState, message: []const u8) void {
     @memset(&state.status_message, 0);
     @memcpy(state.status_message[0..message.len], message);
-    state.status_timer = 3.0;
+    state.status_timer = config.ui.status_message_duration;
 }

@@ -101,22 +101,17 @@ pub const TreeView = struct {
             self.needs_refresh = false;
         }
 
-        // Render each project folder
+        // Render each project folder (using stack buffers to avoid heap allocations per frame)
         for (project.ProjectFolders.all) |folder_name| {
             const icon = FolderIcons.forFolder(folder_name);
 
-            // Build folder path
-            const folder_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ base_path, folder_name }) catch continue;
-            defer self.allocator.free(folder_path);
+            // Build folder path on stack
+            var folder_path_buf: [512]u8 = undefined;
+            const folder_path = std.fmt.bufPrint(&folder_path_buf, "{s}/{s}", .{ base_path, folder_name }) catch continue;
 
-            // Create tree node with icon
-            const node_label_slice = std.fmt.allocPrint(self.allocator, "{s} {s}", .{ icon, folder_name }) catch continue;
-            defer self.allocator.free(node_label_slice);
-
-            // Create sentinel-terminated string for zgui
-            var node_label: [256:0]u8 = [_:0]u8{0} ** 256;
-            const copy_len = @min(node_label_slice.len, 255);
-            @memcpy(node_label[0..copy_len], node_label_slice[0..copy_len]);
+            // Create tree node label directly on stack
+            var node_label: [256:0]u8 = undefined;
+            _ = std.fmt.bufPrintZ(&node_label, "{s} {s}", .{ icon, folder_name }) catch continue;
 
             const node_open = zgui.treeNodeFlags(&node_label, .{});
 
@@ -133,17 +128,14 @@ pub const TreeView = struct {
                 } else {
                     for (files) |file_entry| {
                         const file_icon = if (file_entry.is_directory) FolderIcons.folder_closed else FolderIcons.file;
-                        const file_label_slice = std.fmt.allocPrint(self.allocator, "{s} {s}", .{ file_icon, file_entry.name }) catch continue;
-                        defer self.allocator.free(file_label_slice);
 
-                        // Create sentinel-terminated string for zgui
-                        var file_label: [256:0]u8 = [_:0]u8{0} ** 256;
-                        const file_copy_len = @min(file_label_slice.len, 255);
-                        @memcpy(file_label[0..file_copy_len], file_label_slice[0..file_copy_len]);
+                        // Create file label directly on stack
+                        var file_label: [256:0]u8 = undefined;
+                        _ = std.fmt.bufPrintZ(&file_label, "{s} {s}", .{ file_icon, file_entry.name }) catch continue;
 
-                        // Check if this file is selected
-                        const full_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ folder_path, file_entry.name }) catch continue;
-                        defer self.allocator.free(full_path);
+                        // Build full path on stack for selection check
+                        var full_path_buf: [1024]u8 = undefined;
+                        const full_path = std.fmt.bufPrint(&full_path_buf, "{s}/{s}", .{ folder_path, file_entry.name }) catch continue;
 
                         const is_selected = if (self.selected_path) |sel|
                             std.mem.eql(u8, sel, full_path)
@@ -151,7 +143,7 @@ pub const TreeView = struct {
                             false;
 
                         if (zgui.selectable(&file_label, .{ .selected = is_selected })) {
-                            // Update selected path
+                            // Update selected path (only allocate when selection changes)
                             if (self.selected_path) |old_path| {
                                 self.allocator.free(old_path);
                             }

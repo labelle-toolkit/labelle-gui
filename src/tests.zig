@@ -148,7 +148,7 @@ pub const ConstantsTests = struct {
 };
 
 pub const FolderIconsTests = struct {
-    test "models folder has theater mask icon" {
+    test "models folder has cube icon" {
         const icon = tree_view.FolderIcons.forFolder("models");
         try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.models));
     }
@@ -158,7 +158,7 @@ pub const FolderIconsTests = struct {
         try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.fixtures));
     }
 
-    test "prefabs folder has package icon" {
+    test "prefabs folder has box icon" {
         const icon = tree_view.FolderIcons.forFolder("prefabs");
         try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.prefabs));
     }
@@ -168,12 +168,12 @@ pub const FolderIconsTests = struct {
         try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.scripts));
     }
 
-    test "resources folder has folder icon" {
+    test "resources folder has database icon" {
         const icon = tree_view.FolderIcons.forFolder("resources");
         try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.resources));
     }
 
-    test "unknown folder returns default icon" {
+    test "unknown folder returns default folder icon" {
         const icon = tree_view.FolderIcons.forFolder("unknown");
         try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.folder_closed));
     }
