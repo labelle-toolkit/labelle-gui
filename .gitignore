@@ -1,0 +1,14 @@
+# Zig build artifacts
+zig-out/
+.zig-cache/
+
+# ImGui config
+imgui.ini
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
