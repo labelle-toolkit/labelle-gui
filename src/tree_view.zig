@@ -2,16 +2,16 @@ const std = @import("std");
 const zgui = @import("zgui");
 const project = @import("project.zig");
 
-/// Icons for each folder type (Unicode)
+/// Icons for each folder type (ASCII-based for ImGui compatibility)
 pub const FolderIcons = struct {
-    pub const models = "\u{1F3AD}"; // 🎭 Theater masks for 3D models
-    pub const fixtures = "\u{1F527}"; // 🔧 Wrench for fixtures
-    pub const prefabs = "\u{1F4E6}"; // 📦 Package for prefabs
-    pub const scripts = "\u{1F4DC}"; // 📜 For scripts
-    pub const resources = "\u{1F4C1}"; // 📁 Folder for resources
-    pub const file = "\u{1F4C4}"; // 📄 Document for files
-    pub const folder_open = "\u{1F4C2}"; // 📂 Open folder
-    pub const folder_closed = "\u{1F4C1}"; // 📁 Closed folder
+    pub const models = "[M]"; // 3D models
+    pub const fixtures = "[F]"; // Fixtures
+    pub const prefabs = "[P]"; // Prefabs
+    pub const scripts = "[S]"; // Scripts
+    pub const resources = "[R]"; // Resources
+    pub const file = " * "; // Document for files
+    pub const folder_open = "[+]"; // Open folder
+    pub const folder_closed = "[-]"; // Closed folder
 
     pub fn forFolder(name: []const u8) []const u8 {
         if (std.mem.eql(u8, name, project.ProjectFolders.models)) return models;
