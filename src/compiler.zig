@@ -337,10 +337,15 @@ pub const Compiler = struct {
         self.build_process = child;
     }
 
-    /// Check if build is complete and get result
+    /// Check if build is complete and get result.
+    /// Note: This uses a blocking wait. For long builds, the UI may briefly pause.
     pub fn pollBuild(self: *Self) ?CompilationResult {
+        if (self.state != .building) {
+            return null;
+        }
+
         if (self.build_process) |*proc| {
-            // Try to wait without blocking
+            // Wait for process to complete (blocking)
             const result = proc.wait() catch |err| {
                 self.state = .failed;
                 self.build_process = null;

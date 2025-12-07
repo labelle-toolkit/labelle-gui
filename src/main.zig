@@ -229,38 +229,44 @@ pub fn main() !void {
                 const can_build = state.compiler.isIdle();
                 if (zgui.menuItem("Generate Build Files", .{ .enabled = can_build })) {
                     if (state.project_manager.current_project) |proj| {
-                        state.compiler.generateAllBuildFiles(proj) catch |err| {
+                        if (state.compiler.generateAllBuildFiles(proj)) {
+                            setStatus(&state, "Build files generated!");
+                            state.tree_view.refresh();
+                        } else |err| {
                             std.debug.print("Error generating build files: {}\n", .{err});
                             setStatus(&state, "Error generating build files!");
-                        };
-                        setStatus(&state, "Build files generated!");
-                        state.tree_view.refresh();
+                        }
                     }
                 }
                 zgui.separator();
                 if (zgui.menuItem("Build", .{ .enabled = can_build })) {
                     if (state.project_manager.current_project) |proj| {
                         // First ensure build files exist
-                        state.compiler.generateAllBuildFiles(proj) catch |err| {
+                        const gen_ok = if (state.compiler.generateAllBuildFiles(proj)) true else |err| blk: {
                             std.debug.print("Error generating build files: {}\n", .{err});
                             setStatus(&state, "Error generating build files!");
+                            break :blk false;
                         };
-                        state.compiler.build(proj) catch |err| {
-                            std.debug.print("Error starting build: {}\n", .{err});
-                            setStatus(&state, "Error starting build!");
-                        };
-                        setStatus(&state, "Building...");
-                        state.show_compiler_output = true;
-                        state.compiler_output_scroll_to_bottom = true;
+                        if (gen_ok) {
+                            if (state.compiler.build(proj)) {
+                                setStatus(&state, "Building...");
+                                state.show_compiler_output = true;
+                                state.compiler_output_scroll_to_bottom = true;
+                            } else |err| {
+                                std.debug.print("Error starting build: {}\n", .{err});
+                                setStatus(&state, "Error starting build!");
+                            }
+                        }
                     }
                 }
                 if (zgui.menuItem("Run", .{ .enabled = can_build })) {
                     if (state.project_manager.current_project) |proj| {
-                        state.compiler.run(proj) catch |err| {
+                        if (state.compiler.run(proj)) {
+                            setStatus(&state, "Running game...");
+                        } else |err| {
                             std.debug.print("Error running game: {}\n", .{err});
                             setStatus(&state, "Error running game!");
-                        };
-                        setStatus(&state, "Running game...");
+                        }
                     }
                 }
                 zgui.separator();
@@ -544,8 +550,18 @@ pub fn main() !void {
                                 \\[entities]
                                 \\# Define your entities here
                                 \\
-                            , .{ scene_name, scene_name }) catch "";
-                            file.writeAll(content) catch {};
+                            , .{ scene_name, scene_name }) catch {
+                                setStatus(&state, "Error formatting scene content!");
+                                state.show_new_scene_dialog = false;
+                                zgui.endPopup();
+                                continue;
+                            };
+                            file.writeAll(content) catch {
+                                setStatus(&state, "Error writing scene file!");
+                                state.show_new_scene_dialog = false;
+                                zgui.endPopup();
+                                continue;
+                            };
 
                             setStatus(&state, "Scene created!");
                             state.tree_view.refresh();
