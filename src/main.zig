@@ -11,6 +11,10 @@ const compiler = @import("compiler.zig");
 
 const gl = zopengl.bindings;
 
+// DPI handling constants
+const dpi_epsilon: f32 = 1e-6;
+const dpi_change_threshold: f32 = 0.05; // 5% change considered significant
+
 // DPI state for handling dynamic scale changes
 var g_initial_scale: f32 = 1.0;
 var g_current_scale: std.atomic.Value(f32) = std.atomic.Value(f32).init(1.0);
@@ -124,9 +128,8 @@ pub fn main() !void {
         // Check for DPI changes (e.g., window moved to monitor with different scale)
         if (g_dpi_changed.swap(false, .acquire)) {
             const new_scale = g_current_scale.load(.acquire);
-            // Only show warning if scale changed significantly (>5% difference)
-            const epsilon = 1e-6;
-            if (g_initial_scale > epsilon and @abs(new_scale - g_initial_scale) / g_initial_scale > 0.05) {
+            // Only show warning if scale changed significantly
+            if (g_initial_scale > dpi_epsilon and @abs(new_scale - g_initial_scale) / g_initial_scale > dpi_change_threshold) {
                 state.show_dpi_warning = true;
             }
         }
@@ -618,7 +621,7 @@ pub fn main() !void {
             zgui.separator();
             zgui.spacing();
 
-            if (zgui.button("OK", .{ .w = 120 })) {
+            if (zgui.button("OK", .{ .w = 120 * g_initial_scale })) {
                 state.show_dpi_warning = false;
             }
             zgui.endPopup();
