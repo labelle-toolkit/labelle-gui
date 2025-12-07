@@ -4,6 +4,7 @@ const expect = zspec.expect;
 
 const project = @import("project.zig");
 const tree_view = @import("tree_view.zig");
+const compiler = @import("compiler.zig");
 
 test {
     zspec.runAll(@This());
@@ -37,12 +38,12 @@ pub const ProjectFoldersTests = struct {
         return false;
     }
 
-    test "has 5 default folders" {
-        try expect.equal(project.ProjectFolders.all.len, 5);
+    test "has 6 default folders" {
+        try expect.equal(project.ProjectFolders.all.len, 6);
     }
 
-    test "contains models folder" {
-        try expect.toBeTrue(containsFolder("models"));
+    test "contains components folder" {
+        try expect.toBeTrue(containsFolder("components"));
     }
 
     test "contains fixtures folder" {
@@ -51,6 +52,10 @@ pub const ProjectFoldersTests = struct {
 
     test "contains prefabs folder" {
         try expect.toBeTrue(containsFolder("prefabs"));
+    }
+
+    test "contains scenes folder" {
+        try expect.toBeTrue(containsFolder("scenes"));
     }
 
     test "contains scripts folder" {
@@ -148,9 +153,9 @@ pub const ConstantsTests = struct {
 };
 
 pub const FolderIconsTests = struct {
-    test "models folder has cube icon" {
-        const icon = tree_view.FolderIcons.forFolder("models");
-        try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.models));
+    test "components folder has cube icon" {
+        const icon = tree_view.FolderIcons.forFolder("components");
+        try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.components));
     }
 
     test "fixtures folder has wrench icon" {
@@ -161,6 +166,11 @@ pub const FolderIconsTests = struct {
     test "prefabs folder has box icon" {
         const icon = tree_view.FolderIcons.forFolder("prefabs");
         try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.prefabs));
+    }
+
+    test "scenes folder has film icon" {
+        const icon = tree_view.FolderIcons.forFolder("scenes");
+        try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.scenes));
     }
 
     test "scripts folder has scroll icon" {
@@ -205,5 +215,53 @@ pub const TreeViewTests = struct {
         tv.refresh();
 
         try expect.toBeTrue(tv.needs_refresh);
+    }
+};
+
+pub const CompilerTests = struct {
+    test "initializes in idle state" {
+        const allocator = std.testing.allocator;
+        var comp = compiler.Compiler.init(allocator);
+        defer comp.deinit();
+
+        try expect.equal(comp.getState(), .idle);
+    }
+
+    test "isIdle returns true for idle state" {
+        const allocator = std.testing.allocator;
+        var comp = compiler.Compiler.init(allocator);
+        defer comp.deinit();
+
+        try expect.toBeTrue(comp.isIdle());
+    }
+
+    test "has no last result initially" {
+        const allocator = std.testing.allocator;
+        var comp = compiler.Compiler.init(allocator);
+        defer comp.deinit();
+
+        try expect.toBeTrue(comp.last_result == null);
+    }
+
+    test "has no build process initially" {
+        const allocator = std.testing.allocator;
+        var comp = compiler.Compiler.init(allocator);
+        defer comp.deinit();
+
+        try expect.toBeTrue(comp.build_process == null);
+    }
+};
+
+pub const CompilerStateTests = struct {
+    test "idle state is initial state" {
+        try expect.equal(@intFromEnum(compiler.CompilerState.idle), 0);
+    }
+
+    test "all states are distinct" {
+        try expect.notEqual(@intFromEnum(compiler.CompilerState.idle), @intFromEnum(compiler.CompilerState.generating));
+        try expect.notEqual(@intFromEnum(compiler.CompilerState.generating), @intFromEnum(compiler.CompilerState.building));
+        try expect.notEqual(@intFromEnum(compiler.CompilerState.building), @intFromEnum(compiler.CompilerState.running));
+        try expect.notEqual(@intFromEnum(compiler.CompilerState.running), @intFromEnum(compiler.CompilerState.failed));
+        try expect.notEqual(@intFromEnum(compiler.CompilerState.failed), @intFromEnum(compiler.CompilerState.success));
     }
 };

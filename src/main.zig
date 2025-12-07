@@ -7,14 +7,21 @@ const project = @import("project.zig");
 const tree_view = @import("tree_view.zig");
 const icons = @import("icons.zig");
 const config = @import("config.zig");
+const compiler = @import("compiler.zig");
 
 const gl = zopengl.bindings;
 
 const AppState = struct {
     project_manager: project.ProjectManager,
     tree_view: tree_view.TreeView,
+    compiler: compiler.Compiler,
     status_message: [256]u8 = [_]u8{0} ** 256,
     status_timer: f32 = 0,
+    show_compiler_output: bool = false,
+    compiler_output_scroll_to_bottom: bool = false,
+    // New scene dialog
+    show_new_scene_dialog: bool = false,
+    new_scene_name: [128:0]u8 = [_:0]u8{0} ** 128,
 };
 
 pub fn main() !void {
@@ -58,8 +65,10 @@ pub fn main() !void {
     const scale_factor = window.getContentScale()[0];
     const font_size = config.ui.base_font_size * scale_factor;
 
-    // Add default font
-    _ = zgui.io.addFontDefault(null);
+    // Add default font at scaled size for Retina displays
+    var default_config = zgui.FontConfig.init();
+    default_config.size_pixels = font_size;
+    _ = zgui.io.addFontDefault(default_config);
 
     // Add FontAwesome icons (merged into the default font)
     var fa_config = zgui.FontConfig.init();
@@ -72,8 +81,8 @@ pub fn main() !void {
         fa_config,
         &icons.FA_ICON_RANGES,
     );
-    // Note: Font loading errors are handled internally by zgui/ImGui
 
+    // Scale UI elements for high-DPI displays
     zgui.getStyle().scaleAllSizes(scale_factor);
 
     zgui.backend.init(window);
@@ -83,9 +92,11 @@ pub fn main() !void {
     var state = AppState{
         .project_manager = project.ProjectManager.init(allocator),
         .tree_view = tree_view.TreeView.init(allocator),
+        .compiler = compiler.Compiler.init(allocator),
     };
     defer state.project_manager.deinit();
     defer state.tree_view.deinit();
+    defer state.compiler.deinit();
 
     std.debug.print("Labelle started!\n", .{});
 
@@ -93,8 +104,16 @@ pub fn main() !void {
     while (!window.shouldClose()) {
         zglfw.pollEvents();
 
+        // Pass window size (not framebuffer size) to ImGui for correct mouse coordinates
+        // The backend sets framebuffer scale to 1.0, so we need window coordinates
+        const win_size = window.getSize();
         const fb_size = window.getFramebufferSize();
-        zgui.backend.newFrame(@intCast(fb_size[0]), @intCast(fb_size[1]));
+        zgui.backend.newFrame(@intCast(win_size[0]), @intCast(win_size[1]));
+
+        // Manually set the correct framebuffer scale for Retina displays
+        const fb_scale_x = @as(f32, @floatFromInt(fb_size[0])) / @as(f32, @floatFromInt(win_size[0]));
+        const fb_scale_y = @as(f32, @floatFromInt(fb_size[1])) / @as(f32, @floatFromInt(win_size[1]));
+        zgui.io.setDisplayFramebufferScale(fb_scale_x, fb_scale_y);
 
         // Update status timer
         if (state.status_timer > 0) {
@@ -149,6 +168,11 @@ pub fn main() !void {
                     }
                 }
                 zgui.separator();
+                if (zgui.menuItem("New Scene...", .{ .enabled = state.project_manager.current_project != null })) {
+                    state.show_new_scene_dialog = true;
+                    @memset(&state.new_scene_name, 0);
+                }
+                zgui.separator();
                 if (zgui.menuItem("Save", .{})) {
                     if (state.project_manager.current_project) |proj| {
                         if (proj.path) |path| {
@@ -201,11 +225,71 @@ pub fn main() !void {
                 }
                 zgui.endMenu();
             }
+            if (zgui.beginMenu("Build", state.project_manager.current_project != null)) {
+                const can_build = state.compiler.isIdle();
+                if (zgui.menuItem("Generate Build Files", .{ .enabled = can_build })) {
+                    if (state.project_manager.current_project) |proj| {
+                        if (state.compiler.generateAllBuildFiles(proj)) {
+                            setStatus(&state, "Build files generated!");
+                            state.tree_view.refresh();
+                        } else |err| {
+                            std.debug.print("Error generating build files: {}\n", .{err});
+                            setStatus(&state, "Error generating build files!");
+                        }
+                    }
+                }
+                zgui.separator();
+                if (zgui.menuItem("Build", .{ .enabled = can_build })) {
+                    if (state.project_manager.current_project) |proj| {
+                        // First ensure build files exist
+                        const gen_ok = if (state.compiler.generateAllBuildFiles(proj)) true else |err| blk: {
+                            std.debug.print("Error generating build files: {}\n", .{err});
+                            setStatus(&state, "Error generating build files!");
+                            break :blk false;
+                        };
+                        if (gen_ok) {
+                            if (state.compiler.build(proj)) {
+                                setStatus(&state, "Building...");
+                                state.show_compiler_output = true;
+                                state.compiler_output_scroll_to_bottom = true;
+                            } else |err| {
+                                std.debug.print("Error starting build: {}\n", .{err});
+                                setStatus(&state, "Error starting build!");
+                            }
+                        }
+                    }
+                }
+                if (zgui.menuItem("Run", .{ .enabled = can_build })) {
+                    if (state.project_manager.current_project) |proj| {
+                        if (state.compiler.run(proj)) {
+                            setStatus(&state, "Running game...");
+                        } else |err| {
+                            std.debug.print("Error running game: {}\n", .{err});
+                            setStatus(&state, "Error running game!");
+                        }
+                    }
+                }
+                zgui.separator();
+                if (zgui.menuItem("Show Output", .{ .selected = state.show_compiler_output })) {
+                    state.show_compiler_output = !state.show_compiler_output;
+                }
+                zgui.endMenu();
+            }
             if (zgui.beginMenu("Help", true)) {
                 if (zgui.menuItem("About", .{})) {}
                 zgui.endMenu();
             }
             zgui.endMainMenuBar();
+        }
+
+        // Poll compiler for build completion
+        if (state.compiler.pollBuild()) |result| {
+            if (result.success) {
+                setStatus(&state, "Build successful!");
+            } else {
+                setStatus(&state, "Build failed!");
+            }
+            state.compiler_output_scroll_to_bottom = true;
         }
 
         // Main window
@@ -322,6 +406,56 @@ pub fn main() !void {
         }
         zgui.end();
 
+        // Compiler output panel (shown when building or when user toggles it)
+        const compiler_output_height: f32 = if (state.show_compiler_output) 200 else 0;
+        if (state.show_compiler_output) {
+            zgui.setNextWindowPos(.{ .x = work_pos[0], .y = work_pos[1] + work_size[1] - config.ui.status_bar_height - compiler_output_height });
+            zgui.setNextWindowSize(.{ .w = work_size[0], .h = compiler_output_height });
+
+            if (zgui.begin("Compiler Output", .{
+                .popen = &state.show_compiler_output,
+                .flags = .{
+                    .no_resize = true,
+                    .no_move = true,
+                    .no_collapse = true,
+                },
+            })) {
+                // Show compiler state
+                const compiler_state = state.compiler.getState();
+                switch (compiler_state) {
+                    .idle => zgui.textDisabled("Ready", .{}),
+                    .generating => zgui.textColored(.{ 1.0, 1.0, 0.0, 1.0 }, "Generating...", .{}),
+                    .building => zgui.textColored(.{ 1.0, 1.0, 0.0, 1.0 }, "Building...", .{}),
+                    .running => zgui.textColored(.{ 0.0, 1.0, 0.0, 1.0 }, "Running...", .{}),
+                    .success => zgui.textColored(.{ 0.0, 1.0, 0.0, 1.0 }, "Success", .{}),
+                    .failed => zgui.textColored(.{ 1.0, 0.0, 0.0, 1.0 }, "Failed", .{}),
+                }
+                zgui.separator();
+
+                // Show output/errors
+                if (zgui.beginChild("##output", .{ .h = -1 })) {
+                    if (state.compiler.last_result) |result| {
+                        if (result.errors.len > 0) {
+                            zgui.textColored(.{ 1.0, 0.3, 0.3, 1.0 }, "{s}", .{result.errors});
+                        }
+                        if (result.output.len > 0) {
+                            zgui.text("{s}", .{result.output});
+                        }
+                    } else {
+                        zgui.textDisabled("No output", .{});
+                    }
+
+                    // Auto-scroll to bottom
+                    if (state.compiler_output_scroll_to_bottom) {
+                        zgui.setScrollHereY(.{ .center_y_ratio = 1.0 });
+                        state.compiler_output_scroll_to_bottom = false;
+                    }
+                }
+                zgui.endChild();
+            }
+            zgui.end();
+        }
+
         // Status bar at bottom
         zgui.setNextWindowPos(.{ .x = work_pos[0], .y = work_pos[1] + work_size[1] - config.ui.status_bar_height });
         zgui.setNextWindowSize(.{ .w = work_size[0], .h = config.ui.status_bar_height });
@@ -351,6 +485,100 @@ pub fn main() !void {
             }
         }
         zgui.end();
+
+        // New Scene Dialog
+        if (state.show_new_scene_dialog) {
+            zgui.openPopup("New Scene", .{});
+        }
+        if (zgui.beginPopupModal("New Scene", .{ .popen = &state.show_new_scene_dialog, .flags = .{ .always_auto_resize = true } })) {
+            zgui.text("Enter scene name:", .{});
+            zgui.spacing();
+
+            // Auto-focus the input field when dialog opens
+            if (zgui.isWindowAppearing()) {
+                zgui.setKeyboardFocusHere(0);
+            }
+
+            const enter_pressed = zgui.inputText("##scene_name", .{ .buf = &state.new_scene_name, .flags = .{ .enter_returns_true = true } });
+
+            zgui.spacing();
+            zgui.separator();
+            zgui.spacing();
+
+            if (zgui.button("Create", .{ .w = 120 }) or enter_pressed) {
+                const scene_name = std.mem.sliceTo(&state.new_scene_name, 0);
+                if (scene_name.len > 0) {
+                    if (state.project_manager.current_project) |proj| {
+                        if (proj.getProjectDir()) |proj_dir| {
+                            // Create scene file
+                            var path_buf: [512]u8 = undefined;
+                            const scene_path = std.fmt.bufPrint(&path_buf, "{s}/{s}/{s}.scene", .{
+                                proj_dir,
+                                project.ProjectFolders.scenes,
+                                scene_name,
+                            }) catch {
+                                setStatus(&state, "Path too long!");
+                                zgui.closeCurrentPopup();
+                                state.show_new_scene_dialog = false;
+                                zgui.endPopup();
+                                continue;
+                            };
+
+                            // Create the scene file
+                            const file = std.fs.cwd().createFile(scene_path, .{ .exclusive = true }) catch |err| {
+                                if (err == error.PathAlreadyExists) {
+                                    setStatus(&state, "Scene already exists!");
+                                } else {
+                                    setStatus(&state, "Error creating scene!");
+                                }
+                                zgui.closeCurrentPopup();
+                                state.show_new_scene_dialog = false;
+                                zgui.endPopup();
+                                continue;
+                            };
+                            defer file.close();
+
+                            // Write default scene content
+                            var content_buf: [512]u8 = undefined;
+                            const content = std.fmt.bufPrint(&content_buf,
+                                \\# {s}
+                                \\# Scene created by Labelle GUI
+                                \\
+                                \\[scene]
+                                \\name = "{s}"
+                                \\
+                                \\[entities]
+                                \\# Define your entities here
+                                \\
+                            , .{ scene_name, scene_name }) catch {
+                                setStatus(&state, "Error formatting scene content!");
+                                state.show_new_scene_dialog = false;
+                                zgui.endPopup();
+                                continue;
+                            };
+                            file.writeAll(content) catch {
+                                setStatus(&state, "Error writing scene file!");
+                                state.show_new_scene_dialog = false;
+                                zgui.endPopup();
+                                continue;
+                            };
+
+                            setStatus(&state, "Scene created!");
+                            state.tree_view.refresh();
+                        }
+                    }
+                    zgui.closeCurrentPopup();
+                    state.show_new_scene_dialog = false;
+                }
+            }
+            zgui.sameLine(.{});
+            if (zgui.button("Cancel", .{ .w = 120 })) {
+                zgui.closeCurrentPopup();
+                state.show_new_scene_dialog = false;
+            }
+
+            zgui.endPopup();
+        }
 
         // Render
         gl.viewport(0, 0, fb_size[0], fb_size[1]);
