@@ -11,6 +11,11 @@ const compiler = @import("compiler.zig");
 
 const gl = zopengl.bindings;
 
+// Configure logging level for the application
+pub const std_options: std.Options = .{
+    .log_level = .info,
+};
+
 // DPI handling constants
 const dpi_epsilon: f32 = 1e-6;
 const dpi_change_threshold: f32 = 0.05; // 5% change considered significant
@@ -78,6 +83,9 @@ pub fn main() !void {
     zgui.init(allocator);
     defer zgui.deinit();
 
+    // Disable ini file to avoid memory leak warning on exit
+    zgui.io.setIniFilename(null);
+
     const scale_factor = window.getContentScale()[0];
 
     // Store initial scale and set up callback for dynamic DPI changes
@@ -119,7 +127,7 @@ pub fn main() !void {
     defer state.tree_view.deinit();
     defer state.compiler.deinit();
 
-    std.debug.print("Labelle started!\n", .{});
+    std.log.info("Labelle started", .{});
 
     // Main loop
     while (!window.shouldClose()) {
@@ -161,7 +169,7 @@ pub fn main() !void {
                             // Create new project with folder name as project name
                             const name = std.fs.path.basename(folder_path);
                             state.project_manager.newProject(name) catch |err| {
-                                std.debug.print("Error creating project: {}\n", .{err});
+                                std.log.err("Error creating project: {}", .{err});
                                 setStatus(&state, "Error creating project!");
                             };
                             // Auto-save to the selected folder
@@ -171,7 +179,7 @@ pub fn main() !void {
                             };
                             defer allocator.free(save_path);
                             state.project_manager.saveProject(save_path) catch |err| {
-                                std.debug.print("Error saving project: {}\n", .{err});
+                                std.log.err("Error saving project: {}", .{err});
                                 setStatus(&state, "Error saving project!");
                             };
                             setStatus(&state, "New project created!");
@@ -187,7 +195,7 @@ pub fn main() !void {
                         if (maybe_path) |file_path| {
                             defer nfd.freePath(file_path);
                             state.project_manager.loadProject(file_path) catch |err| {
-                                std.debug.print("Error loading project: {}\n", .{err});
+                                std.log.err("Error loading project: {}", .{err});
                                 setStatus(&state, "Error loading project!");
                             };
                             setStatus(&state, "Project loaded!");
@@ -208,7 +216,7 @@ pub fn main() !void {
                         if (proj.path) |path| {
                             state.project_manager.saveProject(path) catch |err| {
                                 setStatus(&state, "Error saving project!");
-                                std.debug.print("Save error: {}\n", .{err});
+                                std.log.err("Save error: {}", .{err});
                             };
                             setStatus(&state, "Project saved!");
                         } else {
@@ -217,7 +225,7 @@ pub fn main() !void {
                                 if (maybe_path) |file_path| {
                                     defer nfd.freePath(file_path);
                                     state.project_manager.saveProject(file_path) catch |err| {
-                                        std.debug.print("Save error: {}\n", .{err});
+                                        std.log.err("Save error: {}", .{err});
                                         setStatus(&state, "Error saving project!");
                                     };
                                     setStatus(&state, "Project saved!");
@@ -234,7 +242,7 @@ pub fn main() !void {
                             if (maybe_path) |file_path| {
                                 defer nfd.freePath(file_path);
                                 state.project_manager.saveProject(file_path) catch |err| {
-                                    std.debug.print("Save error: {}\n", .{err});
+                                    std.log.err("Save error: {}", .{err});
                                     setStatus(&state, "Error saving project!");
                                 };
                                 setStatus(&state, "Project saved!");
@@ -263,7 +271,7 @@ pub fn main() !void {
                             setStatus(&state, "Build files generated!");
                             state.tree_view.refresh();
                         } else |err| {
-                            std.debug.print("Error generating build files: {}\n", .{err});
+                            std.log.err("Error generating build files: {}", .{err});
                             setStatus(&state, "Error generating build files!");
                         }
                     }
@@ -273,7 +281,7 @@ pub fn main() !void {
                     if (state.project_manager.current_project) |proj| {
                         // First ensure build files exist
                         const gen_ok = if (state.compiler.generateAllBuildFiles(proj)) true else |err| blk: {
-                            std.debug.print("Error generating build files: {}\n", .{err});
+                            std.log.err("Error generating build files: {}", .{err});
                             setStatus(&state, "Error generating build files!");
                             break :blk false;
                         };
@@ -283,7 +291,7 @@ pub fn main() !void {
                                 state.show_compiler_output = true;
                                 state.compiler_output_scroll_to_bottom = true;
                             } else |err| {
-                                std.debug.print("Error starting build: {}\n", .{err});
+                                std.log.err("Error starting build: {}", .{err});
                                 setStatus(&state, "Error starting build!");
                             }
                         }
@@ -294,7 +302,7 @@ pub fn main() !void {
                         if (state.compiler.run(proj)) {
                             setStatus(&state, "Running game...");
                         } else |err| {
-                            std.debug.print("Error running game: {}\n", .{err});
+                            std.log.err("Error running game: {}", .{err});
                             setStatus(&state, "Error running game!");
                         }
                     }
@@ -346,7 +354,7 @@ pub fn main() !void {
                 if (state.tree_view.render(project_dir)) {
                     // File was selected
                     if (state.tree_view.getSelectedPath()) |selected| {
-                        std.debug.print("Selected: {s}\n", .{selected});
+                        std.log.debug("Selected: {s}", .{selected});
                     }
                 }
             } else {
@@ -398,7 +406,7 @@ pub fn main() !void {
                             defer nfd.freePath(folder_path);
                             const name = std.fs.path.basename(folder_path);
                             state.project_manager.newProject(name) catch |err| {
-                                std.debug.print("Error creating project: {}\n", .{err});
+                                std.log.err("Error creating project: {}", .{err});
                                 setStatus(&state, "Error creating project!");
                             };
                             const save_path = std.fmt.allocPrint(allocator, "{s}/project", .{folder_path}) catch {
@@ -407,7 +415,7 @@ pub fn main() !void {
                             };
                             defer allocator.free(save_path);
                             state.project_manager.saveProject(save_path) catch |err| {
-                                std.debug.print("Error saving project: {}\n", .{err});
+                                std.log.err("Error saving project: {}", .{err});
                                 setStatus(&state, "Error saving project!");
                             };
                             setStatus(&state, "New project created!");
@@ -422,7 +430,7 @@ pub fn main() !void {
                         if (maybe_path) |file_path| {
                             defer nfd.freePath(file_path);
                             state.project_manager.loadProject(file_path) catch |err| {
-                                std.debug.print("Error loading project: {}\n", .{err});
+                                std.log.err("Error loading project: {}", .{err});
                                 setStatus(&state, "Error loading project!");
                             };
                             setStatus(&state, "Project loaded!");
@@ -637,7 +645,7 @@ pub fn main() !void {
         window.swapBuffers();
     }
 
-    std.debug.print("Labelle closed.\n", .{});
+    std.log.info("Labelle closed", .{});
 }
 
 fn setStatus(state: *AppState, message: []const u8) void {
