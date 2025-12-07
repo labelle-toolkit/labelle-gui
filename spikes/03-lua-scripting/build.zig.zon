@@ -1,0 +1,11 @@
+.{
+    .name = .lua_spike,
+    .version = "0.0.1",
+    .fingerprint = 0x416de90e9284e6cd,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "scripts",
+    },
+}
