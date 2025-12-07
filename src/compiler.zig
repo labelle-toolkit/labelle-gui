@@ -155,8 +155,7 @@ pub const Compiler = struct {
             \\    .dependencies = .{{
             \\        .labelle_engine = .{{
             \\            .url = "git+https://github.com/labelle-toolkit/labelle-engine#main",
-            \\            // Update hash after first build attempt
-            \\            // .hash = "",
+            \\            .hash = "labelle_engine-0.2.0-rhO5vroRAgBDibpf32FtJr-Z7YFVzvDgEg_UftNxYbpg",
             \\        }},
             \\        .@"labelle-gfx" = .{{
             \\            .url = "git+https://github.com/labelle-toolkit/labelle-gfx?ref=v0.10.0#2bc00d41de2f067f72aa55629167b0b61e3f4d42",
