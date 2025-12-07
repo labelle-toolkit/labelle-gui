@@ -57,13 +57,18 @@ pub const Compiler = struct {
         }
     }
 
-    /// Generate build.zig for the project
+    /// Generate build.zig for the project (only if it doesn't exist)
     pub fn generateBuildZig(self: *Self, proj: *const project.Project) !void {
         _ = self;
         const project_dir = proj.getProjectDir() orelse return error.NoProjectPath;
 
         const build_path = try std.fs.path.join(proj.allocator, &.{ project_dir, "build.zig" });
         defer proj.allocator.free(build_path);
+
+        // Don't overwrite existing build.zig to preserve user modifications
+        if (std.fs.cwd().access(build_path, .{})) {
+            return;
+        } else |_| {}
 
         const file = try std.fs.cwd().createFile(build_path, .{});
         defer file.close();
@@ -128,7 +133,7 @@ pub const Compiler = struct {
         try file.writeAll(build_content);
     }
 
-    /// Generate build.zig.zon for the project
+    /// Generate build.zig.zon for the project (only if it doesn't exist)
     pub fn generateBuildZigZon(self: *Self, proj: *const project.Project) !void {
         _ = self;
         const project_dir = proj.getProjectDir() orelse return error.NoProjectPath;
@@ -136,15 +141,21 @@ pub const Compiler = struct {
         const zon_path = try std.fs.path.join(proj.allocator, &.{ project_dir, "build.zig.zon" });
         defer proj.allocator.free(zon_path);
 
+        // Don't overwrite existing build.zig.zon to preserve fingerprint and user modifications
+        if (std.fs.cwd().access(zon_path, .{})) {
+            return;
+        } else |_| {}
+
         const file = try std.fs.cwd().createFile(zon_path, .{});
         defer file.close();
 
-        // Generate a simple fingerprint from the project name
-        var fingerprint: u64 = 0;
+        // Generate a deterministic fingerprint from the project name only
+        // This ensures the fingerprint doesn't change between runs
+        // Note: Zig may still suggest a different fingerprint on first build
+        var fingerprint: u64 = 0xcafe_babe_dead_beef; // Start with a seed
         for (proj.metadata.name) |c| {
             fingerprint = fingerprint *% 31 +% c;
         }
-        fingerprint ^= @as(u64, @intCast(proj.metadata.created_at));
 
         const zon_content = try std.fmt.allocPrint(proj.allocator,
             \\.{{
@@ -185,12 +196,18 @@ pub const Compiler = struct {
     }
 
     /// Generate main.zig entry point (at project root, following engine example_5 pattern)
+    /// Only generates if the file doesn't exist
     pub fn generateMainZig(self: *Self, proj: *const project.Project) !void {
         _ = self;
         const project_dir = proj.getProjectDir() orelse return error.NoProjectPath;
 
         const main_path = try std.fs.path.join(proj.allocator, &.{ project_dir, "main.zig" });
         defer proj.allocator.free(main_path);
+
+        // Don't overwrite existing main.zig to preserve user modifications
+        if (std.fs.cwd().access(main_path, .{})) {
+            return;
+        } else |_| {}
 
         const file = try std.fs.cwd().createFile(main_path, .{});
         defer file.close();

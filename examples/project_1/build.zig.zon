@@ -1,5 +1,5 @@
 .{
-    .fingerprint = 0x59d2adfd578b,
+    .fingerprint = 0x6b0a705b10c85502,
     .name = .project_1,
     .version = "0.1.0",
     .minimum_zig_version = "0.15.2",
