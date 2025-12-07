@@ -139,8 +139,16 @@ pub const Compiler = struct {
         const file = try std.fs.cwd().createFile(zon_path, .{});
         defer file.close();
 
+        // Generate a simple fingerprint from the project name
+        var fingerprint: u64 = 0;
+        for (proj.metadata.name) |c| {
+            fingerprint = fingerprint *% 31 +% c;
+        }
+        fingerprint ^= @as(u64, @intCast(proj.metadata.created_at));
+
         const zon_content = try std.fmt.allocPrint(proj.allocator,
             \\.{{
+            \\    .fingerprint = 0x{x},
             \\    .name = .{s},
             \\    .version = "0.1.0",
             \\    .minimum_zig_version = "0.15.2",
@@ -171,7 +179,7 @@ pub const Compiler = struct {
             \\    }},
             \\}}
             \\
-        , .{proj.metadata.name});
+        , .{ fingerprint, proj.metadata.name });
         defer proj.allocator.free(zon_content);
 
         try file.writeAll(zon_content);
