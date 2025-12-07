@@ -26,10 +26,10 @@ jobs:
           sudo apt-get install -y libgtk-3-dev libgl1-mesa-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev
 
       - name: Build
-        run: zig build
+        run: zig build -Dcpu=baseline
 
       - name: Unit Tests
-        run: zig build test
+        run: zig build test -Dcpu=baseline
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
