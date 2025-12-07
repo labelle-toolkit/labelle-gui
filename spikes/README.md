@@ -74,6 +74,62 @@ cd 03-lua-scripting && zig build run
 
 **Best for:** User macros, simple automation, theming
 
+### 04-imgui-modules
+
+**Status:** Working
+
+Compile-time modules with actual ImGui panels. Demonstrates how modules register panels and menu items.
+
+```bash
+cd 04-imgui-modules && zig build run
+```
+
+**Features:**
+- Hierarchy panel with tree view
+- Inspector panel with property editors
+- Console panel with command input
+- Asset Browser panel with file list
+- View menu to toggle panels on/off
+
+**Best for:** Seeing compile-time modules with real UI
+
+### 05-dynamic-imgui
+
+**Status:** Working
+
+Dynamic library plugins with ImGui integration. Plugins provide data, host renders UI.
+
+```bash
+cd 05-dynamic-imgui && zig build run
+```
+
+**Features:**
+- Counter plugin with buttons and slider
+- Color Picker plugin with color editor and presets
+- Plugin Manager panel to toggle plugins
+- Plugins loaded from .dylib/.so/.dll files
+
+**Best for:** Seeing dynamic plugins with real UI
+
+### 06-lua-imgui
+
+**Status:** Working (Mock implementation)
+
+Lua scripts with ImGui panels. Scripts are parsed for metadata, host renders UI based on plugin type.
+
+```bash
+cd 06-lua-imgui && zig build run
+```
+
+**Features:**
+- Counter script with increment/decrement
+- Color Picker script with presets
+- Notepad script with text editor
+- Lua Console showing script actions
+- Scripts loaded from .lua files
+
+**Best for:** Seeing Lua scripting with real UI
+
 ## Recommendations
 
 ### Hybrid Approach
@@ -110,7 +166,7 @@ For actual Lua integration, use [ziglua](https://github.com/natecraddock/ziglua)
 
 ```bash
 # From spikes/ directory
-for spike in 01-* 02-* 03-*; do
+for spike in 01-* 02-* 03-* 04-* 05-* 06-*; do
     echo "=== Running $spike ==="
     (cd "$spike" && zig build run)
     echo

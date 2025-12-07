@@ -1,3 +1,4 @@
+const std = @import("std");
 const zgui = @import("zgui");
 const module = @import("../module.zig");
 
@@ -68,8 +69,6 @@ fn renderPanel() void {
         }
     }
 }
-
-const std = @import("std");
 
 pub const console_module = module.Module{
     .name = "console",

@@ -41,9 +41,10 @@ const LuaScript = struct {
         defer allocator.free(content);
 
         // Parse metadata from Lua script
-        var name: [:0]const u8 = "unknown";
-        var display_name: [:0]const u8 = "Unknown Script";
-        var version: []const u8 = "0.0.0";
+        // Always allocate so we can always free in deinit
+        var name: [:0]const u8 = try allocator.dupeZ(u8, "unknown");
+        var display_name: [:0]const u8 = try allocator.dupeZ(u8, "Unknown Script");
+        var version: []const u8 = try allocator.dupe(u8, "0.0.0");
         var plugin_type: PluginType = .unknown;
 
         var lines = std.mem.splitScalar(u8, content, '\n');
@@ -51,16 +52,19 @@ const LuaScript = struct {
             if (std.mem.indexOf(u8, line, "display_name = \"")) |start| {
                 const value_start = start + 16;
                 if (std.mem.indexOfScalar(u8, line[value_start..], '"')) |end| {
+                    allocator.free(display_name);
                     display_name = try allocator.dupeZ(u8, line[value_start .. value_start + end]);
                 }
             } else if (std.mem.indexOf(u8, line, "name = \"")) |start| {
                 const value_start = start + 8;
                 if (std.mem.indexOfScalar(u8, line[value_start..], '"')) |end| {
+                    allocator.free(name);
                     name = try allocator.dupeZ(u8, line[value_start .. value_start + end]);
                 }
             } else if (std.mem.indexOf(u8, line, "version = \"")) |start| {
                 const value_start = start + 11;
                 if (std.mem.indexOfScalar(u8, line[value_start..], '"')) |end| {
+                    allocator.free(version);
                     version = try allocator.dupe(u8, line[value_start .. value_start + end]);
                 }
             } else if (std.mem.indexOf(u8, line, "plugin_type = \"")) |start| {
@@ -97,15 +101,10 @@ const LuaScript = struct {
     }
 
     pub fn deinit(self: *LuaScript) void {
-        if (!std.mem.eql(u8, self.name, "unknown")) {
-            self.allocator.free(self.name);
-        }
-        if (!std.mem.eql(u8, self.display_name, "Unknown Script")) {
-            self.allocator.free(self.display_name);
-        }
-        if (!std.mem.eql(u8, self.version, "0.0.0")) {
-            self.allocator.free(self.version);
-        }
+        // All fields are always allocated, so always free them
+        self.allocator.free(self.name);
+        self.allocator.free(self.display_name);
+        self.allocator.free(self.version);
         self.allocator.free(self.script_path);
     }
 };
