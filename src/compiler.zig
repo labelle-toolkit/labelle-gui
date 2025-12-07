@@ -271,7 +271,7 @@ pub const Compiler = struct {
         try file.writeAll(main_content);
     }
 
-    /// Create project folder structure (components, scripts, prefabs, assets)
+    /// Create project folder structure (components, scripts, prefabs, assets, scenes)
     pub fn createProjectFolders(self: *Self, proj: *const project.Project) !void {
         _ = self;
         const project_dir = proj.getProjectDir() orelse return error.NoProjectPath;
@@ -282,6 +282,7 @@ pub const Compiler = struct {
             "scripts",
             "prefabs",
             "assets",
+            "scenes",
         };
 
         for (folders) |folder| {
@@ -299,8 +300,10 @@ pub const Compiler = struct {
             if (std.fs.cwd().access(gitkeep_path, .{})) {
                 // File exists, skip
             } else |_| {
-                const gitkeep = std.fs.cwd().createFile(gitkeep_path, .{}) catch continue;
-                gitkeep.close();
+                // Use if/else to ensure defer statements execute even on error
+                if (std.fs.cwd().createFile(gitkeep_path, .{})) |gitkeep| {
+                    gitkeep.close();
+                } else |_| {}
             }
         }
     }
