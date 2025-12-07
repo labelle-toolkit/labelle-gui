@@ -6,17 +6,20 @@ pub fn build(b: *std.Build) void {
 
     const zglfw = b.dependency("zglfw", .{
         .target = target,
+        .optimize = optimize,
     });
 
     const zopengl = b.dependency("zopengl", .{});
 
     const zgui = b.dependency("zgui", .{
         .target = target,
+        .optimize = optimize,
         .backend = .glfw_opengl3,
     });
 
     const nfd = b.dependency("nfd", .{
         .target = target,
+        .optimize = optimize,
     });
 
     const zspec = b.dependency("zspec", .{
@@ -43,6 +46,11 @@ pub fn build(b: *std.Build) void {
     exe.linkLibrary(zgui.artifact("imgui"));
 
     exe.root_module.addImport("nfd", nfd.module("nfd"));
+
+    // Windows-specific: embed DPI awareness manifest
+    if (target.result.os.tag == .windows) {
+        exe.win32_manifest = b.path("assets/labelle-gui.manifest");
+    }
 
     b.installArtifact(exe);
 

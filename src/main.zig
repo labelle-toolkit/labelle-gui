@@ -11,6 +11,20 @@ const compiler = @import("compiler.zig");
 
 const gl = zopengl.bindings;
 
+// DPI handling constants
+const dpi_epsilon: f32 = 1e-6;
+const dpi_change_threshold: f32 = 0.05; // 5% change considered significant
+
+// DPI state for handling dynamic scale changes
+var g_initial_scale: f32 = 1.0;
+var g_current_scale: std.atomic.Value(f32) = std.atomic.Value(f32).init(1.0);
+var g_dpi_changed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+fn contentScaleCallback(_: *zglfw.Window, xscale: f32, _: f32) callconv(.c) void {
+    g_current_scale.store(xscale, .release);
+    g_dpi_changed.store(true, .release);
+}
+
 const AppState = struct {
     project_manager: project.ProjectManager,
     tree_view: tree_view.TreeView,
@@ -22,6 +36,8 @@ const AppState = struct {
     // New scene dialog
     show_new_scene_dialog: bool = false,
     new_scene_name: [128:0]u8 = [_:0]u8{0} ** 128,
+    // DPI change notification
+    show_dpi_warning: bool = false,
 };
 
 pub fn main() !void {
@@ -63,6 +79,11 @@ pub fn main() !void {
     defer zgui.deinit();
 
     const scale_factor = window.getContentScale()[0];
+
+    // Store initial scale and set up callback for dynamic DPI changes
+    g_initial_scale = scale_factor;
+    g_current_scale.store(scale_factor, .release);
+    _ = window.setContentScaleCallback(contentScaleCallback);
     const font_size = config.ui.base_font_size * scale_factor;
 
     // Add default font at scaled size for Retina displays
@@ -103,6 +124,15 @@ pub fn main() !void {
     // Main loop
     while (!window.shouldClose()) {
         zglfw.pollEvents();
+
+        // Check for DPI changes (e.g., window moved to monitor with different scale)
+        if (g_dpi_changed.swap(false, .acquire)) {
+            const new_scale = g_current_scale.load(.acquire);
+            // Only show warning if scale changed significantly
+            if (g_initial_scale > dpi_epsilon and @abs(new_scale - g_initial_scale) / g_initial_scale > dpi_change_threshold) {
+                state.show_dpi_warning = true;
+            }
+        }
 
         // Pass window size (not framebuffer size) to ImGui for correct mouse coordinates
         // The backend sets framebuffer scale to 1.0, so we need window coordinates
@@ -577,6 +607,23 @@ pub fn main() !void {
                 state.show_new_scene_dialog = false;
             }
 
+            zgui.endPopup();
+        }
+
+        // DPI Change Warning Dialog
+        if (state.show_dpi_warning) {
+            zgui.openPopup("Display Scale Changed", .{});
+        }
+        if (zgui.beginPopupModal("Display Scale Changed", .{ .popen = &state.show_dpi_warning, .flags = .{ .always_auto_resize = true } })) {
+            zgui.text("The display scale has changed.", .{});
+            zgui.text("For best results, please restart the application.", .{});
+            zgui.spacing();
+            zgui.separator();
+            zgui.spacing();
+
+            if (zgui.button("OK", .{ .w = 120 * g_initial_scale })) {
+                state.show_dpi_warning = false;
+            }
             zgui.endPopup();
         }
 
