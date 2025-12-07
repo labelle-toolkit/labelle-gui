@@ -57,13 +57,18 @@ pub const Compiler = struct {
         }
     }
 
-    /// Generate build.zig for the project
+    /// Generate build.zig for the project (only if it doesn't exist)
     pub fn generateBuildZig(self: *Self, proj: *const project.Project) !void {
         _ = self;
         const project_dir = proj.getProjectDir() orelse return error.NoProjectPath;
 
         const build_path = try std.fs.path.join(proj.allocator, &.{ project_dir, "build.zig" });
         defer proj.allocator.free(build_path);
+
+        // Don't overwrite existing build.zig to preserve user modifications
+        if (std.fs.cwd().access(build_path, .{})) {
+            return;
+        } else |_| {}
 
         const file = try std.fs.cwd().createFile(build_path, .{});
         defer file.close();
@@ -76,50 +81,50 @@ pub const Compiler = struct {
             \\    const optimize = b.standardOptimizeOption(.{{}});
             \\
             \\    // Dependencies
-            \\    const labelle_gfx = b.dependency("labelle-gfx", .{{
+            \\    const labelle_engine_dep = b.dependency("labelle_engine", .{{
             \\        .target = target,
             \\        .optimize = optimize,
             \\    }});
-            \\    const labelle_engine = b.dependency("labelle-engine", .{{
+            \\    const labelle_engine = labelle_engine_dep.module("labelle-engine");
+            \\
+            \\    const labelle_dep = b.dependency("labelle-gfx", .{{
             \\        .target = target,
             \\        .optimize = optimize,
             \\    }});
+            \\    const labelle = labelle_dep.module("labelle");
+            \\
+            \\    const ecs_dep = b.dependency("zig_ecs", .{{
+            \\        .target = target,
+            \\        .optimize = optimize,
+            \\    }});
+            \\    const ecs = ecs_dep.module("zig-ecs");
             \\
             \\    // Main executable
             \\    const exe = b.addExecutable(.{{
             \\        .name = "{s}",
             \\        .root_module = b.createModule(.{{
-            \\            .root_source_file = b.path("src/main.zig"),
+            \\            .root_source_file = b.path("main.zig"),
             \\            .target = target,
             \\            .optimize = optimize,
+            \\            .imports = &.{{
+            \\                .{{ .name = "labelle-engine", .module = labelle_engine }},
+            \\                .{{ .name = "labelle", .module = labelle }},
+            \\                .{{ .name = "ecs", .module = ecs }},
+            \\            }},
             \\        }}),
             \\    }});
             \\
-            \\    // Link dependencies
-            \\    exe.root_module.addImport("labelle-gfx", labelle_gfx.module("root"));
-            \\    exe.root_module.addImport("labelle-engine", labelle_engine.module("root"));
-            \\
-            \\    // Add user scripts module
-            \\    const scripts_module = b.createModule(.{{
-            \\        .root_source_file = b.path("scripts/root.zig"),
-            \\        .target = target,
-            \\        .optimize = optimize,
-            \\    }});
-            \\    scripts_module.addImport("labelle-gfx", labelle_gfx.module("root"));
-            \\    scripts_module.addImport("labelle-engine", labelle_engine.module("root"));
-            \\    exe.root_module.addImport("scripts", scripts_module);
-            \\
-            \\    // Install
             \\    b.installArtifact(exe);
             \\
-            \\    // Run step
-            \\    const run_cmd = b.addRunArtifact(exe);
-            \\    run_cmd.step.dependOn(b.getInstallStep());
+            \\    const run_exe = b.addRunArtifact(exe);
+            \\    run_exe.step.dependOn(b.getInstallStep());
+            \\
             \\    if (b.args) |args| {{
-            \\        run_cmd.addArgs(args);
+            \\        run_exe.addArgs(args);
             \\    }}
+            \\
             \\    const run_step = b.step("run", "Run the game");
-            \\    run_step.dependOn(&run_cmd.step);
+            \\    run_step.dependOn(&run_exe.step);
             \\}}
             \\
         , .{proj.metadata.name});
@@ -128,7 +133,7 @@ pub const Compiler = struct {
         try file.writeAll(build_content);
     }
 
-    /// Generate build.zig.zon for the project
+    /// Generate build.zig.zon for the project (only if it doesn't exist)
     pub fn generateBuildZigZon(self: *Self, proj: *const project.Project) !void {
         _ = self;
         const project_dir = proj.getProjectDir() orelse return error.NoProjectPath;
@@ -136,132 +141,159 @@ pub const Compiler = struct {
         const zon_path = try std.fs.path.join(proj.allocator, &.{ project_dir, "build.zig.zon" });
         defer proj.allocator.free(zon_path);
 
+        // Don't overwrite existing build.zig.zon to preserve fingerprint and user modifications
+        if (std.fs.cwd().access(zon_path, .{})) {
+            return;
+        } else |_| {}
+
         const file = try std.fs.cwd().createFile(zon_path, .{});
         defer file.close();
 
+        // Generate a deterministic fingerprint from the project name using Wyhash
+        // This ensures the fingerprint doesn't change between runs
+        // Note: Zig may still suggest a different fingerprint on first build
+        const fingerprint = std.hash.Wyhash.hash(0xcafe_babe_dead_beef, proj.metadata.name);
+
         const zon_content = try std.fmt.allocPrint(proj.allocator,
             \\.{{
-            \\    .name = .{{ '{s}' }},
+            \\    .fingerprint = 0x{x},
+            \\    .name = .{s},
             \\    .version = "0.1.0",
+            \\    .minimum_zig_version = "0.15.2",
             \\    .dependencies = .{{
-            \\        .@"labelle-gfx" = .{{
-            \\            .url = "https://github.com/labelle-toolkit/labelle-gfx/archive/refs/heads/main.tar.gz",
-            \\            // Update hash after first build attempt
-            \\            // .hash = "",
+            \\        .labelle_engine = .{{
+            \\            .url = "git+https://github.com/labelle-toolkit/labelle-engine#main",
+            \\            .hash = "labelle_engine-0.2.0-rhO5vroRAgBDibpf32FtJr-Z7YFVzvDgEg_UftNxYbpg",
             \\        }},
-            \\        .@"labelle-engine" = .{{
-            \\            .url = "https://github.com/labelle-toolkit/labelle-engine/archive/refs/heads/main.tar.gz",
-            \\            // Update hash after first build attempt
-            \\            // .hash = "",
+            \\        .@"labelle-gfx" = .{{
+            \\            .url = "git+https://github.com/labelle-toolkit/labelle-gfx?ref=v0.10.0#2bc00d41de2f067f72aa55629167b0b61e3f4d42",
+            \\            .hash = "labelle-0.10.0-2bWPIhW2BAB16mnfjuJYX1meUv3k_EQPzY-oJQXjBL76",
+            \\        }},
+            \\        .zig_ecs = .{{
+            \\            .url = "git+https://github.com/prime31/zig-ecs#dbf3647c2cc4f327fe87067e40f8436c7f87f209",
+            \\            .hash = "entt-1.0.0-qJPtbNLVAgDPXaUbyRSsBTK75Cr1WujUA92kToJugWry",
             \\        }},
             \\    }},
-            \\    .paths = .{{ "." }},
+            \\    .paths = .{{
+            \\        "build.zig",
+            \\        "build.zig.zon",
+            \\        "main.zig",
+            \\        "scenes",
+            \\        "components",
+            \\        "scripts",
+            \\        "prefabs",
+            \\        "assets",
+            \\    }},
             \\}}
             \\
-        , .{proj.metadata.name});
+        , .{ fingerprint, proj.metadata.name });
         defer proj.allocator.free(zon_content);
 
         try file.writeAll(zon_content);
     }
 
-    /// Generate src/main.zig entry point
+    /// Generate main.zig entry point (at project root, following engine example_5 pattern)
+    /// Only generates if the file doesn't exist
     pub fn generateMainZig(self: *Self, proj: *const project.Project) !void {
         _ = self;
         const project_dir = proj.getProjectDir() orelse return error.NoProjectPath;
 
-        // Create src directory
-        const src_path = try std.fs.path.join(proj.allocator, &.{ project_dir, "src" });
-        defer proj.allocator.free(src_path);
-
-        std.fs.cwd().makeDir(src_path) catch |err| {
-            if (err != error.PathAlreadyExists) return err;
-        };
-
-        const main_path = try std.fs.path.join(proj.allocator, &.{ project_dir, "src", "main.zig" });
+        const main_path = try std.fs.path.join(proj.allocator, &.{ project_dir, "main.zig" });
         defer proj.allocator.free(main_path);
+
+        // Don't overwrite existing main.zig to preserve user modifications
+        if (std.fs.cwd().access(main_path, .{})) {
+            return;
+        } else |_| {}
 
         const file = try std.fs.cwd().createFile(main_path, .{});
         defer file.close();
 
         const main_content = try std.fmt.allocPrint(proj.allocator,
+            \\// {s} - Generated by Labelle GUI
+            \\//
+            \\// This is the main entry point for your game.
+            \\// Edit this file to customize game initialization and behavior.
+            \\
             \\const std = @import("std");
-            \\const gfx = @import("labelle-gfx");
             \\const engine = @import("labelle-engine");
-            \\const scripts = @import("scripts");
+            \\const labelle = @import("labelle");
+            \\
+            \\// Import components from the components/ folder
+            \\// Example: const velocity = @import("components/velocity.zig");
+            \\
+            \\// Component registry - add your components here
+            \\const Components = engine.ComponentRegistry(struct {{
+            \\    // Example: pub const Velocity = velocity.Velocity;
+            \\}});
+            \\
+            \\// Prefab registry - add your prefabs here
+            \\const Prefabs = engine.PrefabRegistry(.{{}});
+            \\
+            \\// Script registry - add your scripts here
+            \\const Scripts = engine.ScriptRegistry(struct {{}});
+            \\
+            \\// Scene loader type
+            \\const Loader = engine.SceneLoader(Prefabs, Components, Scripts);
             \\
             \\pub fn main() !void {{
             \\    var gpa = std.heap.GeneralPurposeAllocator(.{{}}){{}};
             \\    defer _ = gpa.deinit();
             \\    const allocator = gpa.allocator();
             \\
-            \\    // Initialize the engine
-            \\    var game_engine = try engine.Engine.init(allocator, .{{
-            \\        .title = "{s}",
-            \\        .width = 1280,
-            \\        .height = 720,
+            \\    // Initialize game with the Game facade
+            \\    var game = try engine.Game.init(allocator, .{{
+            \\        .window = .{{
+            \\            .width = 1280,
+            \\            .height = 720,
+            \\            .title = "{s}",
+            \\        }},
+            \\        .clear_color = .{{ .r = 30, .g = 35, .b = 45 }},
             \\    }});
-            \\    defer game_engine.deinit();
+            \\    defer game.deinit();
             \\
-            \\    // Register user scripts
-            \\    scripts.registerAll(&game_engine);
+            \\    // Register scenes - import your scene .zon files here
+            \\    try game.registerSceneSimple("main", Loader, @import("scenes/main.zon"));
             \\
-            \\    // Load initial scene
-            \\    try game_engine.loadScene("scenes/main.scene");
+            \\    // Start with main scene
+            \\    try game.setScene("main");
             \\
             \\    // Run the game loop
-            \\    try game_engine.run();
+            \\    try game.run();
             \\}}
             \\
-        , .{proj.metadata.name});
+        , .{ proj.metadata.name, proj.metadata.name });
         defer proj.allocator.free(main_content);
 
         try file.writeAll(main_content);
     }
 
-    /// Generate scripts/root.zig that exports all user scripts
-    pub fn generateScriptsRoot(self: *Self, proj: *const project.Project) !void {
+    /// Create project folder structure using ProjectFolders.all
+    pub fn createProjectFolders(self: *Self, proj: *const project.Project) !void {
         _ = self;
         const project_dir = proj.getProjectDir() orelse return error.NoProjectPath;
 
-        const scripts_dir = try std.fs.path.join(proj.allocator, &.{ project_dir, project.ProjectFolders.scripts });
-        defer proj.allocator.free(scripts_dir);
+        // Create all folders defined in ProjectFolders.all
+        for (project.ProjectFolders.all) |folder| {
+            const folder_path = try std.fs.path.join(proj.allocator, &.{ project_dir, folder });
+            defer proj.allocator.free(folder_path);
 
-        const root_path = try std.fs.path.join(proj.allocator, &.{ scripts_dir, "root.zig" });
-        defer proj.allocator.free(root_path);
+            std.fs.cwd().makeDir(folder_path) catch |err| {
+                if (err != error.PathAlreadyExists) return err;
+            };
 
-        // Check if root.zig already exists
-        if (std.fs.cwd().access(root_path, .{})) {
-            // File exists, don't overwrite user modifications
-            return;
-        } else |_| {
-            // File doesn't exist, create it
+            // Create a .gitkeep file to preserve empty directories in git
+            const gitkeep_path = try std.fs.path.join(proj.allocator, &.{ folder_path, ".gitkeep" });
+            defer proj.allocator.free(gitkeep_path);
+
+            // Attempt to create gitkeep, ignore if it already exists or fails
+            if (std.fs.cwd().createFile(gitkeep_path, .{ .exclusive = true })) |gitkeep| {
+                gitkeep.close();
+            } else |_| {}
         }
-
-        const file = try std.fs.cwd().createFile(root_path, .{});
-        defer file.close();
-
-        const root_content =
-            \\const std = @import("std");
-            \\const engine = @import("labelle-engine");
-            \\
-            \\// Import your script modules here
-            \\// pub const player = @import("player.zig");
-            \\// pub const enemy = @import("enemy.zig");
-            \\
-            \\/// Register all scripts with the engine
-            \\pub fn registerAll(game_engine: *engine.Engine) void {
-            \\    _ = game_engine;
-            \\    // Register your scripts here
-            \\    // game_engine.registerScript("Player", player.Player);
-            \\    // game_engine.registerScript("Enemy", enemy.Enemy);
-            \\}
-            \\
-        ;
-
-        try file.writeAll(root_content);
     }
 
-    /// Generate a default scene file
+    /// Generate a default scene .zon file (compile-time scene format)
     pub fn generateDefaultScene(self: *Self, proj: *const project.Project) !void {
         _ = self;
         const project_dir = proj.getProjectDir() orelse return error.NoProjectPath;
@@ -269,7 +301,7 @@ pub const Compiler = struct {
         const scenes_dir = try std.fs.path.join(proj.allocator, &.{ project_dir, project.ProjectFolders.scenes });
         defer proj.allocator.free(scenes_dir);
 
-        const scene_path = try std.fs.path.join(proj.allocator, &.{ scenes_dir, "main.scene" });
+        const scene_path = try std.fs.path.join(proj.allocator, &.{ scenes_dir, "main.zon" });
         defer proj.allocator.free(scene_path);
 
         // Check if scene already exists
@@ -280,23 +312,31 @@ pub const Compiler = struct {
         const file = try std.fs.cwd().createFile(scene_path, .{});
         defer file.close();
 
-        const scene_content = try std.fmt.allocPrint(proj.allocator,
-            \\# {s} - Main Scene
-            \\# This is the default scene loaded when the game starts
+        // Generate a .zon scene file in the format expected by labelle-engine
+        const scene_content =
+            \\.{
+            \\    .name = "main",
+            \\    .entities = .{
+            \\        // Example entity: a blue rectangle
+            \\        .{
+            \\            .shape = .{
+            \\                .type = .rectangle,
+            \\                .x = 400,
+            \\                .y = 300,
+            \\                .width = 100,
+            \\                .height = 100,
+            \\                .color = .{ .r = 100, .g = 149, .b = 237, .a = 255 },
+            \\                .filled = true,
+            \\            },
+            \\            // Add components here:
+            \\            // .components = .{
+            \\            //     .Velocity = .{ .x = 0, .y = 0 },
+            \\            // },
+            \\        },
+            \\    },
+            \\}
             \\
-            \\[scene]
-            \\name = "Main"
-            \\
-            \\[entities]
-            \\# Define your entities here
-            \\# Example:
-            \\# [[entity]]
-            \\# name = "Player"
-            \\# prefab = "prefabs/player.prefab"
-            \\# position = {{ x = 0, y = 0, z = 0 }}
-            \\
-        , .{proj.metadata.name});
-        defer proj.allocator.free(scene_content);
+        ;
 
         try file.writeAll(scene_content);
     }
@@ -309,7 +349,7 @@ pub const Compiler = struct {
         try self.generateBuildZig(proj);
         try self.generateBuildZigZon(proj);
         try self.generateMainZig(proj);
-        try self.generateScriptsRoot(proj);
+        try self.createProjectFolders(proj);
         try self.generateDefaultScene(proj);
 
         self.state = .idle;
