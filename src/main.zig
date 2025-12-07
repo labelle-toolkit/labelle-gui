@@ -125,7 +125,7 @@ pub fn main() !void {
         if (g_dpi_changed.swap(false, .acquire)) {
             const new_scale = g_current_scale.load(.acquire);
             // Only show warning if scale changed significantly (>5% difference)
-            if (@abs(new_scale - g_initial_scale) / g_initial_scale > 0.05) {
+            if (g_initial_scale > 0.0 and @abs(new_scale - g_initial_scale) / g_initial_scale > 0.05) {
                 state.show_dpi_warning = true;
             }
         }
@@ -618,7 +618,6 @@ pub fn main() !void {
             zgui.spacing();
 
             if (zgui.button("OK", .{ .w = 120 })) {
-                zgui.closeCurrentPopup();
                 state.show_dpi_warning = false;
             }
             zgui.endPopup();
