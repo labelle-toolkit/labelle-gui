@@ -1,0 +1,40 @@
+.{
+    .name = "main",
+    .entities = .{
+        // Blue rectangle in center
+        .{
+            .shape = .{
+                .type = .rectangle,
+                .x = 400,
+                .y = 300,
+                .width = 100,
+                .height = 100,
+                .color = .{ .r = 100, .g = 149, .b = 237, .a = 255 },
+                .filled = true,
+            },
+        },
+        // Green circle on the left
+        .{
+            .shape = .{
+                .type = .circle,
+                .x = 200,
+                .y = 300,
+                .radius = 50,
+                .color = .{ .r = 50, .g = 205, .b = 50, .a = 255 },
+                .filled = true,
+            },
+        },
+        // Red rectangle on the right
+        .{
+            .shape = .{
+                .type = .rectangle,
+                .x = 600,
+                .y = 250,
+                .width = 80,
+                .height = 120,
+                .color = .{ .r = 220, .g = 20, .b = 60, .a = 255 },
+                .filled = true,
+            },
+        },
+    },
+}
