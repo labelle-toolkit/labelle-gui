@@ -38,8 +38,12 @@ pub const ProjectFoldersTests = struct {
         return false;
     }
 
-    test "has 6 default folders" {
-        try expect.equal(project.ProjectFolders.all.len, 6);
+    test "has 7 default folders" {
+        try expect.equal(project.ProjectFolders.all.len, 7);
+    }
+
+    test "contains assets folder" {
+        try expect.toBeTrue(containsFolder("assets"));
     }
 
     test "contains components folder" {
@@ -477,9 +481,8 @@ pub const ProjectCompilationTests = struct {
 
         try comp.generateAllBuildFiles(pm.current_project.?);
 
-        // Verify folder structure
-        const folders = [_][]const u8{ "components", "scripts", "prefabs", "assets", "scenes" };
-        for (folders) |folder| {
+        // Verify folder structure matches ProjectFolders.all
+        for (project.ProjectFolders.all) |folder| {
             const folder_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ temp_dir, folder });
             defer allocator.free(folder_path);
 

@@ -149,13 +149,10 @@ pub const Compiler = struct {
         const file = try std.fs.cwd().createFile(zon_path, .{});
         defer file.close();
 
-        // Generate a deterministic fingerprint from the project name only
+        // Generate a deterministic fingerprint from the project name using Wyhash
         // This ensures the fingerprint doesn't change between runs
         // Note: Zig may still suggest a different fingerprint on first build
-        var fingerprint: u64 = 0xcafe_babe_dead_beef; // Start with a seed
-        for (proj.metadata.name) |c| {
-            fingerprint = fingerprint *% 31 +% c;
-        }
+        const fingerprint = std.hash.Wyhash.hash(0xcafe_babe_dead_beef, proj.metadata.name);
 
         const zon_content = try std.fmt.allocPrint(proj.allocator,
             \\.{{
@@ -271,21 +268,13 @@ pub const Compiler = struct {
         try file.writeAll(main_content);
     }
 
-    /// Create project folder structure (components, scripts, prefabs, assets, scenes)
+    /// Create project folder structure using ProjectFolders.all
     pub fn createProjectFolders(self: *Self, proj: *const project.Project) !void {
         _ = self;
         const project_dir = proj.getProjectDir() orelse return error.NoProjectPath;
 
-        // Create folder structure matching the engine example_5 pattern
-        const folders = [_][]const u8{
-            "components",
-            "scripts",
-            "prefabs",
-            "assets",
-            "scenes",
-        };
-
-        for (folders) |folder| {
+        // Create all folders defined in ProjectFolders.all
+        for (project.ProjectFolders.all) |folder| {
             const folder_path = try std.fs.path.join(proj.allocator, &.{ project_dir, folder });
             defer proj.allocator.free(folder_path);
 
@@ -297,14 +286,10 @@ pub const Compiler = struct {
             const gitkeep_path = try std.fs.path.join(proj.allocator, &.{ folder_path, ".gitkeep" });
             defer proj.allocator.free(gitkeep_path);
 
-            if (std.fs.cwd().access(gitkeep_path, .{})) {
-                // File exists, skip
-            } else |_| {
-                // Use if/else to ensure defer statements execute even on error
-                if (std.fs.cwd().createFile(gitkeep_path, .{})) |gitkeep| {
-                    gitkeep.close();
-                } else |_| {}
-            }
+            // Attempt to create gitkeep, ignore if it already exists or fails
+            if (std.fs.cwd().createFile(gitkeep_path, .{ .exclusive = true })) |gitkeep| {
+                gitkeep.close();
+            } else |_| {}
         }
     }
 

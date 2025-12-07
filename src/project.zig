@@ -4,6 +4,7 @@ pub const PROJECT_EXTENSION = ".labelle";
 pub const PROJECT_VERSION = 1;
 
 pub const ProjectFolders = struct {
+    pub const assets = "assets";
     pub const components = "components";
     pub const fixtures = "fixtures";
     pub const prefabs = "prefabs";
@@ -12,6 +13,7 @@ pub const ProjectFolders = struct {
     pub const resources = "resources";
 
     pub const all = [_][]const u8{
+        assets,
         components,
         fixtures,
         prefabs,
