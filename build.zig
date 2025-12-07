@@ -44,6 +44,11 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.addImport("nfd", nfd.module("nfd"));
 
+    // Windows-specific: embed DPI awareness manifest
+    if (target.result.os.tag == .windows) {
+        exe.win32_manifest = b.path("assets/labelle-gui.manifest");
+    }
+
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
