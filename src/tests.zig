@@ -265,3 +265,229 @@ pub const CompilerStateTests = struct {
         try expect.notEqual(@intFromEnum(compiler.CompilerState.failed), @intFromEnum(compiler.CompilerState.success));
     }
 };
+
+/// System tests for end-to-end project compilation
+pub const ProjectCompilationTests = struct {
+    fn createTempDir(allocator: std.mem.Allocator) ![]const u8 {
+        const tmp_base = "/tmp";
+        const timestamp = std.time.timestamp();
+        const dir_name = try std.fmt.allocPrint(allocator, "{s}/labelle_test_{d}", .{ tmp_base, timestamp });
+
+        try std.fs.cwd().makeDir(dir_name);
+        return dir_name;
+    }
+
+    fn deleteTempDir(allocator: std.mem.Allocator, dir_path: []const u8) void {
+        std.fs.cwd().deleteTree(dir_path) catch {};
+        allocator.free(dir_path);
+    }
+
+    test "generates valid build.zig" {
+        const allocator = std.testing.allocator;
+
+        // Create temp directory
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        // Create project
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+
+        try pm.newProject("test_project");
+
+        // Save project to temp directory
+        const project_path = try std.fmt.allocPrint(allocator, "{s}/project", .{temp_dir});
+        defer allocator.free(project_path);
+
+        try pm.saveProject(project_path);
+
+        // Generate build files
+        var comp = compiler.Compiler.init(allocator);
+        defer comp.deinit();
+
+        try comp.generateAllBuildFiles(pm.current_project.?);
+
+        // Verify build.zig exists
+        const build_zig_path = try std.fmt.allocPrint(allocator, "{s}/build.zig", .{temp_dir});
+        defer allocator.free(build_zig_path);
+
+        const build_zig = try std.fs.cwd().openFile(build_zig_path, .{});
+        defer build_zig.close();
+
+        const content = try build_zig.readToEndAlloc(allocator, 1024 * 1024);
+        defer allocator.free(content);
+
+        // Verify key parts of build.zig
+        try expect.toBeTrue(std.mem.indexOf(u8, content, "labelle_engine") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, content, "labelle-gfx") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, content, "zig_ecs") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, content, "main.zig") != null);
+    }
+
+    test "generates valid build.zig.zon with fingerprint" {
+        const allocator = std.testing.allocator;
+
+        // Create temp directory
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        // Create project
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+
+        try pm.newProject("test_project");
+
+        // Save project
+        const project_path = try std.fmt.allocPrint(allocator, "{s}/project", .{temp_dir});
+        defer allocator.free(project_path);
+
+        try pm.saveProject(project_path);
+
+        // Generate build files
+        var comp = compiler.Compiler.init(allocator);
+        defer comp.deinit();
+
+        try comp.generateAllBuildFiles(pm.current_project.?);
+
+        // Verify build.zig.zon exists and has correct content
+        const zon_path = try std.fmt.allocPrint(allocator, "{s}/build.zig.zon", .{temp_dir});
+        defer allocator.free(zon_path);
+
+        const zon_file = try std.fs.cwd().openFile(zon_path, .{});
+        defer zon_file.close();
+
+        const content = try zon_file.readToEndAlloc(allocator, 1024 * 1024);
+        defer allocator.free(content);
+
+        // Verify key parts of build.zig.zon
+        try expect.toBeTrue(std.mem.indexOf(u8, content, ".fingerprint") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, content, ".name = .test_project") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, content, "labelle_engine") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, content, "labelle-gfx") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, content, "zig_ecs") != null);
+        // Verify hashes are present
+        try expect.toBeTrue(std.mem.indexOf(u8, content, ".hash = ") != null);
+    }
+
+    test "generates main.zig with Game facade" {
+        const allocator = std.testing.allocator;
+
+        // Create temp directory
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        // Create project
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+
+        try pm.newProject("test_project");
+
+        // Save project
+        const project_path = try std.fmt.allocPrint(allocator, "{s}/project", .{temp_dir});
+        defer allocator.free(project_path);
+
+        try pm.saveProject(project_path);
+
+        // Generate build files
+        var comp = compiler.Compiler.init(allocator);
+        defer comp.deinit();
+
+        try comp.generateAllBuildFiles(pm.current_project.?);
+
+        // Verify main.zig exists at root (not in src/)
+        const main_path = try std.fmt.allocPrint(allocator, "{s}/main.zig", .{temp_dir});
+        defer allocator.free(main_path);
+
+        const main_file = try std.fs.cwd().openFile(main_path, .{});
+        defer main_file.close();
+
+        const content = try main_file.readToEndAlloc(allocator, 1024 * 1024);
+        defer allocator.free(content);
+
+        // Verify main.zig uses Game facade
+        try expect.toBeTrue(std.mem.indexOf(u8, content, "engine.Game.init") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, content, "ComponentRegistry") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, content, "SceneLoader") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, content, "scenes/main.zon") != null);
+    }
+
+    test "generates scene .zon file" {
+        const allocator = std.testing.allocator;
+
+        // Create temp directory
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        // Create project
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+
+        try pm.newProject("test_project");
+
+        // Save project
+        const project_path = try std.fmt.allocPrint(allocator, "{s}/project", .{temp_dir});
+        defer allocator.free(project_path);
+
+        try pm.saveProject(project_path);
+
+        // Generate build files
+        var comp = compiler.Compiler.init(allocator);
+        defer comp.deinit();
+
+        try comp.generateAllBuildFiles(pm.current_project.?);
+
+        // Verify main.zon scene exists
+        const scene_path = try std.fmt.allocPrint(allocator, "{s}/scenes/main.zon", .{temp_dir});
+        defer allocator.free(scene_path);
+
+        const scene_file = try std.fs.cwd().openFile(scene_path, .{});
+        defer scene_file.close();
+
+        const content = try scene_file.readToEndAlloc(allocator, 1024 * 1024);
+        defer allocator.free(content);
+
+        // Verify scene has valid structure
+        try expect.toBeTrue(std.mem.indexOf(u8, content, ".name = ") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, content, ".entities = ") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, content, ".shape = ") != null);
+    }
+
+    test "creates project folder structure" {
+        const allocator = std.testing.allocator;
+
+        // Create temp directory
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        // Create project
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+
+        try pm.newProject("test_project");
+
+        // Save project
+        const project_path = try std.fmt.allocPrint(allocator, "{s}/project", .{temp_dir});
+        defer allocator.free(project_path);
+
+        try pm.saveProject(project_path);
+
+        // Generate build files
+        var comp = compiler.Compiler.init(allocator);
+        defer comp.deinit();
+
+        try comp.generateAllBuildFiles(pm.current_project.?);
+
+        // Verify folder structure
+        const folders = [_][]const u8{ "components", "scripts", "prefabs", "assets", "scenes" };
+        for (folders) |folder| {
+            const folder_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ temp_dir, folder });
+            defer allocator.free(folder_path);
+
+            var dir = std.fs.cwd().openDir(folder_path, .{}) catch {
+                std.debug.print("Missing folder: {s}\n", .{folder});
+                return error.MissingFolder;
+            };
+            dir.close();
+        }
+    }
+};
