@@ -1,0 +1,24 @@
+.{
+    .name = .imgui_modules_spike,
+    .version = "0.0.1",
+    .fingerprint = 0xd602cb8c81ef85,
+    .dependencies = .{
+        .zgui = .{
+            .url = "https://github.com/zig-gamedev/zgui/archive/refs/heads/main.tar.gz",
+            .hash = "zgui-0.6.0-dev--L6sZBHybQAZLl719GjSlogZC3MhuGRf4wI48tjbnW3z",
+        },
+        .zglfw = .{
+            .url = "https://github.com/zig-gamedev/zglfw/archive/refs/heads/main.tar.gz",
+            .hash = "zglfw-0.10.0-dev-zgVDNHO2IQDy_fSdwY5U4z42rHUuKgt7T9f-qmQ3FnuL",
+        },
+        .zopengl = .{
+            .url = "https://github.com/zig-gamedev/zopengl/archive/refs/heads/main.tar.gz",
+            .hash = "zopengl-0.6.0-dev-5-tnz6-mCgD65lY7NrNAU4haXCpVHUpTUEznTwfmBB96",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
