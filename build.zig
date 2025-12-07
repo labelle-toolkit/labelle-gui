@@ -6,17 +6,20 @@ pub fn build(b: *std.Build) void {
 
     const zglfw = b.dependency("zglfw", .{
         .target = target,
+        .optimize = optimize,
     });
 
     const zopengl = b.dependency("zopengl", .{});
 
     const zgui = b.dependency("zgui", .{
         .target = target,
+        .optimize = optimize,
         .backend = .glfw_opengl3,
     });
 
     const nfd = b.dependency("nfd", .{
         .target = target,
+        .optimize = optimize,
     });
 
     const zspec = b.dependency("zspec", .{
