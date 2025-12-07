@@ -13,7 +13,7 @@ pub const ui = struct {
     pub const default_window_height: u32 = 720;
 
     /// Font size base (will be scaled by display scale factor)
-    pub const base_font_size: f32 = 16.0;
+    pub const base_font_size: f32 = 11.0;
 
     /// Status message display duration in seconds
     pub const status_message_duration: f32 = 3.0;

@@ -16,9 +16,10 @@ pub const FA_FILE = "\u{f15b}"; // file
 pub const FA_FILE_CODE = "\u{f1c9}"; // file-code
 
 // Project folder icons
-pub const FA_CUBE = "\u{f1b2}"; // cube (for 3D models)
+pub const FA_CUBE = "\u{f1b2}"; // cube (for 3D components)
 pub const FA_WRENCH = "\u{f0ad}"; // wrench (for fixtures)
 pub const FA_BOX = "\u{f466}"; // box (for prefabs)
+pub const FA_FILM = "\u{f008}"; // film (for scenes)
 pub const FA_SCROLL = "\u{f70e}"; // scroll (for scripts)
 pub const FA_DATABASE = "\u{f1c0}"; // database (for resources)
 
