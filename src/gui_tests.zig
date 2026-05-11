@@ -19,6 +19,12 @@ const gl_minor = 1;
 /// before queueing tests, clear in the deferred teardown.
 var g_app: ?*App = null;
 
+/// Path to a temp project directory created for the project_settings
+/// test. The test's `run` callback reads the file back from disk to
+/// verify the Save button actually persisted, so the path needs to be
+/// reachable from the C-ABI callback.
+var g_settings_project_dir: ?[]const u8 = null;
+
 pub fn main() !void {
     try zglfw.init();
     defer zglfw.terminate();
@@ -68,6 +74,20 @@ pub fn main() !void {
         }
     });
 
+    // Project Settings test owns its own temp project on disk, written
+    // via the gui's own ProjectManager so the test exercises the real
+    // save path. Cleanup runs after engine drains.
+    var prng = std.Random.DefaultPrng.init(@intCast(std.time.nanoTimestamp()));
+    var tmp_buf: [64]u8 = undefined;
+    const tmp = try std.fmt.bufPrint(&tmp_buf, "/tmp/labelle_gui_te_{x}", .{prng.random().int(u64)});
+    try std.fs.cwd().makePath(tmp);
+    defer std.fs.cwd().deleteTree(tmp) catch {};
+
+    try app.project_manager.newProject("settings_te");
+    try app.project_manager.saveProject(tmp);
+    g_settings_project_dir = tmp;
+    defer g_settings_project_dir = null;
+
     _ = engine.registerTest("phase3", "view_compiler_output_toggle", @src(), struct {
         fn gui(_: *zgui.te.TestContext) !void {
             if (g_app) |a| a.renderFrame();
@@ -92,6 +112,44 @@ pub fn main() !void {
             // Toggle off again to confirm the menu reflects current state.
             ctx.menuAction(.click, "View/Compiler Output");
             _ = zgui.te.check(@src(), .{}, !a.show_compiler_output, "View/Compiler Output closes panel");
+        }
+    });
+
+    _ = engine.registerTest("phase3", "project_settings_edit_save", @src(), struct {
+        fn gui(_: *zgui.te.TestContext) !void {
+            if (g_app) |a| a.renderFrame();
+        }
+        fn run(ctx: *zgui.te.TestContext) !void {
+            const a = g_app orelse {
+                _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
+                return;
+            };
+
+            // Open the panel.
+            ctx.menuAction(.click, "View/Project Settings");
+            _ = zgui.te.check(@src(), .{}, a.show_project_settings, "panel opened");
+
+            // Type into the Title field and click Save. The button click
+            // also drives the on-disk write via ProjectManager.saveProject.
+            ctx.itemInputStrValue("Project Settings/Title", "Edited By TE");
+            ctx.itemAction(.click, "Project Settings/Save", .{}, null);
+
+            const proj = a.project_manager.current_project.?;
+            const in_memory = std.mem.eql(u8, proj.config.title, "Edited By TE");
+            _ = zgui.te.check(@src(), .{}, in_memory, "config.title updated in memory");
+
+            // Reread project.labelle from disk and confirm the new title
+            // landed there. Failure here means Save ran but didn't
+            // persist (the integration we actually care about).
+            const dir = g_settings_project_dir.?;
+            var path_buf: [512]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buf, "{s}/project.labelle", .{dir}) catch return;
+            var file_buf: [4096]u8 = undefined;
+            const file = std.fs.cwd().openFile(path, .{}) catch return;
+            defer file.close();
+            const n = file.read(&file_buf) catch return;
+            const on_disk = std.mem.indexOf(u8, file_buf[0..n], "Edited By TE") != null;
+            _ = zgui.te.check(@src(), .{}, on_disk, "project.labelle on disk has new title");
         }
     });
 

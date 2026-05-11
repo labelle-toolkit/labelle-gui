@@ -45,6 +45,7 @@ src/
   module.zig                     # Module + Registry — togglable panels and View menu (issue #22)
   modules/
     compiler_output.zig          # Bottom-dock compiler output panel
+    project_settings.zig         # Edit ProjectConfig fields and persist via ProjectManager
   project.zig                    # ProjectConfig, ProjectManager, project.labelle ZON I/O
   compiler.zig                   # Launches `labelle generate/build/run` and polls the child
   tree_view.zig                  # Project tree view widget

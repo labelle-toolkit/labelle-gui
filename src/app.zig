@@ -16,6 +16,7 @@ const compiler = @import("compiler.zig");
 const config = @import("config.zig");
 const module = @import("module.zig");
 const compiler_output = @import("modules/compiler_output.zig");
+const project_settings_mod = @import("modules/project_settings.zig");
 
 const STATUS_BUF_LEN = 256;
 const SCENE_NAME_BUF_LEN = 128;
@@ -36,13 +37,16 @@ pub const App = struct {
     show_compiler_output: bool = false,
     compiler_output_scroll_to_bottom: bool = false,
 
+    show_project_settings: bool = false,
+    project_settings: project_settings_mod.ProjectSettings = .{},
+
     show_new_scene_dialog: bool = false,
     new_scene_name: [SCENE_NAME_BUF_LEN:0]u8 = [_:0]u8{0} ** SCENE_NAME_BUF_LEN,
     show_dpi_warning: bool = false,
 
     /// Fixed-size storage for registered modules. Grow the array literal
     /// when adding modules; Zig will tell you if it overflows.
-    modules: [1]module.Module = undefined,
+    modules: [2]module.Module = undefined,
     registry: module.Registry = .{ .modules = &.{} },
 
     const Self = @This();
@@ -60,6 +64,7 @@ pub const App = struct {
         };
 
         app.modules[0] = compiler_output.makeModule(app);
+        app.modules[1] = project_settings_mod.makeModule(app);
         app.registry = .{ .modules = &app.modules };
 
         return app;
