@@ -25,7 +25,6 @@
 const std = @import("std");
 
 const gizmo_io = @import("gizmo_io.zig");
-const scene_io = @import("scene_io.zig");
 
 pub const FillMode = enum {
     filled,
@@ -154,19 +153,18 @@ pub const Index = struct {
 
 fn loadOne(allocator: std.mem.Allocator, idx: *Index, path: []const u8) !void {
     var loaded = try gizmo_io.loadFromFile(allocator, path);
-    errdefer loaded.deinit();
+    defer loaded.deinit();
 
     const entity_text = loaded.gizmo.entity_verbatim orelse {
         // Gizmo with no `.entity` block — could still have `.children`,
         // but we don't support multi-shape gizmos yet. Skip.
-        loaded.deinit();
         return;
     };
 
     // Stand up a fresh arena to own the entry's typed data. We move
     // the match/exclude lists across by deep-copying into this arena;
-    // then we can free the LoadedGizmo. This keeps the per-entry
-    // lifetime tidy independent of the source.
+    // then `loaded` can be freed by the defer above. This keeps the
+    // per-entry lifetime tidy independent of the source.
     const arena = try allocator.create(std.heap.ArenaAllocator);
     errdefer allocator.destroy(arena);
     arena.* = std.heap.ArenaAllocator.init(allocator);
@@ -179,10 +177,14 @@ fn loadOne(allocator: std.mem.Allocator, idx: *Index, path: []const u8) !void {
     const parsed = try parseEntityBlock(a, entity_text);
     const source_owned = try a.dupe(u8, path);
 
-    loaded.deinit();
-
-    try idx.arenas.append(allocator, arena);
-    try idx.entries.append(allocator, .{
+    // Reserve both list slots up front so the two appends below are
+    // infallible — otherwise an OOM between the two would leave the
+    // arena tracked in `idx.arenas` while also being freed by the
+    // arena errdefers above (dangling pointer on next `Index.deinit`).
+    try idx.arenas.ensureUnusedCapacity(allocator, 1);
+    try idx.entries.ensureUnusedCapacity(allocator, 1);
+    idx.arenas.appendAssumeCapacity(arena);
+    idx.entries.appendAssumeCapacity(.{
         .source = source_owned,
         .match = match_owned,
         .exclude = exclude_owned,
@@ -239,26 +241,6 @@ fn parseEntityBlock(arena: std.mem.Allocator, verbatim: []const u8) !ParsedEntit
 }
 
 // ─── Match logic ───────────────────────────────────────────────────────
-
-/// Build the set of component names present *directly* on an entity.
-/// `extras` are the unmodeled-component slice scenes/prefabs collect
-/// in parallel with their entity arrays; modeled component names
-/// (Position, Sprite) are inferred from the typed fields.
-///
-/// Caller owns the returned slice via `allocator` — it's a transient
-/// scratch list, typically discarded per entity per frame.
-pub fn entityComponentNames(
-    allocator: std.mem.Allocator,
-    entity: scene_io.Entity,
-    extras: []const scene_io.ComponentExtra,
-) ![]const []const u8 {
-    var names: std.ArrayListUnmanaged([]const u8) = .{};
-    errdefer names.deinit(allocator);
-    if (entity.position != null) try names.append(allocator, "Position");
-    if (entity.sprite != null) try names.append(allocator, "Sprite");
-    for (extras) |e| try names.append(allocator, e.name);
-    return names.toOwnedSlice(allocator);
-}
 
 /// Returns true when at least one `match` name is in `present` and
 /// no `exclude` name is. Empty `match` is treated as "matches

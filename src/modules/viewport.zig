@@ -464,8 +464,10 @@ fn drawGizmoOverlay(
 
         // Build the entity's direct component name set into a stack
         // buffer — most entities have <8 components so 32 is plenty.
+        // `pos` is non-null here (orelse-continue above), so Position
+        // is always present.
         var n: usize = 0;
-        if (e.position != null and n < name_buf.len) {
+        if (n < name_buf.len) {
             name_buf[n] = "Position";
             n += 1;
         }
