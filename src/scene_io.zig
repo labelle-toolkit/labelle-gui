@@ -147,6 +147,12 @@ pub const LoadedPrefab = struct {
     children: []Entity,
     /// Per-child unmodeled components, parallel to `children`.
     children_extras: []const []const ComponentExtra,
+    /// Top-level keys other than `components` / `children` that the
+    /// gui doesn't model (custom prefab metadata, future schema
+    /// extensions). Captured verbatim at load and re-emitted on save
+    /// so editing a prefab never silently drops fields the gui
+    /// doesn't know about — same contract scenes use.
+    top_level_extras: []const TopLevelExtra = &.{},
 
     pub fn deinit(self: *LoadedPrefab) void {
         const child_alloc = self.arena.child_allocator;
@@ -209,12 +215,19 @@ pub fn parsePrefab(allocator: std.mem.Allocator, raw: []const u8) !LoadedPrefab 
         }
     }
 
+    // Capture every other top-level key verbatim so the writer can
+    // splice them back in unchanged. Closes the data-loss gap where
+    // editing+saving a prefab would silently drop schema fields the
+    // gui doesn't model.
+    const top_level_extras = try extractPrefabTopLevelExtras(arena.allocator(), raw);
+
     return .{
         .arena = arena,
         .entity = entity,
         .component_extras = component_extras,
         .children = children,
         .children_extras = child_extras,
+        .top_level_extras = top_level_extras,
     };
 }
 
@@ -305,6 +318,14 @@ pub fn renderPrefabJsonc(allocator: std.mem.Allocator, loaded: LoadedPrefab) ![]
             try w.writeAll("\n");
         }
         try w.writeAll("    ]");
+    }
+
+    // Splice unmodeled top-level keys back in, after the modeled
+    // fields. Order shifts relative to the source (managed first)
+    // but the content is faithful — same trade-off scenes make.
+    for (loaded.top_level_extras) |kv| {
+        try w.writeAll(",\n");
+        try w.print("    \"{s}\": {s}", .{ kv.name, kv.value_text });
     }
 
     try w.writeAll("\n}\n");
@@ -695,10 +716,15 @@ pub fn stripLineComments(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
 // ─── Pass-through extras: capture + writer ─────────────────────────────
 
 /// Scan the top-level JSON object and capture every `"key": value` pair
-/// where `key` isn't one of the names this gui models (`name`,
-/// `entities`). Value text spans from the first non-whitespace byte
-/// after `:` through to just before the trailing `,` or `}`.
-fn extractTopLevelExtras(arena: std.mem.Allocator, raw: []const u8) ![]const TopLevelExtra {
+/// whose key the caller's `isManaged` predicate doesn't claim. Value
+/// text spans from the first non-whitespace byte after `:` through to
+/// just before the trailing `,` or `}`. Scenes and prefabs share this
+/// scanner — they differ only in which keys count as managed.
+fn extractTopLevelExtrasFiltered(
+    arena: std.mem.Allocator,
+    raw: []const u8,
+    isManaged: *const fn ([]const u8) bool,
+) ![]const TopLevelExtra {
     var out: std.ArrayList(TopLevelExtra) = .{};
     errdefer out.deinit(arena);
 
@@ -737,7 +763,7 @@ fn extractTopLevelExtras(arena: std.mem.Allocator, raw: []const u8) ![]const Top
         scanValueJson(raw, &i);
         const value_end = i;
 
-        if (!isManagedTopLevelKey(key)) {
+        if (!isManaged(key)) {
             try out.append(arena, .{
                 .name = try arena.dupe(u8, key),
                 .value_text = try arena.dupe(u8, std.mem.trim(u8, raw[value_start..value_end], " \t\r\n")),
@@ -745,6 +771,14 @@ fn extractTopLevelExtras(arena: std.mem.Allocator, raw: []const u8) ![]const Top
         }
     }
     return out.toOwnedSlice(arena);
+}
+
+fn extractTopLevelExtras(arena: std.mem.Allocator, raw: []const u8) ![]const TopLevelExtra {
+    return extractTopLevelExtrasFiltered(arena, raw, isManagedTopLevelKey);
+}
+
+fn extractPrefabTopLevelExtras(arena: std.mem.Allocator, raw: []const u8) ![]const TopLevelExtra {
+    return extractTopLevelExtrasFiltered(arena, raw, isManagedPrefabTopLevelKey);
 }
 
 /// Per-entity: scan each `{ ... }` in the entities array. Inside,
@@ -939,6 +973,10 @@ fn scanValueJson(raw: []const u8, i: *usize) void {
 
 fn isManagedTopLevelKey(name: []const u8) bool {
     return std.mem.eql(u8, name, "name") or std.mem.eql(u8, name, "entities");
+}
+
+fn isManagedPrefabTopLevelKey(name: []const u8) bool {
+    return std.mem.eql(u8, name, "components") or std.mem.eql(u8, name, "children");
 }
 
 // ─── Writer ────────────────────────────────────────────────────────────

@@ -29,12 +29,12 @@ const dpi_warning_dialog = @import("dialogs/dpi_warning.zig");
 const STATUS_BUF_LEN = 256;
 const SCENE_NAME_BUF_LEN = 128;
 
-/// One entry in the main-content tab strip. Today only `scene`
-/// exists; the `prefab` variant lands in a follow-up slice. The
-/// union exists now so the tab strip, close-confirmation modal, and
-/// `App.open_tabs` machinery don't need a second pass when prefab
-/// support arrives — they already dispatch through the methods
-/// below.
+/// One entry in the main-content tab strip. Each variant wraps an
+/// editor's per-tab state (loaded file, dirty flag, view state) and
+/// the tab strip + close-confirmation modal dispatch through the
+/// shared methods (`displayName`, `path`, `isDirty`, `save`, `render`,
+/// `deinit`) below. Add a new editor by adding a variant and a case
+/// to each method.
 pub const OpenTab = union(enum) {
     scene: scene_mod.SceneState,
     prefab: prefab_mod.PrefabState,
@@ -104,10 +104,10 @@ pub const App = struct {
     show_resources: bool = false,
     resources_editor: resources_mod.ResourcesEditor = .{},
 
-    /// Open editor tabs. Each entry is an `OpenTab` (currently only
-    /// scene, prefab landing in a follow-up). Populated when the
-    /// user clicks an editable file in the project tree; closed via
-    /// the × on a tab. `closeAllTabs` runs on project transitions.
+    /// Open editor tabs — scenes and prefabs share this list as
+    /// `OpenTab` variants. Populated when the user clicks an
+    /// editable file in the project tree; closed via the × on a
+    /// tab. `closeAllTabs` runs on project transitions.
     open_tabs: std.ArrayList(OpenTab) = .{},
     /// Which tab is foregrounded. null when no tabs are open.
     /// Updated each frame from whichever tab ImGui reports active.

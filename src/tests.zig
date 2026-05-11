@@ -811,6 +811,41 @@ pub const SceneIoTests = struct {
         try expect.equal(loaded2.children[0].position.?.x, 99);
     }
 
+    test "parsePrefab preserves unmodeled top-level keys verbatim" {
+        // Regression for copilot PR #30 review: a prefab with custom
+        // top-level keys (metadata, schema_version, anything outside
+        // `components` / `children`) must round-trip those fields
+        // unchanged. Without this, editing+saving a prefab would
+        // silently drop everything the gui doesn't model.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "components": { "Coin": {} },
+            \\    "metadata": { "author": "alex", "tags": ["currency", "pickup"] },
+            \\    "schema_version": 3
+            \\}
+        ;
+        var loaded = try scene_io.parsePrefab(allocator, src);
+        defer loaded.deinit();
+
+        try expect.equal(loaded.top_level_extras.len, 2);
+        try expect.toBeTrue(std.mem.eql(u8, loaded.top_level_extras[0].name, "metadata"));
+        try expect.toBeTrue(std.mem.eql(u8, loaded.top_level_extras[1].name, "schema_version"));
+
+        const text = try scene_io.renderPrefabJsonc(allocator, loaded);
+        defer allocator.free(text);
+
+        // Both extras must reappear in the output…
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"metadata\":") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"author\": \"alex\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"schema_version\": 3") != null);
+        // …and the output must re-parse cleanly, with the same
+        // extras captured the second time.
+        var loaded2 = try scene_io.parsePrefab(allocator, text);
+        defer loaded2.deinit();
+        try expect.equal(loaded2.top_level_extras.len, 2);
+    }
+
     test "parsePrefab captures extras when file has leading whitespace + comment" {
         // Regression for cursor[bot] PR #30 review: findKeyObject
         // used to bail when the body didn't start with `{` (because

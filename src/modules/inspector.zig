@@ -1,7 +1,7 @@
 //! Shared entity inspector — renders an entity's properties +
 //! components into the current imgui window. Called from both the
-//! Scene module (one selected entity at a time) and, once it lands,
-//! the Prefab module (the single entity that is the prefab).
+//! Scene module (one selected entity at a time) and the Prefab
+//! module (the prefab body itself or a selected child).
 //!
 //! `is_dirty` is a `*bool` so the caller can hand in whatever tracks
 //! "needs save" on its side — `SceneState.is_dirty` for scenes,
