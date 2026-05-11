@@ -268,15 +268,44 @@ fn copyToCommentBuf(buf: []u8, src: []const u8) void {
 /// Return a fresh allocator-owned copy of `src` with each `//`-to-EOL
 /// comment replaced by spaces. Preserves byte offsets so any later
 /// parser diagnostics still align with column numbers in the source.
+///
+/// String-aware: a `//` sequence that appears inside a `"..."` string
+/// literal is left intact (think `"https://example.com"`). Escape
+/// sequences within strings (`\"`, `\\`) are honored so a backslash
+/// followed by a quote doesn't prematurely close the string.
 pub fn stripLineComments(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
     const out = try allocator.dupe(u8, src);
     var i: usize = 0;
-    while (i + 1 < out.len) : (i += 1) {
-        if (out[i] == '/' and out[i + 1] == '/') {
+    var in_string = false;
+    var escaped = false;
+    while (i < out.len) {
+        const c = out[i];
+        if (escaped) {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if (in_string) {
+            if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+        if (c == '/' and i + 1 < out.len and out[i + 1] == '/') {
             var j = i;
             while (j < out.len and out[j] != '\n') : (j += 1) out[j] = ' ';
             i = j;
+            continue;
         }
+        i += 1;
     }
     return out;
 }

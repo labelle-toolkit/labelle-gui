@@ -318,6 +318,33 @@ pub const SceneIoTests = struct {
         try expect.equal(loaded.scene.entities[1].position.?.x, 50);
     }
 
+    test "stripLineComments leaves // inside string literals alone" {
+        // Regression: a URL like "https://example.com" must survive
+        // intact. Naive `//` replacement would mangle it.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "x",
+            \\    "entities": [
+            \\        { "prefab": "wall", "components": { "Position": { "x": 0, "y": 0 } }, "url": "https://labelle.games/docs" }
+            \\    ]
+            \\}
+        ;
+        const stripped = try scene_io.stripLineComments(allocator, src);
+        defer allocator.free(stripped);
+        try expect.toBeTrue(std.mem.indexOf(u8, stripped, "https://labelle.games/docs") != null);
+    }
+
+    test "stripLineComments respects escape sequences" {
+        // A backslash-escaped quote inside a string must NOT close the
+        // string, so a following `//` stays inside the literal.
+        const allocator = std.testing.allocator;
+        const src = "{ \"k\": \"\\\"//not-a-comment\" }";
+        const stripped = try scene_io.stripLineComments(allocator, src);
+        defer allocator.free(stripped);
+        try expect.toBeTrue(std.mem.indexOf(u8, stripped, "//not-a-comment") != null);
+    }
+
     test "tolerates // line comments" {
         const allocator = std.testing.allocator;
         const src =

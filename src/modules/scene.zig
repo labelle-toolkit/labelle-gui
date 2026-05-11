@@ -42,12 +42,26 @@ pub const SceneState = struct {
     /// `loaded` when the active project changes so we don't carry stale
     /// arena memory across project switches.
     last_synced: ?*const project.Project = null,
+    /// Cached list of `<project>/scenes/*.jsonc` stems. Populated on
+    /// project change or by clicking Refresh — avoids opening and
+    /// iterating the scenes directory every frame, which the bot
+    /// reviewer rightly flagged as a per-frame I/O hot path.
+    /// Memory is owned by `file_list_arena`.
+    scene_files: []const []const u8 = &.{},
+    file_list_arena: ?*std.heap.ArenaAllocator = null,
 
     pub fn deinit(self: *SceneState) void {
         if (self.loaded) |*l| l.deinit();
         self.loaded = null;
         self.selected_index = null;
         self.is_dirty = false;
+        if (self.file_list_arena) |a| {
+            const child = a.child_allocator;
+            a.deinit();
+            child.destroy(a);
+            self.file_list_arena = null;
+            self.scene_files = &.{};
+        }
     }
 };
 
@@ -75,20 +89,70 @@ fn render(app: *App) void {
         return;
     };
 
-    syncProjectChange(&app.scene_state, proj);
+    syncProjectChange(&app.scene_state, app, proj);
     maybeLoadSelected(&app.scene_state, proj);
 
-    renderFileList(&app.scene_state, proj);
+    renderFileList(&app.scene_state, app, proj);
     zgui.sameLine(.{});
     renderInspectorAndViewport(&app.scene_state);
 }
 
-fn syncProjectChange(s: *SceneState, proj: *project.Project) void {
+fn syncProjectChange(s: *SceneState, app: *App, proj: *project.Project) void {
     if (s.last_synced == proj) return;
     s.deinit();
     @memset(&s.selected_name, 0);
     @memset(&s.loaded_name, 0);
     s.last_synced = proj;
+    rescanScenes(s, app, proj);
+}
+
+/// (Re)read the scenes directory and store the result in `s.scene_files`.
+/// Resets any previously held file-list arena. Called on project change
+/// and from the Refresh button. Disk I/O is bounded to this call rather
+/// than running every frame inside `renderFileList`.
+fn rescanScenes(s: *SceneState, app: *App, proj: *project.Project) void {
+    if (s.file_list_arena) |old| {
+        const child = old.child_allocator;
+        old.deinit();
+        child.destroy(old);
+        s.file_list_arena = null;
+        s.scene_files = &.{};
+    }
+
+    const dir_path = proj.dir orelse return;
+    var path_buf: [512]u8 = undefined;
+    const scenes_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{
+        dir_path,
+        project.ProjectFolders.scenes,
+    }) catch return;
+
+    const arena = app.allocator.create(std.heap.ArenaAllocator) catch return;
+    arena.* = std.heap.ArenaAllocator.init(app.allocator);
+    errdefer {
+        arena.deinit();
+        app.allocator.destroy(arena);
+    }
+    const a = arena.allocator();
+
+    var dir = std.fs.cwd().openDir(scenes_path, .{ .iterate = true }) catch {
+        // Scenes dir missing — leave file list empty and keep the
+        // arena registered so subsequent Refreshes can refill into it.
+        s.file_list_arena = arena;
+        return;
+    };
+    defer dir.close();
+
+    var files: std.ArrayList([]const u8) = .{};
+    var it = dir.iterate();
+    while (it.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".jsonc")) continue;
+        const stem = entry.name[0 .. entry.name.len - ".jsonc".len];
+        const copy = a.dupe(u8, stem) catch continue;
+        files.append(a, copy) catch continue;
+    }
+    s.scene_files = files.toOwnedSlice(a) catch &.{};
+    s.file_list_arena = arena;
 }
 
 fn maybeLoadSelected(s: *SceneState, proj: *project.Project) void {
@@ -120,7 +184,7 @@ fn maybeLoadSelected(s: *SceneState, proj: *project.Project) void {
 
 // ─── File list ──────────────────────────────────────────────────────────
 
-fn renderFileList(s: *SceneState, proj: *project.Project) void {
+fn renderFileList(s: *SceneState, app: *App, proj: *project.Project) void {
     _ = zgui.beginChild("##scene_files", .{
         .w = sidebar_w,
         .h = 0,
@@ -129,23 +193,16 @@ fn renderFileList(s: *SceneState, proj: *project.Project) void {
     defer zgui.endChild();
 
     zgui.text("Scenes", .{});
+    zgui.sameLine(.{});
+    if (zgui.smallButton("Refresh")) rescanScenes(s, app, proj);
     zgui.separator();
 
-    const dir_path = proj.dir orelse return;
-    var path_buf: [512]u8 = undefined;
-    const scenes_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{
-        dir_path,
-        project.ProjectFolders.scenes,
-    }) catch return;
+    if (s.scene_files.len == 0) {
+        zgui.textDisabled("(no .jsonc scenes)", .{});
+        return;
+    }
 
-    var dir = std.fs.cwd().openDir(scenes_path, .{ .iterate = true }) catch return;
-    defer dir.close();
-    var it = dir.iterate();
-    while (it.next() catch null) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".jsonc")) continue;
-        const stem = entry.name[0 .. entry.name.len - ".jsonc".len];
-
+    for (s.scene_files) |stem| {
         var label_buf: [name_cap + 1]u8 = undefined;
         const label = std.fmt.bufPrintZ(&label_buf, "{s}", .{stem}) catch continue;
 
