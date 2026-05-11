@@ -623,15 +623,16 @@ pub const SceneHitTestTests = struct {
         try expect.equal(hit.?, 1);
     }
 
-    test "pan + zoom affect the hit projection" {
+    test "pan + zoom affect the hit projection (Y flipped)" {
         const allocator = std.testing.allocator;
         const entities = try makeEntities(allocator, &.{.{ 10, 10 }});
         defer allocator.free(entities);
-        // World (10,10) projected with zoom=2 and pan=(100,100) lands at
-        // (120, 120) in screen space. A click there should hit.
+        // World +y goes up. World (10,10) projected with zoom=2 and
+        // pan=(100,100) lands at (100 + 10*2, 100 - 10*2) = (120, 80)
+        // in screen space.
         const hit = scene_module.hitTestEntity(
             entities,
-            .{ 120, 120 },
+            .{ 120, 80 },
             .{ 0, 0 },
             .{ 100, 100 },
             2.0,

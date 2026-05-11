@@ -401,7 +401,9 @@ fn renderViewport(s: *SceneState, loaded: scene_io.LoadedScene) void {
                     if (e.position) |*pos| {
                         const d = zgui.getMouseDragDelta(.left, .{});
                         pos.x += d[0] / s.zoom;
-                        pos.y += d[1] / s.zoom;
+                        // Screen +y is down but world +y is up, so a
+                        // downward mouse drag should decrease world y.
+                        pos.y -= d[1] / s.zoom;
                         s.is_dirty = true;
                         zgui.resetMouseDragDelta(.left);
                     }
@@ -430,7 +432,8 @@ pub fn hitTestEntity(
     for (entities, 0..) |e, i| {
         const pos = e.position orelse continue;
         const px = canvas_min[0] + pan[0] + pos.x * zoom;
-        const py = canvas_min[1] + pan[1] + pos.y * zoom;
+        // Match drawEntities — world +y is up, so subtract from screen y.
+        const py = canvas_min[1] + pan[1] - pos.y * zoom;
         const dx = mouse[0] - px;
         const dy = mouse[1] - py;
         const d2 = dx * dx + dy * dy;
@@ -488,7 +491,10 @@ fn drawEntities(dl: zgui.DrawList, cmin: [2]f32, cmax: [2]f32, s: SceneState, lo
     for (loaded.scene.entities, 0..) |e, i| {
         const pos = e.position orelse continue;
         const px = cmin[0] + s.pan[0] + pos.x * s.zoom;
-        const py = cmin[1] + s.pan[1] + pos.y * s.zoom;
+        // World +y goes up; ImGui screen +y goes down. Flip during
+        // projection so the editor's spatial intuition matches the
+        // math convention (positive y above the origin axis line).
+        const py = cmin[1] + s.pan[1] - pos.y * s.zoom;
         const col = colorForPrefab(e.prefab);
         dl.addCircleFilled(.{
             .p = .{ px, py },
