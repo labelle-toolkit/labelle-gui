@@ -17,6 +17,9 @@ const config = @import("config.zig");
 const module = @import("module.zig");
 const compiler_output = @import("modules/compiler_output.zig");
 const project_settings_mod = @import("modules/project_settings.zig");
+const project_tree_mod = @import("modules/project_tree.zig");
+const new_scene_dialog = @import("dialogs/new_scene.zig");
+const dpi_warning_dialog = @import("dialogs/dpi_warning.zig");
 
 const STATUS_BUF_LEN = 256;
 const SCENE_NAME_BUF_LEN = 128;
@@ -40,13 +43,15 @@ pub const App = struct {
     show_project_settings: bool = false,
     project_settings: project_settings_mod.ProjectSettings = .{},
 
+    show_project_tree: bool = true,
+
     show_new_scene_dialog: bool = false,
     new_scene_name: [SCENE_NAME_BUF_LEN:0]u8 = [_:0]u8{0} ** SCENE_NAME_BUF_LEN,
     show_dpi_warning: bool = false,
 
     /// Fixed-size storage for registered modules. Grow the array literal
     /// when adding modules; Zig will tell you if it overflows.
-    modules: [2]module.Module = undefined,
+    modules: [3]module.Module = undefined,
     registry: module.Registry = .{ .modules = &.{} },
 
     const Self = @This();
@@ -63,8 +68,9 @@ pub const App = struct {
             .compiler = compiler.Compiler.init(allocator),
         };
 
-        app.modules[0] = compiler_output.makeModule(app);
-        app.modules[1] = project_settings_mod.makeModule(app);
+        app.modules[0] = project_tree_mod.makeModule(app);
+        app.modules[1] = compiler_output.makeModule(app);
+        app.modules[2] = project_settings_mod.makeModule(app);
         app.registry = .{ .modules = &app.modules };
 
         return app;
@@ -91,12 +97,11 @@ pub const App = struct {
 
         self.renderMenuBar();
         self.pollCompiler();
-        self.renderProjectSidebar();
         self.renderMainContent();
         self.registry.renderAllPanels(self);
         self.renderStatusBar();
-        self.renderNewSceneDialog();
-        self.renderDpiWarning();
+        new_scene_dialog.render(self);
+        dpi_warning_dialog.render(self);
     }
 
     // ─── Menu bar ───────────────────────────────────────────────────────
@@ -263,23 +268,6 @@ pub const App = struct {
 
     // ─── Panels ─────────────────────────────────────────────────────────
 
-    fn renderProjectSidebar(self: *Self) void {
-        const viewport = zgui.getMainViewport();
-        const work_pos = viewport.getWorkPos();
-        const work_size = viewport.getWorkSize();
-        zgui.setNextWindowPos(.{ .x = work_pos[0], .y = work_pos[1] });
-        zgui.setNextWindowSize(.{ .w = config.ui.sidebar_width, .h = work_size[1] - config.ui.status_bar_height });
-
-        if (zgui.begin("Project", .{ .flags = .{ .no_resize = true, .no_move = true, .no_collapse = true } })) {
-            if (self.project_manager.current_project) |proj| {
-                _ = self.tree_view.render(proj.getProjectDir());
-            } else {
-                zgui.textDisabled("No project open", .{});
-            }
-        }
-        zgui.end();
-    }
-
     fn renderMainContent(self: *Self) void {
         const viewport = zgui.getMainViewport();
         const work_pos = viewport.getWorkPos();
@@ -350,93 +338,4 @@ pub const App = struct {
         zgui.end();
     }
 
-    fn renderNewSceneDialog(self: *Self) void {
-        if (self.show_new_scene_dialog) zgui.openPopup("New Scene", .{});
-        if (!zgui.beginPopupModal("New Scene", .{ .popen = &self.show_new_scene_dialog, .flags = .{ .always_auto_resize = true } })) return;
-        defer zgui.endPopup();
-
-        zgui.text("Enter scene name:", .{});
-        zgui.spacing();
-        if (zgui.isWindowAppearing()) zgui.setKeyboardFocusHere(0);
-
-        const enter_pressed = zgui.inputText("##scene_name", .{
-            .buf = &self.new_scene_name,
-            .flags = .{ .enter_returns_true = true },
-        });
-
-        zgui.spacing();
-        zgui.separator();
-        zgui.spacing();
-
-        if (zgui.button("Create", .{ .w = 120 }) or enter_pressed) {
-            const scene_name = std.mem.sliceTo(&self.new_scene_name, 0);
-            if (scene_name.len > 0) self.createScene(scene_name);
-            zgui.closeCurrentPopup();
-            self.show_new_scene_dialog = false;
-        }
-        zgui.sameLine(.{});
-        if (zgui.button("Cancel", .{ .w = 120 })) {
-            zgui.closeCurrentPopup();
-            self.show_new_scene_dialog = false;
-        }
-    }
-
-    fn createScene(self: *Self, scene_name: []const u8) void {
-        const proj = self.project_manager.current_project orelse return;
-        const proj_dir = proj.getProjectDir() orelse return;
-
-        var path_buf: [512]u8 = undefined;
-        const scene_path = std.fmt.bufPrint(&path_buf, "{s}/{s}/{s}.scene", .{
-            proj_dir,
-            project.ProjectFolders.scenes,
-            scene_name,
-        }) catch {
-            self.setStatus("Path too long!");
-            return;
-        };
-
-        const file = std.fs.cwd().createFile(scene_path, .{ .exclusive = true }) catch |err| {
-            self.setStatus(if (err == error.PathAlreadyExists) "Scene already exists!" else "Error creating scene!");
-            return;
-        };
-        defer file.close();
-
-        var content_buf: [512]u8 = undefined;
-        const content = std.fmt.bufPrint(&content_buf,
-            \\# {s}
-            \\# Scene created by Labelle GUI
-            \\
-            \\[scene]
-            \\name = "{s}"
-            \\
-            \\[entities]
-            \\# Define your entities here
-            \\
-        , .{ scene_name, scene_name }) catch {
-            self.setStatus("Error formatting scene content!");
-            return;
-        };
-        file.writeAll(content) catch {
-            self.setStatus("Error writing scene file!");
-            return;
-        };
-        self.setStatus("Scene created!");
-        self.tree_view.refresh();
-    }
-
-    fn renderDpiWarning(self: *Self) void {
-        if (self.show_dpi_warning) zgui.openPopup("Display Scale Changed", .{});
-        if (!zgui.beginPopupModal("Display Scale Changed", .{
-            .popen = &self.show_dpi_warning,
-            .flags = .{ .always_auto_resize = true },
-        })) return;
-        defer zgui.endPopup();
-
-        zgui.text("The display scale has changed.", .{});
-        zgui.text("For best results, please restart the application.", .{});
-        zgui.spacing();
-        zgui.separator();
-        zgui.spacing();
-        if (zgui.button("OK", .{ .w = 120 })) self.show_dpi_warning = false;
-    }
 };

@@ -25,7 +25,8 @@ zig build smoke     # end-to-end against the real `labelle` launcher — env-dep
 | `src/main.zig` | GLFW init, window + GL context, font + DPI setup, frame loop. Delegates per-frame UI to `App.renderFrame()`. Stays slim on purpose. |
 | `src/app.zig` | `App` struct: owns `ProjectManager`, `Compiler`, `TreeView`, status bar, dialog state, and the `Module.Registry`. `App.renderFrame()` is the single function the test runner can call to drive the real UI. |
 | `src/module.zig` | `Module` and `Registry` (issue #22). Modules expose a togglable panel; the Registry renders the View menu and dispatches `render_panel(*App)` for every open module. Each module's `is_open` points into App state so the menu toggle and the panel's `popen` flag are the same memory. |
-| `src/modules/` | One file per panel. `compiler_output.zig` is the first; add more by writing a `makeModule(*App)` factory and appending to `App.modules`. |
+| `src/modules/` | One file per togglable panel. Each exports `makeModule(*App) module.Module` and gets appended to `App.modules` in `App.init`. Current: `compiler_output`, `project_settings`, `project_tree`. |
+| `src/dialogs/` | Modal popups — transient, not part of the Registry because they're not togglable panels. Each exports `pub fn render(*App) void` called once per frame from `App.renderFrame`. Current: `new_scene`, `dpi_warning`. |
 | `src/project.zig` | `ProjectConfig` (mirrors a subset of `labelle-assembler/src/config.zig:ProjectConfig`), `ProjectManager`, `project.labelle` read/write. Each `Project` owns an `ArenaAllocator` so the parsed config strings free uniformly in `deinit`. |
 | `src/compiler.zig` | Wraps `labelle generate/build/run` as a child process. `syncProjectFiles` calls `ProjectManager.saveProject`. `buildOrRun` spawns; `pollBuild` waits and captures stdout/stderr. |
 | `src/tree_view.zig` | Project tree widget. |

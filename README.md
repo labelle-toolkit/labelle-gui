@@ -46,6 +46,10 @@ src/
   modules/
     compiler_output.zig          # Bottom-dock compiler output panel
     project_settings.zig         # Edit ProjectConfig fields and persist via ProjectManager
+    project_tree.zig             # Project sidebar (file tree)
+  dialogs/
+    new_scene.zig                # New Scene modal + scene-file writer
+    dpi_warning.zig              # One-shot DPI-changed warning modal
   project.zig                    # ProjectConfig, ProjectManager, project.labelle ZON I/O
   compiler.zig                   # Launches `labelle generate/build/run` and polls the child
   tree_view.zig                  # Project tree view widget
