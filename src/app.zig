@@ -18,6 +18,7 @@ const module = @import("module.zig");
 const compiler_output = @import("modules/compiler_output.zig");
 const project_settings_mod = @import("modules/project_settings.zig");
 const project_tree_mod = @import("modules/project_tree.zig");
+const resources_mod = @import("modules/resources.zig");
 const new_scene_dialog = @import("dialogs/new_scene.zig");
 const dpi_warning_dialog = @import("dialogs/dpi_warning.zig");
 
@@ -43,6 +44,9 @@ pub const App = struct {
     show_project_settings: bool = false,
     project_settings: project_settings_mod.ProjectSettings = .{},
 
+    show_resources: bool = false,
+    resources_editor: resources_mod.ResourcesEditor = .{},
+
     show_project_tree: bool = true,
 
     show_new_scene_dialog: bool = false,
@@ -51,7 +55,7 @@ pub const App = struct {
 
     /// Fixed-size storage for registered modules. Grow the array literal
     /// when adding modules; Zig will tell you if it overflows.
-    modules: [3]module.Module = undefined,
+    modules: [4]module.Module = undefined,
     registry: module.Registry = .{ .modules = &.{} },
 
     const Self = @This();
@@ -71,6 +75,7 @@ pub const App = struct {
         app.modules[0] = project_tree_mod.makeModule(app);
         app.modules[1] = compiler_output.makeModule(app);
         app.modules[2] = project_settings_mod.makeModule(app);
+        app.modules[3] = resources_mod.makeModule(app);
         app.registry = .{ .modules = &app.modules };
 
         return app;

@@ -115,6 +115,48 @@ pub fn main() !void {
         }
     });
 
+    _ = engine.registerTest("phase3", "resources_add_and_save", @src(), struct {
+        fn gui(_: *zgui.te.TestContext) !void {
+            if (g_app) |a| a.renderFrame();
+        }
+        fn run(ctx: *zgui.te.TestContext) !void {
+            const a = g_app orelse {
+                _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
+                return;
+            };
+
+            ctx.menuAction(.click, "View/Resources");
+            _ = zgui.te.check(@src(), .{}, a.show_resources, "panel opened");
+
+            ctx.itemAction(.click, "Resources/Add", .{}, null);
+            _ = zgui.te.check(@src(), .{}, a.resources_editor.count == 1, "Add created a slot");
+
+            // Row 0's inputs live under the pushStrIdZ("row0") scope.
+            ctx.itemInputStrValue("Resources/row0/name", "sprites");
+            ctx.itemInputStrValue("Resources/row0/json", "assets/sprites.json");
+            ctx.itemInputStrValue("Resources/row0/texture", "assets/sprites.png");
+
+            ctx.itemAction(.click, "Resources/Save", .{}, null);
+
+            const proj = a.project_manager.current_project.?;
+            const in_memory = proj.config.resources.len == 1 and
+                std.mem.eql(u8, proj.config.resources[0].name, "sprites");
+            _ = zgui.te.check(@src(), .{}, in_memory, "config.resources updated in memory");
+
+            // Read project.labelle off disk and confirm the resource line is there.
+            const dir = g_settings_project_dir.?;
+            var path_buf: [512]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buf, "{s}/project.labelle", .{dir}) catch return;
+            var file_buf: [4096]u8 = undefined;
+            const file = std.fs.cwd().openFile(path, .{}) catch return;
+            defer file.close();
+            const n = file.read(&file_buf) catch return;
+            const on_disk = std.mem.indexOf(u8, file_buf[0..n], "\"sprites\"") != null and
+                std.mem.indexOf(u8, file_buf[0..n], "assets/sprites.json") != null;
+            _ = zgui.te.check(@src(), .{}, on_disk, "project.labelle on disk has the resource");
+        }
+    });
+
     _ = engine.registerTest("phase3", "project_settings_edit_save", @src(), struct {
         fn gui(_: *zgui.te.TestContext) !void {
             if (g_app) |a| a.renderFrame();

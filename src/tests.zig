@@ -401,6 +401,61 @@ pub const ProjectFileTests = struct {
         try expect.toBeFalse(pm.current_project.?.is_dirty);
     }
 
+    test "saveProject omits empty resources block" {
+        const allocator = std.testing.allocator;
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+        try pm.newProject("no_resources");
+        try pm.saveProject(temp_dir);
+
+        const labelle_path = try std.fs.path.join(allocator, &.{ temp_dir, "project.labelle" });
+        defer allocator.free(labelle_path);
+        const file = try std.fs.cwd().openFile(labelle_path, .{});
+        defer file.close();
+        const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+        defer allocator.free(content);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, content, ".resources") == null);
+    }
+
+    test "resources round-trip through save + load" {
+        const allocator = std.testing.allocator;
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        // Build a project with one resource directly via the arena so
+        // the slice is owned correctly. Save then reload via a fresh
+        // ProjectManager and assert the resource came back intact.
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+        try pm.newProject("with_resources");
+
+        const proj = pm.current_project.?;
+        const a = proj.arena.allocator();
+        const resources = try a.alloc(project.ResourceDef, 1);
+        resources[0] = .{
+            .name = try a.dupe(u8, "sprites"),
+            .json = try a.dupe(u8, "assets/sprites.json"),
+            .texture = try a.dupe(u8, "assets/sprites.png"),
+        };
+        proj.config.resources = resources;
+
+        try pm.saveProject(temp_dir);
+
+        var pm2 = project.ProjectManager.init(allocator);
+        defer pm2.deinit();
+        try pm2.loadProject(temp_dir);
+
+        const loaded = pm2.current_project.?.config.resources;
+        try expect.equal(loaded.len, 1);
+        try expect.toBeTrue(std.mem.eql(u8, loaded[0].name, "sprites"));
+        try expect.toBeTrue(std.mem.eql(u8, loaded[0].json, "assets/sprites.json"));
+        try expect.toBeTrue(std.mem.eql(u8, loaded[0].texture, "assets/sprites.png"));
+    }
+
     test "loadProject round-trips a saved project" {
         const allocator = std.testing.allocator;
         const temp_dir = try createTempDir(allocator);

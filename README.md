@@ -47,6 +47,7 @@ src/
     compiler_output.zig          # Bottom-dock compiler output panel
     project_settings.zig         # Edit ProjectConfig fields and persist via ProjectManager
     project_tree.zig             # Project sidebar (file tree)
+    resources.zig                # Edit `resources` block (sprite atlases)
   dialogs/
     new_scene.zig                # New Scene modal + scene-file writer
     dpi_warning.zig              # One-shot DPI-changed warning modal

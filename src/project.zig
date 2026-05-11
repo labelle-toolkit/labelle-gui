@@ -30,6 +30,14 @@ pub const Backend = enum { raylib, sokol, sdl, bgfx, wgpu, null };
 /// Mirrors `labelle-assembler`'s `config.EcsChoice`.
 pub const EcsChoice = enum { mock, zig_ecs, zflecs, mr_ecs };
 
+/// Mirrors `labelle-assembler`'s `config.ResourceDef`. The `lazy` flag is
+/// omitted for now — the assembler infers it from scene asset blocks.
+pub const ResourceDef = struct {
+    name: []const u8,
+    json: []const u8 = "",
+    texture: []const u8 = "",
+};
+
 /// Project configuration written to `<project_dir>/project.labelle` in ZON
 /// format. Schema-compatible with the subset of `labelle-assembler`'s
 /// `ProjectConfig` that gui edits today; the assembler fills in defaults
@@ -55,6 +63,10 @@ pub const ProjectConfig = struct {
     engine_version: []const u8 = "1.21.0",
     gfx_version: []const u8 = "1.7.0",
     assembler_version: []const u8 = "0.8.0",
+    /// Sprite atlas resources — name + JSON manifest + texture file. The
+    /// engine consumes these via the generated `main.zig` (see assembler
+    /// codegen). Defaults to empty; the editor adds entries.
+    resources: []const ResourceDef = &.{},
 };
 
 pub const Project = struct {
@@ -229,36 +241,36 @@ pub const ProjectManager = struct {
 /// stays minimal and hand-editable.
 fn renderProjectLabelle(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]u8 {
     const title = if (cfg.title.len > 0) cfg.title else cfg.name;
-    return std.fmt.allocPrint(allocator,
-        \\.{{
-        \\    .name = "{s}",
-        \\    .description = "{s}",
-        \\    .title = "{s}",
-        \\    .width = {d},
-        \\    .height = {d},
-        \\    .target_fps = {d},
-        \\    .backend = .{s},
-        \\    .ecs = .{s},
-        \\    .initial_scene = "{s}",
-        \\    .core_version = "{s}",
-        \\    .engine_version = "{s}",
-        \\    .gfx_version = "{s}",
-        \\    .assembler_version = "{s}",
-        \\}}
-        \\
-    , .{
-        cfg.name,
-        cfg.description,
-        title,
-        cfg.width,
-        cfg.height,
-        cfg.target_fps,
-        @tagName(cfg.backend),
-        @tagName(cfg.ecs),
-        cfg.initial_scene,
-        cfg.core_version,
-        cfg.engine_version,
-        cfg.gfx_version,
-        cfg.assembler_version,
-    });
+    var buf: std.ArrayList(u8) = .{};
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    try w.writeAll(".{\n");
+    try w.print("    .name = \"{s}\",\n", .{cfg.name});
+    try w.print("    .description = \"{s}\",\n", .{cfg.description});
+    try w.print("    .title = \"{s}\",\n", .{title});
+    try w.print("    .width = {d},\n", .{cfg.width});
+    try w.print("    .height = {d},\n", .{cfg.height});
+    try w.print("    .target_fps = {d},\n", .{cfg.target_fps});
+    try w.print("    .backend = .{s},\n", .{@tagName(cfg.backend)});
+    try w.print("    .ecs = .{s},\n", .{@tagName(cfg.ecs)});
+    try w.print("    .initial_scene = \"{s}\",\n", .{cfg.initial_scene});
+    try w.print("    .core_version = \"{s}\",\n", .{cfg.core_version});
+    try w.print("    .engine_version = \"{s}\",\n", .{cfg.engine_version});
+    try w.print("    .gfx_version = \"{s}\",\n", .{cfg.gfx_version});
+    try w.print("    .assembler_version = \"{s}\",\n", .{cfg.assembler_version});
+
+    if (cfg.resources.len > 0) {
+        try w.writeAll("    .resources = .{\n");
+        for (cfg.resources) |r| {
+            try w.print(
+                "        .{{ .name = \"{s}\", .json = \"{s}\", .texture = \"{s}\" }},\n",
+                .{ r.name, r.json, r.texture },
+            );
+        }
+        try w.writeAll("    },\n");
+    }
+
+    try w.writeAll("}\n");
+    return buf.toOwnedSlice(allocator);
 }
