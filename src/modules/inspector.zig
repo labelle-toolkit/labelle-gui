@@ -14,6 +14,34 @@ const zgui = @import("zgui");
 const scene_io = @import("../scene_io.zig");
 const atlas = @import("../atlas.zig");
 
+/// Canonical Sprite.pivot values, matching the engine's pivot enum
+/// and the order in `modules/viewport.zig:pivotOffset`. Index 0
+/// (`center`) is the default when the buffer is empty or unknown.
+const pivot_names = [_][]const u8{
+    "center",
+    "bottom_center",
+    "top_center",
+    "bottom_left",
+    "bottom_right",
+    "top_left",
+    "top_right",
+    "left_center",
+    "right_center",
+};
+
+/// Zero-separated, zero-terminated form of `pivot_names` for
+/// `zgui.combo`'s `items_separated_by_zeros` argument.
+const pivot_items: [:0]const u8 =
+    "center\x00" ++
+    "bottom_center\x00" ++
+    "top_center\x00" ++
+    "bottom_left\x00" ++
+    "bottom_right\x00" ++
+    "top_left\x00" ++
+    "top_right\x00" ++
+    "left_center\x00" ++
+    "right_center\x00";
+
 /// Render the editable surface for one entity:
 ///
 /// - Heading: prefab name (plus optional `Entity #N` label for scene
@@ -65,7 +93,22 @@ pub fn renderEntity(
                     zgui.textColored(.{ 1.0, 0.5, 0.4, 1.0 }, "(missing)", .{});
                 }
             }
-            if (zgui.inputText("pivot", .{ .buf = &sprite.pivot })) is_dirty.* = true;
+            // Pivot is a closed enum on the engine side — let the
+            // user pick from the 9 valid names rather than free-type.
+            // Order matches `pivotOffset` in modules/viewport.zig.
+            const current_pivot = std.mem.sliceTo(&sprite.pivot, 0);
+            var pivot_idx: i32 = for (pivot_names, 0..) |n, i| {
+                if (std.mem.eql(u8, current_pivot, n)) break @intCast(i);
+            } else 0;
+            if (zgui.combo("pivot", .{
+                .current_item = &pivot_idx,
+                .items_separated_by_zeros = pivot_items,
+            })) {
+                const chosen = pivot_names[@intCast(pivot_idx)];
+                @memset(&sprite.pivot, 0);
+                @memcpy(sprite.pivot[0..chosen.len], chosen);
+                is_dirty.* = true;
+            }
             if (zgui.inputText("layer", .{ .buf = &sprite.layer })) is_dirty.* = true;
 
             // z_index is optional in the source; the checkbox toggles
