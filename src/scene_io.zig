@@ -93,6 +93,186 @@ pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !LoadedScene
     return parseScene(allocator, raw);
 }
 
+// ─── Prefabs ───────────────────────────────────────────────────────────
+//
+// Prefabs live at `<project>/prefabs/<name>.jsonc` with the shape
+// `{ "components": { ... } }` — a single entity template, no `name`
+// field, no `entities` array. Conceptually they're "one entity worth
+// of components" that scenes instance by reference. Our model: load
+// the prefab as a `LoadedPrefab` carrying one `Entity` plus the same
+// `ComponentExtra` list we use for scene entities. Position is
+// typically absent in prefabs (scenes set position per-instance).
+
+pub const LoadedPrefab = struct {
+    arena: *std.heap.ArenaAllocator,
+    /// The prefab's body, modeled as a single entity so the inspector
+    /// can render it with the same code that handles scene entities.
+    /// `entity.prefab` is unused (prefabs don't reference other
+    /// prefabs in this format); `entity.position` is usually null.
+    entity: Entity,
+    /// Components other than `Position` captured verbatim, same as
+    /// scene-side extras. On save, these splice back into the
+    /// emitted `components: { ... }` block.
+    component_extras: []const ComponentExtra,
+    /// Optional `children: [...]` array — a prefab can hold sub-
+    /// entities with their own positions and components (e.g.
+    /// hydroponics has Sprite children that decorate the room).
+    /// Mutable in place so the editor can drag-to-move them.
+    children: []Entity,
+    /// Per-child unmodeled components, parallel to `children`.
+    children_extras: []const []const ComponentExtra,
+
+    pub fn deinit(self: *LoadedPrefab) void {
+        const child_alloc = self.arena.child_allocator;
+        self.arena.deinit();
+        child_alloc.destroy(self.arena);
+    }
+};
+
+pub fn loadPrefabFromFile(allocator: std.mem.Allocator, path: []const u8) !LoadedPrefab {
+    const raw = try std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024);
+    defer allocator.free(raw);
+    return parsePrefab(allocator, raw);
+}
+
+pub fn parsePrefab(allocator: std.mem.Allocator, raw: []const u8) !LoadedPrefab {
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    errdefer allocator.destroy(arena);
+    arena.* = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+
+    const stripped = try stripLineComments(arena.allocator(), raw);
+
+    const Intermediate = struct {
+        components: ?std.json.Value = null,
+        children: []const struct {
+            prefab: ?[]const u8 = null,
+            components: ?std.json.Value = null,
+        } = &.{},
+    };
+    var parsed = try std.json.parseFromSlice(Intermediate, arena.allocator(), stripped, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const entity: Entity = .{
+        .position = readPosition(parsed.value.components),
+    };
+
+    // Re-use the entity-body scanner — walks `{ ... }`, finds the
+    // `components` key, captures every non-Position entry as
+    // verbatim extras. Works the same for prefab body and child
+    // bodies.
+    const component_extras = try extractComponentExtras(arena.allocator(), raw);
+
+    // Children: mutable so the editor can drag-to-move them. Each
+    // child gets its leading `//` comment block attached via the
+    // same rule scenes use.
+    const child_comments = try extractChildComments(arena.allocator(), raw);
+    const child_extras = try extractChildComponentExtras(arena.allocator(), raw);
+    var children = try arena.allocator().alloc(Entity, parsed.value.children.len);
+    for (parsed.value.children, 0..) |c, i| {
+        children[i] = .{
+            .prefab = if (c.prefab) |p| try arena.allocator().dupe(u8, p) else null,
+            .position = readPosition(c.components),
+        };
+        if (i < child_comments.len) {
+            buf.writeZeroed(&children[i].comment, child_comments[i]);
+        }
+    }
+
+    return .{
+        .arena = arena,
+        .entity = entity,
+        .component_extras = component_extras,
+        .children = children,
+        .children_extras = child_extras,
+    };
+}
+
+pub fn savePrefab(allocator: std.mem.Allocator, path: []const u8, loaded: LoadedPrefab) !void {
+    const text = try renderPrefabJsonc(allocator, loaded);
+    defer allocator.free(text);
+    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(text);
+}
+
+/// Emit the prefab as `{ "components": { ... }, "children": [ ... ] }`.
+/// The `components` block mirrors a scene entity's; the `children`
+/// array (omitted when empty) emits one entry per child with its
+/// modeled Position + verbatim component extras + leading comment.
+pub fn renderPrefabJsonc(allocator: std.mem.Allocator, loaded: LoadedPrefab) ![]u8 {
+    var out: std.ArrayList(u8) = .{};
+    errdefer out.deinit(allocator);
+    const w = out.writer(allocator);
+
+    try w.writeAll("{\n");
+    try w.writeAll("    \"components\": {");
+    var first = true;
+    if (loaded.entity.position) |p| {
+        try w.print(" \"Position\": {{ \"x\": {d}, \"y\": {d} }}", .{ p.x, p.y });
+        first = false;
+    }
+    for (loaded.component_extras) |extra| {
+        if (!first) try w.writeAll(",");
+        try w.print(" \"{s}\": {s}", .{ extra.name, extra.value_text });
+        first = false;
+    }
+    if (first) try w.writeAll(" ");
+    try w.writeAll(" }");
+
+    if (loaded.children.len > 0) {
+        try w.writeAll(",\n");
+        try w.writeAll("    \"children\": [\n");
+        for (loaded.children, 0..) |child, i| {
+            const comment = std.mem.sliceTo(&child.comment, 0);
+            if (comment.len > 0) {
+                var lines = std.mem.splitScalar(u8, std.mem.trim(u8, comment, " \t\r\n"), '\n');
+                while (lines.next()) |line| {
+                    try w.print("        {s}\n", .{std.mem.trim(u8, line, " \t\r")});
+                }
+            }
+
+            try w.writeAll("        {");
+            var c_first = true;
+            if (child.prefab) |p| {
+                try w.print(" \"prefab\": \"{s}\"", .{p});
+                c_first = false;
+            }
+            const cextras = if (i < loaded.children_extras.len)
+                loaded.children_extras[i]
+            else
+                &[_]ComponentExtra{};
+            const has_components = child.position != null or cextras.len > 0;
+            if (has_components) {
+                if (!c_first) try w.writeAll(",");
+                try w.writeAll(" \"components\": {");
+                var cc_first = true;
+                if (child.position) |p| {
+                    try w.print(" \"Position\": {{ \"x\": {d}, \"y\": {d} }}", .{ p.x, p.y });
+                    cc_first = false;
+                }
+                for (cextras) |extra| {
+                    if (!cc_first) try w.writeAll(",");
+                    try w.print(" \"{s}\": {s}", .{ extra.name, extra.value_text });
+                    cc_first = false;
+                }
+                try w.writeAll(" }");
+                c_first = false;
+            }
+            if (c_first) try w.writeAll(" ");
+            try w.writeAll(" }");
+            if (i + 1 < loaded.children.len) try w.writeAll(",");
+            try w.writeAll("\n");
+        }
+        try w.writeAll("    ]");
+    }
+
+    try w.writeAll("\n}\n");
+    return out.toOwnedSlice(allocator);
+}
+
 pub fn parseScene(allocator: std.mem.Allocator, raw: []const u8) !LoadedScene {
     const arena = try allocator.create(std.heap.ArenaAllocator);
     errdefer allocator.destroy(arena);
@@ -178,6 +358,17 @@ fn jsonNumberAsF32(v: ?std.json.Value) ?f32 {
     };
 }
 
+/// Strip a trailing `.jsonc` extension from a path's basename and
+/// return the resulting stem (e.g. `"a/b/main.jsonc"` → `"main"`).
+/// Used by Scene + Prefab tabs for the display label; lifted here
+/// so they share the implementation rather than duplicating it.
+pub fn displayNameFromPath(path: []const u8) []const u8 {
+    const base = std.fs.path.basename(path);
+    const ext = ".jsonc";
+    if (std.mem.endsWith(u8, base, ext)) return base[0 .. base.len - ext.len];
+    return base;
+}
+
 /// Walk the JSONC source and capture `// ...` comment blocks that
 /// precede each top-level entity in `entities: [ ... ]`. Returns one
 /// string per entity in source order; entries are empty when an entity
@@ -189,11 +380,25 @@ fn jsonNumberAsF32(v: ?std.json.Value) ?f32 {
 /// an entity opening brace (uncommon and would conflate with the
 /// previous entity).
 pub fn extractEntityComments(arena: std.mem.Allocator, raw: []const u8) ![]const []const u8 {
+    return extractArrayItemComments(arena, raw, findEntitiesArray(raw) orelse return &.{});
+}
+
+/// Same shape as `extractEntityComments` but rooted at a prefab's
+/// `children` array. Returns one comment block per child in source
+/// order; entries are empty when a child had no leading comment.
+pub fn extractChildComments(arena: std.mem.Allocator, raw: []const u8) ![]const []const u8 {
+    return extractArrayItemComments(arena, raw, findChildrenArray(raw) orelse return &.{});
+}
+
+fn extractArrayItemComments(
+    arena: std.mem.Allocator,
+    raw: []const u8,
+    array_lbracket: usize,
+) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .{};
     errdefer out.deinit(arena);
 
-    var i: usize = findEntitiesArray(raw) orelse return out.toOwnedSlice(arena);
-    i += 1; // past '['
+    var i: usize = array_lbracket + 1; // past '['
 
     while (i < raw.len) {
         skipWhitespaceJson(raw, &i);
@@ -208,7 +413,7 @@ pub fn extractEntityComments(arena: std.mem.Allocator, raw: []const u8) ![]const
             i += 1;
             continue;
         }
-        if (raw[i] != '{') break; // unexpected — bail gracefully
+        if (raw[i] != '{') break;
 
         const trimmed = std.mem.trim(u8, raw[comment_start..comment_end], " \t\r\n");
         try out.append(arena, try arena.dupe(u8, trimmed));
@@ -218,17 +423,18 @@ pub fn extractEntityComments(arena: std.mem.Allocator, raw: []const u8) ![]const
     return out.toOwnedSlice(arena);
 }
 
-fn findEntitiesArray(raw: []const u8) ?usize {
-    const key = "\"entities\"";
+/// Locate a `"<key>": [` array in `raw` and return the byte offset
+/// of the opening `[`. Used for both scene entities and prefab
+/// children — same scanner, different key. False-positive guard:
+/// a literal string value equal to the key (e.g. `"tag":
+/// "entities"`) is skipped past so a real later occurrence still
+/// resolves.
+fn findArrayByKey(raw: []const u8, key_with_quotes: []const u8) ?usize {
+    const klen = key_with_quotes.len;
     var i: usize = 0;
-    while (i + key.len <= raw.len) {
-        // Match the key as-a-string first so a literal `"entities"` —
-        // which IS a `"`-prefixed token — isn't eaten by the
-        // string-skip branch below. For any other string we encounter
-        // (e.g. `"name"`, a string *value*), skipString advances past
-        // it so its contents don't false-match.
-        if (std.mem.eql(u8, raw[i .. i + key.len], key)) {
-            var probe = i + key.len;
+    while (i + klen <= raw.len) {
+        if (std.mem.eql(u8, raw[i .. i + klen], key_with_quotes)) {
+            var probe = i + klen;
             skipWhitespaceJson(raw, &probe);
             skipCommentBlock(raw, &probe);
             skipWhitespaceJson(raw, &probe);
@@ -239,10 +445,7 @@ fn findEntitiesArray(raw: []const u8) ?usize {
                 skipWhitespaceJson(raw, &probe);
                 if (probe < raw.len and raw[probe] == '[') return probe;
             }
-            // Not the entities key in object position — e.g. a string
-            // value that happens to be `"entities"`. Keep scanning
-            // past this token so a later real `"entities": [` is found.
-            i += key.len;
+            i += klen;
             continue;
         }
         if (raw[i] == '"') {
@@ -252,6 +455,14 @@ fn findEntitiesArray(raw: []const u8) ?usize {
         i += 1;
     }
     return null;
+}
+
+fn findEntitiesArray(raw: []const u8) ?usize {
+    return findArrayByKey(raw, "\"entities\"");
+}
+
+fn findChildrenArray(raw: []const u8) ?usize {
+    return findArrayByKey(raw, "\"children\"");
 }
 
 fn skipWhitespaceJson(raw: []const u8, i: *usize) void {
@@ -413,11 +624,27 @@ fn extractTopLevelExtras(arena: std.mem.Allocator, raw: []const u8) ![]const Top
 /// key+value pair that isn't `Position` (the only component the gui
 /// models today).
 fn extractEntityComponentExtras(arena: std.mem.Allocator, raw: []const u8) ![]const []const ComponentExtra {
+    return extractArrayItemComponentExtras(arena, raw, findEntitiesArray(raw) orelse return &.{});
+}
+
+/// Per-child component extras for prefabs. Same scanner the scene
+/// side uses, just rooted at the `children` array instead of
+/// `entities`.
+pub fn extractChildComponentExtras(arena: std.mem.Allocator, raw: []const u8) ![]const []const ComponentExtra {
+    return extractArrayItemComponentExtras(arena, raw, findChildrenArray(raw) orelse return &.{});
+}
+
+/// Shared body for entity / child component extraction. Caller passes
+/// the byte offset of the opening `[` of the array to walk.
+fn extractArrayItemComponentExtras(
+    arena: std.mem.Allocator,
+    raw: []const u8,
+    array_lbracket: usize,
+) ![]const []const ComponentExtra {
     var out: std.ArrayList([]const ComponentExtra) = .{};
     errdefer out.deinit(arena);
 
-    var i: usize = findEntitiesArray(raw) orelse return out.toOwnedSlice(arena);
-    i += 1; // past '['
+    var i: usize = array_lbracket + 1; // past '['
 
     while (i < raw.len) {
         skipWhitespaceJson(raw, &i);
@@ -484,8 +711,19 @@ fn extractComponentExtras(arena: std.mem.Allocator, entity_body: []const u8) ![]
 
 /// Find `"<key>": {` inside an object body. Returns the byte offset
 /// of the opening `{`, or null when the key isn't present.
+///
+/// Tolerates leading whitespace / `//` comments / BOM-style padding
+/// before the outer `{`. Scene-entity callers pass a body that
+/// already starts at the opening brace (sliced by `scanBalanced`);
+/// the prefab path passes the full raw file, which may have a
+/// header comment or whitespace before `{`. Without the skip below
+/// the prefab path returned null and silently produced empty
+/// extras — data-destructive on save.
 fn findKeyObject(body: []const u8, key: []const u8) ?usize {
     var i: usize = 0;
+    skipWhitespaceJson(body, &i);
+    skipCommentBlock(body, &i);
+    skipWhitespaceJson(body, &i);
     if (i < body.len and body[i] == '{') i += 1;
     while (i < body.len) {
         skipWhitespaceJson(body, &i);

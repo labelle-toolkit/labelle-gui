@@ -3,8 +3,8 @@
 //! means "the tab at this index has been ×'d and is dirty; ask the
 //! user what to do." Three resolutions:
 //!
-//! - **Save and close**: writes the scene back to disk via the Scene
-//!   module's `saveScene` and then drops the tab.
+//! - **Save and close**: writes the tab back to disk via its
+//!   `OpenTab.save` (dispatches on tab kind) and then drops the tab.
 //! - **Discard**: drops the tab without writing.
 //! - **Cancel**: keeps the tab open; `pending_close_idx` is cleared
 //!   so subsequent close attempts re-fire the dialog.
@@ -12,35 +12,34 @@
 const zgui = @import("zgui");
 
 const App = @import("../app.zig").App;
-const scene_mod = @import("../modules/scene.zig");
 
 pub fn render(app: *App) void {
     const idx = app.pending_close_idx orelse return;
-    if (idx >= app.open_scenes.items.len) {
-        // Tab was already gone (e.g. closeAllScenes ran between
+    if (idx >= app.open_tabs.items.len) {
+        // Tab was already gone (e.g. closeAllTabs ran between
         // request and dialog render). Drop the request silently.
         app.pending_close_idx = null;
         return;
     }
-    const state = &app.open_scenes.items[idx];
+    const tab = &app.open_tabs.items[idx];
 
-    zgui.openPopup("Unsaved scene", .{});
-    if (!zgui.beginPopupModal("Unsaved scene", .{ .flags = .{ .always_auto_resize = true } })) return;
+    zgui.openPopup("Unsaved changes", .{});
+    if (!zgui.beginPopupModal("Unsaved changes", .{ .flags = .{ .always_auto_resize = true } })) return;
     defer zgui.endPopup();
 
-    zgui.text("Scene \"{s}\" has unsaved changes.", .{state.display_name});
+    zgui.text("\"{s}\" has unsaved changes.", .{tab.displayName()});
     zgui.text("Save before closing?", .{});
     zgui.spacing();
     zgui.separator();
     zgui.spacing();
 
     if (zgui.button("Save and close", .{ .w = 150 })) {
-        scene_mod.saveScene(state, app);
-        if (!state.is_dirty) {
+        tab.save(app);
+        if (!tab.isDirty()) {
             // Save succeeded — close.
-            app.closeScene(idx);
+            app.closeTab(idx);
         }
-        // If save_scene failed, is_dirty stays true; status bar already
+        // If save failed, is_dirty stays true; status bar already
         // surfaces the error. Keep the dialog dismissed so the user
         // can investigate without it re-firing on the next frame.
         app.pending_close_idx = null;
@@ -48,7 +47,7 @@ pub fn render(app: *App) void {
     }
     zgui.sameLine(.{});
     if (zgui.button("Discard", .{ .w = 100 })) {
-        app.closeScene(idx);
+        app.closeTab(idx);
         app.pending_close_idx = null;
         zgui.closeCurrentPopup();
     }

@@ -71,24 +71,47 @@ Known limitations of the pass-through:
 2. **Project = directory.** `Project.dir` holds the project directory; `<dir>/project.labelle` is the editable file. Open / Save dialogs use `nfd.openFolderDialog`, not file dialogs.
 3. **Don't reintroduce `build.zig` template generation.** The assembler owns that. If you find yourself writing build files from the gui, you're going the wrong direction.
 
-## Scene editor: tabs, not a panel
+## Editor tabs: scenes and prefabs
 
-The Scene editor isn't a togglable panel through the View menu. Instead:
+Editor tabs aren't togglable panels through the View menu. Instead:
 
 - The user clicks a `.jsonc` file in the Project Tree → `project_tree`
-  routes it through `App.openScene(path)` → a new `SceneState` is
-  appended to `App.open_scenes`.
-- The main content area renders a `TabBar` when `open_scenes.len > 0`;
-  each tab's body is `scene_mod.render(state, app)`.
+  classifies it by directory (`isScenePath`/`isPrefabPath`) and routes
+  it through `App.openScene(path)` or `App.openPrefab(path)` → a new
+  `SceneState` or `PrefabState` is appended to `App.open_tabs`
+  (wrapped in an `OpenTab` tagged union).
+- The main content area renders a `TabBar` when `open_tabs.len > 0`;
+  each tab's body comes from `OpenTab.render(app)`, which dispatches
+  to `scene_mod.render` or `prefab_mod.render`.
 - The × close button on a dirty tab opens `dialogs/close_scene.zig`
   (Save and close / Discard / Cancel) via `App.pending_close_idx`.
+  The modal calls `OpenTab.save(app)` which dispatches by variant.
 - Project transitions (`ProjectManager.generation` change) trigger
-  `App.closeAllScenes` so the next frame doesn't read freed memory
+  `App.closeAllTabs` so the next frame doesn't read freed memory
   belonging to the old project.
+- `OpenTab` has `displayName`, `path`, `isDirty`, `save`, `render`,
+  `deinit` — the rest of `App` (tab strip, close modal, dedup on
+  open) only goes through these, never inspects the variant.
 
-Each `SceneState` carries its own arena (path + display name) and
-owns a `LoadedScene` (parsed-scene arena from `scene_io.parseScene`).
-`SceneState.deinit(allocator)` frees both.
+Both `SceneState` and `PrefabState` carry their own arena (path +
+display name) and own a `Loaded*` value (parsed-source arena from
+`scene_io`). `deinit(allocator)` frees both.
+
+Both editors have a two-column layout: viewport on the left, inspector
+on the right. The shared `modules/viewport.zig` draws entity markers
+on a pan/zoom canvas, handles hit-test, and drives drag-to-move; the
+shared `modules/inspector.zig` renders one entity's editable surface.
+
+- Scene tab → viewport operates on `loaded.scene.entities`.
+- Prefab tab → viewport operates on `loaded.children` (sub-entities
+  with their own Position + components). The prefab's own components
+  live on `loaded.entity`; when nothing is selected in the viewport
+  the inspector shows them, otherwise it shows the selected child.
+
+Sub-entities nested inside a component value (e.g. `Room.workstations`)
+ride along as part of the parent component's verbatim extras — not
+modeled structurally. Editing them means hand-editing the file (or
+extending the gui's component understanding later).
 
 ## Adding a new module
 

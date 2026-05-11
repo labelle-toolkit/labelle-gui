@@ -1,0 +1,75 @@
+//! Shared entity inspector — renders an entity's properties +
+//! components into the current imgui window. Called from both the
+//! Scene module (one selected entity at a time) and, once it lands,
+//! the Prefab module (the single entity that is the prefab).
+//!
+//! `is_dirty` is a `*bool` so the caller can hand in whatever tracks
+//! "needs save" on its side — `SceneState.is_dirty` for scenes,
+//! `PrefabState.is_dirty` for prefabs. Any edit (Position input,
+//! comment change) flips it.
+
+const std = @import("std");
+const zgui = @import("zgui");
+
+const scene_io = @import("../scene_io.zig");
+
+/// Render the editable surface for one entity:
+///
+/// - Heading: prefab name (plus optional `Entity #N` label for scene
+///   entities; pass `null` for the lone entity in a prefab).
+/// - `Position` collapsing header with x/y inputs.
+/// - `Comment` collapsing header with the multiline comment buffer.
+/// - `Other components (N)` group with a collapsing header per
+///   unmodeled component, body shown verbatim (read-only for v1).
+///
+/// Caller controls window placement; this just paints into whatever
+/// container is active.
+pub fn renderEntity(
+    entity: *scene_io.Entity,
+    component_extras: []const scene_io.ComponentExtra,
+    is_dirty: *bool,
+    entity_index: ?usize,
+) void {
+    if (entity_index) |n| {
+        zgui.text("Entity #{d}", .{n});
+    }
+    if (entity.prefab) |p| {
+        zgui.text("prefab: {s}", .{p});
+    } else {
+        zgui.textDisabled("(no prefab)", .{});
+    }
+    zgui.spacing();
+
+    if (zgui.collapsingHeader("Position", .{ .default_open = true })) {
+        if (entity.position) |*pos| {
+            if (zgui.inputFloat("x", .{ .v = &pos.x })) is_dirty.* = true;
+            if (zgui.inputFloat("y", .{ .v = &pos.y })) is_dirty.* = true;
+        } else {
+            zgui.textDisabled("(no Position component)", .{});
+        }
+    }
+
+    if (zgui.collapsingHeader("Comment", .{})) {
+        if (zgui.inputTextMultiline("##comment", .{
+            .buf = &entity.comment,
+            .w = 0,
+            .h = 80,
+        })) is_dirty.* = true;
+    }
+
+    if (component_extras.len > 0) {
+        zgui.spacing();
+        zgui.separator();
+        zgui.textDisabled("Other components ({d})", .{component_extras.len});
+        for (component_extras) |extra| {
+            // Component names are short in practice (Sprite, Coin,
+            // Room…), but allow longer custom names — 256 bytes
+            // covers any reasonable identifier.
+            var label_buf: [256:0]u8 = undefined;
+            const label = std.fmt.bufPrintZ(&label_buf, "{s}", .{extra.name}) catch continue;
+            if (zgui.collapsingHeader(label, .{})) {
+                zgui.textUnformatted(extra.value_text);
+            }
+        }
+    }
+}
