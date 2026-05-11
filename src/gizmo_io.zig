@@ -19,6 +19,7 @@
 //! splice the rest back in unchanged.
 
 const std = @import("std");
+const zon_scan = @import("zon_scan.zig");
 
 /// One parsed gizmo. `match` and `exclude` are typed string lists
 /// owned by the surrounding `LoadedGizmo.arena`. `entity_verbatim` and
@@ -112,10 +113,13 @@ pub fn renderGizmoZon(allocator: std.mem.Allocator, loaded: LoadedGizmo) ![]u8 {
     try w.writeAll(".{\n");
 
     // .match — always emitted (the engine requires it).
+    // Strings are escaped via `std.zig.fmtString` so a hostile value
+    // (containing `"`, `\\`, or non-printables) round-trips as valid
+    // ZON instead of breaking the file.
     try w.writeAll("    .match = .{");
     for (loaded.gizmo.match, 0..) |s, i| {
         if (i > 0) try w.writeAll(", ");
-        try w.print("\"{s}\"", .{s});
+        try w.print("\"{f}\"", .{std.zig.fmtString(s)});
     }
     try w.writeAll("},\n");
 
@@ -123,7 +127,7 @@ pub fn renderGizmoZon(allocator: std.mem.Allocator, loaded: LoadedGizmo) ![]u8 {
         try w.writeAll("    .exclude = .{");
         for (loaded.gizmo.exclude, 0..) |s, i| {
             if (i > 0) try w.writeAll(", ");
-            try w.print("\"{s}\"", .{s});
+            try w.print("\"{f}\"", .{std.zig.fmtString(s)});
         }
         try w.writeAll("},\n");
     }
@@ -161,11 +165,11 @@ pub fn displayNameFromPath(path: []const u8) []const u8 {
 
 // ─── Verbatim scanner ──────────────────────────────────────────────────
 //
-// Same dialect handling as `project.zig`'s top-level scanner: ZON with
-// `// ... \n` comments, `"..."` strings with `\"` escapes, and brace /
-// bracket / paren nesting in values. Multi-line strings (`\\...`) and
-// `'...'` character literals aren't handled because the gizmo schema
-// doesn't use them — extend if a future schema needs them.
+// Dialect handling lives in `zon_scan.zig` and is shared with
+// `project.zig`'s `extractUnmodeledFields` — same ZON grammar (line
+// comments, `"..."` strings with backslash escapes, brace / bracket /
+// paren nesting). Keeping it in one place means future schema growth
+// (multi-line strings, char literals) lands in both consumers at once.
 
 /// Locate the top-level field named `field_name` and return the
 /// verbatim source text of its value (trimmed of surrounding
@@ -176,12 +180,12 @@ fn extractFieldValueVerbatim(
     field_name: []const u8,
 ) !?[]const u8 {
     var i: usize = 0;
-    skipWsAndComments(raw, &i);
+    zon_scan.skipWsAndComments(raw, &i);
     if (i + 1 >= raw.len or raw[i] != '.' or raw[i + 1] != '{') return null;
     i += 2;
 
     while (i < raw.len) {
-        skipWsAndComments(raw, &i);
+        zon_scan.skipWsAndComments(raw, &i);
         if (i >= raw.len) break;
         if (raw[i] == '}') break;
         if (raw[i] == ',') {
@@ -199,13 +203,13 @@ fn extractFieldValueVerbatim(
         const name = raw[name_start..i];
         if (name.len == 0) break;
 
-        skipWsAndComments(raw, &i);
+        zon_scan.skipWsAndComments(raw, &i);
         if (i >= raw.len or raw[i] != '=') break;
         i += 1; // past '='
-        skipWsAndComments(raw, &i);
+        zon_scan.skipWsAndComments(raw, &i);
 
         const value_start = i;
-        scanValue(raw, &i);
+        zon_scan.scanValue(raw, &i);
         const value_end = i;
 
         if (std.mem.eql(u8, name, field_name)) {
@@ -215,7 +219,7 @@ fn extractFieldValueVerbatim(
 
         // Optional trailing comma between fields.
         const save = i;
-        skipWsAndComments(raw, &i);
+        zon_scan.skipWsAndComments(raw, &i);
         if (i < raw.len and raw[i] == ',') {
             i += 1;
         } else {
@@ -223,48 +227,4 @@ fn extractFieldValueVerbatim(
         }
     }
     return null;
-}
-
-fn skipWsAndComments(raw: []const u8, i: *usize) void {
-    while (i.* < raw.len) {
-        const c = raw[i.*];
-        if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
-            i.* += 1;
-        } else if (c == '/' and i.* + 1 < raw.len and raw[i.* + 1] == '/') {
-            while (i.* < raw.len and raw[i.*] != '\n') i.* += 1;
-        } else break;
-    }
-}
-
-fn scanValue(raw: []const u8, i: *usize) void {
-    var depth: usize = 0;
-    while (i.* < raw.len) {
-        const c = raw[i.*];
-        if (c == '"') {
-            i.* += 1;
-            while (i.* < raw.len) {
-                if (raw[i.*] == '\\' and i.* + 1 < raw.len) {
-                    i.* += 2;
-                } else if (raw[i.*] == '"') {
-                    i.* += 1;
-                    break;
-                } else {
-                    i.* += 1;
-                }
-            }
-        } else if (c == '/' and i.* + 1 < raw.len and raw[i.* + 1] == '/') {
-            while (i.* < raw.len and raw[i.*] != '\n') i.* += 1;
-        } else if (c == '{' or c == '[' or c == '(') {
-            depth += 1;
-            i.* += 1;
-        } else if (c == '}' or c == ']' or c == ')') {
-            if (depth == 0) return; // outer `}` — stop without consuming
-            depth -= 1;
-            i.* += 1;
-        } else if (c == ',' and depth == 0) {
-            return;
-        } else {
-            i.* += 1;
-        }
-    }
 }

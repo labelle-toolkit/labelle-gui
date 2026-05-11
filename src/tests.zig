@@ -2132,4 +2132,37 @@ pub const GizmoIoTests = struct {
         try expect.toBeTrue(std.mem.eql(u8, gizmo_io.displayNameFromPath("room.zon"), "room"));
         try expect.toBeTrue(std.mem.eql(u8, gizmo_io.displayNameFromPath("noext"), "noext"));
     }
+
+    test "renderGizmoZon escapes hostile characters in match/exclude" {
+        // Regression for gemini review: the writer used to interpolate
+        // strings raw, so a `"` or `\` in a tag name would break the
+        // file. `std.zig.fmtString` escapes those, and the rendered ZON
+        // must re-parse to the same byte sequence.
+        const allocator = std.testing.allocator;
+        const source = ".{ .match = .{\"Foo\"} }\n";
+        var loaded = try gizmo_io.parseGizmo(allocator, source);
+        defer loaded.deinit();
+
+        const hostile = try loaded.arena.allocator().dupe(u8, "Quote\"Backslash\\End");
+        loaded.gizmo.match[0] = hostile;
+        loaded.gizmo.exclude = try loaded.arena.allocator().alloc([]const u8, 1);
+        loaded.gizmo.exclude[0] = try loaded.arena.allocator().dupe(u8, "Tab\there");
+
+        const rendered = try gizmo_io.renderGizmoZon(allocator, loaded);
+        defer allocator.free(rendered);
+
+        // No unescaped `"` should appear inside our match value beyond
+        // the surrounding delimiters — escaping turned it into `\"`.
+        try expect.toBeTrue(std.mem.indexOf(u8, rendered, "Quote\\\"Backslash\\\\End") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, rendered, "Tab\\there") != null);
+
+        // Round-trip back through the parser and confirm the strings
+        // decode to the originals.
+        var reparsed = try gizmo_io.parseGizmo(allocator, rendered);
+        defer reparsed.deinit();
+        try expect.equal(reparsed.gizmo.match.len, 1);
+        try expect.toBeTrue(std.mem.eql(u8, reparsed.gizmo.match[0], hostile));
+        try expect.equal(reparsed.gizmo.exclude.len, 1);
+        try expect.toBeTrue(std.mem.eql(u8, reparsed.gizmo.exclude[0], "Tab\there"));
+    }
 };

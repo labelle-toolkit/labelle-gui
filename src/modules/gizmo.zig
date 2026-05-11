@@ -34,6 +34,12 @@ pub const GizmoState = struct {
     /// `loaded.gizmo.match` (arena-owned). Sized at load.
     match_bufs: []TagBuf = &.{},
     exclude_bufs: []TagBuf = &.{},
+    /// Sentinel-terminated, mutable copies of the verbatim ZON blocks
+    /// for `inputTextMultiline`. Sized to exactly fit the text — the
+    /// previous fixed 4 KiB stack buffer truncated larger gizmos. Null
+    /// when the corresponding block is absent. Owned by `arena`.
+    entity_buf: ?[:0]u8 = null,
+    children_buf: ?[:0]u8 = null,
     is_dirty: bool = false,
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !GizmoState {
@@ -52,6 +58,15 @@ pub const GizmoState = struct {
         const match_bufs = try makeTagBufs(a, loaded.gizmo.match);
         const exclude_bufs = try makeTagBufs(a, loaded.gizmo.exclude);
 
+        const entity_buf: ?[:0]u8 = if (loaded.gizmo.entity_verbatim) |t|
+            try a.dupeZ(u8, t)
+        else
+            null;
+        const children_buf: ?[:0]u8 = if (loaded.gizmo.children_verbatim) |t|
+            try a.dupeZ(u8, t)
+        else
+            null;
+
         return .{
             .arena = arena,
             .path = path_dup,
@@ -59,6 +74,8 @@ pub const GizmoState = struct {
             .loaded = loaded,
             .match_bufs = match_bufs,
             .exclude_bufs = exclude_bufs,
+            .entity_buf = entity_buf,
+            .children_buf = children_buf,
         };
     }
 
@@ -96,16 +113,16 @@ pub fn render(s: *GizmoState, app: *App) void {
     zgui.spacing();
     zgui.separator();
 
-    if (s.loaded.gizmo.entity_verbatim) |text| {
+    if (s.entity_buf) |buf| {
         if (zgui.collapsingHeader("Entity", .{ .default_open = true })) {
             zgui.textDisabled("(read-only — edit by hand for v1)", .{});
-            renderReadOnlyMultiline("##gizmo_entity", text);
+            renderReadOnlyMultiline("##gizmo_entity", buf);
         }
     }
-    if (s.loaded.gizmo.children_verbatim) |text| {
+    if (s.children_buf) |buf| {
         if (zgui.collapsingHeader("Children", .{ .default_open = true })) {
             zgui.textDisabled("(read-only — edit by hand for v1)", .{});
-            renderReadOnlyMultiline("##gizmo_children", text);
+            renderReadOnlyMultiline("##gizmo_children", buf);
         }
     }
 }
@@ -226,28 +243,24 @@ fn removeBufs(arena: std.mem.Allocator, src: []TagBuf, idx: usize) ![]TagBuf {
     return out;
 }
 
-fn renderReadOnlyMultiline(id: [:0]const u8, text: []const u8) void {
-    // Read-only inputTextMultiline needs a writable buffer (zgui
-    // copies into the buffer for cursor state). Allocate a stack
-    // buffer sized to the text, sentinel-terminated. 4 KiB is plenty
-    // for any v1 gizmo block — they're tiny in practice.
-    var stack_buf: [4096:0]u8 = undefined;
-    @memset(&stack_buf, 0);
-    const n = @min(stack_buf.len - 1, text.len);
-    @memcpy(stack_buf[0..n], text[0..n]);
+fn renderReadOnlyMultiline(id: [:0]const u8, buf: [:0]u8) void {
+    // Read-only inputTextMultiline still requires a writable, sentinel-
+    // terminated buffer (zgui copies into it for cursor state). The
+    // buffer is precomputed and arena-owned by `GizmoState.open`, sized
+    // to fit the full verbatim block — no truncation for large gizmos.
 
     // Approximate line count to size the widget. Clamped so a tiny
     // block doesn't render with a single-line slit and a huge one
     // doesn't dominate the inspector.
     var line_count: usize = 1;
-    for (text) |c| {
+    for (buf) |c| {
         if (c == '\n') line_count += 1;
     }
     const lines_clamped = @max(@min(line_count, @as(usize, 14)), @as(usize, 4));
     const h: f32 = @floatFromInt(@as(u32, @intCast(lines_clamped)) * 18);
 
     _ = zgui.inputTextMultiline(id, .{
-        .buf = &stack_buf,
+        .buf = buf,
         .w = 0,
         .h = h,
         .flags = .{ .read_only = true },
