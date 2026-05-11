@@ -22,6 +22,7 @@ const project = @import("../project.zig");
 const scene_io = @import("../scene_io.zig");
 const config = @import("../config.zig");
 const inspector = @import("inspector.zig");
+const viewport = @import("viewport.zig");
 
 const viewport_min_h: f32 = 240;
 
@@ -174,164 +175,16 @@ fn renderInspector(s: *SceneState) void {
 }
 
 fn renderViewport(s: *SceneState) void {
-    const avail = zgui.getContentRegionAvail();
-    const canvas_h = @max(viewport_min_h, avail[1]);
-    if (!zgui.beginChild("##canvas", .{
-        .w = 0,
-        .h = canvas_h,
-        .child_flags = .{ .border = true },
-    })) {
-        zgui.endChild();
-        return;
-    }
-    defer zgui.endChild();
-
-    const dl = zgui.getWindowDrawList();
-    const cur_pos = zgui.getCursorScreenPos();
-    const canvas_size = zgui.getContentRegionAvail();
-    const canvas_min = cur_pos;
-    const canvas_max: [2]f32 = .{ cur_pos[0] + canvas_size[0], cur_pos[1] + canvas_size[1] };
-
-    dl.addRectFilled(.{
-        .pmin = canvas_min,
-        .pmax = canvas_max,
-        .col = 0xff202225,
-    });
-
-    drawGrid(dl, canvas_min, canvas_max, s.*);
-    drawEntities(dl, canvas_min, canvas_max, s.*, s.loaded);
-
-    _ = zgui.invisibleButton("##canvas_drag", .{ .w = canvas_size[0], .h = canvas_size[1], .flags = .{} });
-
-    // Mouse-down: hit-test entity markers, arm drag-to-move only when
-    // the click landed on an entity.
-    if (zgui.isItemHovered(.{}) and zgui.isMouseClicked(.left)) {
-        const mouse = zgui.getMousePos();
-        const hit = hitTestEntity(s.loaded.scene.entities, mouse, canvas_min, s.pan, s.zoom);
-        s.selected_index = hit;
-        s.drag_armed = hit != null;
-    }
-    if (!zgui.isMouseDown(.left)) s.drag_armed = false;
-
-    if (zgui.isItemActive()) {
-        if (zgui.isMouseDragging(.middle, 0)) {
-            const d = zgui.getMouseDragDelta(.middle, .{});
-            s.pan[0] += d[0];
-            s.pan[1] += d[1];
-            zgui.resetMouseDragDelta(.middle);
-        }
-        if (s.drag_armed) {
-            if (s.selected_index) |idx| {
-                if (idx < s.loaded.scene.entities.len and zgui.isMouseDragging(.left, 0)) {
-                    const e = &s.loaded.scene.entities[idx];
-                    if (e.position) |*pos| {
-                        const d = zgui.getMouseDragDelta(.left, .{});
-                        pos.x += d[0] / s.zoom;
-                        // World +y is up; screen +y is down.
-                        pos.y -= d[1] / s.zoom;
-                        s.is_dirty = true;
-                        zgui.resetMouseDragDelta(.left);
-                    }
-                }
-            }
-        }
-    }
+    viewport.render(.{
+        .pan = &s.pan,
+        .zoom = &s.zoom,
+        .selected_idx = &s.selected_index,
+        .is_dirty = &s.is_dirty,
+        .drag_armed = &s.drag_armed,
+    }, s.loaded.scene.entities);
 }
 
-fn drawGrid(dl: zgui.DrawList, cmin: [2]f32, cmax: [2]f32, s: SceneState) void {
-    const grid_world: f32 = 64;
-    const step = grid_world * s.zoom;
-    if (step <= 4) return;
-
-    const col_major: u32 = 0x40_ff_ff_ff;
-
-    const origin_x = cmin[0] + s.pan[0];
-    const origin_y = cmin[1] + s.pan[1];
-
-    var x = origin_x;
-    while (x > cmin[0]) : (x -= step) {}
-    while (x < cmax[0]) : (x += step) {
-        dl.addLine(.{
-            .p1 = .{ x, cmin[1] },
-            .p2 = .{ x, cmax[1] },
-            .col = col_major,
-            .thickness = 1.0,
-        });
-    }
-    var y = origin_y;
-    while (y > cmin[1]) : (y -= step) {}
-    while (y < cmax[1]) : (y += step) {
-        dl.addLine(.{
-            .p1 = .{ cmin[0], y },
-            .p2 = .{ cmax[0], y },
-            .col = col_major,
-            .thickness = 1.0,
-        });
-    }
-
-    dl.addLine(.{ .p1 = .{ origin_x, cmin[1] }, .p2 = .{ origin_x, cmax[1] }, .col = 0x80_ff_ff_ff, .thickness = 1.0 });
-    dl.addLine(.{ .p1 = .{ cmin[0], origin_y }, .p2 = .{ cmax[0], origin_y }, .col = 0x80_ff_ff_ff, .thickness = 1.0 });
-}
-
-fn drawEntities(dl: zgui.DrawList, cmin: [2]f32, cmax: [2]f32, s: SceneState, loaded: scene_io.LoadedScene) void {
-    _ = cmax;
-    for (loaded.scene.entities, 0..) |e, i| {
-        const pos = e.position orelse continue;
-        const px = cmin[0] + s.pan[0] + pos.x * s.zoom;
-        // World +y is up.
-        const py = cmin[1] + s.pan[1] - pos.y * s.zoom;
-        const col = colorForPrefab(e.prefab);
-        dl.addCircleFilled(.{
-            .p = .{ px, py },
-            .r = 6,
-            .col = col,
-            .num_segments = 16,
-        });
-        if (s.selected_index == i) {
-            dl.addCircle(.{
-                .p = .{ px, py },
-                .r = 12,
-                .col = 0xff_ff_d2_40,
-                .num_segments = 24,
-                .thickness = 2.0,
-            });
-        }
-        if (e.prefab) |p| {
-            dl.addText(.{ px + 8, py - 8 }, 0xff_e0_e0_e0, "{s}", .{p});
-        }
-    }
-}
-
-pub const hit_radius: f32 = 10.0;
-
-pub fn hitTestEntity(
-    entities: []scene_io.Entity,
-    mouse: [2]f32,
-    canvas_min: [2]f32,
-    pan: [2]f32,
-    zoom: f32,
-) ?usize {
-    var best: ?usize = null;
-    var best_d2: f32 = hit_radius * hit_radius;
-    for (entities, 0..) |e, i| {
-        const pos = e.position orelse continue;
-        const px = canvas_min[0] + pan[0] + pos.x * zoom;
-        const py = canvas_min[1] + pan[1] - pos.y * zoom;
-        const dx = mouse[0] - px;
-        const dy = mouse[1] - py;
-        const d2 = dx * dx + dy * dy;
-        if (d2 < best_d2) {
-            best_d2 = d2;
-            best = i;
-        }
-    }
-    return best;
-}
-
-fn colorForPrefab(prefab: ?[]const u8) u32 {
-    const h = if (prefab) |p| std.hash.Wyhash.hash(0, p) else 0;
-    const r: u8 = @truncate((h >> 0) | 0x80);
-    const g: u8 = @truncate((h >> 8) | 0x80);
-    const b: u8 = @truncate((h >> 16) | 0x80);
-    return (@as(u32, 0xff) << 24) | (@as(u32, b) << 16) | (@as(u32, g) << 8) | r;
-}
+/// Re-exported so existing zspec tests (and any other caller of
+/// `scene_module.hitTestEntity`) keep working after the viewport
+/// extraction.
+pub const hitTestEntity = viewport.hitTestEntity;

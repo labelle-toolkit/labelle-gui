@@ -621,6 +621,88 @@ pub const SceneIoTests = struct {
         try expect.equal(loaded2.component_extras.len, 2);
     }
 
+    test "parsePrefab reads children with positions and extras" {
+        // hydroponics-style: prefab body + a children array whose
+        // entries each have a Position and a Sprite. Position is
+        // modeled; Sprite rides along as a component extra.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "components": {
+            \\        "Room": { "room_type": "hydroponics" }
+            \\    },
+            \\    "children": [
+            \\        // Room background
+            \\        {
+            \\            "components": {
+            \\                "Sprite": { "sprite_name": "bg.png" },
+            \\                "Position": { "x": 15, "y": 0 }
+            \\            }
+            \\        },
+            \\        // Pots
+            \\        {
+            \\            "components": {
+            \\                "Sprite": { "sprite_name": "pots.png" },
+            \\                "Position": { "x": 39, "y": 12 }
+            \\            }
+            \\        }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parsePrefab(allocator, src);
+        defer loaded.deinit();
+        try expect.equal(loaded.children.len, 2);
+        try expect.equal(loaded.children[0].position.?.x, 15);
+        try expect.equal(loaded.children[1].position.?.y, 12);
+
+        // Child-level component extras are captured parallel to
+        // children, with Sprite preserved verbatim.
+        try expect.equal(loaded.children_extras.len, 2);
+        try expect.equal(loaded.children_extras[0].len, 1);
+        try expect.toBeTrue(std.mem.eql(u8, loaded.children_extras[0][0].name, "Sprite"));
+
+        // Leading // comments ride along with the child they precede.
+        const c0 = std.mem.sliceTo(&loaded.children[0].comment, 0);
+        const c1 = std.mem.sliceTo(&loaded.children[1].comment, 0);
+        try expect.toBeTrue(std.mem.indexOf(u8, c0, "background") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, c1, "Pots") != null);
+    }
+
+    test "renderPrefabJsonc round-trips children + extras" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "components": { "Room": { "room_type": "x" } },
+            \\    "children": [
+            \\        { "components": { "Sprite": { "n": "a" }, "Position": { "x": 1, "y": 2 } } },
+            \\        { "components": { "Sprite": { "n": "b" }, "Position": { "x": 3, "y": 4 } } }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parsePrefab(allocator, src);
+        defer loaded.deinit();
+
+        // Move child 0; expect the output to reflect the new position
+        // AND preserve Sprite on both children.
+        loaded.children[0].position.?.x = 99;
+
+        const text = try scene_io.renderPrefabJsonc(allocator, loaded);
+        defer allocator.free(text);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"children\":") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"x\": 99") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"n\": \"a\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"n\": \"b\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Room\":") != null);
+
+        // Re-parse the rendered text — same shape, same children
+        // count, edited Position preserved.
+        var loaded2 = try scene_io.parsePrefab(allocator, text);
+        defer loaded2.deinit();
+        try expect.equal(loaded2.children.len, 2);
+        try expect.equal(loaded2.children[0].position.?.x, 99);
+    }
+
     test "renderPrefabJsonc reflects in-memory Position edits" {
         const allocator = std.testing.allocator;
         const src =

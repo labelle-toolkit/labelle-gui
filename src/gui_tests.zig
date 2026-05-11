@@ -144,8 +144,10 @@ pub fn main() !void {
         sf.close();
     }
 
-    // And a prefab so the prefab editor's open + save path has
-    // something to test against.
+    // And a prefab with both top-level components and a children
+    // array so the prefab editor's children-editing path has
+    // something to test against (mirrors hydroponics-style prefabs
+    // in real projects).
     {
         var prefab_path_buf: [512]u8 = undefined;
         const prefab_path = try std.fmt.bufPrint(&prefab_path_buf, "{s}/prefabs/coin.jsonc", .{tmp});
@@ -155,7 +157,10 @@ pub fn main() !void {
             \\    "components": {
             \\        "Sprite": { "sprite_name": "coin", "pivot": "center" },
             \\        "Coin": {}
-            \\    }
+            \\    },
+            \\    "children": [
+            \\        { "components": { "Sprite": { "n": "deco" }, "Position": { "x": 1, "y": 2 } } }
+            \\    ]
             \\}
         );
         pf.close();
@@ -183,12 +188,15 @@ pub fn main() !void {
 
             const opened_ok = a.open_tabs.items.len == 1 and
                 a.open_tabs.items[0] == .prefab and
-                a.open_tabs.items[0].prefab.loaded.component_extras.len == 2;
-            _ = zgui.te.check(@src(), .{}, opened_ok, "prefab opened with 2 components");
+                a.open_tabs.items[0].prefab.loaded.component_extras.len == 2 and
+                a.open_tabs.items[0].prefab.loaded.children.len == 1;
+            _ = zgui.te.check(@src(), .{}, opened_ok, "prefab opened with 2 components + 1 child");
 
-            // Set a Position on the prefab + save via the public API.
+            // Move the child's Position, save through the public API,
+            // and confirm the new position lands on disk while Sprite +
+            // Coin survive verbatim.
             const tab = &a.open_tabs.items[0].prefab;
-            tab.loaded.entity.position = .{ .x = 7, .y = 11 };
+            tab.loaded.children[0].position.?.x = 999;
             tab.is_dirty = true;
             prefab_mod.savePrefab(tab, a);
             _ = zgui.te.check(@src(), .{}, !tab.is_dirty, "is_dirty cleared after Save");
@@ -201,8 +209,8 @@ pub fn main() !void {
 
             _ = zgui.te.check(@src(), .{}, std.mem.indexOf(u8, content, "\"Sprite\"") != null, "Sprite preserved on disk");
             _ = zgui.te.check(@src(), .{}, std.mem.indexOf(u8, content, "\"Coin\"") != null, "Coin preserved on disk");
-            _ = zgui.te.check(@src(), .{}, std.mem.indexOf(u8, content, "\"x\": 7") != null, "Position x persisted");
-            _ = zgui.te.check(@src(), .{}, std.mem.indexOf(u8, content, "\"y\": 11") != null, "Position y persisted");
+            _ = zgui.te.check(@src(), .{}, std.mem.indexOf(u8, content, "\"x\": 999") != null, "child Position x persisted");
+            _ = zgui.te.check(@src(), .{}, std.mem.indexOf(u8, content, "\"children\":") != null, "children block emitted");
 
             a.closeTab(0);
         }

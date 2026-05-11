@@ -97,10 +97,21 @@ Both `SceneState` and `PrefabState` carry their own arena (path +
 display name) and own a `Loaded*` value (parsed-source arena from
 `scene_io`). `deinit(allocator)` frees both.
 
-The Scene editor has a viewport (pan/zoom canvas, hit-test, drag-to-
-move); the Prefab editor doesn't — a prefab is a single entity
-blueprint without positions on a canvas. Both share the entity
-inspector via `modules/inspector.zig`.
+Both editors have a two-column layout: viewport on the left, inspector
+on the right. The shared `modules/viewport.zig` draws entity markers
+on a pan/zoom canvas, handles hit-test, and drives drag-to-move; the
+shared `modules/inspector.zig` renders one entity's editable surface.
+
+- Scene tab → viewport operates on `loaded.scene.entities`.
+- Prefab tab → viewport operates on `loaded.children` (sub-entities
+  with their own Position + components). The prefab's own components
+  live on `loaded.entity`; when nothing is selected in the viewport
+  the inspector shows them, otherwise it shows the selected child.
+
+Sub-entities nested inside a component value (e.g. `Room.workstations`)
+ride along as part of the parent component's verbatim extras — not
+modeled structurally. Editing them means hand-editing the file (or
+extending the gui's component understanding later).
 
 ## Adding a new module
 

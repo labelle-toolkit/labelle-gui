@@ -51,6 +51,7 @@ src/
     scene.zig                    # Scene editor (per-tab state; opens via tree click on scenes/*.jsonc)
     prefab.zig                   # Prefab editor (per-tab state; opens via tree click on prefabs/*.jsonc)
     inspector.zig                # Shared entity inspector — called by both scene.zig and prefab.zig
+    viewport.zig                 # Shared 2D pan/zoom canvas — used by scene.zig and prefab.zig
   dialogs/
     new_scene.zig                # New Scene modal + scene-file writer
     dpi_warning.zig              # One-shot DPI-changed warning modal
