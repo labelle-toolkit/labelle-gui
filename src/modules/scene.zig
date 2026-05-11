@@ -28,6 +28,13 @@ pub const SceneState = struct {
     /// from `selected_name`, the next `render` call reloads from disk.
     loaded_name: [name_cap:0]u8 = [_:0]u8{0} ** name_cap,
     loaded: ?scene_io.LoadedScene = null,
+    /// Index into `loaded.scene.entities`; null = nothing selected.
+    /// Reset whenever a new scene is loaded.
+    selected_index: ?usize = null,
+    /// Set to true on any in-memory edit (drag, inspector input). Cleared
+    /// on scene reload. Save-back is a separate slice; for now this is
+    /// just a visual indicator that changes haven't been persisted.
+    is_dirty: bool = false,
     /// Viewport pan / zoom state (world-space offset + scale factor).
     pan: [2]f32 = .{ 320, 240 },
     zoom: f32 = 1.0,
@@ -39,6 +46,8 @@ pub const SceneState = struct {
     pub fn deinit(self: *SceneState) void {
         if (self.loaded) |*l| l.deinit();
         self.loaded = null;
+        self.selected_index = null;
+        self.is_dirty = false;
     }
 };
 
@@ -91,6 +100,8 @@ fn maybeLoadSelected(s: *SceneState, proj: *project.Project) void {
 
     if (s.loaded) |*l| l.deinit();
     s.loaded = null;
+    s.selected_index = null;
+    s.is_dirty = false;
 
     var path_buf: [512]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}/{s}/{s}.jsonc", .{
@@ -161,7 +172,12 @@ fn renderInspectorAndViewport(s: *SceneState) void {
     };
 
     zgui.text("Scene: {s}", .{loaded.scene.name});
-    zgui.text("Entities: {d}", .{loaded.scene.entities.len});
+    zgui.sameLine(.{});
+    zgui.text("(entities: {d})", .{loaded.scene.entities.len});
+    if (s.is_dirty) {
+        zgui.sameLine(.{});
+        zgui.textColored(.{ 1.0, 0.5, 0.0, 1.0 }, "(unsaved)", .{});
+    }
     zgui.separator();
 
     // Pan/zoom controls. Scroll-wheel reading isn't exposed by zgui's
@@ -179,29 +195,42 @@ fn renderInspectorAndViewport(s: *SceneState) void {
     zgui.text("zoom: {d:.2}x", .{s.zoom});
     zgui.separator();
 
-    renderEntityList(loaded);
+    renderInspector(s, loaded);
     zgui.separator();
     renderViewport(s, loaded);
 }
 
-fn renderEntityList(loaded: scene_io.LoadedScene) void {
-    if (loaded.scene.entities.len == 0) {
-        zgui.textDisabled("(no entities)", .{});
-        return;
-    }
-    if (!zgui.beginChild("##entity_list", .{ .w = 0, .h = 100 })) {
-        zgui.endChild();
-        return;
-    }
-    defer zgui.endChild();
-
-    for (loaded.scene.entities, 0..) |e, i| {
-        const prefab = e.prefab orelse "(no prefab)";
-        if (e.position) |p| {
-            zgui.text("{d}. {s} @ ({d:.0}, {d:.0})", .{ i, prefab, p.x, p.y });
-        } else {
-            zgui.text("{d}. {s}", .{ i, prefab });
+fn renderInspector(s: *SceneState, loaded: scene_io.LoadedScene) void {
+    if (s.selected_index) |idx| {
+        if (idx >= loaded.scene.entities.len) {
+            s.selected_index = null;
+            zgui.textDisabled("(selection out of range)", .{});
+            return;
         }
+        const e = &loaded.scene.entities[idx];
+        const prefab = e.prefab orelse "(no prefab)";
+        zgui.text("Selected: #{d} {s}", .{ idx, prefab });
+
+        if (e.position) |*pos| {
+            if (zgui.inputFloat("x", .{ .v = &pos.x })) s.is_dirty = true;
+            if (zgui.inputFloat("y", .{ .v = &pos.y })) s.is_dirty = true;
+        } else {
+            zgui.textDisabled("(no Position component)", .{});
+        }
+
+        // Multiline comment editor. The buffer is owned by the entity
+        // and modified in place — saves still need a JSONC writer
+        // (deferred slice), but edits persist for the duration of the
+        // scene's lifetime.
+        if (zgui.inputTextMultiline("##comment", .{
+            .buf = &e.comment,
+            .w = 0,
+            .h = 80,
+        })) s.is_dirty = true;
+        zgui.sameLine(.{});
+        zgui.textDisabled("(comment)", .{});
+    } else {
+        zgui.textDisabled("Click an entity in the viewport to select.", .{});
     }
 }
 
@@ -234,17 +263,71 @@ fn renderViewport(s: *SceneState, loaded: scene_io.LoadedScene) void {
     drawGrid(dl, canvas_min, canvas_max, s.*);
     drawEntities(dl, canvas_min, canvas_max, s.*, loaded);
 
-    // Invisible button covering the canvas catches drag events for pan.
+    // Invisible button covering the canvas catches all mouse events.
     _ = zgui.invisibleButton("##canvas_drag", .{ .w = canvas_size[0], .h = canvas_size[1], .flags = .{} });
-    if (zgui.isItemActive() and zgui.isMouseDragging(.middle, 0)) {
-        const d = zgui.getMouseDragDelta(.middle, .{});
-        s.pan[0] += d[0];
-        s.pan[1] += d[1];
-        // resetMouseDragDelta isn't exposed; consume by tracking delta
-        // each frame the user is dragging. This is "good enough" — the
-        // delta resets when the drag ends.
-        zgui.resetMouseDragDelta(.middle);
+
+    if (zgui.isItemActive()) {
+        // Pan with middle-button drag.
+        if (zgui.isMouseDragging(.middle, 0)) {
+            const d = zgui.getMouseDragDelta(.middle, .{});
+            s.pan[0] += d[0];
+            s.pan[1] += d[1];
+            zgui.resetMouseDragDelta(.middle);
+        }
+        // Drag-to-move on the selected entity with left-button drag.
+        if (s.selected_index) |idx| {
+            if (idx < loaded.scene.entities.len and zgui.isMouseDragging(.left, 0)) {
+                const e = &loaded.scene.entities[idx];
+                if (e.position) |*pos| {
+                    const d = zgui.getMouseDragDelta(.left, .{});
+                    pos.x += d[0] / s.zoom;
+                    pos.y += d[1] / s.zoom;
+                    s.is_dirty = true;
+                    zgui.resetMouseDragDelta(.left);
+                }
+            }
+        }
     }
+
+    // Click without drag: hit-test against entity markers and update
+    // selection. `isMouseClicked(left)` fires only on the frame the
+    // button goes down — the drag handler above takes over for any
+    // sustained press, so this doesn't fight the drag.
+    if (zgui.isItemHovered(.{}) and zgui.isMouseClicked(.left)) {
+        const mouse = zgui.getMousePos();
+        s.selected_index = hitTestEntity(loaded.scene.entities, mouse, canvas_min, s.pan, s.zoom);
+    }
+}
+
+/// Pixel radius around an entity marker that counts as a click.
+pub const hit_radius: f32 = 10.0;
+
+/// Return the index of the closest entity whose screen-space marker is
+/// within `hit_radius` pixels of `mouse`, or null if none qualify.
+/// `canvas_min`, `pan`, and `zoom` determine the world-to-screen
+/// projection. Pure / no UI side effects so zspec can drive it.
+pub fn hitTestEntity(
+    entities: []scene_io.Entity,
+    mouse: [2]f32,
+    canvas_min: [2]f32,
+    pan: [2]f32,
+    zoom: f32,
+) ?usize {
+    var best: ?usize = null;
+    var best_d2: f32 = hit_radius * hit_radius;
+    for (entities, 0..) |e, i| {
+        const pos = e.position orelse continue;
+        const px = canvas_min[0] + pan[0] + pos.x * zoom;
+        const py = canvas_min[1] + pan[1] + pos.y * zoom;
+        const dx = mouse[0] - px;
+        const dy = mouse[1] - py;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < best_d2) {
+            best_d2 = d2;
+            best = i;
+        }
+    }
+    return best;
 }
 
 fn drawGrid(dl: zgui.DrawList, cmin: [2]f32, cmax: [2]f32, s: SceneState) void {
@@ -290,7 +373,7 @@ fn drawGrid(dl: zgui.DrawList, cmin: [2]f32, cmax: [2]f32, s: SceneState) void {
 
 fn drawEntities(dl: zgui.DrawList, cmin: [2]f32, cmax: [2]f32, s: SceneState, loaded: scene_io.LoadedScene) void {
     _ = cmax;
-    for (loaded.scene.entities) |e| {
+    for (loaded.scene.entities, 0..) |e, i| {
         const pos = e.position orelse continue;
         const px = cmin[0] + s.pan[0] + pos.x * s.zoom;
         const py = cmin[1] + s.pan[1] + pos.y * s.zoom;
@@ -301,6 +384,16 @@ fn drawEntities(dl: zgui.DrawList, cmin: [2]f32, cmax: [2]f32, s: SceneState, lo
             .col = col,
             .num_segments = 16,
         });
+        if (s.selected_index == i) {
+            // Highlight ring around the selected entity.
+            dl.addCircle(.{
+                .p = .{ px, py },
+                .r = 12,
+                .col = 0xff_ff_d2_40,
+                .num_segments = 24,
+                .thickness = 2.0,
+            });
+        }
         if (e.prefab) |p| {
             dl.addText(.{ px + 8, py - 8 }, 0xff_e0_e0_e0, "{s}", .{p});
         }

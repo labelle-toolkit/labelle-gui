@@ -7,6 +7,7 @@ const tree_view = @import("tree_view.zig");
 const compiler = @import("compiler.zig");
 const new_scene = @import("dialogs/new_scene.zig");
 const scene_io = @import("scene_io.zig");
+const scene_module = @import("modules/scene.zig");
 
 test {
     zspec.runAll(@This());
@@ -335,6 +336,53 @@ pub const SceneIoTests = struct {
         try expect.equal(loaded.scene.entities.len, 1);
     }
 
+    test "extracts leading // comments per entity" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "x",
+            \\    "entities": [
+            \\        // Walls — red rectangles
+            \\        { "prefab": "wall", "components": { "Position": { "x": 100, "y": 100 } } },
+            \\        { "prefab": "wall", "components": { "Position": { "x": 200, "y": 200 } } },
+            \\        // Player — blue square
+            \\        { "prefab": "player", "components": { "Position": { "x": 50, "y": 50 } } }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+        try expect.equal(loaded.scene.entities.len, 3);
+
+        const c0 = std.mem.sliceTo(&loaded.scene.entities[0].comment, 0);
+        const c1 = std.mem.sliceTo(&loaded.scene.entities[1].comment, 0);
+        const c2 = std.mem.sliceTo(&loaded.scene.entities[2].comment, 0);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, c0, "Walls") != null);
+        try expect.equal(c1.len, 0);
+        try expect.toBeTrue(std.mem.indexOf(u8, c2, "Player") != null);
+    }
+
+    test "multi-line comment block attaches as one string" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "x",
+            \\    "entities": [
+            \\        // line 1
+            \\        // line 2
+            \\        // line 3
+            \\        { "prefab": "obj" }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+        const c = std.mem.sliceTo(&loaded.scene.entities[0].comment, 0);
+        try expect.toBeTrue(std.mem.indexOf(u8, c, "line 1") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, c, "line 3") != null);
+    }
+
     test "entity without Position has null position" {
         const allocator = std.testing.allocator;
         const src =
@@ -346,6 +394,80 @@ pub const SceneIoTests = struct {
         var loaded = try scene_io.parseScene(allocator, src);
         defer loaded.deinit();
         try expect.toBeTrue(loaded.scene.entities[0].position == null);
+    }
+};
+
+pub const SceneHitTestTests = struct {
+    fn makeEntities(allocator: std.mem.Allocator, positions: []const [2]f32) ![]scene_io.Entity {
+        const out = try allocator.alloc(scene_io.Entity, positions.len);
+        for (positions, 0..) |p, i| {
+            out[i] = .{ .position = .{ .x = p[0], .y = p[1] } };
+        }
+        return out;
+    }
+
+    test "returns null when no entity is within hit radius" {
+        const allocator = std.testing.allocator;
+        const entities = try makeEntities(allocator, &.{ .{ 0, 0 }, .{ 100, 100 } });
+        defer allocator.free(entities);
+        const hit = scene_module.hitTestEntity(
+            entities,
+            .{ 200, 200 },
+            .{ 0, 0 },
+            .{ 0, 0 },
+            1.0,
+        );
+        try expect.toBeTrue(hit == null);
+    }
+
+    test "returns the nearest entity inside hit radius" {
+        const allocator = std.testing.allocator;
+        const entities = try makeEntities(allocator, &.{ .{ 0, 0 }, .{ 50, 0 } });
+        defer allocator.free(entities);
+        // Mouse at world (48, 0) → entity 1 is closer.
+        const hit = scene_module.hitTestEntity(
+            entities,
+            .{ 48, 0 },
+            .{ 0, 0 },
+            .{ 0, 0 },
+            1.0,
+        );
+        try expect.toBeTrue(hit != null);
+        try expect.equal(hit.?, 1);
+    }
+
+    test "pan + zoom affect the hit projection" {
+        const allocator = std.testing.allocator;
+        const entities = try makeEntities(allocator, &.{.{ 10, 10 }});
+        defer allocator.free(entities);
+        // World (10,10) projected with zoom=2 and pan=(100,100) lands at
+        // (120, 120) in screen space. A click there should hit.
+        const hit = scene_module.hitTestEntity(
+            entities,
+            .{ 120, 120 },
+            .{ 0, 0 },
+            .{ 100, 100 },
+            2.0,
+        );
+        try expect.toBeTrue(hit != null);
+        try expect.equal(hit.?, 0);
+    }
+
+    test "skips entities with no Position" {
+        const allocator = std.testing.allocator;
+        const entities = try allocator.alloc(scene_io.Entity, 2);
+        defer allocator.free(entities);
+        entities[0] = .{}; // no position
+        entities[1] = .{ .position = .{ .x = 0, .y = 0 } };
+        const hit = scene_module.hitTestEntity(
+            entities,
+            .{ 0, 0 },
+            .{ 0, 0 },
+            .{ 0, 0 },
+            1.0,
+        );
+        try expect.toBeTrue(hit != null);
+        try expect.equal(hit.?, 1);
     }
 };
 
