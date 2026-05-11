@@ -129,6 +129,13 @@ pub const Project = struct {
 pub const ProjectManager = struct {
     allocator: std.mem.Allocator,
     current_project: ?*Project,
+    /// Monotonic counter bumped every time `current_project` is
+    /// replaced (new / load / close). Modules that cache per-project
+    /// state should track this rather than the raw `*Project` pointer —
+    /// `GeneralPurposeAllocator` can reuse an address after `deinit`,
+    /// so two different projects can have the same pointer in
+    /// sequence. Comparing the generation avoids that ABA trap.
+    generation: u64,
 
     const Self = @This();
 
@@ -136,6 +143,7 @@ pub const ProjectManager = struct {
         return .{
             .allocator = allocator,
             .current_project = null,
+            .generation = 0,
         };
     }
 
@@ -146,6 +154,7 @@ pub const ProjectManager = struct {
     pub fn newProject(self: *Self, name: []const u8) !void {
         if (self.current_project) |project| project.deinit();
         self.current_project = try Project.create(self.allocator, name);
+        self.generation +%= 1;
     }
 
     pub fn createProjectFolders(_: *Self, base_path: []const u8) !void {
@@ -251,12 +260,14 @@ pub const ProjectManager = struct {
 
         if (self.current_project) |old| old.deinit();
         self.current_project = project;
+        self.generation +%= 1;
     }
 
     pub fn closeProject(self: *Self) void {
         if (self.current_project) |project| {
             project.deinit();
             self.current_project = null;
+            self.generation +%= 1;
         }
     }
 

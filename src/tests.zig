@@ -6,6 +6,8 @@ const project = @import("project.zig");
 const tree_view = @import("tree_view.zig");
 const compiler = @import("compiler.zig");
 const new_scene = @import("dialogs/new_scene.zig");
+const scene_io = @import("scene_io.zig");
+const scene_module = @import("modules/scene.zig");
 
 test {
     zspec.runAll(@This());
@@ -138,6 +140,34 @@ pub const ProjectManagerTests = struct {
         defer pm.deinit();
 
         try expect.toBeFalse(pm.hasUnsavedChanges());
+    }
+
+    test "generation increments on new / close / reopen" {
+        // Regression: cursor[bot] flagged that pointer-identity
+        // comparison can ABA across project close/new cycles when
+        // GeneralPurposeAllocator reuses the same address. Modules
+        // track ProjectManager.generation instead, which must bump on
+        // every transition.
+        const allocator = std.testing.allocator;
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+
+        try expect.equal(pm.generation, 0);
+
+        try pm.newProject("a");
+        try expect.equal(pm.generation, 1);
+
+        pm.closeProject();
+        try expect.equal(pm.generation, 2);
+
+        try pm.newProject("b");
+        try expect.equal(pm.generation, 3);
+
+        // closeProject on an already-empty manager is a no-op and must
+        // not bump.
+        pm.closeProject(); // closes "b" → gen 4
+        pm.closeProject(); // no-op, still gen 4
+        try expect.equal(pm.generation, 4);
     }
 
     test "reports unsaved changes for new project" {
@@ -273,6 +303,362 @@ pub const CompilerStateTests = struct {
 
 /// End-to-end tests for save → load → folder scaffold of the assembler-compatible
 /// `project.labelle` file. These do real filesystem work in /tmp.
+pub const SceneIoTests = struct {
+    test "parses a minimal scene" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "main",
+            \\    "entities": []
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+        try expect.toBeTrue(std.mem.eql(u8, loaded.scene.name, "main"));
+        try expect.equal(loaded.scene.entities.len, 0);
+    }
+
+    test "extracts prefab + Position from entities" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "x",
+            \\    "entities": [
+            \\        { "prefab": "wall", "components": { "Position": { "x": 100, "y": 200 } } },
+            \\        { "components": { "Position": { "x": 50, "y": 75 }, "Sprite": { "sprite_name": "coin" } } }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+        try expect.equal(loaded.scene.entities.len, 2);
+
+        try expect.toBeTrue(loaded.scene.entities[0].prefab != null);
+        try expect.toBeTrue(std.mem.eql(u8, loaded.scene.entities[0].prefab.?, "wall"));
+        try expect.toBeTrue(loaded.scene.entities[0].position != null);
+        try expect.equal(loaded.scene.entities[0].position.?.x, 100);
+        try expect.equal(loaded.scene.entities[0].position.?.y, 200);
+
+        // Second entity: no prefab, but Position present alongside an
+        // unmodeled Sprite component — both must parse without errors.
+        try expect.toBeTrue(loaded.scene.entities[1].prefab == null);
+        try expect.toBeTrue(loaded.scene.entities[1].position != null);
+        try expect.equal(loaded.scene.entities[1].position.?.x, 50);
+    }
+
+    test "stripLineComments leaves // inside string literals alone" {
+        // Regression: a URL like "https://example.com" must survive
+        // intact. Naive `//` replacement would mangle it.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "x",
+            \\    "entities": [
+            \\        { "prefab": "wall", "components": { "Position": { "x": 0, "y": 0 } }, "url": "https://labelle.games/docs" }
+            \\    ]
+            \\}
+        ;
+        const stripped = try scene_io.stripLineComments(allocator, src);
+        defer allocator.free(stripped);
+        try expect.toBeTrue(std.mem.indexOf(u8, stripped, "https://labelle.games/docs") != null);
+    }
+
+    test "stripLineComments respects escape sequences" {
+        // A backslash-escaped quote inside a string must NOT close the
+        // string, so a following `//` stays inside the literal.
+        const allocator = std.testing.allocator;
+        const src = "{ \"k\": \"\\\"//not-a-comment\" }";
+        const stripped = try scene_io.stripLineComments(allocator, src);
+        defer allocator.free(stripped);
+        try expect.toBeTrue(std.mem.indexOf(u8, stripped, "//not-a-comment") != null);
+    }
+
+    test "tolerates // line comments" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    // top-level comment
+            \\    "name": "commented",
+            \\    "entities": [
+            \\        // entity below
+            \\        { "prefab": "p" }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+        try expect.toBeTrue(std.mem.eql(u8, loaded.scene.name, "commented"));
+        try expect.equal(loaded.scene.entities.len, 1);
+    }
+
+    test "extracts leading // comments per entity" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "x",
+            \\    "entities": [
+            \\        // Walls — red rectangles
+            \\        { "prefab": "wall", "components": { "Position": { "x": 100, "y": 100 } } },
+            \\        { "prefab": "wall", "components": { "Position": { "x": 200, "y": 200 } } },
+            \\        // Player — blue square
+            \\        { "prefab": "player", "components": { "Position": { "x": 50, "y": 50 } } }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+        try expect.equal(loaded.scene.entities.len, 3);
+
+        const c0 = std.mem.sliceTo(&loaded.scene.entities[0].comment, 0);
+        const c1 = std.mem.sliceTo(&loaded.scene.entities[1].comment, 0);
+        const c2 = std.mem.sliceTo(&loaded.scene.entities[2].comment, 0);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, c0, "Walls") != null);
+        try expect.equal(c1.len, 0);
+        try expect.toBeTrue(std.mem.indexOf(u8, c2, "Player") != null);
+    }
+
+    test "ignores false 'entities' literal before the real key" {
+        // Regression: a value containing the literal string `"entities"`
+        // must not stop the scanner from finding the real `entities: [`
+        // later in the document.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "tag": "entities",
+            \\    "name": "x",
+            \\    "entities": [
+            \\        // comment
+            \\        { "prefab": "p" }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+        try expect.equal(loaded.scene.entities.len, 1);
+        const c = std.mem.sliceTo(&loaded.scene.entities[0].comment, 0);
+        try expect.toBeTrue(std.mem.indexOf(u8, c, "comment") != null);
+    }
+
+    test "multi-line comment block attaches as one string" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "x",
+            \\    "entities": [
+            \\        // line 1
+            \\        // line 2
+            \\        // line 3
+            \\        { "prefab": "obj" }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+        const c = std.mem.sliceTo(&loaded.scene.entities[0].comment, 0);
+        try expect.toBeTrue(std.mem.indexOf(u8, c, "line 1") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, c, "line 3") != null);
+    }
+
+    test "renderSceneJsonc round-trips Sprite + Shape components verbatim" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "lab",
+            \\    "entities": [
+            \\        // Collectible
+            \\        {
+            \\            "prefab": "coin",
+            \\            "components": {
+            \\                "Position": { "x": 100, "y": 200 },
+            \\                "Sprite": { "sprite_name": "coin", "pivot": "center" },
+            \\                "Coin": {}
+            \\            }
+            \\        }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+
+        const text = try scene_io.renderSceneJsonc(allocator, loaded);
+        defer allocator.free(text);
+
+        // Managed fields landed in canonical form.
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"name\": \"lab\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"prefab\": \"coin\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Position\":") != null);
+
+        // Unmodeled components round-tripped verbatim.
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Sprite\":") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"sprite_name\": \"coin\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Coin\":") != null);
+
+        // Comment preserved at the entities-array indent.
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "// Collectible") != null);
+    }
+
+    test "renderSceneJsonc reflects in-memory Position edits" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "x",
+            \\    "entities": [
+            \\        { "prefab": "p", "components": { "Position": { "x": 0, "y": 0 } } }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+
+        loaded.scene.entities[0].position.?.x = 999;
+        loaded.scene.entities[0].position.?.y = 42;
+
+        const text = try scene_io.renderSceneJsonc(allocator, loaded);
+        defer allocator.free(text);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"x\": 999") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"y\": 42") != null);
+        // Old zero values must not appear (would mean the writer ignored
+        // the in-memory edit and re-emitted the original).
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"x\": 0,") == null);
+    }
+
+    test "renderSceneJsonc preserves top-level include" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "main",
+            \\    "include": ["scenes/obstacles.jsonc", "scenes/extras.jsonc"],
+            \\    "entities": []
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+
+        const text = try scene_io.renderSceneJsonc(allocator, loaded);
+        defer allocator.free(text);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"include\":") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "scenes/obstacles.jsonc") != null);
+    }
+
+    test "renderSceneJsonc output re-parses cleanly" {
+        // End-to-end: scene → render → re-parse → render again
+        // should give us the same managed state plus the same extras.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "x",
+            \\    "entities": [
+            \\        // c
+            \\        { "prefab": "p", "components": { "Position": { "x": 1, "y": 2 }, "Sprite": { "n": "s" } } }
+            \\    ]
+            \\}
+        ;
+        var loaded1 = try scene_io.parseScene(allocator, src);
+        defer loaded1.deinit();
+        const t1 = try scene_io.renderSceneJsonc(allocator, loaded1);
+        defer allocator.free(t1);
+
+        var loaded2 = try scene_io.parseScene(allocator, t1);
+        defer loaded2.deinit();
+        try expect.equal(loaded2.scene.entities.len, 1);
+        try expect.toBeTrue(std.mem.eql(u8, loaded2.scene.entities[0].prefab.?, "p"));
+        try expect.equal(loaded2.scene.entities[0].position.?.x, 1);
+        try expect.equal(loaded2.scene.entities[0].position.?.y, 2);
+        try expect.equal(loaded2.extras.entity_components[0].len, 1);
+        try expect.toBeTrue(std.mem.eql(u8, loaded2.extras.entity_components[0][0].name, "Sprite"));
+    }
+
+    test "entity without Position has null position" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "x",
+            \\    "entities": [ { "prefab": "abstract" } ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+        try expect.toBeTrue(loaded.scene.entities[0].position == null);
+    }
+};
+
+pub const SceneHitTestTests = struct {
+    fn makeEntities(allocator: std.mem.Allocator, positions: []const [2]f32) ![]scene_io.Entity {
+        const out = try allocator.alloc(scene_io.Entity, positions.len);
+        for (positions, 0..) |p, i| {
+            out[i] = .{ .position = .{ .x = p[0], .y = p[1] } };
+        }
+        return out;
+    }
+
+    test "returns null when no entity is within hit radius" {
+        const allocator = std.testing.allocator;
+        const entities = try makeEntities(allocator, &.{ .{ 0, 0 }, .{ 100, 100 } });
+        defer allocator.free(entities);
+        const hit = scene_module.hitTestEntity(
+            entities,
+            .{ 200, 200 },
+            .{ 0, 0 },
+            .{ 0, 0 },
+            1.0,
+        );
+        try expect.toBeTrue(hit == null);
+    }
+
+    test "returns the nearest entity inside hit radius" {
+        const allocator = std.testing.allocator;
+        const entities = try makeEntities(allocator, &.{ .{ 0, 0 }, .{ 50, 0 } });
+        defer allocator.free(entities);
+        // Mouse at world (48, 0) → entity 1 is closer.
+        const hit = scene_module.hitTestEntity(
+            entities,
+            .{ 48, 0 },
+            .{ 0, 0 },
+            .{ 0, 0 },
+            1.0,
+        );
+        try expect.toBeTrue(hit != null);
+        try expect.equal(hit.?, 1);
+    }
+
+    test "pan + zoom affect the hit projection (Y flipped)" {
+        const allocator = std.testing.allocator;
+        const entities = try makeEntities(allocator, &.{.{ 10, 10 }});
+        defer allocator.free(entities);
+        // World +y goes up. World (10,10) projected with zoom=2 and
+        // pan=(100,100) lands at (100 + 10*2, 100 - 10*2) = (120, 80)
+        // in screen space.
+        const hit = scene_module.hitTestEntity(
+            entities,
+            .{ 120, 80 },
+            .{ 0, 0 },
+            .{ 100, 100 },
+            2.0,
+        );
+        try expect.toBeTrue(hit != null);
+        try expect.equal(hit.?, 0);
+    }
+
+    test "skips entities with no Position" {
+        const allocator = std.testing.allocator;
+        const entities = try allocator.alloc(scene_io.Entity, 2);
+        defer allocator.free(entities);
+        entities[0] = .{}; // no position
+        entities[1] = .{ .position = .{ .x = 0, .y = 0 } };
+        const hit = scene_module.hitTestEntity(
+            entities,
+            .{ 0, 0 },
+            .{ 0, 0 },
+            .{ 0, 0 },
+            1.0,
+        );
+        try expect.toBeTrue(hit != null);
+        try expect.equal(hit.?, 1);
+    }
+};
+
 pub const SceneTemplateTests = struct {
     /// Strip `//`-to-end-of-line comments so the JSONC template can be
     /// fed to std.json (which doesn't accept comments). Replaces the
