@@ -117,8 +117,10 @@ pub fn render(s: *SceneState, app: *App) void {
     const total_w = zgui.getContentRegionAvail()[0];
     const viewport_w = @max(120.0, total_w - inspector_w - split_gap);
 
+    const atlas_index_ptr: ?*const @import("../atlas.zig").Index = if (app.atlas_index) |*ix| ix else null;
+
     if (zgui.beginChild("##viewport_col", .{ .w = viewport_w, .h = 0 })) {
-        renderViewport(s);
+        renderViewport(s, atlas_index_ptr);
     }
     zgui.endChild();
     zgui.sameLine(.{});
@@ -127,7 +129,7 @@ pub fn render(s: *SceneState, app: *App) void {
         .h = 0,
         .child_flags = .{ .border = true },
     })) {
-        renderInspector(s);
+        renderInspector(s, atlas_index_ptr);
     }
     zgui.endChild();
 }
@@ -144,7 +146,7 @@ pub fn saveScene(s: *SceneState, app: *App) void {
     app.setStatus("Scene saved!");
 }
 
-fn renderInspector(s: *SceneState) void {
+fn renderInspector(s: *SceneState, atlas_index: ?*const @import("../atlas.zig").Index) void {
     zgui.text("Inspector", .{});
     zgui.separator();
 
@@ -164,17 +166,17 @@ fn renderInspector(s: *SceneState) void {
     else
         &[_]scene_io.ComponentExtra{};
 
-    inspector.renderEntity(entity, extras, &s.is_dirty, idx);
+    inspector.renderEntity(entity, extras, &s.is_dirty, idx, atlas_index);
 }
 
-fn renderViewport(s: *SceneState) void {
+fn renderViewport(s: *SceneState, atlas_index: ?*const @import("../atlas.zig").Index) void {
     viewport.render(.{
         .pan = &s.pan,
         .zoom = &s.zoom,
         .selected_idx = &s.selected_index,
         .is_dirty = &s.is_dirty,
         .drag_armed = &s.drag_armed,
-    }, s.loaded.scene.entities);
+    }, s.loaded.scene.entities, atlas_index);
 }
 
 /// Re-exported so existing zspec tests (and any other caller of

@@ -93,6 +93,8 @@ pub fn render(s: *PrefabState, app: *App) void {
     const total_w = zgui.getContentRegionAvail()[0];
     const viewport_w = @max(120.0, total_w - inspector_w - split_gap);
 
+    const atlas_index_ptr: ?*const @import("../atlas.zig").Index = if (app.atlas_index) |*ix| ix else null;
+
     if (zgui.beginChild("##prefab_viewport_col", .{ .w = viewport_w, .h = 0 })) {
         viewport.render(.{
             .pan = &s.pan,
@@ -100,7 +102,7 @@ pub fn render(s: *PrefabState, app: *App) void {
             .selected_idx = &s.selected_child_idx,
             .is_dirty = &s.is_dirty,
             .drag_armed = &s.drag_armed,
-        }, s.loaded.children);
+        }, s.loaded.children, atlas_index_ptr);
     }
     zgui.endChild();
     zgui.sameLine(.{});
@@ -109,7 +111,7 @@ pub fn render(s: *PrefabState, app: *App) void {
         .h = 0,
         .child_flags = .{ .border = true },
     })) {
-        renderInspector(s);
+        renderInspector(s, atlas_index_ptr);
     }
     zgui.endChild();
 }
@@ -124,7 +126,7 @@ pub fn savePrefab(s: *PrefabState, app: *App) void {
     app.setStatus("Prefab saved!");
 }
 
-fn renderInspector(s: *PrefabState) void {
+fn renderInspector(s: *PrefabState, atlas_index: ?*const @import("../atlas.zig").Index) void {
     zgui.text("Inspector", .{});
     zgui.separator();
 
@@ -146,14 +148,14 @@ fn renderInspector(s: *PrefabState) void {
         else
             &[_]scene_io.ComponentExtra{};
 
-        inspector.renderEntity(child, extras, &s.is_dirty, idx);
+        inspector.renderEntity(child, extras, &s.is_dirty, idx, atlas_index);
         return;
     }
 
     // Nothing selected → show the prefab's own components.
     zgui.text("Prefab body", .{});
     zgui.spacing();
-    inspector.renderEntity(&s.loaded.entity, s.loaded.component_extras, &s.is_dirty, null);
+    inspector.renderEntity(&s.loaded.entity, s.loaded.component_extras, &s.is_dirty, null, atlas_index);
 
     if (s.loaded.children.len > 0) {
         zgui.spacing();

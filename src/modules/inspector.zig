@@ -1,7 +1,7 @@
 //! Shared entity inspector — renders an entity's properties +
 //! components into the current imgui window. Called from both the
-//! Scene module (one selected entity at a time) and, once it lands,
-//! the Prefab module (the single entity that is the prefab).
+//! Scene module (one selected entity at a time) and the Prefab
+//! module (the prefab body itself or a selected child).
 //!
 //! `is_dirty` is a `*bool` so the caller can hand in whatever tracks
 //! "needs save" on its side — `SceneState.is_dirty` for scenes,
@@ -12,6 +12,7 @@ const std = @import("std");
 const zgui = @import("zgui");
 
 const scene_io = @import("../scene_io.zig");
+const atlas = @import("../atlas.zig");
 
 /// Render the editable surface for one entity:
 ///
@@ -29,6 +30,7 @@ pub fn renderEntity(
     component_extras: []const scene_io.ComponentExtra,
     is_dirty: *bool,
     entity_index: ?usize,
+    atlas_index: ?*const atlas.Index,
 ) void {
     if (entity_index) |n| {
         zgui.text("Entity #{d}", .{n});
@@ -46,6 +48,35 @@ pub fn renderEntity(
             if (zgui.inputFloat("y", .{ .v = &pos.y })) is_dirty.* = true;
         } else {
             zgui.textDisabled("(no Position component)", .{});
+        }
+    }
+
+    if (entity.sprite) |sprite| {
+        if (zgui.collapsingHeader("Sprite", .{ .default_open = true })) {
+            if (zgui.inputText("sprite_name", .{ .buf = &sprite.sprite_name })) is_dirty.* = true;
+            // Resolve the typed sprite name against the project's
+            // atlas index; surface a soft `(missing)` hint when it
+            // doesn't match anything. Doesn't block edits — the
+            // engine ultimately decides what's valid; we just guide.
+            if (atlas_index) |idx| {
+                const name_str = std.mem.sliceTo(&sprite.sprite_name, 0);
+                if (name_str.len > 0 and idx.find(name_str) == null) {
+                    zgui.sameLine(.{});
+                    zgui.textColored(.{ 1.0, 0.5, 0.4, 1.0 }, "(missing)", .{});
+                }
+            }
+            if (zgui.inputText("pivot", .{ .buf = &sprite.pivot })) is_dirty.* = true;
+            if (zgui.inputText("layer", .{ .buf = &sprite.layer })) is_dirty.* = true;
+
+            // z_index is optional in the source; the checkbox toggles
+            // whether we emit it at all. Editing the int alone (with
+            // the box unchecked) doesn't suddenly add a `"z_index"`
+            // key to the file — the user has to opt in explicitly.
+            if (zgui.checkbox("z_index?", .{ .v = &sprite.has_z_index })) is_dirty.* = true;
+            if (sprite.has_z_index) {
+                zgui.sameLine(.{});
+                if (zgui.inputInt("##z_index", .{ .v = &sprite.z_index })) is_dirty.* = true;
+            }
         }
     }
 

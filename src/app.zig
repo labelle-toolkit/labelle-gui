@@ -22,18 +22,19 @@ const resources_mod = @import("modules/resources.zig");
 const scene_mod = @import("modules/scene.zig");
 const prefab_mod = @import("modules/prefab.zig");
 const close_scene_dialog = @import("dialogs/close_scene.zig");
+const atlas = @import("atlas.zig");
 const new_scene_dialog = @import("dialogs/new_scene.zig");
 const dpi_warning_dialog = @import("dialogs/dpi_warning.zig");
 
 const STATUS_BUF_LEN = 256;
 const SCENE_NAME_BUF_LEN = 128;
 
-/// One entry in the main-content tab strip. Today only `scene`
-/// exists; the `prefab` variant lands in a follow-up slice. The
-/// union exists now so the tab strip, close-confirmation modal, and
-/// `App.open_tabs` machinery don't need a second pass when prefab
-/// support arrives — they already dispatch through the methods
-/// below.
+/// One entry in the main-content tab strip. Each variant wraps an
+/// editor's per-tab state (loaded file, dirty flag, view state) and
+/// the tab strip + close-confirmation modal dispatch through the
+/// shared methods (`displayName`, `path`, `isDirty`, `save`, `render`,
+/// `deinit`) below. Add a new editor by adding a variant and a case
+/// to each method.
 pub const OpenTab = union(enum) {
     scene: scene_mod.SceneState,
     prefab: prefab_mod.PrefabState,
@@ -103,10 +104,10 @@ pub const App = struct {
     show_resources: bool = false,
     resources_editor: resources_mod.ResourcesEditor = .{},
 
-    /// Open editor tabs. Each entry is an `OpenTab` (currently only
-    /// scene, prefab landing in a follow-up). Populated when the
-    /// user clicks an editable file in the project tree; closed via
-    /// the × on a tab. `closeAllTabs` runs on project transitions.
+    /// Open editor tabs — scenes and prefabs share this list as
+    /// `OpenTab` variants. Populated when the user clicks an
+    /// editable file in the project tree; closed via the × on a
+    /// tab. `closeAllTabs` runs on project transitions.
     open_tabs: std.ArrayList(OpenTab) = .{},
     /// Which tab is foregrounded. null when no tabs are open.
     /// Updated each frame from whichever tab ImGui reports active.
@@ -124,6 +125,13 @@ pub const App = struct {
     /// Last seen `ProjectManager.generation`. Compared each frame so
     /// `closeAllTabs` runs the frame the active project changes.
     last_project_generation: ?u64 = null,
+
+    /// Per-project atlas index (sprite name → frame + GL texture).
+    /// Built lazily the first frame the active project's generation
+    /// is observed; invalidated when the generation bumps. Inspector
+    /// + viewport consult it to validate `sprite_name` and draw the
+    /// real pixels for entities with a Sprite component.
+    atlas_index: ?atlas.Index = null,
 
     show_project_tree: bool = true,
 
@@ -162,10 +170,43 @@ pub const App = struct {
     pub fn deinit(self: *Self) void {
         self.closeAllTabs();
         self.open_tabs.deinit(self.allocator);
+        if (self.atlas_index) |*idx| idx.deinit();
         self.project_manager.deinit();
         self.tree_view.deinit();
         self.compiler.deinit();
         self.allocator.destroy(self);
+    }
+
+    /// Rebuild the atlas index from the active project's
+    /// `resources` block. Called whenever the project generation
+    /// changes. Closing the project invalidates the index without
+    /// rebuilding.
+    fn rebuildAtlasIndex(self: *Self) void {
+        if (self.atlas_index) |*idx| {
+            idx.deinit();
+            self.atlas_index = null;
+        }
+        const proj = self.project_manager.current_project orelse return;
+        const dir = proj.dir orelse return;
+
+        // Map ProjectConfig.resources → atlas.Resource (decoupling
+        // the atlas module from project.zig). Allocated on the
+        // stack via ArrayList because the count is small.
+        var resources: std.ArrayList(atlas.Resource) = .{};
+        defer resources.deinit(self.allocator);
+        for (proj.config.resources) |r| {
+            resources.append(self.allocator, .{
+                .name = r.name,
+                .json = r.json,
+                .texture = r.texture,
+            }) catch return;
+        }
+        self.atlas_index = atlas.Index.build(
+            self.allocator,
+            dir,
+            resources.items,
+            self.project_manager.generation,
+        );
     }
 
     // ─── Scene tabs ─────────────────────────────────────────────────────
@@ -269,10 +310,16 @@ pub const App = struct {
         // Project transitions close all open scene tabs so the next
         // frame doesn't read into freed memory belonging to the old
         // project. Detected via ProjectManager.generation, which is
-        // bumped on new/load/close.
+        // bumped on new/load/close. The atlas index is also keyed
+        // to the project so we rebuild it here.
         const gen = self.project_manager.generation;
         if (self.last_project_generation) |prev| {
-            if (prev != gen) self.closeAllTabs();
+            if (prev != gen) {
+                self.closeAllTabs();
+                self.rebuildAtlasIndex();
+            }
+        } else {
+            self.rebuildAtlasIndex();
         }
         self.last_project_generation = gen;
 

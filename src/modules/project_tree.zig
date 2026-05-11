@@ -62,12 +62,11 @@ fn render(app: *App) void {
     } })) {
         if (app.project_manager.current_project) |proj| {
             // Tree returns true on the frame a file is newly clicked.
-            // Route `.jsonc` files under the project's `scenes/` dir
-            // to the scene editor. Prefabs (also `.jsonc`, but under
-            // `prefabs/`) intentionally fall through here — they
-            // need their own editor (not yet implemented) and must
-            // not open in the scene editor, since saving back would
-            // overwrite the prefab as an empty scene.
+            // `.jsonc` files under `scenes/` route to the scene
+            // editor; `.jsonc` files under `prefabs/` route to the
+            // prefab editor. The two paths are mutually exclusive
+            // (see `isScenePath` / `isPrefabPath`) so a single click
+            // never opens both.
             if (app.tree_view.render(proj.getProjectDir())) {
                 if (app.tree_view.getSelectedPath()) |path| {
                     const proj_dir = proj.getProjectDir();
