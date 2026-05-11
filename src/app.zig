@@ -20,6 +20,7 @@ const project_settings_mod = @import("modules/project_settings.zig");
 const project_tree_mod = @import("modules/project_tree.zig");
 const resources_mod = @import("modules/resources.zig");
 const scene_mod = @import("modules/scene.zig");
+const close_scene_dialog = @import("dialogs/close_scene.zig");
 const new_scene_dialog = @import("dialogs/new_scene.zig");
 const dpi_warning_dialog = @import("dialogs/dpi_warning.zig");
 
@@ -48,8 +49,27 @@ pub const App = struct {
     show_resources: bool = false,
     resources_editor: resources_mod.ResourcesEditor = .{},
 
-    show_scene: bool = false,
-    scene_state: scene_mod.SceneState = .{},
+    /// Scene editor tabs. Each entry owns a loaded `.jsonc` plus
+    /// per-tab UI state (selection, pan/zoom, dirty flag). Populated
+    /// when the user clicks a `.jsonc` file in the project tree;
+    /// `closeAllScenes` runs on project transitions.
+    open_scenes: std.ArrayList(scene_mod.SceneState) = .{},
+    /// Which tab is foregrounded. null when no scenes are open.
+    /// Updated each frame from whichever tab ImGui reports active.
+    active_scene_idx: ?usize = null,
+    /// One-shot: when set, the next `renderSceneTabs` forces this tab
+    /// to be active via ImGui's `set_selected` flag, then clears the
+    /// field. `set_selected` is one-shot in ImGui — applying it every
+    /// frame would re-force the same tab and prevent the user from
+    /// switching by clicking other tabs.
+    focus_tab_idx: ?usize = null,
+    /// Set when the user clicks the × on a dirty tab. While non-null
+    /// the close-confirmation dialog is shown and other tabs can't be
+    /// closed.
+    pending_close_idx: ?usize = null,
+    /// Last seen `ProjectManager.generation`. Compared each frame so
+    /// `closeAllScenes` runs the frame the active project changes.
+    last_project_generation: ?u64 = null,
 
     show_project_tree: bool = true,
 
@@ -59,7 +79,7 @@ pub const App = struct {
 
     /// Fixed-size storage for registered modules. Grow the array literal
     /// when adding modules; Zig will tell you if it overflows.
-    modules: [5]module.Module = undefined,
+    modules: [4]module.Module = undefined,
     registry: module.Registry = .{ .modules = &.{} },
 
     const Self = @This();
@@ -80,18 +100,86 @@ pub const App = struct {
         app.modules[1] = compiler_output.makeModule(app);
         app.modules[2] = project_settings_mod.makeModule(app);
         app.modules[3] = resources_mod.makeModule(app);
-        app.modules[4] = scene_mod.makeModule(app);
         app.registry = .{ .modules = &app.modules };
 
         return app;
     }
 
     pub fn deinit(self: *Self) void {
-        self.scene_state.deinit();
+        self.closeAllScenes();
+        self.open_scenes.deinit(self.allocator);
         self.project_manager.deinit();
         self.tree_view.deinit();
         self.compiler.deinit();
         self.allocator.destroy(self);
+    }
+
+    // ─── Scene tabs ─────────────────────────────────────────────────────
+
+    /// Open `path` (typically a `.jsonc` under the project's `scenes/`
+    /// directory) as a tab in the main content area. If the path is
+    /// already open, focuses the existing tab instead of reloading.
+    pub fn openScene(self: *Self, path: []const u8) !void {
+        for (self.open_scenes.items, 0..) |s, i| {
+            if (std.mem.eql(u8, s.path, path)) {
+                self.focus_tab_idx = i; // bring the existing tab forward once
+                return;
+            }
+        }
+        var state = try scene_mod.SceneState.open(self.allocator, path);
+        errdefer state.deinit(self.allocator);
+        try self.open_scenes.append(self.allocator, state);
+        const new_idx = self.open_scenes.items.len - 1;
+        self.active_scene_idx = new_idx;
+        self.focus_tab_idx = new_idx;
+    }
+
+    /// Close the tab at `idx` unconditionally. Caller is responsible
+    /// for asking the user about unsaved changes — `closeSceneSafe`
+    /// does that.
+    pub fn closeScene(self: *Self, idx: usize) void {
+        if (idx >= self.open_scenes.items.len) return;
+        var removed = self.open_scenes.orderedRemove(idx);
+        removed.deinit(self.allocator);
+
+        if (self.open_scenes.items.len == 0) {
+            self.active_scene_idx = null;
+        } else if (self.active_scene_idx) |a| {
+            if (a == idx) {
+                self.active_scene_idx = if (idx > 0) idx - 1 else 0;
+            } else if (a > idx) {
+                self.active_scene_idx = a - 1;
+            }
+        }
+        // If pending_close was pointing at this tab (or one shifted by
+        // the removal), clear / adjust it so the dialog doesn't end up
+        // tracking the wrong tab.
+        if (self.pending_close_idx) |p| {
+            if (p == idx) {
+                self.pending_close_idx = null;
+            } else if (p > idx) {
+                self.pending_close_idx = p - 1;
+            }
+        }
+    }
+
+    /// Close the tab at `idx`, prompting the user first if the tab has
+    /// unsaved changes.
+    pub fn requestCloseScene(self: *Self, idx: usize) void {
+        if (idx >= self.open_scenes.items.len) return;
+        if (self.open_scenes.items[idx].is_dirty) {
+            self.pending_close_idx = idx;
+        } else {
+            self.closeScene(idx);
+        }
+    }
+
+    pub fn closeAllScenes(self: *Self) void {
+        for (self.open_scenes.items) |*s| s.deinit(self.allocator);
+        self.open_scenes.clearRetainingCapacity();
+        self.active_scene_idx = null;
+        self.focus_tab_idx = null;
+        self.pending_close_idx = null;
     }
 
     pub fn setStatus(self: *Self, message: []const u8) void {
@@ -109,12 +197,23 @@ pub const App = struct {
     pub fn renderFrame(self: *Self, dt_seconds: f32) void {
         if (self.status_timer > 0) self.status_timer -= dt_seconds;
 
+        // Project transitions close all open scene tabs so the next
+        // frame doesn't read into freed memory belonging to the old
+        // project. Detected via ProjectManager.generation, which is
+        // bumped on new/load/close.
+        const gen = self.project_manager.generation;
+        if (self.last_project_generation) |prev| {
+            if (prev != gen) self.closeAllScenes();
+        }
+        self.last_project_generation = gen;
+
         self.renderMenuBar();
         self.pollCompiler();
         self.renderMainContent();
         self.registry.renderAllPanels(self);
         self.renderStatusBar();
         new_scene_dialog.render(self);
+        close_scene_dialog.render(self);
         dpi_warning_dialog.render(self);
     }
 
@@ -301,6 +400,15 @@ pub const App = struct {
         }
         defer zgui.end();
 
+        // When at least one scene tab is open, the main area becomes
+        // a TabBar; the welcome view is purely the empty-state. The
+        // first frame after `openScene` selects the new tab via
+        // `set_selected` so the user lands on what they just clicked.
+        if (self.open_scenes.items.len > 0) {
+            self.renderSceneTabs();
+            return;
+        }
+
         if (self.project_manager.current_project) |proj| {
             zgui.text("Project: {s}", .{proj.config.name});
             if (proj.is_dirty) {
@@ -308,11 +416,7 @@ pub const App = struct {
                 zgui.textColored(.{ 1.0, 0.5, 0.0, 1.0 }, "(unsaved)", .{});
             }
             zgui.separator();
-            if (self.tree_view.getSelectedPath()) |selected| {
-                zgui.text("Selected: {s}", .{std.fs.path.basename(selected)});
-                zgui.separator();
-            }
-            zgui.text("Ready to work!", .{});
+            zgui.text("Click a scene in the tree to open it.", .{});
         } else {
             zgui.text("Welcome to Labelle!", .{});
             zgui.spacing();
@@ -321,6 +425,56 @@ pub const App = struct {
             if (zgui.button("New Project...", .{ .w = 150 })) self.pickFolderAndCreateProject();
             if (zgui.button("Open Project...", .{ .w = 150 })) self.pickFolderAndOpenProject();
         }
+    }
+
+    /// Render the per-scene tab strip and the active tab's body. Tabs
+    /// use `popen` on the tab item so the × close button fires through
+    /// `requestCloseScene`, which routes a dirty tab to the
+    /// confirmation dialog.
+    fn renderSceneTabs(self: *Self) void {
+        if (!zgui.beginTabBar("##scene_tabs", .{
+            .reorderable = true,
+            .auto_select_new_tabs = true,
+            .tab_list_popup_button = true,
+        })) return;
+        defer zgui.endTabBar();
+
+        // Consume the one-shot focus request *before* the loop so each
+        // tab sees the same value and we don't re-apply it next frame.
+        const focus = self.focus_tab_idx;
+        self.focus_tab_idx = null;
+
+        var to_close: ?usize = null;
+
+        for (self.open_scenes.items, 0..) |*s, i| {
+            // Disambiguate tabs by full path so two scenes with the
+            // same stem (across projects or fragments) get distinct
+            // imgui IDs. `unsaved_document` puts ImGui's own marker
+            // on dirty tabs. Buffer is sized for the longest plausible
+            // absolute path (`std.fs.max_path_bytes`, which is 4096 on
+            // Linux + larger limits on macOS) plus slack for the label
+            // prefix; smaller buffers silently dropped the tab when
+            // pointed at deeply-nested project paths.
+            var label_buf: [std.fs.max_path_bytes + 256]u8 = undefined;
+            const label = std.fmt.bufPrintZ(&label_buf, "{s}##{s}", .{ s.display_name, s.path }) catch continue;
+
+            var open: bool = true;
+            // `set_selected` is one-shot in ImGui — fire it only when
+            // we explicitly want to bring a tab forward (just-opened
+            // or re-focused via tree click on an already-open scene).
+            // Applying it every frame creates a feedback loop that
+            // prevents the user from switching tabs by clicking.
+            const set_selected = focus != null and focus.? == i;
+            const flags: zgui.TabItemFlags = .{ .set_selected = set_selected, .unsaved_document = s.is_dirty };
+            if (zgui.beginTabItem(label, .{ .p_open = &open, .flags = flags })) {
+                self.active_scene_idx = i;
+                scene_mod.render(s, self);
+                zgui.endTabItem();
+            }
+            if (!open and to_close == null) to_close = i;
+        }
+
+        if (to_close) |i| self.requestCloseScene(i);
     }
 
     fn renderStatusBar(self: *Self) void {

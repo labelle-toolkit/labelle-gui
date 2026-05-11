@@ -48,10 +48,11 @@ src/
     project_settings.zig         # Edit ProjectConfig fields and persist via ProjectManager
     project_tree.zig             # Project sidebar (file tree)
     resources.zig                # Edit `resources` block (sprite atlases)
-    scene.zig                    # Scene viewer: file list + entity list + 2D viewport
+    scene.zig                    # Scene editor (per-tab state; opens via tree click, not View menu)
   dialogs/
     new_scene.zig                # New Scene modal + scene-file writer
     dpi_warning.zig              # One-shot DPI-changed warning modal
+    close_scene.zig              # Unsaved-scene "Save and close / Discard / Cancel" modal
   project.zig                    # ProjectConfig, ProjectManager, project.labelle ZON I/O
   scene_io.zig                   # JSONC scene loader (used by modules/scene.zig)
   compiler.zig                   # Launches `labelle generate/build/run` and polls the child

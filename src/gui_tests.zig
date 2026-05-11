@@ -10,6 +10,7 @@ const zopengl = @import("zopengl");
 const zgui = @import("zgui");
 
 const App = @import("app.zig").App;
+const scene_mod = @import("modules/scene.zig");
 
 const gl_major = 4;
 const gl_minor = 1;
@@ -142,7 +143,7 @@ pub fn main() !void {
         sf.close();
     }
 
-    _ = engine.registerTest("phase3", "scene_save_preserves_extras", @src(), struct {
+    _ = engine.registerTest("phase3", "scene_open_save_preserves_extras", @src(), struct {
         fn gui(_: *zgui.te.TestContext) !void {
             if (g_app) |a| a.renderFrame(1.0 / 60.0);
         }
@@ -152,30 +153,33 @@ pub fn main() !void {
                 return;
             };
 
-            // Set selection directly — clicking entries in the file-list
-            // child window is fiddly to address via TE refs, and we're
-            // testing Save, not selection wiring.
-            const name = "scene_with_sprite";
-            @memset(&a.scene_state.selected_name, 0);
-            @memcpy(a.scene_state.selected_name[0..name.len], name);
-
-            ctx.menuAction(.click, "View/Scene");
-            ctx.yield(2); // give the panel time to load the scene from disk
-
-            const loaded_ok = a.scene_state.loaded != null and
-                a.scene_state.loaded.?.scene.entities.len == 1;
-            _ = zgui.te.check(@src(), .{}, loaded_ok, "scene loaded with one entity");
-
-            // Edit the in-memory position, then save.
-            a.scene_state.loaded.?.scene.entities[0].position.?.x = 999;
-            a.scene_state.is_dirty = true;
-            ctx.itemAction(.click, "Scene/Save", .{}, null);
-            _ = zgui.te.check(@src(), .{}, !a.scene_state.is_dirty, "is_dirty cleared after Save");
-
-            // Read the file back and confirm Sprite + edited Position landed.
             const dir = g_settings_project_dir.?;
             var path_buf: [512]u8 = undefined;
             const path = std.fmt.bufPrint(&path_buf, "{s}/scenes/scene_with_sprite.jsonc", .{dir}) catch return;
+
+            // Drive the public openScene API — same path the tree-click
+            // handler uses, just bypassed for test setup.
+            a.openScene(path) catch {
+                _ = zgui.te.check(@src(), .{}, false, "openScene must succeed");
+                return;
+            };
+            ctx.yield(1);
+
+            const opened_ok = a.open_scenes.items.len == 1 and
+                a.open_scenes.items[0].loaded.scene.entities.len == 1;
+            _ = zgui.te.check(@src(), .{}, opened_ok, "scene opened with one entity");
+
+            // Edit the in-memory position, then save via the module's
+            // public saveScene (the same function the tab's Save button
+            // calls). Driving the button via TE refs through the
+            // nested tab-bar ID stack is brittle; saveScene is what we
+            // actually care about here.
+            const tab = &a.open_scenes.items[0];
+            tab.loaded.scene.entities[0].position.?.x = 999;
+            tab.is_dirty = true;
+            scene_mod.saveScene(tab, a);
+            _ = zgui.te.check(@src(), .{}, !tab.is_dirty, "is_dirty cleared after Save");
+
             var file_buf: [4096]u8 = undefined;
             const file = std.fs.cwd().openFile(path, .{}) catch return;
             defer file.close();
@@ -184,25 +188,9 @@ pub fn main() !void {
 
             _ = zgui.te.check(@src(), .{}, std.mem.indexOf(u8, content, "\"Sprite\"") != null, "Sprite preserved on disk");
             _ = zgui.te.check(@src(), .{}, std.mem.indexOf(u8, content, "\"x\": 999") != null, "edited Position written");
-        }
-    });
 
-    _ = engine.registerTest("phase3", "scene_panel_toggles", @src(), struct {
-        fn gui(_: *zgui.te.TestContext) !void {
-            // Synthetic dt; tests don't observe status_timer decay.
-            if (g_app) |a| a.renderFrame(1.0 / 60.0);
-        }
-        fn run(ctx: *zgui.te.TestContext) !void {
-            const a = g_app orelse {
-                _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
-                return;
-            };
-
-            _ = zgui.te.check(@src(), .{}, !a.show_scene, "Scene panel starts closed");
-            ctx.menuAction(.click, "View/Scene");
-            _ = zgui.te.check(@src(), .{}, a.show_scene, "View/Scene opens panel");
-            ctx.menuAction(.click, "View/Scene");
-            _ = zgui.te.check(@src(), .{}, !a.show_scene, "View/Scene closes panel");
+            // Close the tab cleanly so subsequent tests see a fresh App.
+            a.closeScene(0);
         }
     });
 

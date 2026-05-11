@@ -8,6 +8,7 @@ const compiler = @import("compiler.zig");
 const new_scene = @import("dialogs/new_scene.zig");
 const scene_io = @import("scene_io.zig");
 const scene_module = @import("modules/scene.zig");
+const project_tree = @import("modules/project_tree.zig");
 
 test {
     zspec.runAll(@This());
@@ -581,6 +582,28 @@ pub const SceneIoTests = struct {
         var loaded = try scene_io.parseScene(allocator, src);
         defer loaded.deinit();
         try expect.toBeTrue(loaded.scene.entities[0].position == null);
+    }
+};
+
+pub const SceneRoutingTests = struct {
+    test "scene path under scenes/ is accepted" {
+        try expect.toBeTrue(project_tree.isScenePath("/p", "/p/scenes/main.jsonc"));
+        try expect.toBeTrue(project_tree.isScenePath("/p", "/p/scenes/sub/fragment.jsonc"));
+    }
+
+    test "prefab path is rejected" {
+        // Same extension, different folder — must not open as a scene
+        // (would otherwise be data-destructive on Save).
+        try expect.toBeFalse(project_tree.isScenePath("/p", "/p/prefabs/coin.jsonc"));
+    }
+
+    test "non-jsonc files are rejected" {
+        try expect.toBeFalse(project_tree.isScenePath("/p", "/p/scenes/main.json"));
+        try expect.toBeFalse(project_tree.isScenePath("/p", "/p/scenes/notes.md"));
+    }
+
+    test "no project dir → no scene routing" {
+        try expect.toBeFalse(project_tree.isScenePath(null, "/p/scenes/main.jsonc"));
     }
 };
 
