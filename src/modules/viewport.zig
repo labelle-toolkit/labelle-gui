@@ -28,6 +28,42 @@ pub const State = struct {
 /// Pixel radius around an entity marker that counts as a click.
 pub const hit_radius: f32 = 10.0;
 
+/// Which visual path `drawEntities` takes for one entity. Pulled out
+/// so the priority + unresolved-sprite logic is testable without an
+/// ImGui draw context.
+pub const RenderPath = enum {
+    /// Atlas-resolved sprite was drawn at the entity position.
+    sprite,
+    /// Sprite either wasn't declared or couldn't resolve; polygon
+    /// geometry drew instead.
+    polygon,
+    /// No drawable component resolved; the colored prefab-tinted
+    /// circle marker drew as a last resort.
+    marker,
+};
+
+/// What `drawEntities` should put on the canvas for one entity, given
+/// which components are present and whether the sprite atlas could
+/// resolve. `sprite_resolved` is true only when an atlas-backed quad
+/// will actually be drawn (atlas index present + name in atlas +
+/// non-empty name); see `drawSpriteIfResolved` for the runtime check.
+/// `overlay_question` mirrors the inline `?` overlay rule: any
+/// declared-but-unresolved sprite gets it, no matter which fallback
+/// drew the visual.
+pub fn planRender(has_sprite: bool, sprite_resolved: bool, has_polygon: bool) struct {
+    path: RenderPath,
+    overlay_question: bool,
+} {
+    if (has_sprite and sprite_resolved) {
+        return .{ .path = .sprite, .overlay_question = false };
+    }
+    const sprite_unresolved = has_sprite and !sprite_resolved;
+    if (has_polygon) {
+        return .{ .path = .polygon, .overlay_question = sprite_unresolved };
+    }
+    return .{ .path = .marker, .overlay_question = sprite_unresolved };
+}
+
 /// Render the viewport canvas for `entities` into the current
 /// imgui window. Caller is responsible for the surrounding container
 /// (e.g. a beginChild) and any controls bar.

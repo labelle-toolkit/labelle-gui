@@ -105,10 +105,6 @@ pub const Polygon = struct {
     b: u8 = 255,
     a: u8 = 255,
     filled: bool = true,
-
-    pub fn livePoints(self: *const Polygon) []const Position {
-        return self.points[0..self.point_count];
-    }
 };
 
 pub const Entity = struct {

@@ -9,6 +9,7 @@ const new_scene = @import("dialogs/new_scene.zig");
 const scene_io = @import("scene_io.zig");
 const scene_module = @import("modules/scene.zig");
 const project_tree = @import("modules/project_tree.zig");
+const viewport = @import("modules/viewport.zig");
 const atlas = @import("atlas.zig");
 
 test {
@@ -1456,6 +1457,52 @@ pub const SceneHitTestTests = struct {
         );
         try expect.toBeTrue(hit != null);
         try expect.equal(hit.?, 1);
+    }
+};
+
+pub const ViewportRenderPlanTests = struct {
+    // Regression coverage for the render-priority + `?` overlay logic
+    // in `drawEntities`. PR #37 review (Cursor Bugbot) flagged that
+    // when a sprite was declared-but-unresolved AND a polygon was
+    // present, the polygon fallback used to suppress the `?` overlay.
+
+    test "resolved sprite wins; no question mark overlay" {
+        const plan = viewport.planRender(true, true, false);
+        try expect.equal(plan.path, .sprite);
+        try expect.toBeFalse(plan.overlay_question);
+    }
+
+    test "no sprite, polygon present → polygon path, no overlay" {
+        const plan = viewport.planRender(false, false, true);
+        try expect.equal(plan.path, .polygon);
+        try expect.toBeFalse(plan.overlay_question);
+    }
+
+    test "no components at all → marker path, no overlay" {
+        const plan = viewport.planRender(false, false, false);
+        try expect.equal(plan.path, .marker);
+        try expect.toBeFalse(plan.overlay_question);
+    }
+
+    test "unresolved sprite + no polygon → marker path with overlay" {
+        const plan = viewport.planRender(true, false, false);
+        try expect.equal(plan.path, .marker);
+        try expect.toBeTrue(plan.overlay_question);
+    }
+
+    test "unresolved sprite + polygon → polygon path STILL shows overlay" {
+        // The bug Cursor Bugbot caught: this case used to silently
+        // render the polygon with no `?` indicator that the sprite
+        // failed to resolve.
+        const plan = viewport.planRender(true, false, true);
+        try expect.equal(plan.path, .polygon);
+        try expect.toBeTrue(plan.overlay_question);
+    }
+
+    test "resolved sprite + polygon → sprite wins (polygon ignored)" {
+        const plan = viewport.planRender(true, true, true);
+        try expect.equal(plan.path, .sprite);
+        try expect.toBeFalse(plan.overlay_question);
     }
 };
 
