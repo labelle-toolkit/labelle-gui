@@ -202,9 +202,23 @@ pub const ProjectManager = struct {
         const arena_alloc = arena.allocator();
         const source = try arena_alloc.dupeZ(u8, raw);
 
+        // Real-world project.labelle files (e.g. ../flying-platform-labelle/)
+        // carry fields the assembler models that we don't yet — states,
+        // layers, plugins, gui, ios, android, labelle_version, hidden.
+        // Default ZON parsing rejects unknown fields, so we'd refuse to
+        // open any project that wasn't created by this gui. Tolerant
+        // parse lets the user open them and edit the fields we *do*
+        // know — at the cost of dropping the unknown ones on Save.
+        // Saving an externally-authored project is therefore unsafe;
+        // the editor needs full pass-through before we lift that caveat.
         var diag: std.zon.parse.Diagnostics = .{};
         defer diag.deinit(arena_alloc);
-        const parsed = try std.zon.parse.fromSlice(ProjectConfig, arena_alloc, source, &diag, .{});
+        const parsed = std.zon.parse.fromSlice(ProjectConfig, arena_alloc, source, &diag, .{
+            .ignore_unknown_fields = true,
+        }) catch |err| {
+            std.log.err("project.labelle parse failed at {s}: {s}", .{ file_path, @errorName(err) });
+            return err;
+        };
 
         project.* = .{
             .allocator = self.allocator,

@@ -456,6 +456,93 @@ pub const ProjectFileTests = struct {
         try expect.toBeTrue(std.mem.eql(u8, loaded[0].texture, "assets/sprites.png"));
     }
 
+    // Regression: ../flying-platform-labelle/project.labelle (and any
+    // project authored by the assembler / CLI) carries fields like
+    // `states`, `layers`, `plugins`, `gui`, `labelle_version`, etc. that
+    // our minimal ProjectConfig doesn't model. Default ZON parsing
+    // rejects unknown fields, which made every real project fail to
+    // open. Load must tolerate those fields and recover the ones we do
+    // model.
+    test "loadProject ignores unknown ZON fields" {
+        const allocator = std.testing.allocator;
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        const labelle_path = try std.fs.path.join(allocator, &.{ temp_dir, "project.labelle" });
+        defer allocator.free(labelle_path);
+
+        // Hand-written project.labelle mimicking what flying-platform
+        // and the assembler examples ship: every modeled field plus a
+        // representative set of unmodeled ones.
+        const synthetic =
+            \\.{
+            \\    .name = "external_project",
+            \\    .title = "External",
+            \\    .width = 1024,
+            \\    .height = 768,
+            \\    .target_fps = 60,
+            \\    .backend = .sokol,
+            \\    .ecs = .zig_ecs,
+            \\    .initial_scene = "loading",
+            \\    .states = .{ "loading", "playing" },
+            \\    .gui = .{ .plugin = "imgui" },
+            \\    .resources = .{
+            \\        .{ .name = "sprites", .json = "assets/sprites.json", .texture = "assets/sprites.png" },
+            \\    },
+            \\    .plugins = .{
+            \\        .{ .name = "imgui", .repo = "local:../labelle-imgui" },
+            \\    },
+            \\    .layers = .{
+            \\        .{ .name = "world", .order = 0, .space = .world },
+            \\    },
+            \\    .core_version = "1.10.0",
+            \\    .engine_version = "1.21.0",
+            \\    .gfx_version = "1.7.0",
+            \\    .labelle_version = "1.36.0",
+            \\    .assembler_version = "0.8.0",
+            \\    .hidden = false,
+            \\}
+            \\
+        ;
+        const file = try std.fs.cwd().createFile(labelle_path, .{});
+        file.writeAll(synthetic) catch unreachable;
+        file.close();
+
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+        try pm.loadProject(temp_dir);
+
+        const cfg = pm.current_project.?.config;
+        try expect.toBeTrue(std.mem.eql(u8, cfg.name, "external_project"));
+        try expect.equal(cfg.backend, .sokol);
+        try expect.equal(cfg.ecs, .zig_ecs);
+        try expect.toBeTrue(std.mem.eql(u8, cfg.initial_scene, "loading"));
+        try expect.equal(cfg.resources.len, 1);
+        try expect.toBeTrue(std.mem.eql(u8, cfg.resources[0].name, "sprites"));
+    }
+
+    test "loadProject still errors on malformed ZON" {
+        const allocator = std.testing.allocator;
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        const labelle_path = try std.fs.path.join(allocator, &.{ temp_dir, "project.labelle" });
+        defer allocator.free(labelle_path);
+
+        // Unbalanced braces — syntactically invalid ZON, not just an
+        // unknown field. ignore_unknown_fields must not mask this.
+        const broken = ".{ .name = \"oops\",";
+        const file = try std.fs.cwd().createFile(labelle_path, .{});
+        file.writeAll(broken) catch unreachable;
+        file.close();
+
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+
+        const got = pm.loadProject(temp_dir);
+        try expect.toBeTrue(std.meta.isError(got));
+    }
+
     test "loadProject round-trips a saved project" {
         const allocator = std.testing.allocator;
         const temp_dir = try createTempDir(allocator);
