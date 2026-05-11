@@ -43,6 +43,28 @@ than guessing or grabbing from older examples in this tree. The
 assembler's `examples/` directory has stripped-down minimal projects for
 each backend (`raylib`, `sokol`, etc.) that are also kept current.
 
+## project.labelle pass-through
+
+External projects (e.g. `../flying-platform-labelle/`) carry top-level
+fields the gui doesn't model — `states`, `layers`, `plugins`, `gui`,
+`ios`, `android`, `labelle_version`, `hidden`. On `loadProject`,
+`extractUnmodeledFields` (a small ZON top-level scanner in `project.zig`)
+captures the verbatim source text for each of those into `Project.extras`.
+`renderProjectLabelle` re-emits them inside the closing `}` after the
+managed fields, so external projects round-trip without data loss.
+
+Known limitations of the pass-through:
+
+- **Detached top-level comments** (those between fields, not attached
+  to a particular value) are not preserved — the scanner walks
+  field-by-field.
+- **Multi-line strings (`\\...`)** and **`'...'` character literals**
+  aren't handled because the assembler's schema doesn't use them. If
+  either appears in a future schema, grow `scanValue` in `project.zig`.
+- **Field order shifts** — managed fields are re-emitted first, then
+  extras. Functionally equivalent but the file isn't byte-identical
+  to its loaded form.
+
 ## Key invariants
 
 1. **`project.labelle` must pin all four versions** — `core_version`, `engine_version`, `gfx_version`, `assembler_version`. The launcher's resolver falls back to its own version for missing fields (`labelle-cli/src/cli/cache.zig:29`: `cfg.assembler_version orelse cfg.labelle_version`), which 404s when CLI and assembler aren't lockstep. Defaults in `ProjectConfig` track `labelle-cli/versions.zon` and the CLI's own assembler pin.

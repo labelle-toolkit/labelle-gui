@@ -71,11 +71,20 @@ pub const ProjectConfig = struct {
 
 pub const Project = struct {
     allocator: std.mem.Allocator,
-    /// Owns every string in `config` and the `dir` field. Freed in `deinit`.
+    /// Owns every string in `config`, `extras`, and the `dir` field.
+    /// Freed in `deinit`.
     arena: *std.heap.ArenaAllocator,
     /// Project directory (absolute path). null until the project is saved.
     dir: ?[]const u8,
     config: ProjectConfig,
+    /// Verbatim text for top-level `project.labelle` fields the gui's
+    /// `ProjectConfig` doesn't model (e.g. `states`, `plugins`, `layers`,
+    /// `gui`, `ios`, `android`, `labelle_version`, `hidden`). Captured on
+    /// `loadProject` and re-emitted on `saveProject` so external projects
+    /// round-trip without data loss. Each element is one field's source
+    /// text, starting at `.name` and ending right before the trailing
+    /// comma. Empty for projects authored by the gui.
+    extras: []const []const u8,
     is_dirty: bool,
 
     const Self = @This();
@@ -96,6 +105,7 @@ pub const Project = struct {
             .arena = arena,
             .dir = null,
             .config = .{ .name = name_copy },
+            .extras = &.{},
             .is_dirty = true,
         };
         return project;
@@ -163,7 +173,7 @@ pub const ProjectManager = struct {
         const file_path = try std.fs.path.join(self.allocator, &.{ dir_path, PROJECT_FILENAME });
         defer self.allocator.free(file_path);
 
-        const content = try renderProjectLabelle(self.allocator, proj.config);
+        const content = try renderProjectLabelle(self.allocator, proj.config, proj.extras);
         defer self.allocator.free(content);
 
         const file = try std.fs.cwd().createFile(file_path, .{});
@@ -220,11 +230,19 @@ pub const ProjectManager = struct {
             return err;
         };
 
+        // Capture text for any top-level field our ProjectConfig doesn't
+        // model, so we can re-emit them on save without dropping data.
+        const extras = extractUnmodeledFields(arena_alloc, source) catch |err| blk: {
+            std.log.warn("project.labelle extras scan failed at {s}: {s} (saving will drop unknown fields)", .{ file_path, @errorName(err) });
+            break :blk &.{};
+        };
+
         project.* = .{
             .allocator = self.allocator,
             .arena = arena,
             .dir = try arena_alloc.dupe(u8, dir_path),
             .config = parsed,
+            .extras = extras,
             .is_dirty = false,
         };
 
@@ -250,10 +268,144 @@ pub const ProjectManager = struct {
     }
 };
 
+/// Field names we render explicitly via `renderProjectLabelle`. Any
+/// top-level key in the loaded file that isn't in this set is captured
+/// verbatim into `Project.extras` for round-trip preservation. Keep in
+/// sync with the field list in `renderProjectLabelle` above — these are
+/// the names of the fields we emit ourselves and must not duplicate.
+const managed_field_names = [_][]const u8{
+    "name",         "description",       "title",
+    "width",        "height",            "target_fps",
+    "backend",      "ecs",               "initial_scene",
+    "core_version", "engine_version",    "gfx_version",
+    "assembler_version",                 "resources",
+};
+
+fn isManaged(name: []const u8) bool {
+    for (managed_field_names) |m| {
+        if (std.mem.eql(u8, m, name)) return true;
+    }
+    return false;
+}
+
+/// Extract verbatim source text for every top-level field in a ZON
+/// document that the gui's `ProjectConfig` doesn't model. The returned
+/// slices live in `arena` and each is the field's text starting at the
+/// leading `.` and ending right before the trailing comma (or the
+/// closing `}` for a final field).
+///
+/// Scope: handles the ZON dialect actually used in `project.labelle` —
+/// `// ... \n` comments, `"..."` strings with `\"` escapes, and brace /
+/// bracket / paren nesting in values. Multi-line strings (`\\...`) and
+/// `'...'` character literals are not handled because the assembler's
+/// project schema doesn't use them; if either appears in a future
+/// schema, this scanner will need to grow.
+fn extractUnmodeledFields(arena: std.mem.Allocator, raw: []const u8) ![]const []const u8 {
+    var i: usize = 0;
+    skipWsAndComments(raw, &i);
+    // Top-level shape is `.{ ... }`. Bail quietly on anything else; the
+    // caller treats a missing extras list as "no preservation possible".
+    if (i + 1 >= raw.len or raw[i] != '.' or raw[i + 1] != '{') return &.{};
+    i += 2;
+
+    var out: std.ArrayList([]const u8) = .{};
+    errdefer out.deinit(arena);
+
+    while (i < raw.len) {
+        skipWsAndComments(raw, &i);
+        if (i >= raw.len) break;
+        if (raw[i] == '}') break;
+        if (raw[i] != '.') break; // unexpected; stop rather than mis-parse
+
+        const field_start = i;
+        i += 1; // past '.'
+        const name_start = i;
+        while (i < raw.len) : (i += 1) {
+            const c = raw[i];
+            if (!std.ascii.isAlphanumeric(c) and c != '_') break;
+        }
+        const name = raw[name_start..i];
+        if (name.len == 0) break;
+
+        skipWsAndComments(raw, &i);
+        if (i >= raw.len or raw[i] != '=') break;
+        i += 1; // past '='
+
+        // Scan the value up to (but not including) the next top-level
+        // `,` or the outer `}`. Brace/string/comment aware.
+        scanValue(raw, &i);
+        const field_end = i;
+
+        // Consume optional trailing comma.
+        const save = i;
+        skipWsAndComments(raw, &i);
+        if (i < raw.len and raw[i] == ',') {
+            i += 1;
+        } else {
+            i = save;
+        }
+
+        if (!isManaged(name)) {
+            const trimmed = std.mem.trimRight(u8, raw[field_start..field_end], " \t\r\n");
+            const text = try arena.dupe(u8, trimmed);
+            try out.append(arena, text);
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
+fn skipWsAndComments(raw: []const u8, i: *usize) void {
+    while (i.* < raw.len) {
+        const c = raw[i.*];
+        if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
+            i.* += 1;
+        } else if (c == '/' and i.* + 1 < raw.len and raw[i.* + 1] == '/') {
+            while (i.* < raw.len and raw[i.*] != '\n') i.* += 1;
+        } else break;
+    }
+}
+
+fn scanValue(raw: []const u8, i: *usize) void {
+    var depth: usize = 0;
+    while (i.* < raw.len) {
+        const c = raw[i.*];
+        if (c == '"') {
+            i.* += 1;
+            while (i.* < raw.len) {
+                if (raw[i.*] == '\\' and i.* + 1 < raw.len) {
+                    i.* += 2;
+                } else if (raw[i.*] == '"') {
+                    i.* += 1;
+                    break;
+                } else {
+                    i.* += 1;
+                }
+            }
+        } else if (c == '/' and i.* + 1 < raw.len and raw[i.* + 1] == '/') {
+            while (i.* < raw.len and raw[i.*] != '\n') i.* += 1;
+        } else if (c == '{' or c == '[' or c == '(') {
+            depth += 1;
+            i.* += 1;
+        } else if (c == '}' or c == ']' or c == ')') {
+            if (depth == 0) return; // outer `}` — stop without consuming
+            depth -= 1;
+            i.* += 1;
+        } else if (c == ',' and depth == 0) {
+            return;
+        } else {
+            i.* += 1;
+        }
+    }
+}
+
 /// Format a `ProjectConfig` as ZON source matching `labelle-assembler`'s
 /// expected schema. Omits fields the assembler can default so the file
 /// stays minimal and hand-editable.
-fn renderProjectLabelle(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]u8 {
+fn renderProjectLabelle(
+    allocator: std.mem.Allocator,
+    cfg: ProjectConfig,
+    extras: []const []const u8,
+) ![]u8 {
     const title = if (cfg.title.len > 0) cfg.title else cfg.name;
     var buf: std.ArrayList(u8) = .{};
     errdefer buf.deinit(allocator);
@@ -283,6 +435,18 @@ fn renderProjectLabelle(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]u8 
             );
         }
         try w.writeAll("    },\n");
+    }
+
+    // Re-emit fields the gui doesn't model, verbatim from the source we
+    // loaded. Captured text already starts at `.name` and excludes the
+    // trailing comma; we just indent and add `,\n`. Multi-line values
+    // (e.g. nested struct literals) keep their original line breaks but
+    // not their original indentation level — good enough; the file is
+    // still ZON-parseable and human-editable.
+    for (extras) |field_text| {
+        try w.writeAll("    ");
+        try w.writeAll(field_text);
+        try w.writeAll(",\n");
     }
 
     try w.writeAll("}\n");

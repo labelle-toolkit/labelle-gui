@@ -521,6 +521,141 @@ pub const ProjectFileTests = struct {
         try expect.toBeTrue(std.mem.eql(u8, cfg.resources[0].name, "sprites"));
     }
 
+    test "saveProject preserves unmodeled fields verbatim (round-trip)" {
+        const allocator = std.testing.allocator;
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        const labelle_path = try std.fs.path.join(allocator, &.{ temp_dir, "project.labelle" });
+        defer allocator.free(labelle_path);
+
+        const original =
+            \\.{
+            \\    .name = "external_project",
+            \\    .title = "External",
+            \\    .width = 1024,
+            \\    .height = 768,
+            \\    .target_fps = 60,
+            \\    .backend = .sokol,
+            \\    .ecs = .zig_ecs,
+            \\    .initial_scene = "loading",
+            \\    .states = .{ "loading", "playing" },
+            \\    .gui = .{ .plugin = "imgui" },
+            \\    .plugins = .{
+            \\        .{ .name = "imgui", .repo = "local:../labelle-imgui" },
+            \\    },
+            \\    .layers = .{
+            \\        .{ .name = "world", .order = 0, .space = .world },
+            \\    },
+            \\    .core_version = "1.10.0",
+            \\    .engine_version = "1.21.0",
+            \\    .gfx_version = "1.7.0",
+            \\    .labelle_version = "1.36.0",
+            \\    .assembler_version = "0.8.0",
+            \\    .hidden = false,
+            \\}
+            \\
+        ;
+        const file = try std.fs.cwd().createFile(labelle_path, .{});
+        file.writeAll(original) catch unreachable;
+        file.close();
+
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+        try pm.loadProject(temp_dir);
+        try pm.saveProject(temp_dir);
+
+        const reread = try std.fs.cwd().openFile(labelle_path, .{});
+        defer reread.close();
+        const saved = try reread.readToEndAlloc(allocator, 1024 * 1024);
+        defer allocator.free(saved);
+
+        // The five unmodeled fields must survive a save+load cycle.
+        try expect.toBeTrue(std.mem.indexOf(u8, saved, ".states") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, saved, ".gui") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, saved, ".plugins") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, saved, ".layers") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, saved, ".labelle_version") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, saved, ".hidden") != null);
+        // And the unmodeled struct literals must still be there.
+        try expect.toBeTrue(std.mem.indexOf(u8, saved, "\"loading\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, saved, "imgui") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, saved, "local:../labelle-imgui") != null);
+    }
+
+    test "saveProject re-parses cleanly after extras round-trip" {
+        // Belt-and-suspenders: after save, loading the saved file again
+        // must succeed. Catches accidental syntax breakage in the
+        // verbatim-extras emission (missing commas, wrong braces, etc.).
+        const allocator = std.testing.allocator;
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        const labelle_path = try std.fs.path.join(allocator, &.{ temp_dir, "project.labelle" });
+        defer allocator.free(labelle_path);
+
+        const original =
+            \\.{
+            \\    .name = "x",
+            \\    .states = .{ "menu", "playing" },
+            \\    .gui = .{ .plugin = "imgui" },
+            \\}
+            \\
+        ;
+        const file = try std.fs.cwd().createFile(labelle_path, .{});
+        file.writeAll(original) catch unreachable;
+        file.close();
+
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+        try pm.loadProject(temp_dir);
+        try pm.saveProject(temp_dir);
+
+        var pm2 = project.ProjectManager.init(allocator);
+        defer pm2.deinit();
+        try pm2.loadProject(temp_dir);
+        try expect.toBeTrue(std.mem.eql(u8, pm2.current_project.?.config.name, "x"));
+    }
+
+    test "saveProject keeps extras when a modeled field changes" {
+        // Editing .title via the gui must not collateral-damage .states/.gui.
+        const allocator = std.testing.allocator;
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        const labelle_path = try std.fs.path.join(allocator, &.{ temp_dir, "project.labelle" });
+        defer allocator.free(labelle_path);
+
+        const original =
+            \\.{
+            \\    .name = "x",
+            \\    .title = "Old Title",
+            \\    .states = .{ "menu" },
+            \\}
+            \\
+        ;
+        const file = try std.fs.cwd().createFile(labelle_path, .{});
+        file.writeAll(original) catch unreachable;
+        file.close();
+
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+        try pm.loadProject(temp_dir);
+
+        const proj = pm.current_project.?;
+        proj.config.title = try proj.arena.allocator().dupe(u8, "New Title");
+
+        try pm.saveProject(temp_dir);
+
+        const reread = try std.fs.cwd().openFile(labelle_path, .{});
+        defer reread.close();
+        const saved = try reread.readToEndAlloc(allocator, 1024 * 1024);
+        defer allocator.free(saved);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, saved, "\"New Title\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, saved, ".states") != null);
+    }
+
     test "loadProject still errors on malformed ZON" {
         const allocator = std.testing.allocator;
         const temp_dir = try createTempDir(allocator);
