@@ -30,17 +30,15 @@ const pivot_names = [_][]const u8{
 };
 
 /// Zero-separated, zero-terminated form of `pivot_names` for
-/// `zgui.combo`'s `items_separated_by_zeros` argument.
-const pivot_items: [:0]const u8 =
-    "center\x00" ++
-    "bottom_center\x00" ++
-    "top_center\x00" ++
-    "bottom_left\x00" ++
-    "bottom_right\x00" ++
-    "top_left\x00" ++
-    "top_right\x00" ++
-    "left_center\x00" ++
-    "right_center\x00";
+/// `zgui.combo`'s `items_separated_by_zeros` argument. Built at
+/// comptime from `pivot_names` so the two lists can't drift.
+const pivot_items: [:0]const u8 = blk: {
+    var res: [:0]const u8 = "";
+    for (pivot_names) |name| {
+        res = res ++ name ++ "\x00";
+    }
+    break :blk res;
+};
 
 /// Render the editable surface for one entity:
 ///
