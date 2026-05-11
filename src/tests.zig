@@ -543,6 +543,62 @@ pub const SceneIoTests = struct {
         try expect.toBeTrue(std.mem.indexOf(u8, text, "scenes/obstacles.jsonc") != null);
     }
 
+    test "Sprite component round-trips with all four typed fields" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "x",
+            \\    "entities": [
+            \\        { "components": { "Position": { "x": 0, "y": 0 }, "Sprite": { "sprite_name": "coin", "pivot": "center", "layer": "world", "z_index": -5 } } }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+        const sprite = loaded.scene.entities[0].sprite orelse return error.MissingSprite;
+        try expect.toBeTrue(std.mem.eql(u8, std.mem.sliceTo(&sprite.sprite_name, 0), "coin"));
+        try expect.toBeTrue(std.mem.eql(u8, std.mem.sliceTo(&sprite.pivot, 0), "center"));
+        try expect.toBeTrue(std.mem.eql(u8, std.mem.sliceTo(&sprite.layer, 0), "world"));
+        try expect.toBeTrue(sprite.has_z_index);
+        try expect.equal(sprite.z_index, -5);
+
+        const text = try scene_io.renderSceneJsonc(allocator, loaded);
+        defer allocator.free(text);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"sprite_name\": \"coin\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"pivot\": \"center\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"layer\": \"world\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"z_index\": -5") != null);
+    }
+
+    test "edit Sprite.sprite_name in memory; saved output reflects it" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{ "components": { "Sprite": { "sprite_name": "old" } } }
+        ;
+        var loaded = try scene_io.parsePrefab(allocator, src);
+        defer loaded.deinit();
+        // In-place edit via the inspector's path (mutate the buffer).
+        const sprite = loaded.entity.sprite orelse return error.MissingSprite;
+        @memset(&sprite.sprite_name, 0);
+        const new_name = "new";
+        @memcpy(sprite.sprite_name[0..new_name.len], new_name);
+
+        const text = try scene_io.renderPrefabJsonc(allocator, loaded);
+        defer allocator.free(text);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"sprite_name\": \"new\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"sprite_name\": \"old\"") == null);
+    }
+
+    test "entity without Sprite component leaves sprite null" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{ "components": { "Coin": {} } }
+        ;
+        var loaded = try scene_io.parsePrefab(allocator, src);
+        defer loaded.deinit();
+        try expect.toBeTrue(loaded.entity.sprite == null);
+    }
+
     test "renderSceneJsonc output re-parses cleanly" {
         // End-to-end: scene → render → re-parse → render again
         // should give us the same managed state plus the same extras.
@@ -552,7 +608,7 @@ pub const SceneIoTests = struct {
             \\    "name": "x",
             \\    "entities": [
             \\        // c
-            \\        { "prefab": "p", "components": { "Position": { "x": 1, "y": 2 }, "Sprite": { "n": "s" } } }
+            \\        { "prefab": "p", "components": { "Position": { "x": 1, "y": 2 }, "Sprite": { "sprite_name": "s" } } }
             \\    ]
             \\}
         ;
@@ -567,8 +623,13 @@ pub const SceneIoTests = struct {
         try expect.toBeTrue(std.mem.eql(u8, loaded2.scene.entities[0].prefab.?, "p"));
         try expect.equal(loaded2.scene.entities[0].position.?.x, 1);
         try expect.equal(loaded2.scene.entities[0].position.?.y, 2);
-        try expect.equal(loaded2.extras.entity_components[0].len, 1);
-        try expect.toBeTrue(std.mem.eql(u8, loaded2.extras.entity_components[0][0].name, "Sprite"));
+        // Sprite is typed now, so it's read out of the entity, not
+        // captured in extras. Entity should carry the typed Sprite
+        // with `sprite_name` round-tripped from the source.
+        try expect.equal(loaded2.extras.entity_components[0].len, 0);
+        try expect.toBeTrue(loaded2.scene.entities[0].sprite != null);
+        const sprite_name = std.mem.sliceTo(&loaded2.scene.entities[0].sprite.?.sprite_name, 0);
+        try expect.toBeTrue(std.mem.eql(u8, sprite_name, "s"));
     }
 
     test "parsePrefab reads Position + extras from a prefab body" {
@@ -587,10 +648,16 @@ pub const SceneIoTests = struct {
         try expect.toBeTrue(loaded.entity.position != null);
         try expect.equal(loaded.entity.position.?.x, 5);
         try expect.equal(loaded.entity.position.?.y, 10);
-        try expect.equal(loaded.component_extras.len, 2);
-        // Order matches source: Sprite first, then Coin.
-        try expect.toBeTrue(std.mem.eql(u8, loaded.component_extras[0].name, "Sprite"));
-        try expect.toBeTrue(std.mem.eql(u8, loaded.component_extras[1].name, "Coin"));
+        // Sprite is typed (issue #31 slice 1) so it lives on
+        // entity.sprite, not in extras. Coin remains an unmodeled
+        // extra.
+        try expect.equal(loaded.component_extras.len, 1);
+        try expect.toBeTrue(std.mem.eql(u8, loaded.component_extras[0].name, "Coin"));
+        try expect.toBeTrue(loaded.entity.sprite != null);
+        const sn = std.mem.sliceTo(&loaded.entity.sprite.?.sprite_name, 0);
+        const pv = std.mem.sliceTo(&loaded.entity.sprite.?.pivot, 0);
+        try expect.toBeTrue(std.mem.eql(u8, sn, "coin"));
+        try expect.toBeTrue(std.mem.eql(u8, pv, "center"));
     }
 
     test "renderPrefabJsonc round-trips a prefab with extras" {
@@ -614,11 +681,13 @@ pub const SceneIoTests = struct {
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"sprite_name\": \"coin\"") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Coin\"") != null);
 
-        // Re-parse the rendered text to confirm the writer's output is
-        // self-consistent — same shape, same extras.
+        // Re-parse the rendered text to confirm the writer's output
+        // is self-consistent — Sprite back on entity.sprite, Coin
+        // back in extras.
         var loaded2 = try scene_io.parsePrefab(allocator, text);
         defer loaded2.deinit();
-        try expect.equal(loaded2.component_extras.len, 2);
+        try expect.equal(loaded2.component_extras.len, 1);
+        try expect.toBeTrue(loaded2.entity.sprite != null);
     }
 
     test "parsePrefab reads children with positions and extras" {
@@ -655,11 +724,13 @@ pub const SceneIoTests = struct {
         try expect.equal(loaded.children[0].position.?.x, 15);
         try expect.equal(loaded.children[1].position.?.y, 12);
 
-        // Child-level component extras are captured parallel to
-        // children, with Sprite preserved verbatim.
+        // Sprite is typed now (#31 slice 1) — sits on
+        // child.sprite, not in children_extras.
         try expect.equal(loaded.children_extras.len, 2);
-        try expect.equal(loaded.children_extras[0].len, 1);
-        try expect.toBeTrue(std.mem.eql(u8, loaded.children_extras[0][0].name, "Sprite"));
+        try expect.equal(loaded.children_extras[0].len, 0);
+        try expect.toBeTrue(loaded.children[0].sprite != null);
+        const sn = std.mem.sliceTo(&loaded.children[0].sprite.?.sprite_name, 0);
+        try expect.toBeTrue(std.mem.eql(u8, sn, "bg.png"));
 
         // Leading // comments ride along with the child they precede.
         const c0 = std.mem.sliceTo(&loaded.children[0].comment, 0);
@@ -669,13 +740,16 @@ pub const SceneIoTests = struct {
     }
 
     test "renderPrefabJsonc round-trips children + extras" {
+        // Uses real Sprite fields (sprite_name) since the typed
+        // model only round-trips the four canonical fields; unmodeled
+        // sub-fields like `n` would be silently dropped (#31 follow-up).
         const allocator = std.testing.allocator;
         const src =
             \\{
             \\    "components": { "Room": { "room_type": "x" } },
             \\    "children": [
-            \\        { "components": { "Sprite": { "n": "a" }, "Position": { "x": 1, "y": 2 } } },
-            \\        { "components": { "Sprite": { "n": "b" }, "Position": { "x": 3, "y": 4 } } }
+            \\        { "components": { "Sprite": { "sprite_name": "a" }, "Position": { "x": 1, "y": 2 } } },
+            \\        { "components": { "Sprite": { "sprite_name": "b" }, "Position": { "x": 3, "y": 4 } } }
             \\    ]
             \\}
         ;
@@ -691,8 +765,8 @@ pub const SceneIoTests = struct {
 
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"children\":") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"x\": 99") != null);
-        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"n\": \"a\"") != null);
-        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"n\": \"b\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"sprite_name\": \"a\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"sprite_name\": \"b\"") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Room\":") != null);
 
         // Re-parse the rendered text — same shape, same children
@@ -716,16 +790,17 @@ pub const SceneIoTests = struct {
             \\
             \\{
             \\    "components": {
-            \\        "Sprite": { "n": "x" },
+            \\        "Sprite": { "sprite_name": "x" },
             \\        "Coin": {}
             \\    }
             \\}
         ;
         var loaded = try scene_io.parsePrefab(allocator, src);
         defer loaded.deinit();
-        try expect.equal(loaded.component_extras.len, 2);
-        try expect.toBeTrue(std.mem.eql(u8, loaded.component_extras[0].name, "Sprite"));
-        try expect.toBeTrue(std.mem.eql(u8, loaded.component_extras[1].name, "Coin"));
+        // Sprite typed → on entity. Coin unmodeled → still in extras.
+        try expect.equal(loaded.component_extras.len, 1);
+        try expect.toBeTrue(std.mem.eql(u8, loaded.component_extras[0].name, "Coin"));
+        try expect.toBeTrue(loaded.entity.sprite != null);
     }
 
     test "renderPrefabJsonc reflects in-memory Position edits" {

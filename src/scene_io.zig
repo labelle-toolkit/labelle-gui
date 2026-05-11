@@ -24,13 +24,39 @@ pub const Position = struct {
 /// scenes with room to grow.
 pub const comment_cap = 1024;
 
+/// Buffer sizes for the typed Sprite component. The inspector edits
+/// these in place via `zgui.inputText`, so the buffers live on the
+/// Sprite struct itself rather than as caller-owned scratch.
+pub const sprite_name_cap = 128;
+pub const sprite_pivot_cap = 32;
+pub const sprite_layer_cap = 32;
+
+/// Typed model of the `Sprite` component (issue #31, slice 1).
+/// Parsed verbatim into the edit buffers when a scene/prefab loads;
+/// re-emitted from the buffers on save. Sub-fields beyond these
+/// four (sprite_name / pivot / layer / z_index) are not preserved
+/// yet — slice 2's merge work picks that up. Most real Sprite
+/// blocks use only the four below, so the immediate data loss
+/// risk is small.
+pub const Sprite = struct {
+    sprite_name: [sprite_name_cap:0]u8 = [_:0]u8{0} ** sprite_name_cap,
+    pivot: [sprite_pivot_cap:0]u8 = [_:0]u8{0} ** sprite_pivot_cap,
+    layer: [sprite_layer_cap:0]u8 = [_:0]u8{0} ** sprite_layer_cap,
+    z_index: i32 = 0,
+    has_z_index: bool = false,
+};
+
 pub const Entity = struct {
     prefab: ?[]const u8 = null,
     /// Parsed once on load; viewport reads it when drawing the entity
     /// marker. Components that aren't known to this struct are ignored,
     /// which lets the gui open scenes that reference component types
-    /// we don't model yet (Sprite, Shape, user-defined components).
+    /// we don't model yet (Shape, user-defined components).
     position: ?Position = null,
+    /// Typed `Sprite` component when the source had one. Null
+    /// otherwise. Heap-allocated in the LoadedScene/LoadedPrefab
+    /// arena so the inspector can edit the buffers in place.
+    sprite: ?*Sprite = null,
     /// Leading `//` comments captured from the source file, attached
     /// to the first entity that follows them — same rule we use for
     /// project.labelle pass-through. Lines keep their `//` markers and
@@ -157,12 +183,13 @@ pub fn parsePrefab(allocator: std.mem.Allocator, raw: []const u8) !LoadedPrefab 
 
     const entity: Entity = .{
         .position = readPosition(parsed.value.components),
+        .sprite = try readSprite(arena.allocator(), parsed.value.components),
     };
 
     // Re-use the entity-body scanner — walks `{ ... }`, finds the
-    // `components` key, captures every non-Position entry as
-    // verbatim extras. Works the same for prefab body and child
-    // bodies.
+    // `components` key, captures every non-Position / non-Sprite
+    // entry as verbatim extras. Works the same for prefab body and
+    // child bodies.
     const component_extras = try extractComponentExtras(arena.allocator(), raw);
 
     // Children: mutable so the editor can drag-to-move them. Each
@@ -175,6 +202,7 @@ pub fn parsePrefab(allocator: std.mem.Allocator, raw: []const u8) !LoadedPrefab 
         children[i] = .{
             .prefab = if (c.prefab) |p| try arena.allocator().dupe(u8, p) else null,
             .position = readPosition(c.components),
+            .sprite = try readSprite(arena.allocator(), c.components),
         };
         if (i < child_comments.len) {
             buf.writeZeroed(&children[i].comment, child_comments[i]);
@@ -214,6 +242,11 @@ pub fn renderPrefabJsonc(allocator: std.mem.Allocator, loaded: LoadedPrefab) ![]
         try w.print(" \"Position\": {{ \"x\": {d}, \"y\": {d} }}", .{ p.x, p.y });
         first = false;
     }
+    if (loaded.entity.sprite) |sp| {
+        if (!first) try w.writeAll(",");
+        _ = try emitSprite(&w, sp.*);
+        first = false;
+    }
     for (loaded.component_extras) |extra| {
         if (!first) try w.writeAll(",");
         try w.print(" \"{s}\": {s}", .{ extra.name, extra.value_text });
@@ -244,13 +277,18 @@ pub fn renderPrefabJsonc(allocator: std.mem.Allocator, loaded: LoadedPrefab) ![]
                 loaded.children_extras[i]
             else
                 &[_]ComponentExtra{};
-            const has_components = child.position != null or cextras.len > 0;
+            const has_components = child.position != null or child.sprite != null or cextras.len > 0;
             if (has_components) {
                 if (!c_first) try w.writeAll(",");
                 try w.writeAll(" \"components\": {");
                 var cc_first = true;
                 if (child.position) |p| {
                     try w.print(" \"Position\": {{ \"x\": {d}, \"y\": {d} }}", .{ p.x, p.y });
+                    cc_first = false;
+                }
+                if (child.sprite) |sp| {
+                    if (!cc_first) try w.writeAll(",");
+                    _ = try emitSprite(&w, sp.*);
                     cc_first = false;
                 }
                 for (cextras) |extra| {
@@ -310,6 +348,7 @@ pub fn parseScene(allocator: std.mem.Allocator, raw: []const u8) !LoadedScene {
         entities[i] = .{
             .prefab = if (e.prefab) |p| try arena.allocator().dupe(u8, p) else null,
             .position = readPosition(e.components),
+            .sprite = try readSprite(arena.allocator(), e.components),
         };
         // Comments are extracted on a best-effort basis: if the scanner
         // landed fewer entries than parser saw entities (recovery from
@@ -349,6 +388,27 @@ fn readPosition(components: ?std.json.Value) ?Position {
     };
 }
 
+fn readSprite(arena: std.mem.Allocator, components: ?std.json.Value) !?*Sprite {
+    const c = components orelse return null;
+    if (c != .object) return null;
+    const s_val = c.object.get("Sprite") orelse return null;
+    if (s_val != .object) return null;
+
+    const out = try arena.create(Sprite);
+    out.* = .{};
+    if (s_val.object.get("sprite_name")) |v| if (v == .string) buf.writeZeroed(&out.sprite_name, v.string);
+    if (s_val.object.get("pivot")) |v| if (v == .string) buf.writeZeroed(&out.pivot, v.string);
+    if (s_val.object.get("layer")) |v| if (v == .string) buf.writeZeroed(&out.layer, v.string);
+    if (s_val.object.get("z_index")) |v| switch (v) {
+        .integer => |i| {
+            out.z_index = @intCast(i);
+            out.has_z_index = true;
+        },
+        else => {},
+    };
+    return out;
+}
+
 fn jsonNumberAsF32(v: ?std.json.Value) ?f32 {
     const value = v orelse return null;
     return switch (value) {
@@ -356,6 +416,44 @@ fn jsonNumberAsF32(v: ?std.json.Value) ?f32 {
         .float => |f| @floatCast(f),
         else => null,
     };
+}
+
+/// Emit `"Sprite": { ... }` into `writer` from the typed sprite
+/// fields. Used by both the scene and prefab writers as part of
+/// the per-entity `components` block. Returns `true` if anything
+/// was written so the caller can manage commas between sibling
+/// components — an entirely-empty Sprite still emits `"Sprite": {}`
+/// because we know the entity *has* a Sprite component, just no
+/// non-default fields.
+fn emitSprite(writer: anytype, sprite: Sprite) !bool {
+    const name = std.mem.sliceTo(&sprite.sprite_name, 0);
+    const pivot = std.mem.sliceTo(&sprite.pivot, 0);
+    const layer = std.mem.sliceTo(&sprite.layer, 0);
+
+    try writer.writeAll(" \"Sprite\": {");
+    var first = true;
+    if (name.len > 0) {
+        try writer.print(" \"sprite_name\": \"{s}\"", .{name});
+        first = false;
+    }
+    if (pivot.len > 0) {
+        if (!first) try writer.writeAll(",");
+        try writer.print(" \"pivot\": \"{s}\"", .{pivot});
+        first = false;
+    }
+    if (layer.len > 0) {
+        if (!first) try writer.writeAll(",");
+        try writer.print(" \"layer\": \"{s}\"", .{layer});
+        first = false;
+    }
+    if (sprite.has_z_index) {
+        if (!first) try writer.writeAll(",");
+        try writer.print(" \"z_index\": {d}", .{sprite.z_index});
+        first = false;
+    }
+    if (first) try writer.writeAll(" ");
+    try writer.writeAll(" }");
+    return true;
 }
 
 /// Strip a trailing `.jsonc` extension from a path's basename and
@@ -699,7 +797,11 @@ fn extractComponentExtras(arena: std.mem.Allocator, entity_body: []const u8) ![]
         scanValueJson(entity_body, &i);
         const value_end = i;
 
-        if (!std.mem.eql(u8, key, "Position")) {
+        // Skip components the gui models structurally; their fields
+        // are re-emitted by the writer from the typed Entity, so
+        // capturing them as extras would round-trip them twice.
+        const is_managed = std.mem.eql(u8, key, "Position") or std.mem.eql(u8, key, "Sprite");
+        if (!is_managed) {
             try out.append(arena, .{
                 .name = try arena.dupe(u8, key),
                 .value_text = try arena.dupe(u8, std.mem.trim(u8, entity_body[value_start..value_end], " \t\r\n")),
@@ -866,13 +968,18 @@ pub fn renderSceneJsonc(allocator: std.mem.Allocator, loaded: LoadedScene) ![]u8
             loaded.extras.entity_components[i]
         else
             &[_]ComponentExtra{};
-        const has_components = e.position != null or extras.len > 0;
+        const has_components = e.position != null or e.sprite != null or extras.len > 0;
         if (has_components) {
             if (!first) try w.writeAll(",");
             try w.writeAll(" \"components\": {");
             var c_first = true;
             if (e.position) |p| {
                 try w.print(" \"Position\": {{ \"x\": {d}, \"y\": {d} }}", .{ p.x, p.y });
+                c_first = false;
+            }
+            if (e.sprite) |sp| {
+                if (!c_first) try w.writeAll(",");
+                _ = try emitSprite(&w, sp.*);
                 c_first = false;
             }
             for (extras) |extra| {

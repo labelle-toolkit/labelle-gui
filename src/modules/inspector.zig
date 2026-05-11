@@ -49,6 +49,24 @@ pub fn renderEntity(
         }
     }
 
+    if (entity.sprite) |sprite| {
+        if (zgui.collapsingHeader("Sprite", .{ .default_open = true })) {
+            if (zgui.inputText("sprite_name", .{ .buf = &sprite.sprite_name })) is_dirty.* = true;
+            if (zgui.inputText("pivot", .{ .buf = &sprite.pivot })) is_dirty.* = true;
+            if (zgui.inputText("layer", .{ .buf = &sprite.layer })) is_dirty.* = true;
+
+            // z_index is optional in the source; the checkbox toggles
+            // whether we emit it at all. Editing the int alone (with
+            // the box unchecked) doesn't suddenly add a `"z_index"`
+            // key to the file — the user has to opt in explicitly.
+            if (zgui.checkbox("z_index?", .{ .v = &sprite.has_z_index })) is_dirty.* = true;
+            if (sprite.has_z_index) {
+                zgui.sameLine(.{});
+                if (zgui.inputInt("##z_index", .{ .v = &sprite.z_index })) is_dirty.* = true;
+            }
+        }
+    }
+
     if (zgui.collapsingHeader("Comment", .{})) {
         if (zgui.inputTextMultiline("##comment", .{
             .buf = &entity.comment,
