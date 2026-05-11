@@ -80,4 +80,54 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);
+
+    // UI test runner ------------------------------------------------------
+    //
+    // A separate exe linking a second zgui instance built with the bundled
+    // Dear ImGui Test Engine (`with_te = true`). It opens a hidden GLFW
+    // window, drives the imgui frame loop, and runs registered TE tests to
+    // completion. Not part of the default install — only `zig build gui-test`
+    // builds and runs it, so the production exe stays free of TE overhead.
+    const zgui_te = b.dependency("zgui", .{
+        .target = target,
+        .optimize = optimize,
+        .backend = .glfw_opengl3,
+        .with_te = true,
+    });
+
+    const gui_tests_exe = b.addExecutable(.{
+        .name = "gui-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gui_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    gui_tests_exe.root_module.addImport("zglfw", zglfw.module("root"));
+    gui_tests_exe.linkLibrary(zglfw.artifact("glfw"));
+    gui_tests_exe.root_module.addImport("zopengl", zopengl.module("root"));
+    gui_tests_exe.root_module.addImport("zgui", zgui_te.module("root"));
+    gui_tests_exe.linkLibrary(zgui_te.artifact("imgui"));
+
+    const run_gui_tests = b.addRunArtifact(gui_tests_exe);
+    const gui_test_step = b.step("gui-test", "Run the UI test runner");
+    gui_test_step.dependOn(&run_gui_tests.step);
+
+    // End-to-end smoke check ----------------------------------------------
+    //
+    // Drives the gui's project writer + Compiler.launcherGenerate against
+    // the real `labelle` launcher to confirm the chain works on this
+    // machine. Not part of `zig build test` because it requires `labelle`
+    // on PATH and a populated package cache (or at least network).
+    const smoke_exe = b.addExecutable(.{
+        .name = "gui-smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/smoke.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_smoke = b.addRunArtifact(smoke_exe);
+    const smoke_step = b.step("smoke", "End-to-end smoke check against `labelle` launcher");
+    smoke_step.dependOn(&run_smoke.step);
 }

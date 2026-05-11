@@ -64,7 +64,7 @@ pub fn main() !void {
     zglfw.windowHint(.opengl_forward_compat, true);
 
     // Create window
-    const window = zglfw.createWindow(1280, 720, "Labelle", null) catch {
+    const window = zglfw.createWindow(1280, 720, "Labelle", null, null) catch {
         std.log.err("Failed to create GLFW window", .{});
         return error.WindowCreationFailed;
     };
@@ -166,19 +166,12 @@ pub fn main() !void {
                     if (nfd.openFolderDialog(null)) |maybe_path| {
                         if (maybe_path) |folder_path| {
                             defer nfd.freePath(folder_path);
-                            // Create new project with folder name as project name
                             const name = std.fs.path.basename(folder_path);
                             state.project_manager.newProject(name) catch |err| {
                                 std.log.err("Error creating project: {}", .{err});
                                 setStatus(&state, "Error creating project!");
                             };
-                            // Auto-save to the selected folder
-                            const save_path = std.fmt.allocPrint(allocator, "{s}/project", .{folder_path}) catch {
-                                setStatus(&state, "Memory error!");
-                                continue;
-                            };
-                            defer allocator.free(save_path);
-                            state.project_manager.saveProject(save_path) catch |err| {
+                            state.project_manager.saveProject(folder_path) catch |err| {
                                 std.log.err("Error saving project: {}", .{err});
                                 setStatus(&state, "Error saving project!");
                             };
@@ -190,11 +183,10 @@ pub fn main() !void {
                     }
                 }
                 if (zgui.menuItem("Open Project...", .{})) {
-                    // Open file picker for .labelle files
-                    if (nfd.openFileDialog("labelle", null)) |maybe_path| {
-                        if (maybe_path) |file_path| {
-                            defer nfd.freePath(file_path);
-                            state.project_manager.loadProject(file_path) catch |err| {
+                    if (nfd.openFolderDialog(null)) |maybe_path| {
+                        if (maybe_path) |folder_path| {
+                            defer nfd.freePath(folder_path);
+                            state.project_manager.loadProject(folder_path) catch |err| {
                                 std.log.err("Error loading project: {}", .{err});
                                 setStatus(&state, "Error loading project!");
                             };
@@ -202,7 +194,7 @@ pub fn main() !void {
                             state.tree_view.refresh();
                         }
                     } else |_| {
-                        setStatus(&state, "Error opening file dialog!");
+                        setStatus(&state, "Error opening folder dialog!");
                     }
                 }
                 zgui.separator();
@@ -213,18 +205,17 @@ pub fn main() !void {
                 zgui.separator();
                 if (zgui.menuItem("Save", .{})) {
                     if (state.project_manager.current_project) |proj| {
-                        if (proj.path) |path| {
-                            state.project_manager.saveProject(path) catch |err| {
+                        if (proj.dir) |dir| {
+                            state.project_manager.saveProject(dir) catch |err| {
                                 setStatus(&state, "Error saving project!");
                                 std.log.err("Save error: {}", .{err});
                             };
                             setStatus(&state, "Project saved!");
                         } else {
-                            // No path yet, use Save As
-                            if (nfd.saveFileDialog("labelle", null)) |maybe_path| {
-                                if (maybe_path) |file_path| {
-                                    defer nfd.freePath(file_path);
-                                    state.project_manager.saveProject(file_path) catch |err| {
+                            if (nfd.openFolderDialog(null)) |maybe_path| {
+                                if (maybe_path) |folder_path| {
+                                    defer nfd.freePath(folder_path);
+                                    state.project_manager.saveProject(folder_path) catch |err| {
                                         std.log.err("Save error: {}", .{err});
                                         setStatus(&state, "Error saving project!");
                                     };
@@ -238,10 +229,10 @@ pub fn main() !void {
                 }
                 if (zgui.menuItem("Save As...", .{})) {
                     if (state.project_manager.current_project != null) {
-                        if (nfd.saveFileDialog("labelle", null)) |maybe_path| {
-                            if (maybe_path) |file_path| {
-                                defer nfd.freePath(file_path);
-                                state.project_manager.saveProject(file_path) catch |err| {
+                        if (nfd.openFolderDialog(null)) |maybe_path| {
+                            if (maybe_path) |folder_path| {
+                                defer nfd.freePath(folder_path);
+                                state.project_manager.saveProject(folder_path) catch |err| {
                                     std.log.err("Save error: {}", .{err});
                                     setStatus(&state, "Error saving project!");
                                 };
@@ -265,27 +256,24 @@ pub fn main() !void {
             }
             if (zgui.beginMenu("Build", state.project_manager.current_project != null)) {
                 const can_build = state.compiler.isIdle();
-                if (zgui.menuItem("Generate Build Files", .{ .enabled = can_build })) {
-                    if (state.project_manager.current_project) |proj| {
-                        if (state.compiler.generateAllBuildFiles(proj)) {
-                            setStatus(&state, "Build files generated!");
-                            state.tree_view.refresh();
-                        } else |err| {
-                            std.log.err("Error generating build files: {}", .{err});
-                            setStatus(&state, "Error generating build files!");
-                        }
+                if (zgui.menuItem("Sync Project Files", .{ .enabled = can_build })) {
+                    if (state.compiler.syncProjectFiles(&state.project_manager)) {
+                        setStatus(&state, "Project files synced!");
+                        state.tree_view.refresh();
+                    } else |err| {
+                        std.log.err("Error syncing project files: {}", .{err});
+                        setStatus(&state, "Error syncing project files!");
                     }
                 }
                 zgui.separator();
                 if (zgui.menuItem("Build", .{ .enabled = can_build })) {
                     if (state.project_manager.current_project) |proj| {
-                        // First ensure build files exist
-                        const gen_ok = if (state.compiler.generateAllBuildFiles(proj)) true else |err| blk: {
-                            std.log.err("Error generating build files: {}", .{err});
-                            setStatus(&state, "Error generating build files!");
+                        const sync_ok = if (state.compiler.syncProjectFiles(&state.project_manager)) true else |err| blk: {
+                            std.log.err("Error syncing project files: {}", .{err});
+                            setStatus(&state, "Error syncing project files!");
                             break :blk false;
                         };
-                        if (gen_ok) {
+                        if (sync_ok) {
                             if (state.compiler.build(proj)) {
                                 setStatus(&state, "Building...");
                                 state.show_compiler_output = true;
@@ -299,11 +287,20 @@ pub fn main() !void {
                 }
                 if (zgui.menuItem("Run", .{ .enabled = can_build })) {
                     if (state.project_manager.current_project) |proj| {
-                        if (state.compiler.run(proj)) {
-                            setStatus(&state, "Running game...");
-                        } else |err| {
-                            std.log.err("Error running game: {}", .{err});
-                            setStatus(&state, "Error running game!");
+                        const sync_ok = if (state.compiler.syncProjectFiles(&state.project_manager)) true else |err| blk: {
+                            std.log.err("Error syncing project files: {}", .{err});
+                            setStatus(&state, "Error syncing project files!");
+                            break :blk false;
+                        };
+                        if (sync_ok) {
+                            if (state.compiler.run(proj)) {
+                                setStatus(&state, "Running game...");
+                                state.show_compiler_output = true;
+                                state.compiler_output_scroll_to_bottom = true;
+                            } else |err| {
+                                std.log.err("Error running game: {}", .{err});
+                                setStatus(&state, "Error running game!");
+                            }
                         }
                     }
                 }
@@ -378,7 +375,7 @@ pub fn main() !void {
         })) {
             if (state.project_manager.current_project) |proj| {
                 // Project is open
-                zgui.text("Project: {s}", .{proj.metadata.name});
+                zgui.text("Project: {s}", .{proj.config.name});
                 if (proj.is_dirty) {
                     zgui.sameLine(.{});
                     zgui.textColored(.{ 1.0, 0.5, 0.0, 1.0 }, "(unsaved)", .{});
@@ -409,12 +406,7 @@ pub fn main() !void {
                                 std.log.err("Error creating project: {}", .{err});
                                 setStatus(&state, "Error creating project!");
                             };
-                            const save_path = std.fmt.allocPrint(allocator, "{s}/project", .{folder_path}) catch {
-                                setStatus(&state, "Memory error!");
-                                continue;
-                            };
-                            defer allocator.free(save_path);
-                            state.project_manager.saveProject(save_path) catch |err| {
+                            state.project_manager.saveProject(folder_path) catch |err| {
                                 std.log.err("Error saving project: {}", .{err});
                                 setStatus(&state, "Error saving project!");
                             };
@@ -426,10 +418,10 @@ pub fn main() !void {
                     }
                 }
                 if (zgui.button("Open Project...", .{ .w = 150 })) {
-                    if (nfd.openFileDialog("labelle", null)) |maybe_path| {
-                        if (maybe_path) |file_path| {
-                            defer nfd.freePath(file_path);
-                            state.project_manager.loadProject(file_path) catch |err| {
+                    if (nfd.openFolderDialog(null)) |maybe_path| {
+                        if (maybe_path) |folder_path| {
+                            defer nfd.freePath(folder_path);
+                            state.project_manager.loadProject(folder_path) catch |err| {
                                 std.log.err("Error loading project: {}", .{err});
                                 setStatus(&state, "Error loading project!");
                             };
@@ -437,7 +429,7 @@ pub fn main() !void {
                             state.tree_view.refresh();
                         }
                     } else |_| {
-                        setStatus(&state, "Error opening file dialog!");
+                        setStatus(&state, "Error opening folder dialog!");
                     }
                 }
             }
@@ -512,8 +504,8 @@ pub fn main() !void {
                 zgui.text("{s}", .{status});
             } else {
                 if (state.project_manager.current_project) |proj| {
-                    if (proj.path) |path| {
-                        zgui.text("{s}", .{path});
+                    if (proj.dir) |dir| {
+                        zgui.text("{s}", .{dir});
                     } else {
                         zgui.text("Unsaved project", .{});
                     }
