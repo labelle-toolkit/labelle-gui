@@ -55,7 +55,14 @@ pub const App = struct {
     /// `closeAllScenes` runs on project transitions.
     open_scenes: std.ArrayList(scene_mod.SceneState) = .{},
     /// Which tab is foregrounded. null when no scenes are open.
+    /// Updated each frame from whichever tab ImGui reports active.
     active_scene_idx: ?usize = null,
+    /// One-shot: when set, the next `renderSceneTabs` forces this tab
+    /// to be active via ImGui's `set_selected` flag, then clears the
+    /// field. `set_selected` is one-shot in ImGui — applying it every
+    /// frame would re-force the same tab and prevent the user from
+    /// switching by clicking other tabs.
+    focus_tab_idx: ?usize = null,
     /// Set when the user clicks the × on a dirty tab. While non-null
     /// the close-confirmation dialog is shown and other tabs can't be
     /// closed.
@@ -115,14 +122,16 @@ pub const App = struct {
     pub fn openScene(self: *Self, path: []const u8) !void {
         for (self.open_scenes.items, 0..) |s, i| {
             if (std.mem.eql(u8, s.path, path)) {
-                self.active_scene_idx = i;
+                self.focus_tab_idx = i; // bring the existing tab forward once
                 return;
             }
         }
         var state = try scene_mod.SceneState.open(self.allocator, path);
         errdefer state.deinit(self.allocator);
         try self.open_scenes.append(self.allocator, state);
-        self.active_scene_idx = self.open_scenes.items.len - 1;
+        const new_idx = self.open_scenes.items.len - 1;
+        self.active_scene_idx = new_idx;
+        self.focus_tab_idx = new_idx;
     }
 
     /// Close the tab at `idx` unconditionally. Caller is responsible
@@ -169,6 +178,7 @@ pub const App = struct {
         for (self.open_scenes.items) |*s| s.deinit(self.allocator);
         self.open_scenes.clearRetainingCapacity();
         self.active_scene_idx = null;
+        self.focus_tab_idx = null;
         self.pending_close_idx = null;
     }
 
@@ -429,18 +439,32 @@ pub const App = struct {
         })) return;
         defer zgui.endTabBar();
 
+        // Consume the one-shot focus request *before* the loop so each
+        // tab sees the same value and we don't re-apply it next frame.
+        const focus = self.focus_tab_idx;
+        self.focus_tab_idx = null;
+
         var to_close: ?usize = null;
 
         for (self.open_scenes.items, 0..) |*s, i| {
             // Disambiguate tabs by full path so two scenes with the
             // same stem (across projects or fragments) get distinct
             // imgui IDs. `unsaved_document` puts ImGui's own marker
-            // on dirty tabs.
-            var label_buf: [512]u8 = undefined;
+            // on dirty tabs. Buffer is sized for the longest plausible
+            // absolute path (`std.fs.max_path_bytes`, which is 4096 on
+            // Linux + larger limits on macOS) plus slack for the label
+            // prefix; smaller buffers silently dropped the tab when
+            // pointed at deeply-nested project paths.
+            var label_buf: [std.fs.max_path_bytes + 256]u8 = undefined;
             const label = std.fmt.bufPrintZ(&label_buf, "{s}##{s}", .{ s.display_name, s.path }) catch continue;
 
             var open: bool = true;
-            const set_selected = self.active_scene_idx != null and self.active_scene_idx.? == i;
+            // `set_selected` is one-shot in ImGui — fire it only when
+            // we explicitly want to bring a tab forward (just-opened
+            // or re-focused via tree click on an already-open scene).
+            // Applying it every frame creates a feedback loop that
+            // prevents the user from switching tabs by clicking.
+            const set_selected = focus != null and focus.? == i;
             const flags: zgui.TabItemFlags = .{ .set_selected = set_selected, .unsaved_document = s.is_dirty };
             if (zgui.beginTabItem(label, .{ .p_open = &open, .flags = flags })) {
                 self.active_scene_idx = i;
