@@ -145,9 +145,10 @@ fn drawEntities(
         const selected = state.selected_idx.* == i;
 
         // Render priority: sprite (when it resolves against the
-        // atlas) > rectangle geometry > circle geometry > colored-
-        // circle marker. A declared-but-unresolved sprite still gets
-        // a `?` overlay on whatever fallback it falls into.
+        // atlas) > rectangle geometry > circle geometry > polygon
+        // geometry > colored-circle marker. A declared-but-unresolved
+        // sprite still gets a `?` overlay on whatever fallback it
+        // falls into.
         const drew_sprite = drawSpriteIfResolved(dl, e, px, py, state.zoom.*, atlas_index);
         var drew_visual = drew_sprite;
         if (!drew_visual and e.rectangle != null) {
@@ -156,6 +157,10 @@ fn drawEntities(
         }
         if (!drew_visual and e.circle != null) {
             drawCircle(dl, e.circle.?.*, px, py, state.zoom.*);
+            drew_visual = true;
+        }
+        if (!drew_visual and e.polygon != null) {
+            drawPolygon(dl, e.polygon.?.*, px, py, state.zoom.*);
             drew_visual = true;
         }
         if (!drew_visual) {
@@ -295,6 +300,52 @@ fn drawCircle(dl: zgui.DrawList, circle: scene_io.Circle, px: f32, py: f32, zoom
             .r = r,
             .col = col,
             .num_segments = 32,
+            .thickness = 1.5,
+        });
+    }
+}
+
+/// Draw a `Polygon` geometry component anchored on `(px, py)` in
+/// screen space, scaled by `zoom`. Each point is world-space relative
+/// to the entity's position; the projection mirrors what `drawEntities`
+/// does for the entity marker itself (X scales linearly with zoom; Y
+/// is flipped because world +y is up and screen +y is down).
+///
+/// Filled rendering uses `addConvexPolyFilled` — **only correct for
+/// convex polygons**. Authors of non-convex shapes (L-shapes, stars,
+/// etc.) should set `filled: false`; the outline path uses a closed
+/// polyline which handles both convex and concave geometry. Two or
+/// fewer points fall back to an outline only because a filled poly
+/// would degenerate. Empty polygons render nothing at all.
+fn drawPolygon(dl: zgui.DrawList, poly: scene_io.Polygon, px: f32, py: f32, zoom: f32) void {
+    if (poly.point_count == 0) return;
+
+    // Project up to `polygon_max_points` points into a fixed-size
+    // stack buffer. Matches the source-of-truth cap on `Polygon`
+    // itself, so no allocator is needed.
+    var pts: [scene_io.polygon_max_points][2]f32 = undefined;
+    var i: u32 = 0;
+    while (i < poly.point_count) : (i += 1) {
+        pts[i][0] = px + poly.points[i].x * zoom;
+        pts[i][1] = py - poly.points[i].y * zoom;
+    }
+    const live = pts[0..poly.point_count];
+
+    // ImGui colors are 0xAABBGGRR. Build it from the u8 RGBA fields.
+    const col: u32 = (@as(u32, poly.a) << 24) |
+        (@as(u32, poly.b) << 16) |
+        (@as(u32, poly.g) << 8) |
+        @as(u32, poly.r);
+
+    if (poly.filled and poly.point_count >= 3) {
+        dl.addConvexPolyFilled(live, col);
+    } else {
+        // Closed polyline so the last segment connects back to the
+        // first vertex. For 1–2 points this still gives the user a
+        // visual cue (point or line) while they finish authoring.
+        dl.addPolyline(live, .{
+            .col = col,
+            .flags = .{ .closed = poly.point_count >= 3 },
             .thickness = 1.5,
         });
     }

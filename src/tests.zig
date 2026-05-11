@@ -1103,6 +1103,116 @@ pub const SceneIoTests = struct {
         defer loaded.deinit();
         try expect.toBeTrue(loaded.scene.entities[0].position == null);
     }
+
+    test "Polygon round-trips with points + color + filled through a prefab" {
+        // Geometry slice 3 (issue #6): a prefab carrying a Polygon
+        // component must parse into the typed model with every field
+        // populated, and the writer must emit it back in the same
+        // shape — `points` as an array of `{x,y}` objects, color as a
+        // nested object, filled as bool. Polygon is managed so it
+        // must NOT leak into component_extras.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "components": {
+            \\        "Polygon": { "points": [ { "x": 0, "y": 0 }, { "x": 10, "y": 0 }, { "x": 5, "y": 8 } ], "color": { "r": 200, "g": 50, "b": 25, "a": 240 }, "filled": false }
+            \\    }
+            \\}
+        ;
+        var loaded = try scene_io.parsePrefab(allocator, src);
+        defer loaded.deinit();
+
+        const poly = loaded.entity.polygon orelse return error.MissingPolygon;
+        try expect.equal(poly.point_count, 3);
+        try expect.equal(poly.points[0].x, 0);
+        try expect.equal(poly.points[1].x, 10);
+        try expect.equal(poly.points[2].y, 8);
+        try expect.equal(poly.r, 200);
+        try expect.equal(poly.g, 50);
+        try expect.equal(poly.b, 25);
+        try expect.equal(poly.a, 240);
+        try expect.toBeFalse(poly.filled);
+
+        try expect.equal(loaded.component_extras.len, 0);
+
+        const text = try scene_io.renderPrefabJsonc(allocator, loaded);
+        defer allocator.free(text);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Polygon\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"points\":") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"x\": 10") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"filled\": false") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"r\": 200") != null);
+
+        // Re-parse the rendered output — same shape, same values.
+        var loaded2 = try scene_io.parsePrefab(allocator, text);
+        defer loaded2.deinit();
+        const poly2 = loaded2.entity.polygon orelse return error.MissingPolygon;
+        try expect.equal(poly2.point_count, 3);
+        try expect.equal(poly2.points[2].y, 8);
+        try expect.equal(poly2.b, 25);
+        try expect.toBeFalse(poly2.filled);
+    }
+
+    test "Polygon add + remove point survives a save / load round-trip" {
+        // The inspector's add-point / remove-point actions mutate the
+        // fixed-cap inline buffer in place. The saved output must
+        // reflect whatever the live slice (`points[0..point_count]`)
+        // contains at save time — not the original parsed source.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{ "components": { "Polygon": { "points": [ { "x": 0, "y": 0 }, { "x": 1, "y": 1 } ], "color": { "r": 0, "g": 0, "b": 0, "a": 255 }, "filled": true } } }
+        ;
+        var loaded = try scene_io.parsePrefab(allocator, src);
+        defer loaded.deinit();
+        const poly = loaded.entity.polygon orelse return error.MissingPolygon;
+        try expect.equal(poly.point_count, 2);
+
+        // Add a point.
+        poly.points[poly.point_count] = .{ .x = 7, .y = 9 };
+        poly.point_count += 1;
+        try expect.equal(poly.point_count, 3);
+
+        // Remove the first point (shift tail down — same path the
+        // inspector takes when the user clicks `×` on row 0).
+        var k: u32 = 0;
+        while (k + 1 < poly.point_count) : (k += 1) {
+            poly.points[k] = poly.points[k + 1];
+        }
+        poly.point_count -= 1;
+
+        const text = try scene_io.renderPrefabJsonc(allocator, loaded);
+        defer allocator.free(text);
+        // Original `(0, 0)` first point must be gone; the appended
+        // `(7, 9)` must be present.
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"x\": 7") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"y\": 9") != null);
+
+        var loaded2 = try scene_io.parsePrefab(allocator, text);
+        defer loaded2.deinit();
+        const poly2 = loaded2.entity.polygon orelse return error.MissingPolygon;
+        try expect.equal(poly2.point_count, 2);
+        try expect.equal(poly2.points[0].x, 1);
+        try expect.equal(poly2.points[1].x, 7);
+    }
+
+    test "edit Polygon color in memory; saved output reflects it" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{ "components": { "Polygon": { "points": [], "color": { "r": 0, "g": 0, "b": 0, "a": 255 }, "filled": true } } }
+        ;
+        var loaded = try scene_io.parsePrefab(allocator, src);
+        defer loaded.deinit();
+        const poly = loaded.entity.polygon orelse return error.MissingPolygon;
+        poly.r = 128;
+        poly.g = 64;
+        poly.filled = false;
+
+        const text = try scene_io.renderPrefabJsonc(allocator, loaded);
+        defer allocator.free(text);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"r\": 128") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"g\": 64") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"filled\": false") != null);
+    }
 };
 
 pub const AtlasJsonTests = struct {

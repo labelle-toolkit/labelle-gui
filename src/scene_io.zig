@@ -75,6 +75,42 @@ pub const Circle = struct {
     filled: bool = true,
 };
 
+/// Hard cap on how many points a single `Polygon` component can hold.
+/// We use a fixed-capacity inline array instead of an arena-grown slice
+/// so the inspector can add/remove points without re-allocating in the
+/// LoadedScene/LoadedPrefab arena. 64 is well above what any hand-
+/// authored geometry needs (real-world platformer collision polys top
+/// out around a dozen vertices); if a future use case wants more, bump
+/// the cap or migrate to an arena-realloc strategy.
+pub const polygon_max_points: u32 = 64;
+
+/// Typed model of the `Polygon` geometry component (issue #6, slice 3).
+/// Shape on disk:
+/// `{ "points": [ { "x": N, "y": N }, ... ], "color": { "r": .., "g": .., "b": .., "a": .. }, "filled": bool }`
+///
+/// Points are world-space offsets from the entity's `Position`. Color
+/// matches labelle-gfx's u8 RGBA convention so values flow straight
+/// through to the engine's renderer.
+///
+/// Storage: fixed-capacity inline buffer (`polygon_max_points`) with a
+/// `point_count` cursor. The inspector can add/remove points in place
+/// without touching the arena — same lifecycle story as `Sprite`'s
+/// inline char buffers. `points[0..point_count]` is the live slice;
+/// entries beyond `point_count` are undefined and must not be read.
+pub const Polygon = struct {
+    points: [polygon_max_points]Position = [_]Position{.{}} ** polygon_max_points,
+    point_count: u32 = 0,
+    r: u8 = 255,
+    g: u8 = 255,
+    b: u8 = 255,
+    a: u8 = 255,
+    filled: bool = true,
+
+    pub fn livePoints(self: *const Polygon) []const Position {
+        return self.points[0..self.point_count];
+    }
+};
+
 pub const Entity = struct {
     prefab: ?[]const u8 = null,
     /// Parsed once on load; viewport reads it when drawing the entity
@@ -92,6 +128,11 @@ pub const Entity = struct {
     /// Typed `Circle` geometry component (issue #6). Same
     /// arena-ownership story as `sprite`.
     circle: ?*Circle = null,
+    /// Typed `Polygon` geometry component (issue #6, slice 3). Same
+    /// arena-ownership story as `sprite`: the struct itself lives in
+    /// the arena, but its fixed-cap point buffer lives inline so
+    /// adding / removing points doesn't need a realloc.
+    polygon: ?*Polygon = null,
     /// Leading `//` comments captured from the source file, attached
     /// to the first entity that follows them — same rule we use for
     /// project.labelle pass-through. Lines keep their `//` markers and
@@ -227,6 +268,7 @@ pub fn parsePrefab(allocator: std.mem.Allocator, raw: []const u8) !LoadedPrefab 
         .sprite = try readSprite(arena.allocator(), parsed.value.components),
         .rectangle = try readRectangle(arena.allocator(), parsed.value.components),
         .circle = try readCircle(arena.allocator(), parsed.value.components),
+        .polygon = try readPolygon(arena.allocator(), parsed.value.components),
     };
 
     // Re-use the entity-body scanner — walks `{ ... }`, finds the
@@ -247,6 +289,7 @@ pub fn parsePrefab(allocator: std.mem.Allocator, raw: []const u8) !LoadedPrefab 
             .sprite = try readSprite(arena.allocator(), c.components),
             .rectangle = try readRectangle(arena.allocator(), c.components),
             .circle = try readCircle(arena.allocator(), c.components),
+            .polygon = try readPolygon(arena.allocator(), c.components),
         };
         if (i < child_comments.len) {
             buf.writeZeroed(&children[i].comment, child_comments[i]);
@@ -308,6 +351,11 @@ pub fn renderPrefabJsonc(allocator: std.mem.Allocator, loaded: LoadedPrefab) ![]
         _ = try emitCircle(&w, ci.*);
         first = false;
     }
+    if (loaded.entity.polygon) |po| {
+        if (!first) try w.writeAll(",");
+        _ = try emitPolygon(&w, po.*);
+        first = false;
+    }
     for (loaded.component_extras) |extra| {
         if (!first) try w.writeAll(",");
         try w.print(" \"{s}\": {s}", .{ extra.name, extra.value_text });
@@ -342,6 +390,7 @@ pub fn renderPrefabJsonc(allocator: std.mem.Allocator, loaded: LoadedPrefab) ![]
                 child.sprite != null or
                 child.rectangle != null or
                 child.circle != null or
+                child.polygon != null or
                 cextras.len > 0;
             if (has_components) {
                 if (!c_first) try w.writeAll(",");
@@ -364,6 +413,11 @@ pub fn renderPrefabJsonc(allocator: std.mem.Allocator, loaded: LoadedPrefab) ![]
                 if (child.circle) |ci| {
                     if (!cc_first) try w.writeAll(",");
                     _ = try emitCircle(&w, ci.*);
+                    cc_first = false;
+                }
+                if (child.polygon) |po| {
+                    if (!cc_first) try w.writeAll(",");
+                    _ = try emitPolygon(&w, po.*);
                     cc_first = false;
                 }
                 for (cextras) |extra| {
@@ -434,6 +488,7 @@ pub fn parseScene(allocator: std.mem.Allocator, raw: []const u8) !LoadedScene {
             .sprite = try readSprite(arena.allocator(), e.components),
             .rectangle = try readRectangle(arena.allocator(), e.components),
             .circle = try readCircle(arena.allocator(), e.components),
+            .polygon = try readPolygon(arena.allocator(), e.components),
         };
         // Comments are extracted on a best-effort basis: if the scanner
         // landed fewer entries than parser saw entities (recovery from
@@ -555,6 +610,43 @@ fn readCircle(arena: std.mem.Allocator, components: ?std.json.Value) !?*Circle {
     return out;
 }
 
+/// Read a `Polygon` component out of the parsed `components` object,
+/// allocating into `arena`. Returns null when the entity has no
+/// `Polygon` key. Points beyond `polygon_max_points` are dropped with
+/// no warning — the cap is documented on `Polygon` itself; in practice
+/// no hand-authored geometry hits it.
+fn readPolygon(arena: std.mem.Allocator, components: ?std.json.Value) !?*Polygon {
+    const c = components orelse return null;
+    if (c != .object) return null;
+    const p_val = c.object.get("Polygon") orelse return null;
+    if (p_val != .object) return null;
+
+    const out = try arena.create(Polygon);
+    out.* = .{};
+    if (p_val.object.get("points")) |pts| if (pts == .array) {
+        var n: u32 = 0;
+        for (pts.array.items) |item| {
+            if (n >= polygon_max_points) break;
+            if (item != .object) continue;
+            const x = jsonNumberAsF32(item.object.get("x")) orelse 0;
+            const y = jsonNumberAsF32(item.object.get("y")) orelse 0;
+            out.points[n] = .{ .x = x, .y = y };
+            n += 1;
+        }
+        out.point_count = n;
+    };
+    if (p_val.object.get("color")) |col| if (col == .object) {
+        if (jsonNumberAsU8(col.object.get("r"))) |x| out.r = x;
+        if (jsonNumberAsU8(col.object.get("g"))) |x| out.g = x;
+        if (jsonNumberAsU8(col.object.get("b"))) |x| out.b = x;
+        if (jsonNumberAsU8(col.object.get("a"))) |x| out.a = x;
+    };
+    if (p_val.object.get("filled")) |v| if (v == .bool) {
+        out.filled = v.bool;
+    };
+    return out;
+}
+
 /// Emit `s` as a JSON-escaped string literal (`"..."`) into `writer`.
 /// Handles the escapes the JSON spec requires for byte values < 0x20
 /// plus the two embeddable bytes (`"` and `\`); leaves the rest of
@@ -651,6 +743,32 @@ fn emitCircle(writer: anytype, circle: Circle) !bool {
         circle.r, circle.g, circle.b, circle.a,
     });
     try writer.print(" \"filled\": {s}", .{if (circle.filled) "true" else "false"});
+    try writer.writeAll(" }");
+    return true;
+}
+
+/// Emit `"Polygon": { ... }` into `writer` from the typed polygon
+/// fields. Same comma-management contract as `emitSprite`. We always
+/// emit `points`, `color`, and `filled` so the file is self-describing
+/// — an empty point list still renders `"points": []`, which makes
+/// the disk shape obvious and lets the inspector show what was saved
+/// without inferring defaults.
+fn emitPolygon(writer: anytype, poly: Polygon) !bool {
+    try writer.writeAll(" \"Polygon\": {");
+    try writer.writeAll(" \"points\": [");
+    var first_pt = true;
+    var i: u32 = 0;
+    while (i < poly.point_count) : (i += 1) {
+        if (!first_pt) try writer.writeAll(",");
+        try writer.print(" {{ \"x\": {d}, \"y\": {d} }}", .{ poly.points[i].x, poly.points[i].y });
+        first_pt = false;
+    }
+    if (poly.point_count == 0) try writer.writeAll(" ");
+    try writer.writeAll(" ],");
+    try writer.print(" \"color\": {{ \"r\": {d}, \"g\": {d}, \"b\": {d}, \"a\": {d} }},", .{
+        poly.r, poly.g, poly.b, poly.a,
+    });
+    try writer.print(" \"filled\": {s}", .{if (poly.filled) "true" else "false"});
     try writer.writeAll(" }");
     return true;
 }
@@ -1015,7 +1133,8 @@ fn extractComponentExtras(arena: std.mem.Allocator, entity_body: []const u8) ![]
         const is_managed = std.mem.eql(u8, key, "Position") or
             std.mem.eql(u8, key, "Sprite") or
             std.mem.eql(u8, key, "Rectangle") or
-            std.mem.eql(u8, key, "Circle");
+            std.mem.eql(u8, key, "Circle") or
+            std.mem.eql(u8, key, "Polygon");
         if (!is_managed) {
             try out.append(arena, .{
                 .name = try arena.dupe(u8, key),
@@ -1191,6 +1310,7 @@ pub fn renderSceneJsonc(allocator: std.mem.Allocator, loaded: LoadedScene) ![]u8
             e.sprite != null or
             e.rectangle != null or
             e.circle != null or
+            e.polygon != null or
             extras.len > 0;
         if (has_components) {
             if (!first) try w.writeAll(",");
@@ -1213,6 +1333,11 @@ pub fn renderSceneJsonc(allocator: std.mem.Allocator, loaded: LoadedScene) ![]u8
             if (e.circle) |ci| {
                 if (!c_first) try w.writeAll(",");
                 _ = try emitCircle(&w, ci.*);
+                c_first = false;
+            }
+            if (e.polygon) |po| {
+                if (!c_first) try w.writeAll(",");
+                _ = try emitPolygon(&w, po.*);
                 c_first = false;
             }
             for (extras) |extra| {
