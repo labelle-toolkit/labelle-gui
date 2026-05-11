@@ -25,9 +25,11 @@ zig build smoke     # end-to-end against the real `labelle` launcher — env-dep
 | `src/main.zig` | GLFW init, window + GL context, font + DPI setup, frame loop. Delegates per-frame UI to `App.renderFrame()`. Stays slim on purpose. |
 | `src/app.zig` | `App` struct: owns `ProjectManager`, `Compiler`, `TreeView`, status bar, dialog state, and the `Module.Registry`. `App.renderFrame()` is the single function the test runner can call to drive the real UI. |
 | `src/module.zig` | `Module` and `Registry` (issue #22). Modules expose a togglable panel; the Registry renders the View menu and dispatches `render_panel(*App)` for every open module. Each module's `is_open` points into App state so the menu toggle and the panel's `popen` flag are the same memory. |
-| `src/modules/` | One file per togglable panel. Each exports `makeModule(*App) module.Module` and gets appended to `App.modules` in `App.init`. Current: `compiler_output`, `project_settings`, `project_tree`, `resources`. The Scene editor lives here too but is *not* registered as a togglable panel — it opens as a tab via tree-click. |
+| `src/modules/` | One file per togglable panel. Each exports `makeModule(*App) module.Module` and gets appended to `App.modules` in `App.init`. Current togglable panels: `compiler_output`, `project_settings`, `project_tree`, `resources`. The `scene` and `prefab` editors live here too but are *not* registered as togglable panels — they open as tabs via tree-click. `viewport.zig` and `inspector.zig` are shared widgets (not modules) used by both editors. |
 | `src/dialogs/` | Modal popups — transient, not part of the Registry because they're not togglable panels. Each exports `pub fn render(*App) void` called once per frame from `App.renderFrame`. Current: `new_scene`, `dpi_warning`, `close_scene` (unsaved-tab confirmation). |
 | `src/project.zig` | `ProjectConfig` (mirrors a subset of `labelle-assembler/src/config.zig:ProjectConfig`), `ProjectManager`, `project.labelle` read/write. Each `Project` owns an `ArenaAllocator` so the parsed config strings free uniformly in `deinit`. |
+| `src/scene_io.zig` | JSONC scene/prefab loader + writer. Typed `Sprite` and `Position` components round-trip as managed fields; everything else is captured as verbatim `component_extras` / `TopLevelExtra` so unknown keys survive a save. `LoadedScene` and `LoadedPrefab` both own a parse arena. |
+| `src/atlas.zig` | Per-project atlas index. Walks `ProjectConfig.resources`, parses each TexturePacker JSON, decodes the PNG via `zstbi`, uploads a GL texture, and folds all sprite names into one combined lookup. Owned by `App` and keyed by `ProjectManager.generation` — invalidated on project new/load/close. The inspector uses it to flag missing `sprite_name`; the viewport uses it to draw the real atlas frame as a textured quad. |
 | `src/compiler.zig` | Wraps `labelle generate/build/run` as a child process. `syncProjectFiles` calls `ProjectManager.saveProject`. `buildOrRun` spawns; `pollBuild` waits and captures stdout/stderr. |
 | `src/tree_view.zig` | Project tree widget. |
 | `src/tests.zig` | zspec test root; covers `ProjectConfig`, `ProjectManager`, scaffold folders, save/load round-trip, `Compiler` state. |
@@ -101,12 +103,20 @@ Both editors have a two-column layout: viewport on the left, inspector
 on the right. The shared `modules/viewport.zig` draws entity markers
 on a pan/zoom canvas, handles hit-test, and drives drag-to-move; the
 shared `modules/inspector.zig` renders one entity's editable surface.
+Both take an optional `*const atlas.Index` so they can resolve typed
+`Sprite` components against the active project's atlases: the viewport
+draws the resolved frame as a textured quad with pivot-aware placement
+(falling back to a coloured marker plus a `?` overlay when a Sprite is
+declared but unresolved), and the inspector shows a `(missing)` hint
+next to `sprite_name` when the index can't find it. World +y is up
+(Y-axis flipped from screen space).
 
 - Scene tab → viewport operates on `loaded.scene.entities`.
 - Prefab tab → viewport operates on `loaded.children` (sub-entities
-  with their own Position + components). The prefab's own components
-  live on `loaded.entity`; when nothing is selected in the viewport
-  the inspector shows them, otherwise it shows the selected child.
+  with their own Position + components — e.g. hydroponics room tiles
+  drag-to-move). The prefab's own components live on `loaded.entity`;
+  when nothing is selected in the viewport the inspector shows them,
+  otherwise it shows the selected child.
 
 Sub-entities nested inside a component value (e.g. `Room.workstations`)
 ride along as part of the parent component's verbatim extras — not
