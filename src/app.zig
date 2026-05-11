@@ -254,6 +254,13 @@ pub const App = struct {
         );
     }
 
+    /// Refresh the per-project gizmo overlay index after an in-session
+    /// gizmo file edit/save so scene/prefab overlays update without
+    /// requiring a full project reload.
+    pub fn refreshGizmoIndex(self: *Self) void {
+        self.rebuildGizmoIndex();
+    }
+
     // ─── Scene tabs ─────────────────────────────────────────────────────
 
     /// Open a `.jsonc` scene file (under `<project>/scenes/`) as a
