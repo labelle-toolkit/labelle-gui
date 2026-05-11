@@ -4,24 +4,24 @@
     .fingerprint = 0x3fd05a33857eec15,
     .dependencies = .{
         .zgui = .{
-            .url = "https://github.com/zig-gamedev/zgui/archive/refs/heads/main.tar.gz",
-            .hash = "zgui-0.6.0-dev--L6sZBHybQAZLl719GjSlogZC3MhuGRf4wI48tjbnW3z",
+            .url = "https://github.com/zig-gamedev/zgui/archive/f1c6c5bab.tar.gz",
+            .hash = "zgui-0.6.0-dev--L6sZCLzbQBM1I4oIbtd5_ClKk9rNExPOCYkCMP_TZad",
         },
         .zglfw = .{
-            .url = "https://github.com/zig-gamedev/zglfw/archive/refs/heads/main.tar.gz",
-            .hash = "zglfw-0.10.0-dev-zgVDNHO2IQDy_fSdwY5U4z42rHUuKgt7T9f-qmQ3FnuL",
+            .url = "https://github.com/zig-gamedev/zglfw/archive/0dd29d807.tar.gz",
+            .hash = "zglfw-0.10.0-dev-zgVDNIG4IQBWN_sfMD-xfC9bJS2hbBN2W7jNlDLovcdC",
         },
         .zopengl = .{
-            .url = "https://github.com/zig-gamedev/zopengl/archive/refs/heads/main.tar.gz",
-            .hash = "zopengl-0.6.0-dev-5-tnz6-mCgD65lY7NrNAU4haXCpVHUpTUEznTwfmBB96",
+            .url = "https://github.com/zig-gamedev/zopengl/archive/db9d615c7.tar.gz",
+            .hash = "zopengl-0.6.0-dev-5-tnz36mDgBuU9pDfag6_B-qCWOJQc5GXiXuZ6z41zQM",
         },
         .nfd = .{
             .url = "https://github.com/fabioarnold/nfd-zig/archive/refs/heads/master.tar.gz",
-            .hash = "nfdzig-0.1.0-11fxvN6IBgD5rvvfjrw1wPqibMsbUJ-h2ZcGR6FOEvrm",
+            .hash = "nfd-0.1.0-y82kbsSLBgBgSEauGFsHxH7RmcL4AEOqZEqOvA8-NEFq",
         },
         .zspec = .{
             .url = "https://github.com/apotema/zspec/archive/refs/heads/main.tar.gz",
-            .hash = "zspec-0.3.0-jaKLbbqZAgAB-MBfy6M3HKB3jSTQ-TsNW9OxpLhLlav5",
+            .hash = "zspec-0.8.0-jaKLbSK-AwD6myJjkg3OfGAKJyj5iaFzFfVu-pcUsUn1",
         },
     },
     .paths = .{

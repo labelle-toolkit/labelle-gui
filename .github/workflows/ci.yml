@@ -9,7 +9,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    name: Build & Test (Linux)
+    name: Build & Unit Tests (Linux)
 
     steps:
       - name: Checkout
@@ -18,7 +18,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.1
+          version: 0.15.2
 
       - name: Install dependencies
         run: |
@@ -28,7 +28,7 @@ jobs:
       - name: Build
         run: zig build -Dcpu=baseline
 
-      - name: Unit Tests
+      - name: Unit Tests (zspec)
         run: zig build test -Dcpu=baseline
 
       - name: Upload artifact
@@ -38,9 +38,43 @@ jobs:
           path: zig-out/bin/
           if-no-files-found: error
 
-  gui-test:
+  # ImGui Test Engine harness — `zig build gui-test`. Drives real menu
+  # actions against a hidden GLFW window and asserts on App state. Still
+  # needs an X display on Linux because zglfw.init touches X even with
+  # the window kept invisible.
+  ui-tests:
     runs-on: ubuntu-latest
-    name: GUI Smoke Test
+    name: ImGui Test Engine
+    needs: build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libgtk-3-dev libgl1-mesa-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev
+
+      - name: Run UI tests under Xvfb
+        run: |
+          export DISPLAY=:99
+          Xvfb :99 -screen 0 1280x720x24 &
+          sleep 1
+          zig build gui-test -Dcpu=baseline
+
+  # Process-launch sanity check — confirms the production binary starts,
+  # doesn't crash for a few seconds, and renders something. Separate from
+  # `zig build gui-test` because that runs a *different* binary (the
+  # test runner) that has its own with-test-engine zgui module.
+  launch-check:
+    runs-on: ubuntu-latest
+    name: Launch Smoke (Linux)
     needs: build
 
     steps:
@@ -70,7 +104,7 @@ jobs:
             wmctrl \
             imagemagick
 
-      - name: Run GUI Smoke Test
+      - name: Launch and screenshot
         run: |
           # Start Xvfb
           export DISPLAY=:99
@@ -96,7 +130,7 @@ jobs:
             kill $APP_PID 2>/dev/null || true
             wait $APP_PID 2>/dev/null || true
 
-            echo "GUI test passed!"
+            echo "Launch smoke passed!"
             exit 0
           else
             echo "FAILED: Application did not start or crashed"
@@ -107,6 +141,6 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: gui-test-screenshot
+          name: launch-screenshot
           path: screenshot.png
           if-no-files-found: ignore
