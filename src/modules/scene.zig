@@ -1,7 +1,9 @@
 //! Scene module — togglable panel that lists `<project>/scenes/*.jsonc`,
 //! parses a selected scene, and renders entity positions in a 2D
-//! viewport. Read-only for this slice; editing (selection, drag-to-move,
-//! save-back) is a follow-up.
+//! viewport. Supports in-memory editing (selection, drag-to-move,
+//! per-entity comment + position inputs); save-back to disk is a
+//! separate slice (needs a JSONC writer that preserves comments and
+//! unmodeled components).
 //!
 //! Memory model: the loaded scene owns an arena (see `scene_io.zig`)
 //! that lives across frames until the user picks another scene or
@@ -35,6 +37,11 @@ pub const SceneState = struct {
     /// on scene reload. Save-back is a separate slice; for now this is
     /// just a visual indicator that changes haven't been persisted.
     is_dirty: bool = false,
+    /// True between mouse-down on a selected entity and mouse-up. Gates
+    /// drag-to-move so dragging in empty canvas space (or starting a
+    /// drag from a non-hit spot) doesn't move the previously selected
+    /// entity by accident.
+    drag_armed: bool = false,
     /// Viewport pan / zoom state (world-space offset + scale factor).
     pan: [2]f32 = .{ 320, 240 },
     zoom: f32 = 1.0,
@@ -176,6 +183,9 @@ fn maybeLoadSelected(s: *SceneState, proj: *project.Project) void {
 
     s.loaded = scene_io.loadFromFile(proj.allocator, path) catch |err| {
         std.log.warn("Scene module: failed to load {s}: {s}", .{ path, @errorName(err) });
+        // Clear both names so we don't retry-and-log every frame.
+        // The user can re-click the entry to attempt a fresh load.
+        @memset(&s.selected_name, 0);
         @memset(&s.loaded_name, 0);
         return;
     };
@@ -323,6 +333,20 @@ fn renderViewport(s: *SceneState, loaded: scene_io.LoadedScene) void {
     // Invisible button covering the canvas catches all mouse events.
     _ = zgui.invisibleButton("##canvas_drag", .{ .w = canvas_size[0], .h = canvas_size[1], .flags = .{} });
 
+    // Mouse-down: hit-test entity markers, update selection, and arm
+    // drag-to-move only when the click landed on an entity. Done
+    // *before* the drag handler so `drag_armed` reflects this frame's
+    // click before any drag-delta is consumed.
+    if (zgui.isItemHovered(.{}) and zgui.isMouseClicked(.left)) {
+        const mouse = zgui.getMousePos();
+        const hit = hitTestEntity(loaded.scene.entities, mouse, canvas_min, s.pan, s.zoom);
+        s.selected_index = hit;
+        s.drag_armed = hit != null;
+    }
+    // Disarm when the left button is released, even if the drag ended
+    // outside the canvas item.
+    if (!zgui.isMouseDown(.left)) s.drag_armed = false;
+
     if (zgui.isItemActive()) {
         // Pan with middle-button drag.
         if (zgui.isMouseDragging(.middle, 0)) {
@@ -331,28 +355,24 @@ fn renderViewport(s: *SceneState, loaded: scene_io.LoadedScene) void {
             s.pan[1] += d[1];
             zgui.resetMouseDragDelta(.middle);
         }
-        // Drag-to-move on the selected entity with left-button drag.
-        if (s.selected_index) |idx| {
-            if (idx < loaded.scene.entities.len and zgui.isMouseDragging(.left, 0)) {
-                const e = &loaded.scene.entities[idx];
-                if (e.position) |*pos| {
-                    const d = zgui.getMouseDragDelta(.left, .{});
-                    pos.x += d[0] / s.zoom;
-                    pos.y += d[1] / s.zoom;
-                    s.is_dirty = true;
-                    zgui.resetMouseDragDelta(.left);
+        // Drag-to-move on the selected entity with left-button drag —
+        // only when the drag was armed by a click on the entity itself,
+        // so a click in empty space (which deselects) followed by a drag
+        // doesn't drag the previously-selected entity.
+        if (s.drag_armed) {
+            if (s.selected_index) |idx| {
+                if (idx < loaded.scene.entities.len and zgui.isMouseDragging(.left, 0)) {
+                    const e = &loaded.scene.entities[idx];
+                    if (e.position) |*pos| {
+                        const d = zgui.getMouseDragDelta(.left, .{});
+                        pos.x += d[0] / s.zoom;
+                        pos.y += d[1] / s.zoom;
+                        s.is_dirty = true;
+                        zgui.resetMouseDragDelta(.left);
+                    }
                 }
             }
         }
-    }
-
-    // Click without drag: hit-test against entity markers and update
-    // selection. `isMouseClicked(left)` fires only on the frame the
-    // button goes down — the drag handler above takes over for any
-    // sustained press, so this doesn't fight the drag.
-    if (zgui.isItemHovered(.{}) and zgui.isMouseClicked(.left)) {
-        const mouse = zgui.getMousePos();
-        s.selected_index = hitTestEntity(loaded.scene.entities, mouse, canvas_min, s.pan, s.zoom);
     }
 }
 

@@ -82,9 +82,14 @@ pub fn parseScene(allocator: std.mem.Allocator, raw: []const u8) !LoadedScene {
         } = &.{},
     };
 
-    const parsed = try std.json.parseFromSlice(Intermediate, arena.allocator(), stripped, .{
+    var parsed = try std.json.parseFromSlice(Intermediate, arena.allocator(), stripped, .{
         .ignore_unknown_fields = true,
     });
+    // `parsed.deinit` is functionally a no-op here because the inner
+    // arena std.json creates is backed by our outer arena (which is
+    // freed wholesale on `LoadedScene.deinit`). Calling it anyway keeps
+    // the ownership story consistent with other call sites.
+    defer parsed.deinit();
 
     // Walk the source a second time to pluck out each entity's leading
     // comments. Done as a separate pass over the *raw* (pre-stripped)
@@ -184,18 +189,22 @@ fn findEntitiesArray(raw: []const u8) ?usize {
         // (e.g. `"name"`, a string *value*), skipString advances past
         // it so its contents don't false-match.
         if (std.mem.eql(u8, raw[i .. i + key.len], key)) {
-            i += key.len;
-            skipWhitespaceJson(raw, &i);
-            skipCommentBlock(raw, &i);
-            skipWhitespaceJson(raw, &i);
-            if (i < raw.len and raw[i] == ':') {
-                i += 1;
-                skipWhitespaceJson(raw, &i);
-                skipCommentBlock(raw, &i);
-                skipWhitespaceJson(raw, &i);
-                if (i < raw.len and raw[i] == '[') return i;
+            var probe = i + key.len;
+            skipWhitespaceJson(raw, &probe);
+            skipCommentBlock(raw, &probe);
+            skipWhitespaceJson(raw, &probe);
+            if (probe < raw.len and raw[probe] == ':') {
+                probe += 1;
+                skipWhitespaceJson(raw, &probe);
+                skipCommentBlock(raw, &probe);
+                skipWhitespaceJson(raw, &probe);
+                if (probe < raw.len and raw[probe] == '[') return probe;
             }
-            return null;
+            // Not the entities key in object position — e.g. a string
+            // value that happens to be `"entities"`. Keep scanning
+            // past this token so a later real `"entities": [` is found.
+            i += key.len;
+            continue;
         }
         if (raw[i] == '"') {
             skipString(raw, &i);

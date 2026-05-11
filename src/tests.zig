@@ -390,6 +390,28 @@ pub const SceneIoTests = struct {
         try expect.toBeTrue(std.mem.indexOf(u8, c2, "Player") != null);
     }
 
+    test "ignores false 'entities' literal before the real key" {
+        // Regression: a value containing the literal string `"entities"`
+        // must not stop the scanner from finding the real `entities: [`
+        // later in the document.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "tag": "entities",
+            \\    "name": "x",
+            \\    "entities": [
+            \\        // comment
+            \\        { "prefab": "p" }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+        try expect.equal(loaded.scene.entities.len, 1);
+        const c = std.mem.sliceTo(&loaded.scene.entities[0].comment, 0);
+        try expect.toBeTrue(std.mem.indexOf(u8, c, "comment") != null);
+    }
+
     test "multi-line comment block attaches as one string" {
         const allocator = std.testing.allocator;
         const src =
