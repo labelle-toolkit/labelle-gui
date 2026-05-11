@@ -93,6 +93,111 @@ pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !LoadedScene
     return parseScene(allocator, raw);
 }
 
+// ─── Prefabs ───────────────────────────────────────────────────────────
+//
+// Prefabs live at `<project>/prefabs/<name>.jsonc` with the shape
+// `{ "components": { ... } }` — a single entity template, no `name`
+// field, no `entities` array. Conceptually they're "one entity worth
+// of components" that scenes instance by reference. Our model: load
+// the prefab as a `LoadedPrefab` carrying one `Entity` plus the same
+// `ComponentExtra` list we use for scene entities. Position is
+// typically absent in prefabs (scenes set position per-instance).
+
+pub const LoadedPrefab = struct {
+    arena: *std.heap.ArenaAllocator,
+    /// The prefab's body, modeled as a single entity so the inspector
+    /// can render it with the same code that handles scene entities.
+    /// `entity.prefab` is unused (prefabs don't reference other
+    /// prefabs in this format); `entity.position` is usually null.
+    entity: Entity,
+    /// Components other than `Position` captured verbatim, same as
+    /// scene-side extras. On save, these splice back into the
+    /// emitted `components: { ... }` block.
+    component_extras: []const ComponentExtra,
+
+    pub fn deinit(self: *LoadedPrefab) void {
+        const child_alloc = self.arena.child_allocator;
+        self.arena.deinit();
+        child_alloc.destroy(self.arena);
+    }
+};
+
+pub fn loadPrefabFromFile(allocator: std.mem.Allocator, path: []const u8) !LoadedPrefab {
+    const raw = try std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024);
+    defer allocator.free(raw);
+    return parsePrefab(allocator, raw);
+}
+
+pub fn parsePrefab(allocator: std.mem.Allocator, raw: []const u8) !LoadedPrefab {
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    errdefer allocator.destroy(arena);
+    arena.* = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+
+    const stripped = try stripLineComments(arena.allocator(), raw);
+
+    const Intermediate = struct {
+        components: ?std.json.Value = null,
+    };
+    var parsed = try std.json.parseFromSlice(Intermediate, arena.allocator(), stripped, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const entity: Entity = .{
+        .position = readPosition(parsed.value.components),
+    };
+
+    // Re-use the entity-body scanner from the scene path: it walks
+    // a `{ ... }` body, finds the `components` key inside, and
+    // captures every non-Position entry. Wrap the prefab body in a
+    // synthetic outer for the scanner to consume — easier than
+    // teaching the scanner about top-level vs entity-level. The
+    // brace pair is already in the raw text, so we just point the
+    // scanner at it.
+    const component_extras = try extractComponentExtras(arena.allocator(), raw);
+
+    return .{
+        .arena = arena,
+        .entity = entity,
+        .component_extras = component_extras,
+    };
+}
+
+pub fn savePrefab(allocator: std.mem.Allocator, path: []const u8, loaded: LoadedPrefab) !void {
+    const text = try renderPrefabJsonc(allocator, loaded);
+    defer allocator.free(text);
+    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(text);
+}
+
+/// Emit the prefab as `{ "components": { "Position": ..., …extras } }`.
+/// Mirrors the scene writer's per-entity `components` block; the
+/// outer wrapper is just the prefab object.
+pub fn renderPrefabJsonc(allocator: std.mem.Allocator, loaded: LoadedPrefab) ![]u8 {
+    var out: std.ArrayList(u8) = .{};
+    errdefer out.deinit(allocator);
+    const w = out.writer(allocator);
+
+    try w.writeAll("{\n");
+    try w.writeAll("    \"components\": {");
+    var first = true;
+    if (loaded.entity.position) |p| {
+        try w.print(" \"Position\": {{ \"x\": {d}, \"y\": {d} }}", .{ p.x, p.y });
+        first = false;
+    }
+    for (loaded.component_extras) |extra| {
+        if (!first) try w.writeAll(",");
+        try w.print(" \"{s}\": {s}", .{ extra.name, extra.value_text });
+        first = false;
+    }
+    if (first) try w.writeAll(" "); // empty body — keep braces apart
+    try w.writeAll(" }\n");
+    try w.writeAll("}\n");
+    return out.toOwnedSlice(allocator);
+}
+
 pub fn parseScene(allocator: std.mem.Allocator, raw: []const u8) !LoadedScene {
     const arena = try allocator.create(std.heap.ArenaAllocator);
     errdefer allocator.destroy(arena);

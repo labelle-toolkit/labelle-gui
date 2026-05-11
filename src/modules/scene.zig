@@ -1,10 +1,14 @@
 //! Scene editor — per-tab state and rendering.
 //!
-//! No longer a top-level View-menu panel. The Scene editor opens as a
-//! tab in the main content area when the user clicks a `.jsonc` file
-//! in the project tree. `App` owns an `ArrayList(SceneState)` of open
-//! tabs; this module renders one tab's body (inspector + viewport)
-//! given a single state.
+//! Inspector body is delegated to `modules/inspector.zig`, which
+//! is shared with the prefab editor. This module owns the
+//! viewport (canvas, grid, pan/zoom, hit-test, drag-to-move) and
+//! the scene-specific Save path.
+//!
+//! Opens as a tab when the user clicks a `.jsonc` file under
+//! `<project>/scenes/`. `App` owns an `ArrayList(OpenTab)` whose
+//! `.scene` variant wraps a `SceneState`; this module renders one
+//! such state given a single value.
 //!
 //! Each `SceneState` carries its own arena (for path/display name
 //! strings) and a `LoadedScene` (which carries its own arena for the
@@ -17,6 +21,7 @@ const App = @import("../app.zig").App;
 const project = @import("../project.zig");
 const scene_io = @import("../scene_io.zig");
 const config = @import("../config.zig");
+const inspector = @import("inspector.zig");
 
 const viewport_min_h: f32 = 240;
 
@@ -158,54 +163,14 @@ fn renderInspector(s: *SceneState) void {
         zgui.textDisabled("(selection out of range)", .{});
         return;
     }
-    const e = &s.loaded.scene.entities[idx];
-    const prefab = e.prefab orelse "(no prefab)";
-    zgui.text("Entity #{d}", .{idx});
-    if (e.prefab) |p| zgui.text("prefab: {s}", .{p}) else {
-        _ = prefab;
-        zgui.textDisabled("(no prefab)", .{});
-    }
-    zgui.spacing();
 
-    // Position is the only component the gui models structurally.
-    // Other components are read from the captured extras list and
-    // rendered as collapsible value previews.
-    if (zgui.collapsingHeader("Position", .{ .default_open = true })) {
-        if (e.position) |*pos| {
-            if (zgui.inputFloat("x", .{ .v = &pos.x })) s.is_dirty = true;
-            if (zgui.inputFloat("y", .{ .v = &pos.y })) s.is_dirty = true;
-        } else {
-            zgui.textDisabled("(no Position component)", .{});
-        }
-    }
+    const entity = &s.loaded.scene.entities[idx];
+    const extras = if (idx < s.loaded.extras.entity_components.len)
+        s.loaded.extras.entity_components[idx]
+    else
+        &[_]scene_io.ComponentExtra{};
 
-    if (zgui.collapsingHeader("Comment", .{})) {
-        if (zgui.inputTextMultiline("##comment", .{
-            .buf = &e.comment,
-            .w = 0,
-            .h = 80,
-        })) s.is_dirty = true;
-    }
-
-    // Per-entity unmodeled components captured verbatim at load time
-    // (Sprite, Shape, user-defined). Read-only display for now —
-    // structured editing of these is a follow-up; users can still
-    // hand-edit the .jsonc directly and reopen the scene.
-    if (idx < s.loaded.extras.entity_components.len) {
-        const extras = s.loaded.extras.entity_components[idx];
-        if (extras.len > 0) {
-            zgui.spacing();
-            zgui.separator();
-            zgui.textDisabled("Other components ({d})", .{extras.len});
-            for (extras) |extra| {
-                var label_buf: [128:0]u8 = undefined;
-                const label = std.fmt.bufPrintZ(&label_buf, "{s}", .{extra.name}) catch continue;
-                if (zgui.collapsingHeader(label, .{})) {
-                    zgui.textUnformatted(extra.value_text);
-                }
-            }
-        }
-    }
+    inspector.renderEntity(entity, extras, &s.is_dirty, idx);
 }
 
 fn renderViewport(s: *SceneState) void {

@@ -11,6 +11,7 @@ const zgui = @import("zgui");
 
 const App = @import("app.zig").App;
 const scene_mod = @import("modules/scene.zig");
+const prefab_mod = @import("modules/prefab.zig");
 
 const gl_major = 4;
 const gl_minor = 1;
@@ -143,6 +144,70 @@ pub fn main() !void {
         sf.close();
     }
 
+    // And a prefab so the prefab editor's open + save path has
+    // something to test against.
+    {
+        var prefab_path_buf: [512]u8 = undefined;
+        const prefab_path = try std.fmt.bufPrint(&prefab_path_buf, "{s}/prefabs/coin.jsonc", .{tmp});
+        const pf = try std.fs.cwd().createFile(prefab_path, .{});
+        try pf.writeAll(
+            \\{
+            \\    "components": {
+            \\        "Sprite": { "sprite_name": "coin", "pivot": "center" },
+            \\        "Coin": {}
+            \\    }
+            \\}
+        );
+        pf.close();
+    }
+
+    _ = engine.registerTest("phase3", "prefab_open_save_preserves_extras", @src(), struct {
+        fn gui(_: *zgui.te.TestContext) !void {
+            if (g_app) |a| a.renderFrame(1.0 / 60.0);
+        }
+        fn run(ctx: *zgui.te.TestContext) !void {
+            const a = g_app orelse {
+                _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
+                return;
+            };
+
+            const dir = g_settings_project_dir.?;
+            var path_buf: [512]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buf, "{s}/prefabs/coin.jsonc", .{dir}) catch return;
+
+            a.openPrefab(path) catch {
+                _ = zgui.te.check(@src(), .{}, false, "openPrefab must succeed");
+                return;
+            };
+            ctx.yield(1);
+
+            const opened_ok = a.open_tabs.items.len == 1 and
+                a.open_tabs.items[0] == .prefab and
+                a.open_tabs.items[0].prefab.loaded.component_extras.len == 2;
+            _ = zgui.te.check(@src(), .{}, opened_ok, "prefab opened with 2 components");
+
+            // Set a Position on the prefab + save via the public API.
+            const tab = &a.open_tabs.items[0].prefab;
+            tab.loaded.entity.position = .{ .x = 7, .y = 11 };
+            tab.is_dirty = true;
+            prefab_mod.savePrefab(tab, a);
+            _ = zgui.te.check(@src(), .{}, !tab.is_dirty, "is_dirty cleared after Save");
+
+            var file_buf: [4096]u8 = undefined;
+            const file = std.fs.cwd().openFile(path, .{}) catch return;
+            defer file.close();
+            const n = file.read(&file_buf) catch return;
+            const content = file_buf[0..n];
+
+            _ = zgui.te.check(@src(), .{}, std.mem.indexOf(u8, content, "\"Sprite\"") != null, "Sprite preserved on disk");
+            _ = zgui.te.check(@src(), .{}, std.mem.indexOf(u8, content, "\"Coin\"") != null, "Coin preserved on disk");
+            _ = zgui.te.check(@src(), .{}, std.mem.indexOf(u8, content, "\"x\": 7") != null, "Position x persisted");
+            _ = zgui.te.check(@src(), .{}, std.mem.indexOf(u8, content, "\"y\": 11") != null, "Position y persisted");
+
+            a.closeTab(0);
+        }
+    });
+
     _ = engine.registerTest("phase3", "scene_open_save_preserves_extras", @src(), struct {
         fn gui(_: *zgui.te.TestContext) !void {
             if (g_app) |a| a.renderFrame(1.0 / 60.0);
@@ -165,8 +230,9 @@ pub fn main() !void {
             };
             ctx.yield(1);
 
-            const opened_ok = a.open_scenes.items.len == 1 and
-                a.open_scenes.items[0].loaded.scene.entities.len == 1;
+            const opened_ok = a.open_tabs.items.len == 1 and
+                a.open_tabs.items[0] == .scene and
+                a.open_tabs.items[0].scene.loaded.scene.entities.len == 1;
             _ = zgui.te.check(@src(), .{}, opened_ok, "scene opened with one entity");
 
             // Edit the in-memory position, then save via the module's
@@ -174,7 +240,7 @@ pub fn main() !void {
             // calls). Driving the button via TE refs through the
             // nested tab-bar ID stack is brittle; saveScene is what we
             // actually care about here.
-            const tab = &a.open_scenes.items[0];
+            const tab = &a.open_tabs.items[0].scene;
             tab.loaded.scene.entities[0].position.?.x = 999;
             tab.is_dirty = true;
             scene_mod.saveScene(tab, a);
@@ -190,7 +256,7 @@ pub fn main() !void {
             _ = zgui.te.check(@src(), .{}, std.mem.indexOf(u8, content, "\"x\": 999") != null, "edited Position written");
 
             // Close the tab cleanly so subsequent tests see a fresh App.
-            a.closeScene(0);
+            a.closeTab(0);
         }
     });
 

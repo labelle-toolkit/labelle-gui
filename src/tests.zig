@@ -571,6 +571,72 @@ pub const SceneIoTests = struct {
         try expect.toBeTrue(std.mem.eql(u8, loaded2.extras.entity_components[0][0].name, "Sprite"));
     }
 
+    test "parsePrefab reads Position + extras from a prefab body" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "components": {
+            \\        "Position": { "x": 5, "y": 10 },
+            \\        "Sprite": { "sprite_name": "coin", "pivot": "center" },
+            \\        "Coin": {}
+            \\    }
+            \\}
+        ;
+        var loaded = try scene_io.parsePrefab(allocator, src);
+        defer loaded.deinit();
+        try expect.toBeTrue(loaded.entity.position != null);
+        try expect.equal(loaded.entity.position.?.x, 5);
+        try expect.equal(loaded.entity.position.?.y, 10);
+        try expect.equal(loaded.component_extras.len, 2);
+        // Order matches source: Sprite first, then Coin.
+        try expect.toBeTrue(std.mem.eql(u8, loaded.component_extras[0].name, "Sprite"));
+        try expect.toBeTrue(std.mem.eql(u8, loaded.component_extras[1].name, "Coin"));
+    }
+
+    test "renderPrefabJsonc round-trips a prefab with extras" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "components": {
+            \\        "Sprite": { "sprite_name": "coin" },
+            \\        "Coin": {}
+            \\    }
+            \\}
+        ;
+        var loaded = try scene_io.parsePrefab(allocator, src);
+        defer loaded.deinit();
+
+        const text = try scene_io.renderPrefabJsonc(allocator, loaded);
+        defer allocator.free(text);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"components\":") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Sprite\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"sprite_name\": \"coin\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Coin\"") != null);
+
+        // Re-parse the rendered text to confirm the writer's output is
+        // self-consistent — same shape, same extras.
+        var loaded2 = try scene_io.parsePrefab(allocator, text);
+        defer loaded2.deinit();
+        try expect.equal(loaded2.component_extras.len, 2);
+    }
+
+    test "renderPrefabJsonc reflects in-memory Position edits" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{ "components": { "Position": { "x": 0, "y": 0 } } }
+        ;
+        var loaded = try scene_io.parsePrefab(allocator, src);
+        defer loaded.deinit();
+        loaded.entity.position.?.x = 42;
+        loaded.entity.position.?.y = 84;
+
+        const text = try scene_io.renderPrefabJsonc(allocator, loaded);
+        defer allocator.free(text);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"x\": 42") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"y\": 84") != null);
+    }
+
     test "entity without Position has null position" {
         const allocator = std.testing.allocator;
         const src =
@@ -604,6 +670,31 @@ pub const SceneRoutingTests = struct {
 
     test "no project dir → no scene routing" {
         try expect.toBeFalse(project_tree.isScenePath(null, "/p/scenes/main.jsonc"));
+    }
+
+    test "prefab path under prefabs/ is accepted" {
+        try expect.toBeTrue(project_tree.isPrefabPath("/p", "/p/prefabs/coin.jsonc"));
+        try expect.toBeTrue(project_tree.isPrefabPath("/p", "/p/prefabs/enemies/goblin.jsonc"));
+    }
+
+    test "scene path is not a prefab path" {
+        try expect.toBeFalse(project_tree.isPrefabPath("/p", "/p/scenes/main.jsonc"));
+    }
+
+    test "scene-vs-prefab routing is mutually exclusive" {
+        // No path is both — the caller's if/else if doesn't risk
+        // double-dispatch through a single click.
+        const samples = [_][]const u8{
+            "/p/scenes/main.jsonc",
+            "/p/prefabs/coin.jsonc",
+            "/p/components/foo.zig",
+            "/p/random.jsonc",
+        };
+        for (samples) |sample| {
+            const sc = project_tree.isScenePath("/p", sample);
+            const pf = project_tree.isPrefabPath("/p", sample);
+            try expect.toBeFalse(sc and pf);
+        }
     }
 };
 

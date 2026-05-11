@@ -27,13 +27,21 @@ pub fn makeModule(app: *App) module.Module {
 /// elsewhere in the project return false; the caller skips opening
 /// them as scenes.
 pub fn isScenePath(proj_dir: ?[]const u8, path: []const u8) bool {
+    return isUnderFolder(proj_dir, path, project.ProjectFolders.scenes);
+}
+
+/// Mirror of `isScenePath` for `prefabs/*.jsonc`. Used to route a
+/// tree click on a prefab file into the prefab editor rather than
+/// the scene editor.
+pub fn isPrefabPath(proj_dir: ?[]const u8, path: []const u8) bool {
+    return isUnderFolder(proj_dir, path, project.ProjectFolders.prefabs);
+}
+
+fn isUnderFolder(proj_dir: ?[]const u8, path: []const u8, folder: []const u8) bool {
     const dir = proj_dir orelse return false;
     if (!std.mem.endsWith(u8, path, ".jsonc")) return false;
     var prefix_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const prefix = std.fmt.bufPrint(&prefix_buf, "{s}/{s}/", .{
-        dir,
-        project.ProjectFolders.scenes,
-    }) catch return false;
+    const prefix = std.fmt.bufPrint(&prefix_buf, "{s}/{s}/", .{ dir, folder }) catch return false;
     return std.mem.startsWith(u8, path, prefix);
 }
 
@@ -62,10 +70,16 @@ fn render(app: *App) void {
             // overwrite the prefab as an empty scene.
             if (app.tree_view.render(proj.getProjectDir())) {
                 if (app.tree_view.getSelectedPath()) |path| {
-                    if (isScenePath(proj.getProjectDir(), path)) {
+                    const proj_dir = proj.getProjectDir();
+                    if (isScenePath(proj_dir, path)) {
                         app.openScene(path) catch |err| {
                             std.log.err("Failed to open scene {s}: {s}", .{ path, @errorName(err) });
                             app.setStatus("Error opening scene!");
+                        };
+                    } else if (isPrefabPath(proj_dir, path)) {
+                        app.openPrefab(path) catch |err| {
+                            std.log.err("Failed to open prefab {s}: {s}", .{ path, @errorName(err) });
+                            app.setStatus("Error opening prefab!");
                         };
                     }
                 }
