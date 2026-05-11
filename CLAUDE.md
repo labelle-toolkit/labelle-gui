@@ -106,7 +106,7 @@ shared `modules/inspector.zig` renders one entity's editable surface.
 Both take an optional `*const atlas.Index` so they can resolve typed
 `Sprite` components against the active project's atlases: the viewport
 draws the resolved frame as a textured quad with pivot-aware placement
-(falling back to a coloured marker plus a `?` overlay when a Sprite is
+(falling back to a colored marker plus a `?` overlay when a Sprite is
 declared but unresolved), and the inspector shows a `(missing)` hint
 next to `sprite_name` when the index can't find it. World +y is up
 (Y-axis flipped from screen space).
