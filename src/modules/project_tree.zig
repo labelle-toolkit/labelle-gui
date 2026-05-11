@@ -4,6 +4,7 @@
 //! via the View menu, the space is left empty — Main Content keeps its
 //! hardcoded position. Re-enable to bring the tree back.
 
+const std = @import("std");
 const zgui = @import("zgui");
 
 const App = @import("../app.zig").App;
@@ -35,7 +36,19 @@ fn render(app: *App) void {
         .no_collapse = true,
     } })) {
         if (app.project_manager.current_project) |proj| {
-            _ = app.tree_view.render(proj.getProjectDir());
+            // Tree returns true on the frame a file is newly clicked.
+            // Route `.jsonc` selections through the App so they open
+            // as scene editor tabs in the main content area.
+            if (app.tree_view.render(proj.getProjectDir())) {
+                if (app.tree_view.getSelectedPath()) |path| {
+                    if (std.mem.endsWith(u8, path, ".jsonc")) {
+                        app.openScene(path) catch |err| {
+                            std.log.err("Failed to open scene {s}: {s}", .{ path, @errorName(err) });
+                            app.setStatus("Error opening scene!");
+                        };
+                    }
+                }
+            }
         } else {
             zgui.textDisabled("No project open", .{});
         }

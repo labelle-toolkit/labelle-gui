@@ -25,8 +25,8 @@ zig build smoke     # end-to-end against the real `labelle` launcher — env-dep
 | `src/main.zig` | GLFW init, window + GL context, font + DPI setup, frame loop. Delegates per-frame UI to `App.renderFrame()`. Stays slim on purpose. |
 | `src/app.zig` | `App` struct: owns `ProjectManager`, `Compiler`, `TreeView`, status bar, dialog state, and the `Module.Registry`. `App.renderFrame()` is the single function the test runner can call to drive the real UI. |
 | `src/module.zig` | `Module` and `Registry` (issue #22). Modules expose a togglable panel; the Registry renders the View menu and dispatches `render_panel(*App)` for every open module. Each module's `is_open` points into App state so the menu toggle and the panel's `popen` flag are the same memory. |
-| `src/modules/` | One file per togglable panel. Each exports `makeModule(*App) module.Module` and gets appended to `App.modules` in `App.init`. Current: `compiler_output`, `project_settings`, `project_tree`. |
-| `src/dialogs/` | Modal popups — transient, not part of the Registry because they're not togglable panels. Each exports `pub fn render(*App) void` called once per frame from `App.renderFrame`. Current: `new_scene`, `dpi_warning`. |
+| `src/modules/` | One file per togglable panel. Each exports `makeModule(*App) module.Module` and gets appended to `App.modules` in `App.init`. Current: `compiler_output`, `project_settings`, `project_tree`, `resources`. The Scene editor lives here too but is *not* registered as a togglable panel — it opens as a tab via tree-click. |
+| `src/dialogs/` | Modal popups — transient, not part of the Registry because they're not togglable panels. Each exports `pub fn render(*App) void` called once per frame from `App.renderFrame`. Current: `new_scene`, `dpi_warning`, `close_scene` (unsaved-tab confirmation). |
 | `src/project.zig` | `ProjectConfig` (mirrors a subset of `labelle-assembler/src/config.zig:ProjectConfig`), `ProjectManager`, `project.labelle` read/write. Each `Project` owns an `ArenaAllocator` so the parsed config strings free uniformly in `deinit`. |
 | `src/compiler.zig` | Wraps `labelle generate/build/run` as a child process. `syncProjectFiles` calls `ProjectManager.saveProject`. `buildOrRun` spawns; `pollBuild` waits and captures stdout/stderr. |
 | `src/tree_view.zig` | Project tree widget. |
@@ -70,6 +70,25 @@ Known limitations of the pass-through:
 1. **`project.labelle` must pin all four versions** — `core_version`, `engine_version`, `gfx_version`, `assembler_version`. The launcher's resolver falls back to its own version for missing fields (`labelle-cli/src/cli/cache.zig:29`: `cfg.assembler_version orelse cfg.labelle_version`), which 404s when CLI and assembler aren't lockstep. Defaults in `ProjectConfig` track `labelle-cli/versions.zon` and the CLI's own assembler pin.
 2. **Project = directory.** `Project.dir` holds the project directory; `<dir>/project.labelle` is the editable file. Open / Save dialogs use `nfd.openFolderDialog`, not file dialogs.
 3. **Don't reintroduce `build.zig` template generation.** The assembler owns that. If you find yourself writing build files from the gui, you're going the wrong direction.
+
+## Scene editor: tabs, not a panel
+
+The Scene editor isn't a togglable panel through the View menu. Instead:
+
+- The user clicks a `.jsonc` file in the Project Tree → `project_tree`
+  routes it through `App.openScene(path)` → a new `SceneState` is
+  appended to `App.open_scenes`.
+- The main content area renders a `TabBar` when `open_scenes.len > 0`;
+  each tab's body is `scene_mod.render(state, app)`.
+- The × close button on a dirty tab opens `dialogs/close_scene.zig`
+  (Save and close / Discard / Cancel) via `App.pending_close_idx`.
+- Project transitions (`ProjectManager.generation` change) trigger
+  `App.closeAllScenes` so the next frame doesn't read freed memory
+  belonging to the old project.
+
+Each `SceneState` carries its own arena (path + display name) and
+owns a `LoadedScene` (parsed-scene arena from `scene_io.parseScene`).
+`SceneState.deinit(allocator)` frees both.
 
 ## Adding a new module
 
