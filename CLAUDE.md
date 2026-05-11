@@ -55,9 +55,9 @@ managed fields, so external projects round-trip without data loss.
 
 Known limitations of the pass-through:
 
-- **Detached top-level comments** (those between fields, not attached
-  to a particular value) are not preserved — the scanner walks
-  field-by-field.
+- **Comments above managed fields** are dropped. Comments above
+  unmodeled fields ride along with that field's verbatim block — the
+  scanner captures the comment block as part of the field's text.
 - **Multi-line strings (`\\...`)** and **`'...'` character literals**
   aren't handled because the assembler's schema doesn't use them. If
   either appears in a future schema, grow `scanValue` in `project.zig`.

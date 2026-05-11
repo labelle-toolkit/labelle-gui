@@ -312,12 +312,23 @@ fn extractUnmodeledFields(arena: std.mem.Allocator, raw: []const u8) ![]const []
     errdefer out.deinit(arena);
 
     while (i < raw.len) {
-        skipWsAndComments(raw, &i);
+        // Mark the start of this field's "block" *before* skipping
+        // leading whitespace + comments. We then skip past whitespace
+        // (so blank lines between fields don't accumulate) and any
+        // `//` comment lines, landing on the field's `.`. The captured
+        // block runs from this marker through the field value — so any
+        // comments directly above an unmodeled field travel with it,
+        // not lost between save / load cycles.
+        const block_start = i;
+        skipWhitespace(raw, &i);
+        while (i + 1 < raw.len and raw[i] == '/' and raw[i + 1] == '/') {
+            while (i < raw.len and raw[i] != '\n') i += 1;
+            skipWhitespace(raw, &i);
+        }
         if (i >= raw.len) break;
         if (raw[i] == '}') break;
         if (raw[i] != '.') break; // unexpected; stop rather than mis-parse
 
-        const field_start = i;
         i += 1; // past '.'
         const name_start = i;
         while (i < raw.len) : (i += 1) {
@@ -346,12 +357,27 @@ fn extractUnmodeledFields(arena: std.mem.Allocator, raw: []const u8) ![]const []
         }
 
         if (!isManaged(name)) {
-            const trimmed = std.mem.trimRight(u8, raw[field_start..field_end], " \t\r\n");
-            const text = try arena.dupe(u8, trimmed);
-            try out.append(arena, text);
+            // Trim outer whitespace but keep internal newlines so a
+            // multi-line `// comment\n.field = .{ ... }` block stays
+            // visually intact. The renderer prepends `"    "` to the
+            // first line; subsequent lines retain their original
+            // indentation from the source.
+            const trimmed = std.mem.trim(u8, raw[block_start..field_end], " \t\r\n");
+            if (trimmed.len > 0) {
+                const text = try arena.dupe(u8, trimmed);
+                try out.append(arena, text);
+            }
         }
     }
     return out.toOwnedSlice(arena);
+}
+
+fn skipWhitespace(raw: []const u8, i: *usize) void {
+    while (i.* < raw.len) {
+        const c = raw[i.*];
+        if (c != ' ' and c != '\t' and c != '\n' and c != '\r') break;
+        i.* += 1;
+    }
 }
 
 fn skipWsAndComments(raw: []const u8, i: *usize) void {

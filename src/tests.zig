@@ -617,6 +617,44 @@ pub const ProjectFileTests = struct {
         try expect.toBeTrue(std.mem.eql(u8, pm2.current_project.?.config.name, "x"));
     }
 
+    test "saveProject preserves comments attached to unmodeled fields" {
+        // The flying-platform regression: comments directly above an
+        // unmodeled field must travel with it through save/load.
+        const allocator = std.testing.allocator;
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        const labelle_path = try std.fs.path.join(allocator, &.{ temp_dir, "project.labelle" });
+        defer allocator.free(labelle_path);
+
+        const original =
+            \\.{
+            \\    .name = "x",
+            \\    .initial_scene = "loading",
+            \\    // Loading scene runs first; controller swaps to main
+            \\    // once the manifest is ready.
+            \\    .states = .{ "loading", "playing" },
+            \\}
+            \\
+        ;
+        const file = try std.fs.cwd().createFile(labelle_path, .{});
+        file.writeAll(original) catch unreachable;
+        file.close();
+
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+        try pm.loadProject(temp_dir);
+        try pm.saveProject(temp_dir);
+
+        const reread = try std.fs.cwd().openFile(labelle_path, .{});
+        defer reread.close();
+        const saved = try reread.readToEndAlloc(allocator, 1024 * 1024);
+        defer allocator.free(saved);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, saved, "// Loading scene runs first; controller swaps to main") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, saved, "// once the manifest is ready.") != null);
+    }
+
     test "saveProject keeps extras when a modeled field changes" {
         // Editing .title via the gui must not collateral-damage .states/.gui.
         const allocator = std.testing.allocator;
