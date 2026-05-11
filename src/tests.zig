@@ -79,6 +79,10 @@ pub const ProjectFoldersTests = struct {
         try expect.toBeTrue(containsFolder("scripts"));
     }
 
+    test "contains scripts/flows folder" {
+        try expect.toBeTrue(containsFolder("scripts/flows"));
+    }
+
     test "contains resources folder" {
         try expect.toBeTrue(containsFolder("resources"));
     }
@@ -222,6 +226,11 @@ pub const FolderIconsTests = struct {
     test "scripts folder has scroll icon" {
         const icon = tree_view.FolderIcons.forFolder("scripts");
         try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.scripts));
+    }
+
+    test "scripts/flows has project-diagram icon" {
+        const icon = tree_view.FolderIcons.forFolder("scripts/flows");
+        try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.scripts_flows));
     }
 
     test "resources folder has database icon" {
@@ -1058,6 +1067,25 @@ pub const SceneRoutingTests = struct {
             const pf = project_tree.isPrefabPath("/p", sample);
             try expect.toBeFalse(sc and pf);
         }
+    }
+
+    test "flow path under scripts/flows/ is accepted" {
+        try expect.toBeTrue(project_tree.isFlowPath("/p", "/p/scripts/flows/foo.flow.zon"));
+        try expect.toBeTrue(project_tree.isFlowPath("/p", "/p/scripts/flows/sub/bar.flow.zon"));
+    }
+
+    test "non-flow-extension under scripts/flows is rejected" {
+        try expect.toBeFalse(project_tree.isFlowPath("/p", "/p/scripts/flows/notes.md"));
+        try expect.toBeFalse(project_tree.isFlowPath("/p", "/p/scripts/flows/main.zon"));
+    }
+
+    test "flow path outside scripts/flows/ is rejected" {
+        try expect.toBeFalse(project_tree.isFlowPath("/p", "/p/scripts/foo.flow.zon"));
+        try expect.toBeFalse(project_tree.isFlowPath("/p", "/p/scenes/foo.flow.zon"));
+    }
+
+    test "no project dir → no flow routing" {
+        try expect.toBeFalse(project_tree.isFlowPath(null, "/p/scripts/flows/foo.flow.zon"));
     }
 };
 

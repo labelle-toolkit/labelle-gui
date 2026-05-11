@@ -21,6 +21,7 @@ const project_tree_mod = @import("modules/project_tree.zig");
 const resources_mod = @import("modules/resources.zig");
 const scene_mod = @import("modules/scene.zig");
 const prefab_mod = @import("modules/prefab.zig");
+const flow_mod = @import("modules/flow.zig");
 const close_scene_dialog = @import("dialogs/close_scene.zig");
 const atlas = @import("atlas.zig");
 const new_scene_dialog = @import("dialogs/new_scene.zig");
@@ -38,11 +39,16 @@ const SCENE_NAME_BUF_LEN = 128;
 pub const OpenTab = union(enum) {
     scene: scene_mod.SceneState,
     prefab: prefab_mod.PrefabState,
+    /// Visual-scripting "flow graph" editor — spike for issue #45.
+    /// `save`/`isDirty` are no-ops until Phase 1 lands the
+    /// `.flow.zon` schema.
+    flow: flow_mod.FlowState,
 
     pub fn deinit(self: *OpenTab, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .scene => |*s| s.deinit(allocator),
             .prefab => |*p| p.deinit(allocator),
+            .flow => |*f| f.deinit(allocator),
         }
     }
 
@@ -50,6 +56,7 @@ pub const OpenTab = union(enum) {
         switch (self.*) {
             .scene => |*s| scene_mod.render(s, app),
             .prefab => |*p| prefab_mod.render(p, app),
+            .flow => |*f| flow_mod.render(f, app),
         }
     }
 
@@ -57,6 +64,7 @@ pub const OpenTab = union(enum) {
         switch (self.*) {
             .scene => |*s| scene_mod.saveScene(s, app),
             .prefab => |*p| prefab_mod.savePrefab(p, app),
+            .flow => |*f| flow_mod.saveFlow(f, app),
         }
     }
 
@@ -64,6 +72,7 @@ pub const OpenTab = union(enum) {
         return switch (self) {
             .scene => |s| s.display_name,
             .prefab => |p| p.display_name,
+            .flow => |f| f.display_name,
         };
     }
 
@@ -71,6 +80,7 @@ pub const OpenTab = union(enum) {
         return switch (self) {
             .scene => |s| s.path,
             .prefab => |p| p.path,
+            .flow => |f| f.path,
         };
     }
 
@@ -78,6 +88,7 @@ pub const OpenTab = union(enum) {
         return switch (self) {
             .scene => |s| s.is_dirty,
             .prefab => |p| p.is_dirty,
+            .flow => |f| f.is_dirty,
         };
     }
 };
@@ -244,6 +255,26 @@ pub const App = struct {
         var state = try prefab_mod.PrefabState.open(self.allocator, path);
         errdefer state.deinit(self.allocator);
         try self.open_tabs.append(self.allocator, .{ .prefab = state });
+        const new_idx = self.open_tabs.items.len - 1;
+        self.active_tab_idx = new_idx;
+        self.focus_tab_idx = new_idx;
+    }
+
+    /// Open a `.flow.zon` file (under `<project>/scripts/flows/`)
+    /// as a tab. Spike behavior — the file isn't actually parsed
+    /// yet, the editor renders an empty canvas with one
+    /// placeholder node. See `src/modules/flow.zig` and issue #45.
+    pub fn openFlow(self: *Self, path: []const u8) !void {
+        for (self.open_tabs.items, 0..) |t, i| {
+            if (std.mem.eql(u8, t.path(), path)) {
+                self.focus_tab_idx = i;
+                return;
+            }
+        }
+
+        var state = try flow_mod.FlowState.open(self.allocator, path);
+        errdefer state.deinit(self.allocator);
+        try self.open_tabs.append(self.allocator, .{ .flow = state });
         const new_idx = self.open_tabs.items.len - 1;
         self.active_tab_idx = new_idx;
         self.focus_tab_idx = new_idx;

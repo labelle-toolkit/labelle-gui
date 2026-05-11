@@ -23,6 +23,7 @@ pub const FA_BOX = "\u{f466}"; // box (for prefabs)
 pub const FA_FILM = "\u{f008}"; // film (for scenes)
 pub const FA_SCROLL = "\u{f70e}"; // scroll (for scripts)
 pub const FA_DATABASE = "\u{f1c0}"; // database (for resources)
+pub const FA_PROJECT_DIAGRAM = "\u{f046}"; // project-diagram / graph (for flows)
 
 // Common UI icons
 pub const FA_PLUS = "\u{f067}"; // plus

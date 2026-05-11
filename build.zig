@@ -15,6 +15,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .backend = .glfw_opengl3,
+        // Pulls in thedmd/imgui-node-editor (vendored at
+        // libs/node_editor) and compiles it into the same `imgui`
+        // artifact zgui already produces. Exposed via
+        // `zgui.node_editor.*` (see libs/zgui/src/node_editor.zig).
+        // Linked against the same ImGui instance so the editor's
+        // canvas draws into the gui's existing context — no second
+        // ImGuiContext needed (issue #45, Flows spike).
+        .with_node_editor = true,
     });
 
     const nfd = b.dependency("nfd", .{
@@ -106,6 +114,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .backend = .glfw_opengl3,
         .with_te = true,
+        // Mirror the production `zgui` config so `App` compiles
+        // against the same module shape — the Flow module references
+        // `zgui.node_editor.*` and the test runner imports App.
+        .with_node_editor = true,
     });
 
     const gui_tests_exe = b.addExecutable(.{

@@ -11,6 +11,7 @@ pub const FolderIcons = struct {
     pub const prefabs = icons.FA_BOX; // Box for prefabs
     pub const scenes = icons.FA_FILM; // Film for scenes
     pub const scripts = icons.FA_SCROLL; // Scroll for scripts
+    pub const scripts_flows = icons.FA_PROJECT_DIAGRAM; // Graph icon for flows
     pub const resources = icons.FA_DATABASE; // Database for resources
     pub const file = icons.FA_FILE; // File icon
     pub const folder_open = icons.FA_FOLDER_OPEN; // Open folder
@@ -23,6 +24,10 @@ pub const FolderIcons = struct {
         if (std.mem.eql(u8, name, project.ProjectFolders.prefabs)) return prefabs;
         if (std.mem.eql(u8, name, project.ProjectFolders.scenes)) return scenes;
         if (std.mem.eql(u8, name, project.ProjectFolders.scripts)) return scripts;
+        // The Flows folder is nested under `scripts/` and registered
+        // in `ProjectFolders.all` as the literal `"scripts/flows"`.
+        // Match the full path here so the lookup hits.
+        if (std.mem.eql(u8, name, project.ProjectFolders.scripts_flows)) return scripts_flows;
         if (std.mem.eql(u8, name, project.ProjectFolders.resources)) return resources;
         return folder_closed;
     }

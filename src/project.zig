@@ -10,6 +10,15 @@ pub const ProjectFolders = struct {
     pub const prefabs = "prefabs";
     pub const scenes = "scenes";
     pub const scripts = "scripts";
+    /// Nested subfolder under `scripts/` for visual-scripting
+    /// `.flow.zon` files (issue #45 — Flows editor). Scaffolded as
+    /// part of `ProjectFolders.all` so `createProjectFolders`
+    /// creates it on new project, but `std.fs.Dir.makeDir`
+    /// with this path needs the parent to exist first — it does,
+    /// because `scripts` appears earlier in `all`. The Flow tab
+    /// router (`project_tree.isFlowPath`) requires this exact
+    /// relative path.
+    pub const scripts_flows = "scripts/flows";
     pub const resources = "resources";
 
     pub const all = [_][]const u8{
@@ -20,6 +29,7 @@ pub const ProjectFolders = struct {
         prefabs,
         scenes,
         scripts,
+        scripts_flows,
         resources,
     };
 };
@@ -163,8 +173,12 @@ pub const ProjectManager = struct {
         var dir = try std.fs.cwd().openDir(base_path, .{});
         defer dir.close();
 
+        // `makePath` instead of `makeDir` so `scripts/flows`
+        // creates the `scripts` parent if it's missing — and so
+        // path separators in entries work on Windows (where
+        // `makeDir` only accepts a single component).
         for (ProjectFolders.all) |folder| {
-            dir.makeDir(folder) catch |err| {
+            dir.makePath(folder) catch |err| {
                 if (err != error.PathAlreadyExists) return err;
             };
         }
