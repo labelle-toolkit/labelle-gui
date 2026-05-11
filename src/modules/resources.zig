@@ -18,6 +18,7 @@ const zgui = @import("zgui");
 const App = @import("../app.zig").App;
 const module = @import("../module.zig");
 const project = @import("../project.zig");
+const buf = @import("../buf.zig");
 
 const max_slots = 32;
 const name_cap = 64;
@@ -32,7 +33,11 @@ const Slot = struct {
 pub const ResourcesEditor = struct {
     slots: [max_slots]Slot = [_]Slot{.{}} ** max_slots,
     count: usize = 0,
-    last_synced: ?*const project.Project = null,
+    /// `ProjectManager.generation` at the time the slots were filled.
+    /// Compared to detect project transitions — using a counter rather
+    /// than a `*Project` pointer side-steps the ABA case where GPA
+    /// reuses an address across close/new cycles.
+    last_generation: ?u64 = null,
 };
 
 pub fn makeModule(app: *App) module.Module {
@@ -59,7 +64,7 @@ fn render(app: *App) void {
         return;
     };
 
-    syncIfNeeded(&app.resources_editor, proj);
+    syncIfNeeded(&app.resources_editor, app.project_manager.generation, proj);
     const ed = &app.resources_editor;
 
     if (ed.count == 0) {
@@ -90,23 +95,25 @@ fn render(app: *App) void {
     if (zgui.button("Save", .{ .w = 80 })) saveAndPersist(app, proj);
     zgui.sameLine(.{});
     if (zgui.button("Revert", .{ .w = 80 })) {
-        ed.last_synced = null; // resync next frame
+        ed.last_generation = null; // resync next frame
     }
 }
 
-fn syncIfNeeded(ed: *ResourcesEditor, proj: *project.Project) void {
-    if (ed.last_synced == proj) return;
+fn syncIfNeeded(ed: *ResourcesEditor, gen: u64, proj: *project.Project) void {
+    if (ed.last_generation) |g| {
+        if (g == gen) return;
+    }
     ed.count = @min(proj.config.resources.len, max_slots);
     for (proj.config.resources[0..ed.count], 0..) |r, i| {
-        copyToBuf(&ed.slots[i].name, r.name);
-        copyToBuf(&ed.slots[i].json, r.json);
-        copyToBuf(&ed.slots[i].texture, r.texture);
+        buf.writeZeroed(&ed.slots[i].name, r.name);
+        buf.writeZeroed(&ed.slots[i].json, r.json);
+        buf.writeZeroed(&ed.slots[i].texture, r.texture);
     }
     // Clear any leftover rows from a previous project so stale buffers
     // don't show up if the new project has fewer resources.
     var k = ed.count;
     while (k < max_slots) : (k += 1) ed.slots[k] = .{};
-    ed.last_synced = proj;
+    ed.last_generation = gen;
 }
 
 fn addSlot(ed: *ResourcesEditor) void {
@@ -159,12 +166,6 @@ fn applyBuffers(app: *App, proj: *project.Project) !void {
     proj.markDirty();
 }
 
-fn copyToBuf(buf: []u8, src: []const u8) void {
-    @memset(buf, 0);
-    const n = @min(buf.len, src.len);
-    @memcpy(buf[0..n], src[0..n]);
-}
-
-fn bufStr(buf: []const u8) []const u8 {
-    return std.mem.sliceTo(buf, 0);
+fn bufStr(slice: []const u8) []const u8 {
+    return std.mem.sliceTo(slice, 0);
 }

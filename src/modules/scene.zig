@@ -17,6 +17,7 @@ const App = @import("../app.zig").App;
 const module = @import("../module.zig");
 const project = @import("../project.zig");
 const scene_io = @import("../scene_io.zig");
+const buf = @import("../buf.zig");
 
 const name_cap = 128;
 const sidebar_w: f32 = 200;
@@ -45,10 +46,12 @@ pub const SceneState = struct {
     /// Viewport pan / zoom state (world-space offset + scale factor).
     pan: [2]f32 = .{ 320, 240 },
     zoom: f32 = 1.0,
-    /// Project pointer the selection was tracked against — closes
-    /// `loaded` when the active project changes so we don't carry stale
-    /// arena memory across project switches.
-    last_synced: ?*const project.Project = null,
+    /// Generation counter the selection was synced against. Compared
+    /// to `ProjectManager.generation` to detect project transitions —
+    /// using a counter instead of the raw `*Project` pointer avoids
+    /// the ABA hazard where GPA reuses an address after a close/new
+    /// cycle. `null` = not yet synced against any project.
+    last_generation: ?u64 = null,
     /// Cached list of `<project>/scenes/*.jsonc` stems. Populated on
     /// project change or by clicking Refresh — avoids opening and
     /// iterating the scenes directory every frame, which the bot
@@ -105,11 +108,14 @@ fn render(app: *App) void {
 }
 
 fn syncProjectChange(s: *SceneState, app: *App, proj: *project.Project) void {
-    if (s.last_synced == proj) return;
+    const gen = app.project_manager.generation;
+    if (s.last_generation) |g| {
+        if (g == gen) return;
+    }
     s.deinit();
     @memset(&s.selected_name, 0);
     @memset(&s.loaded_name, 0);
-    s.last_synced = proj;
+    s.last_generation = gen;
     rescanScenes(s, app, proj);
 }
 
@@ -189,7 +195,7 @@ fn maybeLoadSelected(s: *SceneState, proj: *project.Project) void {
         @memset(&s.loaded_name, 0);
         return;
     };
-    copyToBuf(&s.loaded_name, sel);
+    buf.writeZeroed(&s.loaded_name, sel);
 }
 
 // ─── File list ──────────────────────────────────────────────────────────
@@ -218,7 +224,7 @@ fn renderFileList(s: *SceneState, app: *App, proj: *project.Project) void {
 
         const is_selected = std.mem.eql(u8, std.mem.sliceTo(&s.selected_name, 0), stem);
         if (zgui.selectable(label, .{ .selected = is_selected })) {
-            copyToBuf(&s.selected_name, stem);
+            buf.writeZeroed(&s.selected_name, stem);
         }
     }
 }
@@ -487,8 +493,3 @@ fn colorForPrefab(prefab: ?[]const u8) u32 {
     return (@as(u32, 0xff) << 24) | (@as(u32, b) << 16) | (@as(u32, g) << 8) | r;
 }
 
-fn copyToBuf(buf: []u8, src: []const u8) void {
-    @memset(buf, 0);
-    const n = @min(buf.len, src.len);
-    @memcpy(buf[0..n], src[0..n]);
-}

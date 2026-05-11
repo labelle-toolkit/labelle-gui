@@ -142,6 +142,34 @@ pub const ProjectManagerTests = struct {
         try expect.toBeFalse(pm.hasUnsavedChanges());
     }
 
+    test "generation increments on new / close / reopen" {
+        // Regression: cursor[bot] flagged that pointer-identity
+        // comparison can ABA across project close/new cycles when
+        // GeneralPurposeAllocator reuses the same address. Modules
+        // track ProjectManager.generation instead, which must bump on
+        // every transition.
+        const allocator = std.testing.allocator;
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+
+        try expect.equal(pm.generation, 0);
+
+        try pm.newProject("a");
+        try expect.equal(pm.generation, 1);
+
+        pm.closeProject();
+        try expect.equal(pm.generation, 2);
+
+        try pm.newProject("b");
+        try expect.equal(pm.generation, 3);
+
+        // closeProject on an already-empty manager is a no-op and must
+        // not bump.
+        pm.closeProject(); // closes "b" → gen 4
+        pm.closeProject(); // no-op, still gen 4
+        try expect.equal(pm.generation, 4);
+    }
+
     test "reports unsaved changes for new project" {
         const allocator = std.testing.allocator;
         var pm = project.ProjectManager.init(allocator);

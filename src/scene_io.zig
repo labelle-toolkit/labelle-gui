@@ -12,6 +12,7 @@
 //! schema and isn't handled here — extend later if it appears.
 
 const std = @import("std");
+const buf = @import("buf.zig");
 
 pub const Position = struct {
     x: f32 = 0,
@@ -107,7 +108,7 @@ pub fn parseScene(allocator: std.mem.Allocator, raw: []const u8) !LoadedScene {
         // landed fewer entries than parser saw entities (recovery from
         // a malformed scene mid-stream), the remaining entries simply
         // get empty comment buffers.
-        if (i < comments.len) copyToCommentBuf(&entities[i].comment, comments[i]);
+        if (i < comments.len) buf.writeZeroed(&entities[i].comment, comments[i]);
     }
 
     return .{
@@ -268,11 +269,6 @@ fn scanBalanced(raw: []const u8, i: *usize, open: u8, close: u8) void {
     }
 }
 
-fn copyToCommentBuf(buf: []u8, src: []const u8) void {
-    @memset(buf, 0);
-    const n = @min(buf.len, src.len);
-    @memcpy(buf[0..n], src[0..n]);
-}
 
 /// Return a fresh allocator-owned copy of `src` with each `//`-to-EOL
 /// comment replaced by spaces. Preserves byte offsets so any later

@@ -15,6 +15,7 @@ const zgui = @import("zgui");
 const App = @import("../app.zig").App;
 const module = @import("../module.zig");
 const project = @import("../project.zig");
+const buf = @import("../buf.zig");
 
 const name_cap = 128;
 const description_cap = 256;
@@ -39,9 +40,12 @@ pub const ProjectSettings = struct {
     backend: project.Backend = .raylib,
     ecs: project.EcsChoice = .zig_ecs,
 
-    /// Project pointer the buffers were last synced from. When this
-    /// changes (different project opened, project closed) we re-sync.
-    last_synced: ?*const project.Project = null,
+    /// `ProjectManager.generation` value at the time these buffers
+    /// were filled. Comparing the counter instead of `*Project`
+    /// avoids the ABA case where GPA hands back the same address
+    /// after a close/new cycle and the panel would otherwise show
+    /// the previous project's values.
+    last_generation: ?u64 = null,
 };
 
 pub fn makeModule(app: *App) module.Module {
@@ -68,7 +72,7 @@ fn render(app: *App) void {
         return;
     };
 
-    syncIfNeeded(&app.project_settings, proj);
+    syncIfNeeded(&app.project_settings, app.project_manager.generation, proj);
     const s = &app.project_settings;
 
     _ = zgui.inputText("Name", .{ .buf = &s.name });
@@ -95,26 +99,28 @@ fn render(app: *App) void {
     if (zgui.button("Save", .{ .w = 120 })) saveAndPersist(app, proj);
     zgui.sameLine(.{});
     if (zgui.button("Revert", .{ .w = 120 })) {
-        s.last_synced = null; // force resync next frame
+        s.last_generation = null; // force resync next frame
     }
 }
 
-fn syncIfNeeded(s: *ProjectSettings, proj: *project.Project) void {
-    if (s.last_synced == proj) return;
+fn syncIfNeeded(s: *ProjectSettings, gen: u64, proj: *project.Project) void {
+    if (s.last_generation) |g| {
+        if (g == gen) return;
+    }
     syncFromConfig(s, proj);
-    s.last_synced = proj;
+    s.last_generation = gen;
 }
 
 fn syncFromConfig(s: *ProjectSettings, proj: *const project.Project) void {
     const c = proj.config;
-    copyToBuf(&s.name, c.name);
-    copyToBuf(&s.description, c.description);
-    copyToBuf(&s.title, c.title);
-    copyToBuf(&s.initial_scene, c.initial_scene);
-    copyToBuf(&s.core_version, c.core_version);
-    copyToBuf(&s.engine_version, c.engine_version);
-    copyToBuf(&s.gfx_version, c.gfx_version);
-    copyToBuf(&s.assembler_version, c.assembler_version);
+    buf.writeZeroed(&s.name, c.name);
+    buf.writeZeroed(&s.description, c.description);
+    buf.writeZeroed(&s.title, c.title);
+    buf.writeZeroed(&s.initial_scene, c.initial_scene);
+    buf.writeZeroed(&s.core_version, c.core_version);
+    buf.writeZeroed(&s.engine_version, c.engine_version);
+    buf.writeZeroed(&s.gfx_version, c.gfx_version);
+    buf.writeZeroed(&s.assembler_version, c.assembler_version);
     s.width = @intCast(c.width);
     s.height = @intCast(c.height);
     s.target_fps = @intCast(c.target_fps);
@@ -165,12 +171,6 @@ fn applyBuffers(app: *App, proj: *project.Project) !void {
     proj.markDirty();
 }
 
-fn copyToBuf(buf: []u8, src: []const u8) void {
-    @memset(buf, 0);
-    const n = @min(buf.len, src.len);
-    @memcpy(buf[0..n], src[0..n]);
-}
-
-fn bufStr(buf: []const u8) []const u8 {
-    return std.mem.sliceTo(buf, 0);
+fn bufStr(slice: []const u8) []const u8 {
+    return std.mem.sliceTo(slice, 0);
 }
