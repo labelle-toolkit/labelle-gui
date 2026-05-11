@@ -25,6 +25,7 @@ const flow_mod = @import("modules/flow.zig");
 const gizmo_mod = @import("modules/gizmo.zig");
 const close_scene_dialog = @import("dialogs/close_scene.zig");
 const atlas = @import("atlas.zig");
+const gizmos = @import("gizmos.zig");
 const new_scene_dialog = @import("dialogs/new_scene.zig");
 const dpi_warning_dialog = @import("dialogs/dpi_warning.zig");
 
@@ -151,6 +152,13 @@ pub const App = struct {
     /// + viewport consult it to validate `sprite_name` and draw the
     /// real pixels for entities with a Sprite component.
     atlas_index: ?atlas.Index = null,
+    /// Per-project gizmo overlay index. Built alongside `atlas_index`
+    /// on project new/load; viewport queries it when `show_gizmos`
+    /// is true to draw debug visualizations over matched entities.
+    gizmo_index: ?gizmos.Index = null,
+    /// User toggle for the gizmo overlay; on by default so the
+    /// overlay shows up immediately when a project with gizmos opens.
+    show_gizmos: bool = true,
 
     show_project_tree: bool = true,
 
@@ -190,6 +198,7 @@ pub const App = struct {
         self.closeAllTabs();
         self.open_tabs.deinit(self.allocator);
         if (self.atlas_index) |*idx| idx.deinit();
+        if (self.gizmo_index) |*idx| idx.deinit();
         self.project_manager.deinit();
         self.tree_view.deinit();
         self.compiler.deinit();
@@ -224,6 +233,23 @@ pub const App = struct {
             self.allocator,
             dir,
             resources.items,
+            self.project_manager.generation,
+        );
+    }
+
+    /// Rebuild the gizmo overlay index by walking
+    /// `<project_dir>/gizmos/`. Same generation-keyed invalidation
+    /// rule the atlas index uses.
+    fn rebuildGizmoIndex(self: *Self) void {
+        if (self.gizmo_index) |*idx| {
+            idx.deinit();
+            self.gizmo_index = null;
+        }
+        const proj = self.project_manager.current_project orelse return;
+        const dir = proj.dir orelse return;
+        self.gizmo_index = gizmos.Index.build(
+            self.allocator,
+            dir,
             self.project_manager.generation,
         );
     }
@@ -376,9 +402,11 @@ pub const App = struct {
             if (prev != gen) {
                 self.closeAllTabs();
                 self.rebuildAtlasIndex();
+                self.rebuildGizmoIndex();
             }
         } else {
             self.rebuildAtlasIndex();
+            self.rebuildGizmoIndex();
         }
         self.last_project_generation = gen;
 

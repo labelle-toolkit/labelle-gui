@@ -12,6 +12,7 @@ const project_tree = @import("modules/project_tree.zig");
 const viewport = @import("modules/viewport.zig");
 const atlas = @import("atlas.zig");
 const gizmo_io = @import("gizmo_io.zig");
+const gizmos = @import("gizmos.zig");
 
 test {
     zspec.runAll(@This());
@@ -2164,5 +2165,37 @@ pub const GizmoIoTests = struct {
         try expect.toBeTrue(std.mem.eql(u8, reparsed.gizmo.match[0], hostile));
         try expect.equal(reparsed.gizmo.exclude.len, 1);
         try expect.toBeTrue(std.mem.eql(u8, reparsed.gizmo.exclude[0], "Tab\there"));
+    }
+};
+
+pub const GizmoMatchTests = struct {
+    test "match accepts an entity whose components include a match name" {
+        const present = [_][]const u8{ "Position", "Workstation" };
+        const m = [_][]const u8{"Workstation"};
+        const x: [0][]const u8 = .{};
+        try expect.toBeTrue(gizmos.entityMatches(&m, &x, &present));
+    }
+
+    test "match rejects when none of the match names are present" {
+        const present = [_][]const u8{ "Position", "Sprite" };
+        const m = [_][]const u8{"Workstation"};
+        const x: [0][]const u8 = .{};
+        try expect.toBeFalse(gizmos.entityMatches(&m, &x, &present));
+    }
+
+    test "exclude vetoes an otherwise-matching entity" {
+        const present = [_][]const u8{ "Item", "Stored" };
+        const m = [_][]const u8{"Item"};
+        const x = [_][]const u8{"Stored"};
+        try expect.toBeFalse(gizmos.entityMatches(&m, &x, &present));
+    }
+
+    test "empty match matches every non-excluded entity" {
+        // Mirrors the engine convention: an absent `.match` field is
+        // treated as a catch-all.
+        const present = [_][]const u8{ "Position", "Sprite" };
+        const m: [0][]const u8 = .{};
+        const x: [0][]const u8 = .{};
+        try expect.toBeTrue(gizmos.entityMatches(&m, &x, &present));
     }
 };

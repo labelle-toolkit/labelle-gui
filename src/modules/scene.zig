@@ -110,6 +110,8 @@ pub fn render(s: *SceneState, app: *App) void {
     zgui.sameLine(.{});
     zgui.text("zoom: {d:.2}x", .{s.zoom});
     zgui.sameLine(.{});
+    _ = zgui.checkbox("gizmos", .{ .v = &app.show_gizmos });
+    zgui.sameLine(.{});
     if (zgui.button("Save", .{})) saveScene(s, app);
     zgui.separator();
 
@@ -118,9 +120,10 @@ pub fn render(s: *SceneState, app: *App) void {
     const viewport_w = @max(120.0, total_w - inspector_w - split_gap);
 
     const atlas_index_ptr: ?*const @import("../atlas.zig").Index = if (app.atlas_index) |*ix| ix else null;
+    const gizmo_index_ptr: ?*const @import("../gizmos.zig").Index = if (app.gizmo_index) |*ix| ix else null;
 
     if (zgui.beginChild("##viewport_col", .{ .w = viewport_w, .h = 0 })) {
-        renderViewport(s, atlas_index_ptr);
+        renderViewport(s, atlas_index_ptr, gizmo_index_ptr, app.show_gizmos);
     }
     zgui.endChild();
     zgui.sameLine(.{});
@@ -169,14 +172,26 @@ fn renderInspector(s: *SceneState, atlas_index: ?*const @import("../atlas.zig").
     inspector.renderEntity(entity, extras, &s.is_dirty, idx, atlas_index);
 }
 
-fn renderViewport(s: *SceneState, atlas_index: ?*const @import("../atlas.zig").Index) void {
-    viewport.render(.{
-        .pan = &s.pan,
-        .zoom = &s.zoom,
-        .selected_idx = &s.selected_index,
-        .is_dirty = &s.is_dirty,
-        .drag_armed = &s.drag_armed,
-    }, s.loaded.scene.entities, atlas_index);
+fn renderViewport(
+    s: *SceneState,
+    atlas_index: ?*const @import("../atlas.zig").Index,
+    gizmo_index: ?*const @import("../gizmos.zig").Index,
+    show_gizmos: bool,
+) void {
+    viewport.render(
+        .{
+            .pan = &s.pan,
+            .zoom = &s.zoom,
+            .selected_idx = &s.selected_index,
+            .is_dirty = &s.is_dirty,
+            .drag_armed = &s.drag_armed,
+        },
+        s.loaded.scene.entities,
+        s.loaded.extras.entity_components,
+        atlas_index,
+        gizmo_index,
+        show_gizmos,
+    );
 }
 
 /// Re-exported so existing zspec tests (and any other caller of

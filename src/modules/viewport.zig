@@ -13,6 +13,7 @@ const zgui = @import("zgui");
 
 const scene_io = @import("../scene_io.zig");
 const atlas = @import("../atlas.zig");
+const gizmos = @import("../gizmos.zig");
 
 pub const min_h: f32 = 240;
 
@@ -67,7 +68,17 @@ pub fn planRender(has_sprite: bool, sprite_resolved: bool, has_polygon: bool) st
 /// Render the viewport canvas for `entities` into the current
 /// imgui window. Caller is responsible for the surrounding container
 /// (e.g. a beginChild) and any controls bar.
-pub fn render(state: State, entities: []scene_io.Entity, atlas_index: ?*const atlas.Index) void {
+pub fn render(
+    state: State,
+    entities: []scene_io.Entity,
+    /// Parallel to `entities`: the unmodeled-component list per entity.
+    /// Pass an empty slice when the caller doesn't track them
+    /// (gizmo matching against unmodeled components is skipped).
+    entity_extras: []const []const scene_io.ComponentExtra,
+    atlas_index: ?*const atlas.Index,
+    gizmo_index: ?*const gizmos.Index,
+    show_gizmos: bool,
+) void {
     const avail = zgui.getContentRegionAvail();
     const canvas_h = @max(min_h, avail[1]);
     if (!zgui.beginChild("##canvas", .{
@@ -94,6 +105,9 @@ pub fn render(state: State, entities: []scene_io.Entity, atlas_index: ?*const at
 
     drawGrid(dl, canvas_min, canvas_max, state.pan.*, state.zoom.*);
     drawEntities(dl, canvas_min, state, entities, atlas_index);
+    if (show_gizmos) if (gizmo_index) |gi| {
+        drawGizmoOverlay(dl, canvas_min, state, entities, entity_extras, gi);
+    };
 
     _ = zgui.invisibleButton("##canvas_drag", .{ .w = canvas_size[0], .h = canvas_size[1], .flags = .{} });
 
@@ -428,6 +442,119 @@ pub fn hitTestEntity(
         }
     }
     return best;
+}
+
+/// Walk every entity, check every gizmo's predicates, draw the gizmo's
+/// Shape on each match. Uses a tiny per-entity scratch list for the
+/// component-name set; the cost is O(entities × gizmos × names) but
+/// the constants are small (real projects have <50 gizmos).
+fn drawGizmoOverlay(
+    dl: zgui.DrawList,
+    cmin: [2]f32,
+    state: State,
+    entities: []scene_io.Entity,
+    entity_extras: []const []const scene_io.ComponentExtra,
+    index: *const gizmos.Index,
+) void {
+    if (index.entries.items.len == 0) return;
+
+    var name_buf: [32][]const u8 = undefined;
+    for (entities, 0..) |e, i| {
+        const pos = e.position orelse continue;
+
+        // Build the entity's direct component name set into a stack
+        // buffer — most entities have <8 components so 32 is plenty.
+        var n: usize = 0;
+        if (e.position != null and n < name_buf.len) {
+            name_buf[n] = "Position";
+            n += 1;
+        }
+        if (e.sprite != null and n < name_buf.len) {
+            name_buf[n] = "Sprite";
+            n += 1;
+        }
+        if (i < entity_extras.len) {
+            for (entity_extras[i]) |ex| {
+                if (n >= name_buf.len) break;
+                name_buf[n] = ex.name;
+                n += 1;
+            }
+        }
+        const names: []const []const u8 = name_buf[0..n];
+
+        for (index.entries.items) |entry| {
+            if (!gizmos.entityMatches(entry.match, entry.exclude, names)) continue;
+            const px = cmin[0] + state.pan[0] + (pos.x + entry.offset_x) * state.zoom.*;
+            // World +y is up; screen +y is down. Subtract for both
+            // the entity's y and the gizmo offset's y.
+            const py = cmin[1] + state.pan[1] - (pos.y + entry.offset_y) * state.zoom.*;
+            drawShape(dl, entry.shape, entry.color, px, py, state.zoom.*);
+        }
+    }
+}
+
+fn drawShape(dl: zgui.DrawList, shape: gizmos.Shape, color: gizmos.Color, px: f32, py: f32, zoom: f32) void {
+    const col: u32 = (@as(u32, color.a) << 24) |
+        (@as(u32, color.b) << 16) |
+        (@as(u32, color.g) << 8) |
+        @as(u32, color.r);
+    switch (shape) {
+        .circle => |c| {
+            const r = c.radius * zoom;
+            if (c.fill == .filled) {
+                dl.addCircleFilled(.{ .p = .{ px, py }, .r = r, .col = col, .num_segments = 32 });
+            } else {
+                dl.addCircle(.{ .p = .{ px, py }, .r = r, .col = col, .num_segments = 32, .thickness = c.thickness });
+            }
+        },
+        .rectangle => |r| {
+            const half_w = r.width * zoom * 0.5;
+            const half_h = r.height * zoom * 0.5;
+            const pmin: [2]f32 = .{ px - half_w, py - half_h };
+            const pmax: [2]f32 = .{ px + half_w, py + half_h };
+            if (r.fill == .filled) {
+                dl.addRectFilled(.{ .pmin = pmin, .pmax = pmax, .col = col });
+            } else {
+                dl.addRect(.{ .pmin = pmin, .pmax = pmax, .col = col, .thickness = r.thickness });
+            }
+        },
+        .line => |l| {
+            dl.addLine(.{
+                .p1 = .{ px, py },
+                .p2 = .{ px + l.end.x * zoom, py - l.end.y * zoom },
+                .col = col,
+                .thickness = l.thickness,
+            });
+        },
+        .triangle => |t| {
+            const p1: [2]f32 = .{ px, py };
+            const p2: [2]f32 = .{ px + t.p2.x * zoom, py - t.p2.y * zoom };
+            const p3: [2]f32 = .{ px + t.p3.x * zoom, py - t.p3.y * zoom };
+            if (t.fill == .filled) {
+                dl.addTriangleFilled(.{ .p1 = p1, .p2 = p2, .p3 = p3, .col = col });
+            } else {
+                dl.addTriangle(.{ .p1 = p1, .p2 = p2, .p3 = p3, .col = col, .thickness = t.thickness });
+            }
+        },
+        .polygon => |p| {
+            // Regular n-gon: compute vertices on a circle of `radius`
+            // around the entity, then either filled-fan or outline.
+            const sides = std.math.clamp(p.sides, 3, 64);
+            var pts: [64][2]f32 = undefined;
+            var k: usize = 0;
+            while (k < sides) : (k += 1) {
+                const t: f32 = @as(f32, @floatFromInt(k)) / @as(f32, @floatFromInt(sides));
+                const angle = t * std.math.tau;
+                pts[k] = .{ px + @cos(angle) * p.radius * zoom, py - @sin(angle) * p.radius * zoom };
+            }
+            const slice = pts[0..@intCast(sides)];
+            if (p.fill == .filled) {
+                dl.addConvexPolyFilled(slice, col);
+            } else {
+                dl.addPolyline(slice, .{ .col = col, .flags = .{ .closed = true }, .thickness = p.thickness });
+            }
+        },
+    }
 }
 
 fn colorForPrefab(prefab: ?[]const u8) u32 {
