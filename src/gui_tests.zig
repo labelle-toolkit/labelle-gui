@@ -124,6 +124,25 @@ pub fn main() !void {
         }
     });
 
+    _ = engine.registerTest("phase3", "scene_panel_toggles", @src(), struct {
+        fn gui(_: *zgui.te.TestContext) !void {
+            // Synthetic dt; tests don't observe status_timer decay.
+            if (g_app) |a| a.renderFrame(1.0 / 60.0);
+        }
+        fn run(ctx: *zgui.te.TestContext) !void {
+            const a = g_app orelse {
+                _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
+                return;
+            };
+
+            _ = zgui.te.check(@src(), .{}, !a.show_scene, "Scene panel starts closed");
+            ctx.menuAction(.click, "View/Scene");
+            _ = zgui.te.check(@src(), .{}, a.show_scene, "View/Scene opens panel");
+            ctx.menuAction(.click, "View/Scene");
+            _ = zgui.te.check(@src(), .{}, !a.show_scene, "View/Scene closes panel");
+        }
+    });
+
     _ = engine.registerTest("phase3", "resources_add_and_save", @src(), struct {
         fn gui(_: *zgui.te.TestContext) !void {
             // Synthetic dt; tests don't observe status_timer decay.

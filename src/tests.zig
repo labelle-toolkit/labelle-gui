@@ -6,6 +6,7 @@ const project = @import("project.zig");
 const tree_view = @import("tree_view.zig");
 const compiler = @import("compiler.zig");
 const new_scene = @import("dialogs/new_scene.zig");
+const scene_io = @import("scene_io.zig");
 
 test {
     zspec.runAll(@This());
@@ -273,6 +274,81 @@ pub const CompilerStateTests = struct {
 
 /// End-to-end tests for save → load → folder scaffold of the assembler-compatible
 /// `project.labelle` file. These do real filesystem work in /tmp.
+pub const SceneIoTests = struct {
+    test "parses a minimal scene" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "main",
+            \\    "entities": []
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+        try expect.toBeTrue(std.mem.eql(u8, loaded.scene.name, "main"));
+        try expect.equal(loaded.scene.entities.len, 0);
+    }
+
+    test "extracts prefab + Position from entities" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "x",
+            \\    "entities": [
+            \\        { "prefab": "wall", "components": { "Position": { "x": 100, "y": 200 } } },
+            \\        { "components": { "Position": { "x": 50, "y": 75 }, "Sprite": { "sprite_name": "coin" } } }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+        try expect.equal(loaded.scene.entities.len, 2);
+
+        try expect.toBeTrue(loaded.scene.entities[0].prefab != null);
+        try expect.toBeTrue(std.mem.eql(u8, loaded.scene.entities[0].prefab.?, "wall"));
+        try expect.toBeTrue(loaded.scene.entities[0].position != null);
+        try expect.equal(loaded.scene.entities[0].position.?.x, 100);
+        try expect.equal(loaded.scene.entities[0].position.?.y, 200);
+
+        // Second entity: no prefab, but Position present alongside an
+        // unmodeled Sprite component — both must parse without errors.
+        try expect.toBeTrue(loaded.scene.entities[1].prefab == null);
+        try expect.toBeTrue(loaded.scene.entities[1].position != null);
+        try expect.equal(loaded.scene.entities[1].position.?.x, 50);
+    }
+
+    test "tolerates // line comments" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    // top-level comment
+            \\    "name": "commented",
+            \\    "entities": [
+            \\        // entity below
+            \\        { "prefab": "p" }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+        try expect.toBeTrue(std.mem.eql(u8, loaded.scene.name, "commented"));
+        try expect.equal(loaded.scene.entities.len, 1);
+    }
+
+    test "entity without Position has null position" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "x",
+            \\    "entities": [ { "prefab": "abstract" } ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+        try expect.toBeTrue(loaded.scene.entities[0].position == null);
+    }
+};
+
 pub const SceneTemplateTests = struct {
     /// Strip `//`-to-end-of-line comments so the JSONC template can be
     /// fed to std.json (which doesn't accept comments). Replaces the
