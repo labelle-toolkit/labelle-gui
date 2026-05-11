@@ -1,10 +1,12 @@
 //! New Scene modal — opened from File > New Scene.
 //!
-//! Owns the file-creation side-effect because nothing else needs it.
-//! Writes a minimal `.scene` stub next to the project's `scenes/` folder
-//! and refreshes the tree view on success. Note: the stub format is the
-//! pre-engine TOML-ish placeholder; migrating it to engine-compatible
-//! `.zon` is tracked separately as issue #21.
+//! Writes a `<project>/scenes/<name>.zon` file in the format
+//! `labelle-engine`'s `SceneLoader` expects: a top-level ZON struct with
+//! `name` and `entities` (with `scripts` reserved for future use). New
+//! scenes are seeded with one commented-out entity so the user has the
+//! shape in front of them — they're not loadable until the user fills
+//! the entities list, which is fine for now (this is just the file
+//! scaffold; rich editing is a later issue).
 
 const std = @import("std");
 const zgui = @import("zgui");
@@ -51,7 +53,7 @@ fn createScene(app: *App, scene_name: []const u8) void {
     const proj_dir = proj.getProjectDir() orelse return;
 
     var path_buf: [512]u8 = undefined;
-    const scene_path = std.fmt.bufPrint(&path_buf, "{s}/{s}/{s}.scene", .{
+    const scene_path = std.fmt.bufPrint(&path_buf, "{s}/{s}/{s}.zon", .{
         proj_dir,
         project.ProjectFolders.scenes,
         scene_name,
@@ -66,25 +68,43 @@ fn createScene(app: *App, scene_name: []const u8) void {
     };
     defer file.close();
 
-    var content_buf: [512]u8 = undefined;
-    const content = std.fmt.bufPrint(&content_buf,
-        \\# {s}
-        \\# Scene created by Labelle GUI
-        \\
-        \\[scene]
-        \\name = "{s}"
-        \\
-        \\[entities]
-        \\# Define your entities here
-        \\
-    , .{ scene_name, scene_name }) catch {
+    const content = renderSceneZon(app.allocator, scene_name) catch {
         app.setStatus("Error formatting scene content!");
         return;
     };
+    defer app.allocator.free(content);
+
     file.writeAll(content) catch {
         app.setStatus("Error writing scene file!");
         return;
     };
     app.setStatus("Scene created!");
     app.tree_view.refresh();
+}
+
+/// Format an engine-compatible ZON scene scaffold for `scene_name`.
+/// Top-level shape matches `labelle-engine`'s `SceneLoader` expectations
+/// (see `labelle-engine/scene/src/types.zig`): `name`, `entities`, and
+/// optional `scripts`. The `entities` list is empty but accompanied by
+/// one commented-out example so the user can see how prefab + component
+/// entries are written without us guessing which prefabs they registered.
+///
+/// Pure / no I/O so it can be exercised from zspec without touching the
+/// filesystem.
+pub fn renderSceneZon(allocator: std.mem.Allocator, scene_name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator,
+        \\.{{
+        \\    .name = "{s}",
+        \\    // .scripts = .{{ "my_script" }},
+        \\    .entities = .{{
+        \\        // .{{
+        \\        //     .prefab = "my_prefab",
+        \\        //     .components = .{{
+        \\        //         .Position = .{{ .x = 0, .y = 0 }},
+        \\        //     }},
+        \\        // }},
+        \\    }},
+        \\}}
+        \\
+    , .{scene_name});
 }

@@ -5,6 +5,7 @@ const expect = zspec.expect;
 const project = @import("project.zig");
 const tree_view = @import("tree_view.zig");
 const compiler = @import("compiler.zig");
+const new_scene = @import("dialogs/new_scene.zig");
 
 test {
     zspec.runAll(@This());
@@ -272,6 +273,45 @@ pub const CompilerStateTests = struct {
 
 /// End-to-end tests for save → load → folder scaffold of the assembler-compatible
 /// `project.labelle` file. These do real filesystem work in /tmp.
+pub const SceneTemplateTests = struct {
+    test "renders scene name into .name field" {
+        const allocator = std.testing.allocator;
+        const out = try new_scene.renderSceneZon(allocator, "my_scene");
+        defer allocator.free(out);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, ".name = \"my_scene\"") != null);
+    }
+
+    test "includes an entities block" {
+        const allocator = std.testing.allocator;
+        const out = try new_scene.renderSceneZon(allocator, "anything");
+        defer allocator.free(out);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, ".entities = ") != null);
+    }
+
+    test "rendered template parses as ZON with name + entities" {
+        const allocator = std.testing.allocator;
+        const out = try new_scene.renderSceneZon(allocator, "parse_check");
+        defer allocator.free(out);
+
+        const source = try allocator.dupeZ(u8, out);
+        defer allocator.free(source);
+
+        const SceneSchema = struct {
+            name: []const u8,
+            scripts: []const []const u8 = &.{},
+            entities: []const struct {} = &.{},
+        };
+
+        var diag: std.zon.parse.Diagnostics = .{};
+        defer diag.deinit(allocator);
+        const parsed = try std.zon.parse.fromSlice(SceneSchema, allocator, source, &diag, .{});
+        defer std.zon.parse.free(allocator, parsed);
+
+        try expect.toBeTrue(std.mem.eql(u8, parsed.name, "parse_check"));
+        try expect.equal(parsed.entities.len, 0);
+    }
+};
+
 pub const ProjectFileTests = struct {
     fn createTempDir(allocator: std.mem.Allocator) ![]const u8 {
         const tmp_base = "/tmp";
