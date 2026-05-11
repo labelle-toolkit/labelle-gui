@@ -4,8 +4,8 @@
     .fingerprint = 0x3fd05a33857eec15,
     .dependencies = .{
         .zgui = .{
-            .url = "https://github.com/zig-gamedev/zgui/archive/f1c6c5bab.tar.gz",
-            .hash = "zgui-0.6.0-dev--L6sZCLzbQBM1I4oIbtd5_ClKk9rNExPOCYkCMP_TZad",
+            .url = "https://github.com/zig-gamedev/zgui/archive/b6a4dff52.tar.gz",
+            .hash = "zgui-0.6.0-dev--L6sZJUVbgCEsNU_5TOMPX5xl8aSzsbHTIPajxAl5hiR",
         },
         .zglfw = .{
             .url = "https://github.com/zig-gamedev/zglfw/archive/0dd29d807.tar.gz",

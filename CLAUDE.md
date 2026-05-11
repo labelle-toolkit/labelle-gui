@@ -91,4 +91,7 @@ When zgui is built with `with_te = true`:
 
 - `zopengl` must not use `@Enum` (added when upstream switched to 0.16).
 - `zglfw` 5-arg `createWindow` signature is what `main.zig:67` expects.
-- `zgui` must predate the `0.16.x` branch merge.
+- `zgui` must predate the `0.16.x` branch merge. The current pin
+  (`b6a4dff52`, 2026-03-05) includes upstream PR #88, which fixes the
+  128-byte `g_ContextMap` leak warning that older pins logged at
+  shutdown. If bumping zgui further, verify on 0.15.2 first.
