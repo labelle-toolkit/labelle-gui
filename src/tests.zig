@@ -11,6 +11,7 @@ const scene_module = @import("modules/scene.zig");
 const project_tree = @import("modules/project_tree.zig");
 const viewport = @import("modules/viewport.zig");
 const atlas = @import("atlas.zig");
+const gizmo_io = @import("gizmo_io.zig");
 
 test {
     zspec.runAll(@This());
@@ -1383,6 +1384,32 @@ pub const SceneRoutingTests = struct {
     test "no project dir → no flow routing" {
         try expect.toBeFalse(project_tree.isFlowPath(null, "/p/scripts/flows/foo.flow.zon"));
     }
+
+    test "gizmo path under gizmos/ is accepted" {
+        try expect.toBeTrue(project_tree.isGizmoPath("/p", "/p/gizmos/workstation.zon"));
+        try expect.toBeTrue(project_tree.isGizmoPath("/p", "/p/gizmos/sub/room.zon"));
+    }
+
+    test "gizmo path under prefabs/ is rejected" {
+        // Gizmos live under their own folder; a `.zon` file under
+        // prefabs/ (or anywhere else) must not open as a gizmo.
+        try expect.toBeFalse(project_tree.isGizmoPath("/p", "/p/prefabs/coin.zon"));
+        try expect.toBeFalse(project_tree.isGizmoPath("/p", "/p/scenes/main.zon"));
+        try expect.toBeFalse(project_tree.isGizmoPath("/p", "/p/random.zon"));
+    }
+
+    test "gizmo path rejects non-.zon files" {
+        // `.jsonc` files under gizmos/ are not gizmos — the engine's
+        // GizmoRegistry only compiles `.zon`. project.labelle lives
+        // at the project root, never under gizmos/, but defend
+        // anyway.
+        try expect.toBeFalse(project_tree.isGizmoPath("/p", "/p/gizmos/workstation.jsonc"));
+        try expect.toBeFalse(project_tree.isGizmoPath("/p", "/p/gizmos/notes.md"));
+    }
+
+    test "no project dir → no gizmo routing" {
+        try expect.toBeFalse(project_tree.isGizmoPath(null, "/p/gizmos/workstation.zon"));
+    }
 };
 
 pub const SceneHitTestTests = struct {
@@ -1969,5 +1996,140 @@ pub const ProjectFileTests = struct {
         try expect.toBeTrue(std.mem.eql(u8, pm2.current_project.?.config.name, "round_trip"));
         try expect.equal(pm2.current_project.?.config.backend, .raylib);
         try expect.equal(pm2.current_project.?.config.ecs, .zig_ecs);
+    }
+};
+
+pub const GizmoIoTests = struct {
+    // Verbatim is the key contract: gizmos may carry a Shape union
+    // we don't model structurally yet, so the parser must capture
+    // `.entity` / `.children` blocks unchanged and the writer must
+    // splice them back in faithfully.
+
+    const sample_workstation =
+        \\.{
+        \\    .match = .{"Workstation"},
+        \\    .entity = .{
+        \\        .Shape = .{
+        \\            .x = 0,
+        \\            .y = 0,
+        \\            .shape = .{ .triangle = .{ .p2 = .{ .x = 12, .y = -20 }, .p3 = .{ .x = -12, .y = -20 } } },
+        \\            .color = .{ .r = 255, .g = 150, .b = 50, .a = 220 },
+        \\        },
+        \\    },
+        \\}
+        \\
+    ;
+
+    const sample_with_exclude =
+        \\.{
+        \\    .match = .{"Room", "Quarters"},
+        \\    .exclude = .{"Hidden"},
+        \\    .entity = .{
+        \\        .Shape = .{ .shape = .{ .circle = .{ .radius = 8 } } },
+        \\    },
+        \\}
+        \\
+    ;
+
+    test "parses match into a typed list" {
+        const allocator = std.testing.allocator;
+        var loaded = try gizmo_io.parseGizmo(allocator, sample_workstation);
+        defer loaded.deinit();
+
+        try expect.equal(loaded.gizmo.match.len, 1);
+        try expect.toBeTrue(std.mem.eql(u8, loaded.gizmo.match[0], "Workstation"));
+        try expect.equal(loaded.gizmo.exclude.len, 0);
+    }
+
+    test "parses exclude when present" {
+        const allocator = std.testing.allocator;
+        var loaded = try gizmo_io.parseGizmo(allocator, sample_with_exclude);
+        defer loaded.deinit();
+
+        try expect.equal(loaded.gizmo.match.len, 2);
+        try expect.toBeTrue(std.mem.eql(u8, loaded.gizmo.match[0], "Room"));
+        try expect.toBeTrue(std.mem.eql(u8, loaded.gizmo.match[1], "Quarters"));
+        try expect.equal(loaded.gizmo.exclude.len, 1);
+        try expect.toBeTrue(std.mem.eql(u8, loaded.gizmo.exclude[0], "Hidden"));
+    }
+
+    test "captures .entity block verbatim" {
+        const allocator = std.testing.allocator;
+        var loaded = try gizmo_io.parseGizmo(allocator, sample_workstation);
+        defer loaded.deinit();
+
+        try expect.toBeTrue(loaded.gizmo.entity_verbatim != null);
+        const text = loaded.gizmo.entity_verbatim.?;
+        // Spot-check distinctive substrings from the Shape body so a
+        // future writer refactor that drops bytes is caught.
+        try expect.toBeTrue(std.mem.indexOf(u8, text, ".triangle") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, ".x = 12") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, ".r = 255") != null);
+    }
+
+    test "round-trip parse → render → parse preserves match/exclude/entity" {
+        const allocator = std.testing.allocator;
+
+        var loaded1 = try gizmo_io.parseGizmo(allocator, sample_with_exclude);
+        defer loaded1.deinit();
+        const rendered = try gizmo_io.renderGizmoZon(allocator, loaded1);
+        defer allocator.free(rendered);
+
+        var loaded2 = try gizmo_io.parseGizmo(allocator, rendered);
+        defer loaded2.deinit();
+
+        try expect.equal(loaded2.gizmo.match.len, loaded1.gizmo.match.len);
+        for (loaded1.gizmo.match, loaded2.gizmo.match) |a, b| {
+            try expect.toBeTrue(std.mem.eql(u8, a, b));
+        }
+        try expect.equal(loaded2.gizmo.exclude.len, loaded1.gizmo.exclude.len);
+        for (loaded1.gizmo.exclude, loaded2.gizmo.exclude) |a, b| {
+            try expect.toBeTrue(std.mem.eql(u8, a, b));
+        }
+        try expect.toBeTrue(loaded2.gizmo.entity_verbatim != null);
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            loaded2.gizmo.entity_verbatim.?,
+            loaded1.gizmo.entity_verbatim.?,
+        ));
+    }
+
+    test "editing a match entry shows up in saved output" {
+        const allocator = std.testing.allocator;
+        var loaded = try gizmo_io.parseGizmo(allocator, sample_workstation);
+        defer loaded.deinit();
+
+        // Mutate match in place (using the same arena lifetime the
+        // module owns) and re-render. The new string must appear and
+        // the old one must not.
+        const new_str = try loaded.arena.allocator().dupe(u8, "DiningTable");
+        loaded.gizmo.match[0] = new_str;
+
+        const rendered = try gizmo_io.renderGizmoZon(allocator, loaded);
+        defer allocator.free(rendered);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, rendered, "\"DiningTable\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, rendered, "\"Workstation\"") == null);
+    }
+
+    test "omits exclude/entity/children when not present" {
+        const allocator = std.testing.allocator;
+        const minimal = ".{ .match = .{\"Foo\"} }\n";
+        var loaded = try gizmo_io.parseGizmo(allocator, minimal);
+        defer loaded.deinit();
+
+        const rendered = try gizmo_io.renderGizmoZon(allocator, loaded);
+        defer allocator.free(rendered);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, rendered, ".match") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, rendered, ".exclude") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, rendered, ".entity") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, rendered, ".children") == null);
+    }
+
+    test "displayNameFromPath strips .zon extension" {
+        try expect.toBeTrue(std.mem.eql(u8, gizmo_io.displayNameFromPath("/p/gizmos/workstation.zon"), "workstation"));
+        try expect.toBeTrue(std.mem.eql(u8, gizmo_io.displayNameFromPath("room.zon"), "room"));
+        try expect.toBeTrue(std.mem.eql(u8, gizmo_io.displayNameFromPath("noext"), "noext"));
     }
 };

@@ -22,6 +22,7 @@ const resources_mod = @import("modules/resources.zig");
 const scene_mod = @import("modules/scene.zig");
 const prefab_mod = @import("modules/prefab.zig");
 const flow_mod = @import("modules/flow.zig");
+const gizmo_mod = @import("modules/gizmo.zig");
 const close_scene_dialog = @import("dialogs/close_scene.zig");
 const atlas = @import("atlas.zig");
 const new_scene_dialog = @import("dialogs/new_scene.zig");
@@ -43,12 +44,14 @@ pub const OpenTab = union(enum) {
     /// `save`/`isDirty` are no-ops until Phase 1 lands the
     /// `.flow.zon` schema.
     flow: flow_mod.FlowState,
+    gizmo: gizmo_mod.GizmoState,
 
     pub fn deinit(self: *OpenTab, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .scene => |*s| s.deinit(allocator),
             .prefab => |*p| p.deinit(allocator),
             .flow => |*f| f.deinit(allocator),
+            .gizmo => |*g| g.deinit(allocator),
         }
     }
 
@@ -57,6 +60,7 @@ pub const OpenTab = union(enum) {
             .scene => |*s| scene_mod.render(s, app),
             .prefab => |*p| prefab_mod.render(p, app),
             .flow => |*f| flow_mod.render(f, app),
+            .gizmo => |*g| gizmo_mod.render(g, app),
         }
     }
 
@@ -65,6 +69,7 @@ pub const OpenTab = union(enum) {
             .scene => |*s| scene_mod.saveScene(s, app),
             .prefab => |*p| prefab_mod.savePrefab(p, app),
             .flow => |*f| flow_mod.saveFlow(f, app),
+            .gizmo => |*g| gizmo_mod.saveGizmo(g, app),
         }
     }
 
@@ -73,6 +78,7 @@ pub const OpenTab = union(enum) {
             .scene => |s| s.display_name,
             .prefab => |p| p.display_name,
             .flow => |f| f.display_name,
+            .gizmo => |g| g.display_name,
         };
     }
 
@@ -81,6 +87,7 @@ pub const OpenTab = union(enum) {
             .scene => |s| s.path,
             .prefab => |p| p.path,
             .flow => |f| f.path,
+            .gizmo => |g| g.path,
         };
     }
 
@@ -89,6 +96,7 @@ pub const OpenTab = union(enum) {
             .scene => |s| s.is_dirty,
             .prefab => |p| p.is_dirty,
             .flow => |f| f.is_dirty,
+            .gizmo => |g| g.is_dirty,
         };
     }
 };
@@ -275,6 +283,26 @@ pub const App = struct {
         var state = try flow_mod.FlowState.open(self.allocator, path);
         errdefer state.deinit(self.allocator);
         try self.open_tabs.append(self.allocator, .{ .flow = state });
+        const new_idx = self.open_tabs.items.len - 1;
+        self.active_tab_idx = new_idx;
+        self.focus_tab_idx = new_idx;
+    }
+
+    /// Open a `.zon` gizmo file (under `<project>/gizmos/`) as a tab
+    /// in the main content area. De-dups by path; mirrors `openScene`
+    /// and `openPrefab`. `project_tree.isGizmoPath` is the router's
+    /// path discriminator.
+    pub fn openGizmo(self: *Self, path: []const u8) !void {
+        for (self.open_tabs.items, 0..) |t, i| {
+            if (std.mem.eql(u8, t.path(), path)) {
+                self.focus_tab_idx = i;
+                return;
+            }
+        }
+
+        var state = try gizmo_mod.GizmoState.open(self.allocator, path);
+        errdefer state.deinit(self.allocator);
+        try self.open_tabs.append(self.allocator, .{ .gizmo = state });
         const new_idx = self.open_tabs.items.len - 1;
         self.active_tab_idx = new_idx;
         self.focus_tab_idx = new_idx;
