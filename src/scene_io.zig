@@ -418,6 +418,29 @@ fn jsonNumberAsF32(v: ?std.json.Value) ?f32 {
     };
 }
 
+/// Emit `s` as a JSON-escaped string literal (`"..."`) into `writer`.
+/// Handles the escapes the JSON spec requires for byte values < 0x20
+/// plus the two embeddable bytes (`"` and `\`); leaves the rest of
+/// the UTF-8 stream untouched. Sufficient for the inspector-driven
+/// short identifier fields on `Sprite` — the assembler's parser is
+/// a standard JSON reader, so anything we escape per the spec
+/// round-trips faithfully.
+fn writeJsonString(writer: anytype, s: []const u8) !void {
+    try writer.writeByte('"');
+    for (s) |c| switch (c) {
+        '"' => try writer.writeAll("\\\""),
+        '\\' => try writer.writeAll("\\\\"),
+        '\n' => try writer.writeAll("\\n"),
+        '\r' => try writer.writeAll("\\r"),
+        '\t' => try writer.writeAll("\\t"),
+        0x08 => try writer.writeAll("\\b"),
+        0x0C => try writer.writeAll("\\f"),
+        0x00...0x07, 0x0B, 0x0E...0x1F => try writer.print("\\u{x:0>4}", .{c}),
+        else => try writer.writeByte(c),
+    };
+    try writer.writeByte('"');
+}
+
 /// Emit `"Sprite": { ... }` into `writer` from the typed sprite
 /// fields. Used by both the scene and prefab writers as part of
 /// the per-entity `components` block. Returns `true` if anything
@@ -432,18 +455,25 @@ fn emitSprite(writer: anytype, sprite: Sprite) !bool {
 
     try writer.writeAll(" \"Sprite\": {");
     var first = true;
+    // sprite_name / pivot / layer come straight from inspector text
+    // buffers, so they can in principle hold a `"` or `\`. Escape
+    // them so the rendered file stays valid JSONC even with hostile
+    // input.
     if (name.len > 0) {
-        try writer.print(" \"sprite_name\": \"{s}\"", .{name});
+        try writer.writeAll(" \"sprite_name\": ");
+        try writeJsonString(writer, name);
         first = false;
     }
     if (pivot.len > 0) {
         if (!first) try writer.writeAll(",");
-        try writer.print(" \"pivot\": \"{s}\"", .{pivot});
+        try writer.writeAll(" \"pivot\": ");
+        try writeJsonString(writer, pivot);
         first = false;
     }
     if (layer.len > 0) {
         if (!first) try writer.writeAll(",");
-        try writer.print(" \"layer\": \"{s}\"", .{layer});
+        try writer.writeAll(" \"layer\": ");
+        try writeJsonString(writer, layer);
         first = false;
     }
     if (sprite.has_z_index) {

@@ -571,6 +571,39 @@ pub const SceneIoTests = struct {
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"z_index\": -5") != null);
     }
 
+    test "Sprite string fields are JSON-escaped on emit" {
+        // Regression for gemini PR #32 review: sprite_name/pivot/layer
+        // come from inspector text buffers and may contain `"` or `\`.
+        // The writer must escape them so the rendered .jsonc stays
+        // parseable.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{ "components": { "Sprite": { "sprite_name": "x" } } }
+        ;
+        var loaded = try scene_io.parsePrefab(allocator, src);
+        defer loaded.deinit();
+        const sprite = loaded.entity.sprite orelse return error.MissingSprite;
+
+        // Stuff a hostile name (quote + backslash) into the buffer.
+        @memset(&sprite.sprite_name, 0);
+        const hostile = "weird\"\\name";
+        @memcpy(sprite.sprite_name[0..hostile.len], hostile);
+
+        const text = try scene_io.renderPrefabJsonc(allocator, loaded);
+        defer allocator.free(text);
+
+        // Output must escape both bytes — the resulting file must
+        // re-parse cleanly through the same path.
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\\\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\\\\") != null);
+
+        var loaded2 = try scene_io.parsePrefab(allocator, text);
+        defer loaded2.deinit();
+        const sprite2 = loaded2.entity.sprite orelse return error.MissingSprite;
+        const name2 = std.mem.sliceTo(&sprite2.sprite_name, 0);
+        try expect.toBeTrue(std.mem.eql(u8, name2, hostile));
+    }
+
     test "edit Sprite.sprite_name in memory; saved output reflects it" {
         const allocator = std.testing.allocator;
         const src =

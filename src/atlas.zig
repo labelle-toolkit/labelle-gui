@@ -80,12 +80,18 @@ pub const Index = struct {
     ) Index {
         var index: Index = .{ .allocator = allocator, .generation = generation };
         for (resources) |r| {
-            const atlas = loadOne(allocator, project_dir, r) catch |err| {
+            var atlas = loadOne(allocator, project_dir, r) catch |err| {
                 std.log.warn("Atlas '{s}' failed to load: {s}", .{ r.name, @errorName(err) });
                 continue;
             };
             const atlas_idx: u32 = @intCast(index.atlases.items.len);
-            index.atlases.append(allocator, atlas) catch continue;
+            // OOM in `append` would orphan the just-loaded atlas's GL
+            // texture handle and dup'd name; tear it down before
+            // dropping to the next resource.
+            index.atlases.append(allocator, atlas) catch {
+                atlas.deinit(allocator);
+                continue;
+            };
 
             // Mirror this atlas's name → frame map into the combined
             // lookup. First-atlas-wins on collisions; logged so the
