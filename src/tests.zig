@@ -274,41 +274,55 @@ pub const CompilerStateTests = struct {
 /// End-to-end tests for save → load → folder scaffold of the assembler-compatible
 /// `project.labelle` file. These do real filesystem work in /tmp.
 pub const SceneTemplateTests = struct {
-    test "renders scene name into .name field" {
-        const allocator = std.testing.allocator;
-        const out = try new_scene.renderSceneZon(allocator, "my_scene");
-        defer allocator.free(out);
-        try expect.toBeTrue(std.mem.indexOf(u8, out, ".name = \"my_scene\"") != null);
+    /// Strip `//`-to-end-of-line comments so the JSONC template can be
+    /// fed to std.json (which doesn't accept comments). Replaces the
+    /// comment bytes with spaces so column/line offsets — and therefore
+    /// any later parser diagnostics — match the original.
+    fn stripLineComments(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
+        const out = try allocator.dupe(u8, src);
+        var i: usize = 0;
+        while (i + 1 < out.len) : (i += 1) {
+            if (out[i] == '/' and out[i + 1] == '/') {
+                var j = i;
+                while (j < out.len and out[j] != '\n') : (j += 1) out[j] = ' ';
+                i = j;
+            }
+        }
+        return out;
     }
 
-    test "includes an entities block" {
+    test "renders scene name into name field" {
         const allocator = std.testing.allocator;
-        const out = try new_scene.renderSceneZon(allocator, "anything");
+        const out = try new_scene.renderSceneJsonc(allocator, "my_scene");
         defer allocator.free(out);
-        try expect.toBeTrue(std.mem.indexOf(u8, out, ".entities = ") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "\"name\": \"my_scene\"") != null);
     }
 
-    test "rendered template parses as ZON with name + entities" {
+    test "includes an entities array" {
         const allocator = std.testing.allocator;
-        const out = try new_scene.renderSceneZon(allocator, "parse_check");
+        const out = try new_scene.renderSceneJsonc(allocator, "anything");
+        defer allocator.free(out);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "\"entities\":") != null);
+    }
+
+    test "uses .jsonc-compatible content (parses as JSON after stripping comments)" {
+        const allocator = std.testing.allocator;
+        const out = try new_scene.renderSceneJsonc(allocator, "parse_check");
         defer allocator.free(out);
 
-        const source = try allocator.dupeZ(u8, out);
-        defer allocator.free(source);
+        const stripped = try stripLineComments(allocator, out);
+        defer allocator.free(stripped);
 
         const SceneSchema = struct {
             name: []const u8,
-            scripts: []const []const u8 = &.{},
             entities: []const struct {} = &.{},
         };
 
-        var diag: std.zon.parse.Diagnostics = .{};
-        defer diag.deinit(allocator);
-        const parsed = try std.zon.parse.fromSlice(SceneSchema, allocator, source, &diag, .{});
-        defer std.zon.parse.free(allocator, parsed);
+        const parsed = try std.json.parseFromSlice(SceneSchema, allocator, stripped, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
 
-        try expect.toBeTrue(std.mem.eql(u8, parsed.name, "parse_check"));
-        try expect.equal(parsed.entities.len, 0);
+        try expect.toBeTrue(std.mem.eql(u8, parsed.value.name, "parse_check"));
+        try expect.equal(parsed.value.entities.len, 0);
     }
 };
 

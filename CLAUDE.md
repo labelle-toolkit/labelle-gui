@@ -34,6 +34,15 @@ zig build smoke     # end-to-end against the real `labelle` launcher — env-dep
 | `src/gui_tests.zig` | UI test runner using zgui's bundled ImGui Test Engine (`with_te=true`). Constructs an `App` against a hidden window and drives it with `TestContext.menuAction(...)`. See "TE quirks" below. |
 | `src/smoke.zig` | End-to-end smoke harness — temp dir, `ProjectManager.saveProject`, `Compiler.build`, asserts `.labelle/<target>/` appears. |
 
+## Reference example project
+
+`../flying-platform-labelle/` is the canonical real-world project the
+toolkit is currently developed against. Look there for current `project.labelle`,
+`scenes/*.jsonc`, prefab/component shapes, and resource manifests rather
+than guessing or grabbing from older examples in this tree. The
+assembler's `examples/` directory has stripped-down minimal projects for
+each backend (`raylib`, `sokol`, etc.) that are also kept current.
+
 ## Key invariants
 
 1. **`project.labelle` must pin all four versions** — `core_version`, `engine_version`, `gfx_version`, `assembler_version`. The launcher's resolver falls back to its own version for missing fields (`labelle-cli/src/cli/cache.zig:29`: `cfg.assembler_version orelse cfg.labelle_version`), which 404s when CLI and assembler aren't lockstep. Defaults in `ProjectConfig` track `labelle-cli/versions.zon` and the CLI's own assembler pin.

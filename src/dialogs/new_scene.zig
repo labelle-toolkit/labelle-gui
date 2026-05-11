@@ -1,12 +1,12 @@
 //! New Scene modal — opened from File > New Scene.
 //!
-//! Writes a `<project>/scenes/<name>.zon` file in the format
-//! `labelle-engine`'s `SceneLoader` expects: a top-level ZON struct with
-//! `name` and `entities` (with `scripts` reserved for future use). New
-//! scenes are seeded with one commented-out entity so the user has the
-//! shape in front of them — they're not loadable until the user fills
-//! the entities list, which is fine for now (this is just the file
-//! scaffold; rich editing is a later issue).
+//! Writes a `<project>/scenes/<name>.jsonc` file in the format
+//! `labelle-engine`'s scene loader expects: a top-level JSON object with
+//! `name` and `entities` (with `include` and `assets` reserved for
+//! future use). New scenes are seeded with one commented-out entity so
+//! the user has the shape in front of them — they're not loadable until
+//! the user fills the entities list, which is fine for now (this is
+//! just the file scaffold; rich editing is a later issue).
 
 const std = @import("std");
 const zgui = @import("zgui");
@@ -53,7 +53,7 @@ fn createScene(app: *App, scene_name: []const u8) void {
     const proj_dir = proj.getProjectDir() orelse return;
 
     var path_buf: [512]u8 = undefined;
-    const scene_path = std.fmt.bufPrint(&path_buf, "{s}/{s}/{s}.zon", .{
+    const scene_path = std.fmt.bufPrint(&path_buf, "{s}/{s}/{s}.jsonc", .{
         proj_dir,
         project.ProjectFolders.scenes,
         scene_name,
@@ -68,7 +68,7 @@ fn createScene(app: *App, scene_name: []const u8) void {
     };
     defer file.close();
 
-    const content = renderSceneZon(app.allocator, scene_name) catch {
+    const content = renderSceneJsonc(app.allocator, scene_name) catch {
         app.setStatus("Error formatting scene content!");
         return;
     };
@@ -82,28 +82,30 @@ fn createScene(app: *App, scene_name: []const u8) void {
     app.tree_view.refresh();
 }
 
-/// Format an engine-compatible ZON scene scaffold for `scene_name`.
-/// Top-level shape matches `labelle-engine`'s `SceneLoader` expectations
-/// (see `labelle-engine/scene/src/types.zig`): `name`, `entities`, and
-/// optional `scripts`. The `entities` list is empty but accompanied by
-/// one commented-out example so the user can see how prefab + component
-/// entries are written without us guessing which prefabs they registered.
+/// Format an engine-compatible JSONC scene scaffold for `scene_name`.
+/// Top-level shape matches `labelle-engine`'s scene loader (see
+/// `labelle-assembler/examples/*/scenes/main.jsonc` for canonical
+/// examples): `name` and `entities`, with `include` reserved for
+/// composition. The `entities` array is empty but accompanied by one
+/// commented-out example so the user can see how prefab + component
+/// entries are written without us guessing which prefabs they
+/// registered.
 ///
 /// Pure / no I/O so it can be exercised from zspec without touching the
 /// filesystem.
-pub fn renderSceneZon(allocator: std.mem.Allocator, scene_name: []const u8) ![]u8 {
+pub fn renderSceneJsonc(allocator: std.mem.Allocator, scene_name: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator,
-        \\.{{
-        \\    .name = "{s}",
-        \\    // .scripts = .{{ "my_script" }},
-        \\    .entities = .{{
-        \\        // .{{
-        \\        //     .prefab = "my_prefab",
-        \\        //     .components = .{{
-        \\        //         .Position = .{{ .x = 0, .y = 0 }},
-        \\        //     }},
-        \\        // }},
-        \\    }},
+        \\{{
+        \\    "name": "{s}",
+        \\    // "include": ["scenes/other.jsonc"],
+        \\    "entities": [
+        \\        // {{
+        \\        //     "prefab": "my_prefab",
+        \\        //     "components": {{
+        \\        //         "Position": {{ "x": 0, "y": 0 }}
+        \\        //     }}
+        \\        // }}
+        \\    ]
         \\}}
         \\
     , .{scene_name});
