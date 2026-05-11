@@ -240,7 +240,7 @@ pub const App = struct {
     /// Rebuild the gizmo overlay index by walking
     /// `<project_dir>/gizmos/`. Same generation-keyed invalidation
     /// rule the atlas index uses.
-    fn rebuildGizmoIndex(self: *Self) void {
+    pub fn rebuildGizmoIndex(self: *Self) void {
         if (self.gizmo_index) |*idx| {
             idx.deinit();
             self.gizmo_index = null;
@@ -252,13 +252,6 @@ pub const App = struct {
             dir,
             self.project_manager.generation,
         );
-    }
-
-    /// Refresh the per-project gizmo overlay index after an in-session
-    /// gizmo file edit/save so scene/prefab overlays update without
-    /// requiring a full project reload.
-    pub fn refreshGizmoIndex(self: *Self) void {
-        self.rebuildGizmoIndex();
     }
 
     // ─── Scene tabs ─────────────────────────────────────────────────────

@@ -274,6 +274,6 @@ pub fn saveGizmo(s: *GizmoState, app: *App) void {
         return;
     };
     s.is_dirty = false;
-    app.refreshGizmoIndex();
+    app.rebuildGizmoIndex();
     app.setStatus("Gizmo saved!");
 }
