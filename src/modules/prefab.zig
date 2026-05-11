@@ -47,7 +47,7 @@ pub const PrefabState = struct {
 
         const a = arena.allocator();
         const path_dup = try a.dupe(u8, path);
-        const display_name = deriveDisplayName(path_dup);
+        const display_name = scene_io.displayNameFromPath(path_dup);
 
         const loaded = try scene_io.loadPrefabFromFile(allocator, path);
         return .{
@@ -64,13 +64,6 @@ pub const PrefabState = struct {
         allocator.destroy(self.arena);
     }
 };
-
-fn deriveDisplayName(path: []const u8) []const u8 {
-    const base = std.fs.path.basename(path);
-    const ext = ".jsonc";
-    if (std.mem.endsWith(u8, base, ext)) return base[0 .. base.len - ext.len];
-    return base;
-}
 
 pub fn render(s: *PrefabState, app: *App) void {
     zgui.text("Prefab: {s}", .{s.display_name});

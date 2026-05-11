@@ -62,7 +62,7 @@ pub const SceneState = struct {
 
         const a = arena.allocator();
         const path_dup = try a.dupe(u8, path);
-        const display_name = deriveDisplayName(path_dup);
+        const display_name = scene_io.displayNameFromPath(path_dup);
 
         const loaded = try scene_io.loadFromFile(allocator, path);
         return .{
@@ -82,13 +82,6 @@ pub const SceneState = struct {
 
 /// Returns the file basename with its `.jsonc` extension stripped.
 /// `path` must outlive the returned slice (we just slice into it).
-fn deriveDisplayName(path: []const u8) []const u8 {
-    const base = std.fs.path.basename(path);
-    const ext = ".jsonc";
-    if (std.mem.endsWith(u8, base, ext)) return base[0 .. base.len - ext.len];
-    return base;
-}
-
 const inspector_w: f32 = 300;
 const split_gap: f32 = 8;
 

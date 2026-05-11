@@ -358,6 +358,17 @@ fn jsonNumberAsF32(v: ?std.json.Value) ?f32 {
     };
 }
 
+/// Strip a trailing `.jsonc` extension from a path's basename and
+/// return the resulting stem (e.g. `"a/b/main.jsonc"` → `"main"`).
+/// Used by Scene + Prefab tabs for the display label; lifted here
+/// so they share the implementation rather than duplicating it.
+pub fn displayNameFromPath(path: []const u8) []const u8 {
+    const base = std.fs.path.basename(path);
+    const ext = ".jsonc";
+    if (std.mem.endsWith(u8, base, ext)) return base[0 .. base.len - ext.len];
+    return base;
+}
+
 /// Walk the JSONC source and capture `// ...` comment blocks that
 /// precede each top-level entity in `entities: [ ... ]`. Returns one
 /// string per entity in source order; entries are empty when an entity
@@ -700,8 +711,19 @@ fn extractComponentExtras(arena: std.mem.Allocator, entity_body: []const u8) ![]
 
 /// Find `"<key>": {` inside an object body. Returns the byte offset
 /// of the opening `{`, or null when the key isn't present.
+///
+/// Tolerates leading whitespace / `//` comments / BOM-style padding
+/// before the outer `{`. Scene-entity callers pass a body that
+/// already starts at the opening brace (sliced by `scanBalanced`);
+/// the prefab path passes the full raw file, which may have a
+/// header comment or whitespace before `{`. Without the skip below
+/// the prefab path returned null and silently produced empty
+/// extras — data-destructive on save.
 fn findKeyObject(body: []const u8, key: []const u8) ?usize {
     var i: usize = 0;
+    skipWhitespaceJson(body, &i);
+    skipCommentBlock(body, &i);
+    skipWhitespaceJson(body, &i);
     if (i < body.len and body[i] == '{') i += 1;
     while (i < body.len) {
         skipWhitespaceJson(body, &i);

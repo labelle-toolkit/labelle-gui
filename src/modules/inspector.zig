@@ -62,7 +62,10 @@ pub fn renderEntity(
         zgui.separator();
         zgui.textDisabled("Other components ({d})", .{component_extras.len});
         for (component_extras) |extra| {
-            var label_buf: [128:0]u8 = undefined;
+            // Component names are short in practice (Sprite, Coin,
+            // Room…), but allow longer custom names — 256 bytes
+            // covers any reasonable identifier.
+            var label_buf: [256:0]u8 = undefined;
             const label = std.fmt.bufPrintZ(&label_buf, "{s}", .{extra.name}) catch continue;
             if (zgui.collapsingHeader(label, .{})) {
                 zgui.textUnformatted(extra.value_text);

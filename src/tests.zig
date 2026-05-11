@@ -703,6 +703,31 @@ pub const SceneIoTests = struct {
         try expect.equal(loaded2.children[0].position.?.x, 99);
     }
 
+    test "parsePrefab captures extras when file has leading whitespace + comment" {
+        // Regression for cursor[bot] PR #30 review: findKeyObject
+        // used to bail when the body didn't start with `{` (because
+        // it only consumed an outer brace right at position 0).
+        // Prefabs whose source had a header comment or leading
+        // whitespace silently produced empty extras → all non-
+        // Position components got dropped on save.
+        const allocator = std.testing.allocator;
+        const src =
+            \\// header comment
+            \\
+            \\{
+            \\    "components": {
+            \\        "Sprite": { "n": "x" },
+            \\        "Coin": {}
+            \\    }
+            \\}
+        ;
+        var loaded = try scene_io.parsePrefab(allocator, src);
+        defer loaded.deinit();
+        try expect.equal(loaded.component_extras.len, 2);
+        try expect.toBeTrue(std.mem.eql(u8, loaded.component_extras[0].name, "Sprite"));
+        try expect.toBeTrue(std.mem.eql(u8, loaded.component_extras[1].name, "Coin"));
+    }
+
     test "renderPrefabJsonc reflects in-memory Position edits" {
         const allocator = std.testing.allocator;
         const src =
