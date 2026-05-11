@@ -148,7 +148,8 @@ fn drawEntities(
         // atlas) > rectangle geometry > colored-circle marker.
         // A declared-but-unresolved sprite still gets a `?` overlay
         // on whatever fallback it falls into.
-        var drew_visual = drawSpriteIfResolved(dl, e, px, py, state.zoom.*, atlas_index);
+        const drew_sprite = drawSpriteIfResolved(dl, e, px, py, state.zoom.*, atlas_index);
+        var drew_visual = drew_sprite;
         if (!drew_visual and e.rectangle != null) {
             drawRectangle(dl, e.rectangle.?.*, px, py, state.zoom.*);
             drew_visual = true;
@@ -161,9 +162,9 @@ fn drawEntities(
                 .col = col,
                 .num_segments = 16,
             });
-            if (e.sprite != null) {
-                dl.addText(.{ px - 3, py - 7 }, 0xff_ff_ff_ff, "?", .{});
-            }
+        }
+        if (!drew_sprite and e.sprite != null) {
+            dl.addText(.{ px - 3, py - 7 }, 0xff_ff_ff_ff, "?", .{});
         }
 
         if (selected) {

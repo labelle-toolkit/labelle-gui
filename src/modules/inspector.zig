@@ -95,10 +95,13 @@ pub fn renderEntity(
                 @as(f32, @floatFromInt(rect.a)) / 255.0,
             };
             if (zgui.colorEdit4("color", .{ .col = &col4 })) {
-                rect.r = @intFromFloat(@round(col4[0] * 255.0));
-                rect.g = @intFromFloat(@round(col4[1] * 255.0));
-                rect.b = @intFromFloat(@round(col4[2] * 255.0));
-                rect.a = @intFromFloat(@round(col4[3] * 255.0));
+                // Clamp before casting: `@intFromFloat` is safety-checked
+                // and would panic on values outside `[0, 255]`, which can
+                // happen due to float precision or manual hex/int input.
+                rect.r = @intFromFloat(@round(std.math.clamp(col4[0] * 255.0, 0.0, 255.0)));
+                rect.g = @intFromFloat(@round(std.math.clamp(col4[1] * 255.0, 0.0, 255.0)));
+                rect.b = @intFromFloat(@round(std.math.clamp(col4[2] * 255.0, 0.0, 255.0)));
+                rect.a = @intFromFloat(@round(std.math.clamp(col4[3] * 255.0, 0.0, 255.0)));
                 is_dirty.* = true;
             }
             if (zgui.checkbox("filled", .{ .v = &rect.filled })) is_dirty.* = true;
