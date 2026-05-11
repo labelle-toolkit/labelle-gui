@@ -12,6 +12,7 @@ const std = @import("std");
 const zgui = @import("zgui");
 
 const scene_io = @import("../scene_io.zig");
+const atlas = @import("../atlas.zig");
 
 pub const min_h: f32 = 240;
 
@@ -30,7 +31,7 @@ pub const hit_radius: f32 = 10.0;
 /// Render the viewport canvas for `entities` into the current
 /// imgui window. Caller is responsible for the surrounding container
 /// (e.g. a beginChild) and any controls bar.
-pub fn render(state: State, entities: []scene_io.Entity) void {
+pub fn render(state: State, entities: []scene_io.Entity, atlas_index: ?*const atlas.Index) void {
     const avail = zgui.getContentRegionAvail();
     const canvas_h = @max(min_h, avail[1]);
     if (!zgui.beginChild("##canvas", .{
@@ -56,7 +57,7 @@ pub fn render(state: State, entities: []scene_io.Entity) void {
     });
 
     drawGrid(dl, canvas_min, canvas_max, state.pan.*, state.zoom.*);
-    drawEntities(dl, canvas_min, state, entities);
+    drawEntities(dl, canvas_min, state, entities, atlas_index);
 
     _ = zgui.invisibleButton("##canvas_drag", .{ .w = canvas_size[0], .h = canvas_size[1], .flags = .{} });
 
@@ -130,19 +131,39 @@ fn drawGrid(dl: zgui.DrawList, cmin: [2]f32, cmax: [2]f32, pan: [2]f32, zoom: f3
     dl.addLine(.{ .p1 = .{ cmin[0], origin_y }, .p2 = .{ cmax[0], origin_y }, .col = 0x80_ff_ff_ff, .thickness = 1.0 });
 }
 
-fn drawEntities(dl: zgui.DrawList, cmin: [2]f32, state: State, entities: []scene_io.Entity) void {
+fn drawEntities(
+    dl: zgui.DrawList,
+    cmin: [2]f32,
+    state: State,
+    entities: []scene_io.Entity,
+    atlas_index: ?*const atlas.Index,
+) void {
     for (entities, 0..) |e, i| {
         const pos = e.position orelse continue;
         const px = cmin[0] + state.pan[0] + pos.x * state.zoom.*;
         const py = cmin[1] + state.pan[1] - pos.y * state.zoom.*;
-        const col = colorForPrefab(e.prefab);
-        dl.addCircleFilled(.{
-            .p = .{ px, py },
-            .r = 6,
-            .col = col,
-            .num_segments = 16,
-        });
-        if (state.selected_idx.* == i) {
+        const selected = state.selected_idx.* == i;
+
+        // Try to render the sprite texture if one is declared and the
+        // current atlas index can resolve it; otherwise fall through
+        // to the colored-circle marker. A declared-but-unresolved
+        // sprite gets a `?` overlay so it's distinguishable from
+        // entities that simply don't have a Sprite.
+        const drew_sprite = drawSpriteIfResolved(dl, e, px, py, state.zoom.*, atlas_index);
+        if (!drew_sprite) {
+            const col = colorForPrefab(e.prefab);
+            dl.addCircleFilled(.{
+                .p = .{ px, py },
+                .r = 6,
+                .col = col,
+                .num_segments = 16,
+            });
+            if (e.sprite != null) {
+                dl.addText(.{ px - 3, py - 7 }, 0xff_ff_ff_ff, "?", .{});
+            }
+        }
+
+        if (selected) {
             dl.addCircle(.{
                 .p = .{ px, py },
                 .r = 12,
@@ -155,6 +176,86 @@ fn drawEntities(dl: zgui.DrawList, cmin: [2]f32, state: State, entities: []scene
             dl.addText(.{ px + 8, py - 8 }, 0xff_e0_e0_e0, "{s}", .{p});
         }
     }
+}
+
+/// Returns true if a textured quad was drawn at `(px, py)` for the
+/// given entity. False means caller should fall back to the colored-
+/// marker path.
+fn drawSpriteIfResolved(
+    dl: zgui.DrawList,
+    e: scene_io.Entity,
+    px: f32,
+    py: f32,
+    zoom: f32,
+    atlas_index: ?*const atlas.Index,
+) bool {
+    const sprite = e.sprite orelse return false;
+    const idx = atlas_index orelse return false;
+
+    const name = std.mem.sliceTo(&sprite.sprite_name, 0);
+    if (name.len == 0) return false;
+    const ref = idx.find(name) orelse return false;
+
+    const tex_id = idx.textureFor(ref);
+    if (tex_id == 0) return false;
+    const atlas_size = idx.atlasSize(ref);
+
+    // World-space size of one screen pixel of the sprite. No DPI
+    // factor — the canvas itself is screen-space.
+    const w = @as(f32, @floatFromInt(ref.frame.w)) * zoom;
+    const h = @as(f32, @floatFromInt(ref.frame.h)) * zoom;
+
+    const pivot_name = std.mem.sliceTo(&sprite.pivot, 0);
+    const pivot = pivotOffset(pivot_name);
+    // pivot is the fraction of the sprite to the right/below the
+    // anchor point. e.g. center → (0.5, 0.5); world +y is up, screen
+    // +y is down, so we shift the rect down by pivot.y * h.
+    const x0 = px - pivot[0] * w;
+    const y0 = py - (1.0 - pivot[1]) * h;
+    const x1 = x0 + w;
+    const y1 = y0 + h;
+
+    const uv0: [2]f32 = .{
+        @as(f32, @floatFromInt(ref.frame.x)) / atlas_size[0],
+        @as(f32, @floatFromInt(ref.frame.y)) / atlas_size[1],
+    };
+    const uv1: [2]f32 = .{
+        @as(f32, @floatFromInt(ref.frame.x + ref.frame.w)) / atlas_size[0],
+        @as(f32, @floatFromInt(ref.frame.y + ref.frame.h)) / atlas_size[1],
+    };
+
+    // ImGui 1.92+ TextureRef carries either a managed TextureData
+    // pointer (new dynamic-texture API) or a raw backend handle in
+    // `tex_id`. The opengl3 backend reads `tex_id` directly when
+    // `tex_data` is null, which is exactly what we want for atlas
+    // textures we manage ourselves.
+    const tex_ref: zgui.TextureRef = .{
+        .tex_data = null,
+        .tex_id = @enumFromInt(@as(u64, tex_id)),
+    };
+    dl.addImage(tex_ref, .{
+        .pmin = .{ x0, y0 },
+        .pmax = .{ x1, y1 },
+        .uvmin = uv0,
+        .uvmax = uv1,
+    });
+    return true;
+}
+
+/// Convert a pivot name (matching labelle-gfx pivot enums) to a
+/// (x, y) fraction in [0, 1] where (0, 0) is bottom-left and (1, 1)
+/// is top-right of the sprite. Unknown → center.
+fn pivotOffset(name: []const u8) [2]f32 {
+    if (std.mem.eql(u8, name, "center")) return .{ 0.5, 0.5 };
+    if (std.mem.eql(u8, name, "bottom_center")) return .{ 0.5, 0.0 };
+    if (std.mem.eql(u8, name, "top_center")) return .{ 0.5, 1.0 };
+    if (std.mem.eql(u8, name, "bottom_left")) return .{ 0.0, 0.0 };
+    if (std.mem.eql(u8, name, "bottom_right")) return .{ 1.0, 0.0 };
+    if (std.mem.eql(u8, name, "top_left")) return .{ 0.0, 1.0 };
+    if (std.mem.eql(u8, name, "top_right")) return .{ 1.0, 1.0 };
+    if (std.mem.eql(u8, name, "left_center")) return .{ 0.0, 0.5 };
+    if (std.mem.eql(u8, name, "right_center")) return .{ 1.0, 0.5 };
+    return .{ 0.5, 0.5 };
 }
 
 /// Return the index of the closest entity whose screen-space marker

@@ -2,6 +2,7 @@ const std = @import("std");
 const zglfw = @import("zglfw");
 const zopengl = @import("zopengl");
 const zgui = @import("zgui");
+const zstbi = @import("zstbi");
 
 const icons = @import("icons.zig");
 const config = @import("config.zig");
@@ -59,6 +60,12 @@ pub fn main() !void {
     zgui.init(allocator);
     defer zgui.deinit();
     zgui.io.setIniFilename(null);
+
+    // stb_image needs a global allocator before any `Image.loadFromFile`.
+    // The atlas module decodes PNGs through this, so init it once
+    // at startup; the call is idempotent across the gui lifetime.
+    zstbi.init(allocator);
+    defer zstbi.deinit();
 
     const scale_factor = window.getContentScale()[0];
     g_initial_scale = scale_factor;

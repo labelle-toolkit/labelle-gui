@@ -22,6 +22,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const zstbi = b.dependency("zstbi", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const zspec = b.dependency("zspec", .{
         .target = target,
         .optimize = optimize,
@@ -46,6 +51,8 @@ pub fn build(b: *std.Build) void {
     exe.linkLibrary(zgui.artifact("imgui"));
 
     exe.root_module.addImport("nfd", nfd.module("nfd"));
+
+    exe.root_module.addImport("zstbi", zstbi.module("root"));
 
     // Windows-specific: embed DPI awareness manifest
     if (target.result.os.tag == .windows) {
@@ -72,6 +79,12 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zspec", .module = zspec.module("zspec") },
+                // atlas.zig pulls in zopengl + zstbi at module scope
+                // (for the GL upload path); the test target only
+                // exercises the pure-parse function but still needs
+                // both modules to resolve at compile time.
+                .{ .name = "zopengl", .module = zopengl.module("root") },
+                .{ .name = "zstbi", .module = zstbi.module("root") },
             },
         }),
         .test_runner = .{ .path = zspec.path("src/runner.zig"), .mode = .simple },
@@ -108,6 +121,7 @@ pub fn build(b: *std.Build) void {
     gui_tests_exe.root_module.addImport("zopengl", zopengl.module("root"));
     gui_tests_exe.root_module.addImport("zgui", zgui_te.module("root"));
     gui_tests_exe.linkLibrary(zgui_te.artifact("imgui"));
+    gui_tests_exe.root_module.addImport("zstbi", zstbi.module("root"));
 
     const run_gui_tests = b.addRunArtifact(gui_tests_exe);
     const gui_test_step = b.step("gui-test", "Run the UI test runner");

@@ -9,6 +9,7 @@ const new_scene = @import("dialogs/new_scene.zig");
 const scene_io = @import("scene_io.zig");
 const scene_module = @import("modules/scene.zig");
 const project_tree = @import("modules/project_tree.zig");
+const atlas = @import("atlas.zig");
 
 test {
     zspec.runAll(@This());
@@ -830,6 +831,109 @@ pub const SceneIoTests = struct {
         var loaded = try scene_io.parseScene(allocator, src);
         defer loaded.deinit();
         try expect.toBeTrue(loaded.scene.entities[0].position == null);
+    }
+};
+
+pub const AtlasJsonTests = struct {
+    fn emptyAtlas(allocator: std.mem.Allocator) !atlas.Atlas {
+        return .{
+            // Atlas.deinit frees `name`; dupe a placeholder so the
+            // test cleanup path matches the production path. texture_id
+            // stays 0 → deinit skips the GL call.
+            .name = try allocator.dupe(u8, "test"),
+            .texture_id = 0,
+            .width = 0,
+            .height = 0,
+        };
+    }
+
+    test "parses TexturePacker frames into the atlas map" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "frames": {
+            \\    "coin": { "frame": { "x": 0, "y": 0, "w": 16, "h": 16 } },
+            \\    "wall": { "frame": { "x": 16, "y": 0, "w": 32, "h": 32 } }
+            \\  },
+            \\  "meta": { "image": "sprites.png" }
+            \\}
+        ;
+        var a = try emptyAtlas(allocator);
+        defer a.deinit(allocator);
+        try atlas.parseFramesFromJsonText(allocator, src, &a);
+
+        try expect.equal(a.frames.count(), 2);
+        const coin = a.frames.get("coin") orelse return error.MissingFrame;
+        try expect.equal(coin.x, 0);
+        try expect.equal(coin.w, 16);
+        const wall = a.frames.get("wall") orelse return error.MissingFrame;
+        try expect.equal(wall.x, 16);
+        try expect.equal(wall.h, 32);
+    }
+
+    test "missing frames key returns an error" {
+        // A manifest without the top-level "frames" object isn't a
+        // valid TexturePacker file — surface a typed error so the
+        // loader can warn and continue instead of silently producing
+        // an empty atlas.
+        const allocator = std.testing.allocator;
+        const src = "{ \"meta\": {} }";
+        var a = try emptyAtlas(allocator);
+        defer a.deinit(allocator);
+        try expect.toBeTrue(std.meta.isError(atlas.parseFramesFromJsonText(allocator, src, &a)));
+    }
+
+    test "skips entries without a frame rect" {
+        // Malformed entries inside an otherwise-valid manifest should
+        // be skipped, not abort the whole parse. This keeps a single
+        // bad sprite from taking out every other sprite in the atlas.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "frames": {
+            \\    "ok": { "frame": { "x": 1, "y": 2, "w": 3, "h": 4 } },
+            \\    "no_frame": { "rotated": false },
+            \\    "negative_x": { "frame": { "x": -1, "y": 0, "w": 8, "h": 8 } }
+            \\  }
+            \\}
+        ;
+        var a = try emptyAtlas(allocator);
+        defer a.deinit(allocator);
+        try atlas.parseFramesFromJsonText(allocator, src, &a);
+
+        // Only `ok` survives — the other two are malformed in
+        // ways the parser is documented to ignore.
+        try expect.equal(a.frames.count(), 1);
+        try expect.toBeTrue(a.frames.get("ok") != null);
+    }
+
+    test "accepts float coordinates produced by some exporters" {
+        // Some exporters emit `1.0` instead of `1` for integer
+        // coordinates. The parser should accept both shapes (and
+        // truncate floats to u32).
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "frames": {
+            \\    "tile": { "frame": { "x": 10.0, "y": 20.0, "w": 8.0, "h": 8.0 } }
+            \\  }
+            \\}
+        ;
+        var a = try emptyAtlas(allocator);
+        defer a.deinit(allocator);
+        try atlas.parseFramesFromJsonText(allocator, src, &a);
+
+        const tile = a.frames.get("tile") orelse return error.MissingFrame;
+        try expect.equal(tile.x, 10);
+        try expect.equal(tile.w, 8);
+    }
+
+    test "top-level not-an-object surfaces a typed error" {
+        const allocator = std.testing.allocator;
+        const src = "[]";
+        var a = try emptyAtlas(allocator);
+        defer a.deinit(allocator);
+        try expect.toBeTrue(std.meta.isError(atlas.parseFramesFromJsonText(allocator, src, &a)));
     }
 };
 

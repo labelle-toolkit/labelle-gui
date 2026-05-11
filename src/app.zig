@@ -22,6 +22,7 @@ const resources_mod = @import("modules/resources.zig");
 const scene_mod = @import("modules/scene.zig");
 const prefab_mod = @import("modules/prefab.zig");
 const close_scene_dialog = @import("dialogs/close_scene.zig");
+const atlas = @import("atlas.zig");
 const new_scene_dialog = @import("dialogs/new_scene.zig");
 const dpi_warning_dialog = @import("dialogs/dpi_warning.zig");
 
@@ -125,6 +126,13 @@ pub const App = struct {
     /// `closeAllTabs` runs the frame the active project changes.
     last_project_generation: ?u64 = null,
 
+    /// Per-project atlas index (sprite name → frame + GL texture).
+    /// Built lazily the first frame the active project's generation
+    /// is observed; invalidated when the generation bumps. Inspector
+    /// + viewport consult it to validate `sprite_name` and draw the
+    /// real pixels for entities with a Sprite component.
+    atlas_index: ?atlas.Index = null,
+
     show_project_tree: bool = true,
 
     show_new_scene_dialog: bool = false,
@@ -162,10 +170,43 @@ pub const App = struct {
     pub fn deinit(self: *Self) void {
         self.closeAllTabs();
         self.open_tabs.deinit(self.allocator);
+        if (self.atlas_index) |*idx| idx.deinit();
         self.project_manager.deinit();
         self.tree_view.deinit();
         self.compiler.deinit();
         self.allocator.destroy(self);
+    }
+
+    /// Rebuild the atlas index from the active project's
+    /// `resources` block. Called whenever the project generation
+    /// changes. Closing the project invalidates the index without
+    /// rebuilding.
+    fn rebuildAtlasIndex(self: *Self) void {
+        if (self.atlas_index) |*idx| {
+            idx.deinit();
+            self.atlas_index = null;
+        }
+        const proj = self.project_manager.current_project orelse return;
+        const dir = proj.dir orelse return;
+
+        // Map ProjectConfig.resources → atlas.Resource (decoupling
+        // the atlas module from project.zig). Allocated on the
+        // stack via ArrayList because the count is small.
+        var resources: std.ArrayList(atlas.Resource) = .{};
+        defer resources.deinit(self.allocator);
+        for (proj.config.resources) |r| {
+            resources.append(self.allocator, .{
+                .name = r.name,
+                .json = r.json,
+                .texture = r.texture,
+            }) catch return;
+        }
+        self.atlas_index = atlas.Index.build(
+            self.allocator,
+            dir,
+            resources.items,
+            self.project_manager.generation,
+        );
     }
 
     // ─── Scene tabs ─────────────────────────────────────────────────────
@@ -269,10 +310,16 @@ pub const App = struct {
         // Project transitions close all open scene tabs so the next
         // frame doesn't read into freed memory belonging to the old
         // project. Detected via ProjectManager.generation, which is
-        // bumped on new/load/close.
+        // bumped on new/load/close. The atlas index is also keyed
+        // to the project so we rebuild it here.
         const gen = self.project_manager.generation;
         if (self.last_project_generation) |prev| {
-            if (prev != gen) self.closeAllTabs();
+            if (prev != gen) {
+                self.closeAllTabs();
+                self.rebuildAtlasIndex();
+            }
+        } else {
+            self.rebuildAtlasIndex();
         }
         self.last_project_generation = gen;
 

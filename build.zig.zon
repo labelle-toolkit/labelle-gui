@@ -23,6 +23,10 @@
             .url = "https://github.com/apotema/zspec/archive/refs/heads/main.tar.gz",
             .hash = "zspec-0.8.0-jaKLbSK-AwD6myJjkg3OfGAKJyj5iaFzFfVu-pcUsUn1",
         },
+        .zstbi = .{
+            .url = "https://github.com/zig-gamedev/zstbi/archive/664305dd5.tar.gz",
+            .hash = "zstbi-0.11.0-dev-L0Ea_2yVBwA4uh-tHfgdhZcQaWRoZVYlNGs4Dl_WTeuR",
+        },
     },
     .paths = .{
         "build.zig",
