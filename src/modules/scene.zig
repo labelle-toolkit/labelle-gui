@@ -83,8 +83,13 @@ fn deriveDisplayName(path: []const u8) []const u8 {
     return base;
 }
 
+const inspector_w: f32 = 300;
+const split_gap: f32 = 8;
+
 /// Render a single open scene as the content of a tab. Caller has
-/// already entered the tab item; we just paint the body.
+/// already entered the tab item; we just paint the body. Layout is
+/// scene-level header + controls across the top, then a viewport
+/// child on the left and an inspector child on the right.
 pub fn render(s: *SceneState, app: *App) void {
     zgui.text("Scene: {s}", .{s.loaded.scene.name});
     zgui.sameLine(.{});
@@ -109,9 +114,23 @@ pub fn render(s: *SceneState, app: *App) void {
     if (zgui.button("Save", .{})) saveScene(s, app);
     zgui.separator();
 
-    renderInspector(s);
-    zgui.separator();
-    renderViewport(s);
+    // Two-column body: viewport on the left, inspector on the right.
+    const total_w = zgui.getContentRegionAvail()[0];
+    const viewport_w = @max(120.0, total_w - inspector_w - split_gap);
+
+    if (zgui.beginChild("##viewport_col", .{ .w = viewport_w, .h = 0 })) {
+        renderViewport(s);
+    }
+    zgui.endChild();
+    zgui.sameLine(.{});
+    if (zgui.beginChild("##inspector_col", .{
+        .w = 0,
+        .h = 0,
+        .child_flags = .{ .border = true },
+    })) {
+        renderInspector(s);
+    }
+    zgui.endChild();
 }
 
 /// Write the current scene back to its source path. Clears the dirty
@@ -127,32 +146,65 @@ pub fn saveScene(s: *SceneState, app: *App) void {
 }
 
 fn renderInspector(s: *SceneState) void {
-    if (s.selected_index) |idx| {
-        if (idx >= s.loaded.scene.entities.len) {
-            s.selected_index = null;
-            zgui.textDisabled("(selection out of range)", .{});
-            return;
-        }
-        const e = &s.loaded.scene.entities[idx];
-        const prefab = e.prefab orelse "(no prefab)";
-        zgui.text("Selected: #{d} {s}", .{ idx, prefab });
+    zgui.text("Inspector", .{});
+    zgui.separator();
 
+    const idx = s.selected_index orelse {
+        zgui.textDisabled("Click an entity in the viewport to select.", .{});
+        return;
+    };
+    if (idx >= s.loaded.scene.entities.len) {
+        s.selected_index = null;
+        zgui.textDisabled("(selection out of range)", .{});
+        return;
+    }
+    const e = &s.loaded.scene.entities[idx];
+    const prefab = e.prefab orelse "(no prefab)";
+    zgui.text("Entity #{d}", .{idx});
+    if (e.prefab) |p| zgui.text("prefab: {s}", .{p}) else {
+        _ = prefab;
+        zgui.textDisabled("(no prefab)", .{});
+    }
+    zgui.spacing();
+
+    // Position is the only component the gui models structurally.
+    // Other components are read from the captured extras list and
+    // rendered as collapsible value previews.
+    if (zgui.collapsingHeader("Position", .{ .default_open = true })) {
         if (e.position) |*pos| {
             if (zgui.inputFloat("x", .{ .v = &pos.x })) s.is_dirty = true;
             if (zgui.inputFloat("y", .{ .v = &pos.y })) s.is_dirty = true;
         } else {
             zgui.textDisabled("(no Position component)", .{});
         }
+    }
 
+    if (zgui.collapsingHeader("Comment", .{})) {
         if (zgui.inputTextMultiline("##comment", .{
             .buf = &e.comment,
             .w = 0,
             .h = 80,
         })) s.is_dirty = true;
-        zgui.sameLine(.{});
-        zgui.textDisabled("(comment)", .{});
-    } else {
-        zgui.textDisabled("Click an entity in the viewport to select.", .{});
+    }
+
+    // Per-entity unmodeled components captured verbatim at load time
+    // (Sprite, Shape, user-defined). Read-only display for now —
+    // structured editing of these is a follow-up; users can still
+    // hand-edit the .jsonc directly and reopen the scene.
+    if (idx < s.loaded.extras.entity_components.len) {
+        const extras = s.loaded.extras.entity_components[idx];
+        if (extras.len > 0) {
+            zgui.spacing();
+            zgui.separator();
+            zgui.textDisabled("Other components ({d})", .{extras.len});
+            for (extras) |extra| {
+                var label_buf: [128:0]u8 = undefined;
+                const label = std.fmt.bufPrintZ(&label_buf, "{s}", .{extra.name}) catch continue;
+                if (zgui.collapsingHeader(label, .{})) {
+                    zgui.textUnformatted(extra.value_text);
+                }
+            }
+        }
     }
 }
 
