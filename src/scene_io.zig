@@ -61,6 +61,20 @@ pub const Rectangle = struct {
     filled: bool = true,
 };
 
+/// Typed model of the `Circle` geometry component (issue #6, slice 2).
+/// Shape on disk:
+/// `{ "radius": N, "color": { "r": .., "g": .., "b": .., "a": .. }, "filled": bool }`
+/// Color matches labelle-gfx's u8 RGBA convention so values flow
+/// straight through to the engine's renderer.
+pub const Circle = struct {
+    radius: f32 = 0,
+    r: u8 = 255,
+    g: u8 = 255,
+    b: u8 = 255,
+    a: u8 = 255,
+    filled: bool = true,
+};
+
 pub const Entity = struct {
     prefab: ?[]const u8 = null,
     /// Parsed once on load; viewport reads it when drawing the entity
@@ -75,6 +89,9 @@ pub const Entity = struct {
     /// Typed `Rectangle` geometry component (issue #6). Same
     /// arena-ownership story as `sprite`.
     rectangle: ?*Rectangle = null,
+    /// Typed `Circle` geometry component (issue #6). Same
+    /// arena-ownership story as `sprite`.
+    circle: ?*Circle = null,
     /// Leading `//` comments captured from the source file, attached
     /// to the first entity that follows them — same rule we use for
     /// project.labelle pass-through. Lines keep their `//` markers and
@@ -209,6 +226,7 @@ pub fn parsePrefab(allocator: std.mem.Allocator, raw: []const u8) !LoadedPrefab 
         .position = readPosition(parsed.value.components),
         .sprite = try readSprite(arena.allocator(), parsed.value.components),
         .rectangle = try readRectangle(arena.allocator(), parsed.value.components),
+        .circle = try readCircle(arena.allocator(), parsed.value.components),
     };
 
     // Re-use the entity-body scanner — walks `{ ... }`, finds the
@@ -228,6 +246,7 @@ pub fn parsePrefab(allocator: std.mem.Allocator, raw: []const u8) !LoadedPrefab 
             .position = readPosition(c.components),
             .sprite = try readSprite(arena.allocator(), c.components),
             .rectangle = try readRectangle(arena.allocator(), c.components),
+            .circle = try readCircle(arena.allocator(), c.components),
         };
         if (i < child_comments.len) {
             buf.writeZeroed(&children[i].comment, child_comments[i]);
@@ -284,6 +303,11 @@ pub fn renderPrefabJsonc(allocator: std.mem.Allocator, loaded: LoadedPrefab) ![]
         _ = try emitRectangle(&w, re.*);
         first = false;
     }
+    if (loaded.entity.circle) |ci| {
+        if (!first) try w.writeAll(",");
+        _ = try emitCircle(&w, ci.*);
+        first = false;
+    }
     for (loaded.component_extras) |extra| {
         if (!first) try w.writeAll(",");
         try w.print(" \"{s}\": {s}", .{ extra.name, extra.value_text });
@@ -317,6 +341,7 @@ pub fn renderPrefabJsonc(allocator: std.mem.Allocator, loaded: LoadedPrefab) ![]
             const has_components = child.position != null or
                 child.sprite != null or
                 child.rectangle != null or
+                child.circle != null or
                 cextras.len > 0;
             if (has_components) {
                 if (!c_first) try w.writeAll(",");
@@ -334,6 +359,11 @@ pub fn renderPrefabJsonc(allocator: std.mem.Allocator, loaded: LoadedPrefab) ![]
                 if (child.rectangle) |re| {
                     if (!cc_first) try w.writeAll(",");
                     _ = try emitRectangle(&w, re.*);
+                    cc_first = false;
+                }
+                if (child.circle) |ci| {
+                    if (!cc_first) try w.writeAll(",");
+                    _ = try emitCircle(&w, ci.*);
                     cc_first = false;
                 }
                 for (cextras) |extra| {
@@ -403,6 +433,7 @@ pub fn parseScene(allocator: std.mem.Allocator, raw: []const u8) !LoadedScene {
             .position = readPosition(e.components),
             .sprite = try readSprite(arena.allocator(), e.components),
             .rectangle = try readRectangle(arena.allocator(), e.components),
+            .circle = try readCircle(arena.allocator(), e.components),
         };
         // Comments are extracted on a best-effort basis: if the scanner
         // landed fewer entries than parser saw entities (recovery from
@@ -503,6 +534,27 @@ fn readRectangle(arena: std.mem.Allocator, components: ?std.json.Value) !?*Recta
     return out;
 }
 
+fn readCircle(arena: std.mem.Allocator, components: ?std.json.Value) !?*Circle {
+    const c = components orelse return null;
+    if (c != .object) return null;
+    const c_val = c.object.get("Circle") orelse return null;
+    if (c_val != .object) return null;
+
+    const out = try arena.create(Circle);
+    out.* = .{};
+    if (jsonNumberAsF32(c_val.object.get("radius"))) |rv| out.radius = rv;
+    if (c_val.object.get("color")) |col| if (col == .object) {
+        if (jsonNumberAsU8(col.object.get("r"))) |x| out.r = x;
+        if (jsonNumberAsU8(col.object.get("g"))) |x| out.g = x;
+        if (jsonNumberAsU8(col.object.get("b"))) |x| out.b = x;
+        if (jsonNumberAsU8(col.object.get("a"))) |x| out.a = x;
+    };
+    if (c_val.object.get("filled")) |v| if (v == .bool) {
+        out.filled = v.bool;
+    };
+    return out;
+}
+
 /// Emit `s` as a JSON-escaped string literal (`"..."`) into `writer`.
 /// Handles the escapes the JSON spec requires for byte values < 0x20
 /// plus the two embeddable bytes (`"` and `\`); leaves the rest of
@@ -584,6 +636,21 @@ fn emitRectangle(writer: anytype, rect: Rectangle) !bool {
         rect.r, rect.g, rect.b, rect.a,
     });
     try writer.print(" \"filled\": {s}", .{if (rect.filled) "true" else "false"});
+    try writer.writeAll(" }");
+    return true;
+}
+
+/// Emit `"Circle": { ... }` into `writer` from the typed geometry
+/// fields. Same comma-management contract as `emitSprite`. All
+/// fields are always emitted so the file is self-describing and
+/// the inspector shows what was actually saved without inferring.
+fn emitCircle(writer: anytype, circle: Circle) !bool {
+    try writer.writeAll(" \"Circle\": {");
+    try writer.print(" \"radius\": {d},", .{circle.radius});
+    try writer.print(" \"color\": {{ \"r\": {d}, \"g\": {d}, \"b\": {d}, \"a\": {d} }},", .{
+        circle.r, circle.g, circle.b, circle.a,
+    });
+    try writer.print(" \"filled\": {s}", .{if (circle.filled) "true" else "false"});
     try writer.writeAll(" }");
     return true;
 }
@@ -947,7 +1014,8 @@ fn extractComponentExtras(arena: std.mem.Allocator, entity_body: []const u8) ![]
         // capturing them as extras would round-trip them twice.
         const is_managed = std.mem.eql(u8, key, "Position") or
             std.mem.eql(u8, key, "Sprite") or
-            std.mem.eql(u8, key, "Rectangle");
+            std.mem.eql(u8, key, "Rectangle") or
+            std.mem.eql(u8, key, "Circle");
         if (!is_managed) {
             try out.append(arena, .{
                 .name = try arena.dupe(u8, key),
@@ -1122,6 +1190,7 @@ pub fn renderSceneJsonc(allocator: std.mem.Allocator, loaded: LoadedScene) ![]u8
         const has_components = e.position != null or
             e.sprite != null or
             e.rectangle != null or
+            e.circle != null or
             extras.len > 0;
         if (has_components) {
             if (!first) try w.writeAll(",");
@@ -1139,6 +1208,11 @@ pub fn renderSceneJsonc(allocator: std.mem.Allocator, loaded: LoadedScene) ![]u8
             if (e.rectangle) |re| {
                 if (!c_first) try w.writeAll(",");
                 _ = try emitRectangle(&w, re.*);
+                c_first = false;
+            }
+            if (e.circle) |ci| {
+                if (!c_first) try w.writeAll(",");
+                _ = try emitCircle(&w, ci.*);
                 c_first = false;
             }
             for (extras) |extra| {
