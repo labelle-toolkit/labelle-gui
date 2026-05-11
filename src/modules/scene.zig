@@ -104,7 +104,7 @@ fn render(app: *App) void {
 
     renderFileList(&app.scene_state, app, proj);
     zgui.sameLine(.{});
-    renderInspectorAndViewport(&app.scene_state);
+    renderInspectorAndViewport(&app.scene_state, app, proj);
 }
 
 fn syncProjectChange(s: *SceneState, app: *App, proj: *project.Project) void {
@@ -231,7 +231,7 @@ fn renderFileList(s: *SceneState, app: *App, proj: *project.Project) void {
 
 // ─── Inspector + Viewport ───────────────────────────────────────────────
 
-fn renderInspectorAndViewport(s: *SceneState) void {
+fn renderInspectorAndViewport(s: *SceneState, app: *App, proj: *project.Project) void {
     _ = zgui.beginChild("##scene_main", .{
         .w = 0,
         .h = 0,
@@ -266,11 +266,40 @@ fn renderInspectorAndViewport(s: *SceneState) void {
     if (zgui.button("+", .{ .w = 24 })) s.zoom = @min(8.0, s.zoom * 1.25);
     zgui.sameLine(.{});
     zgui.text("zoom: {d:.2}x", .{s.zoom});
+    zgui.sameLine(.{});
+    if (zgui.button("Save", .{})) saveCurrentScene(s, app, proj);
     zgui.separator();
 
     renderInspector(s, loaded);
     zgui.separator();
     renderViewport(s, loaded);
+}
+
+/// Write the current loaded scene to its source path. Clears the
+/// dirty flag and posts a status message on success.
+fn saveCurrentScene(s: *SceneState, app: *App, proj: *project.Project) void {
+    const loaded = s.loaded orelse return;
+    const sel = std.mem.sliceTo(&s.loaded_name, 0);
+    if (sel.len == 0) return;
+    const dir = proj.dir orelse return;
+
+    var path_buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}/{s}.jsonc", .{
+        dir,
+        project.ProjectFolders.scenes,
+        sel,
+    }) catch {
+        app.setStatus("Scene path too long!");
+        return;
+    };
+
+    scene_io.saveScene(app.allocator, path, loaded) catch |err| {
+        std.log.err("Scene save failed at {s}: {s}", .{ path, @errorName(err) });
+        app.setStatus("Error saving scene!");
+        return;
+    };
+    s.is_dirty = false;
+    app.setStatus("Scene saved!");
 }
 
 fn renderInspector(s: *SceneState, loaded: scene_io.LoadedScene) void {

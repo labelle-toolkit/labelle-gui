@@ -460,6 +460,116 @@ pub const SceneIoTests = struct {
         try expect.toBeTrue(std.mem.indexOf(u8, c, "line 3") != null);
     }
 
+    test "renderSceneJsonc round-trips Sprite + Shape components verbatim" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "lab",
+            \\    "entities": [
+            \\        // Collectible
+            \\        {
+            \\            "prefab": "coin",
+            \\            "components": {
+            \\                "Position": { "x": 100, "y": 200 },
+            \\                "Sprite": { "sprite_name": "coin", "pivot": "center" },
+            \\                "Coin": {}
+            \\            }
+            \\        }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+
+        const text = try scene_io.renderSceneJsonc(allocator, loaded);
+        defer allocator.free(text);
+
+        // Managed fields landed in canonical form.
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"name\": \"lab\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"prefab\": \"coin\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Position\":") != null);
+
+        // Unmodeled components round-tripped verbatim.
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Sprite\":") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"sprite_name\": \"coin\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Coin\":") != null);
+
+        // Comment preserved at the entities-array indent.
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "// Collectible") != null);
+    }
+
+    test "renderSceneJsonc reflects in-memory Position edits" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "x",
+            \\    "entities": [
+            \\        { "prefab": "p", "components": { "Position": { "x": 0, "y": 0 } } }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+
+        loaded.scene.entities[0].position.?.x = 999;
+        loaded.scene.entities[0].position.?.y = 42;
+
+        const text = try scene_io.renderSceneJsonc(allocator, loaded);
+        defer allocator.free(text);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"x\": 999") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"y\": 42") != null);
+        // Old zero values must not appear (would mean the writer ignored
+        // the in-memory edit and re-emitted the original).
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"x\": 0,") == null);
+    }
+
+    test "renderSceneJsonc preserves top-level include" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "main",
+            \\    "include": ["scenes/obstacles.jsonc", "scenes/extras.jsonc"],
+            \\    "entities": []
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+
+        const text = try scene_io.renderSceneJsonc(allocator, loaded);
+        defer allocator.free(text);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"include\":") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "scenes/obstacles.jsonc") != null);
+    }
+
+    test "renderSceneJsonc output re-parses cleanly" {
+        // End-to-end: scene → render → re-parse → render again
+        // should give us the same managed state plus the same extras.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "x",
+            \\    "entities": [
+            \\        // c
+            \\        { "prefab": "p", "components": { "Position": { "x": 1, "y": 2 }, "Sprite": { "n": "s" } } }
+            \\    ]
+            \\}
+        ;
+        var loaded1 = try scene_io.parseScene(allocator, src);
+        defer loaded1.deinit();
+        const t1 = try scene_io.renderSceneJsonc(allocator, loaded1);
+        defer allocator.free(t1);
+
+        var loaded2 = try scene_io.parseScene(allocator, t1);
+        defer loaded2.deinit();
+        try expect.equal(loaded2.scene.entities.len, 1);
+        try expect.toBeTrue(std.mem.eql(u8, loaded2.scene.entities[0].prefab.?, "p"));
+        try expect.equal(loaded2.scene.entities[0].position.?.x, 1);
+        try expect.equal(loaded2.scene.entities[0].position.?.y, 2);
+        try expect.equal(loaded2.extras.entity_components[0].len, 1);
+        try expect.toBeTrue(std.mem.eql(u8, loaded2.extras.entity_components[0][0].name, "Sprite"));
+    }
+
     test "entity without Position has null position" {
         const allocator = std.testing.allocator;
         const src =

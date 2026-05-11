@@ -124,6 +124,69 @@ pub fn main() !void {
         }
     });
 
+    // Drop a scene file with a Sprite component into the temp project
+    // so the Scene module's save test can exercise round-trip
+    // preservation through the Save button.
+    {
+        var scene_path_buf: [512]u8 = undefined;
+        const scene_path = try std.fmt.bufPrint(&scene_path_buf, "{s}/scenes/scene_with_sprite.jsonc", .{tmp});
+        const sf = try std.fs.cwd().createFile(scene_path, .{});
+        try sf.writeAll(
+            \\{
+            \\    "name": "scene_with_sprite",
+            \\    "entities": [
+            \\        { "prefab": "coin", "components": { "Position": { "x": 1, "y": 2 }, "Sprite": { "n": "coin" } } }
+            \\    ]
+            \\}
+        );
+        sf.close();
+    }
+
+    _ = engine.registerTest("phase3", "scene_save_preserves_extras", @src(), struct {
+        fn gui(_: *zgui.te.TestContext) !void {
+            if (g_app) |a| a.renderFrame(1.0 / 60.0);
+        }
+        fn run(ctx: *zgui.te.TestContext) !void {
+            const a = g_app orelse {
+                _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
+                return;
+            };
+
+            // Set selection directly — clicking entries in the file-list
+            // child window is fiddly to address via TE refs, and we're
+            // testing Save, not selection wiring.
+            const name = "scene_with_sprite";
+            @memset(&a.scene_state.selected_name, 0);
+            @memcpy(a.scene_state.selected_name[0..name.len], name);
+
+            ctx.menuAction(.click, "View/Scene");
+            ctx.yield(2); // give the panel time to load the scene from disk
+
+            const loaded_ok = a.scene_state.loaded != null and
+                a.scene_state.loaded.?.scene.entities.len == 1;
+            _ = zgui.te.check(@src(), .{}, loaded_ok, "scene loaded with one entity");
+
+            // Edit the in-memory position, then save.
+            a.scene_state.loaded.?.scene.entities[0].position.?.x = 999;
+            a.scene_state.is_dirty = true;
+            ctx.itemAction(.click, "Scene/Save", .{}, null);
+            _ = zgui.te.check(@src(), .{}, !a.scene_state.is_dirty, "is_dirty cleared after Save");
+
+            // Read the file back and confirm Sprite + edited Position landed.
+            const dir = g_settings_project_dir.?;
+            var path_buf: [512]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buf, "{s}/scenes/scene_with_sprite.jsonc", .{dir}) catch return;
+            var file_buf: [4096]u8 = undefined;
+            const file = std.fs.cwd().openFile(path, .{}) catch return;
+            defer file.close();
+            const n = file.read(&file_buf) catch return;
+            const content = file_buf[0..n];
+
+            _ = zgui.te.check(@src(), .{}, std.mem.indexOf(u8, content, "\"Sprite\"") != null, "Sprite preserved on disk");
+            _ = zgui.te.check(@src(), .{}, std.mem.indexOf(u8, content, "\"x\": 999") != null, "edited Position written");
+        }
+    });
+
     _ = engine.registerTest("phase3", "scene_panel_toggles", @src(), struct {
         fn gui(_: *zgui.te.TestContext) !void {
             // Synthetic dt; tests don't observe status_timer decay.
