@@ -95,10 +95,13 @@ pub const App = struct {
         self.status_timer = config.ui.status_message_duration;
     }
 
-    /// One UI frame. Caller is responsible for `backend.newFrame`/`backend.draw`
+    /// One UI frame. `dt_seconds` is the wall-clock time since the last
+    /// frame, used to decrement transient timers (status messages, etc.)
+    /// so they last a consistent duration regardless of frame rate.
+    /// Caller is responsible for `backend.newFrame`/`backend.draw`
     /// around this; the test harness needs that boundary to inject events.
-    pub fn renderFrame(self: *Self) void {
-        if (self.status_timer > 0) self.status_timer -= 1.0 / 60.0;
+    pub fn renderFrame(self: *Self, dt_seconds: f32) void {
+        if (self.status_timer > 0) self.status_timer -= dt_seconds;
 
         self.renderMenuBar();
         self.pollCompiler();

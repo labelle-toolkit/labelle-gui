@@ -76,10 +76,18 @@ pub fn main() !void {
 
     // Project Settings test owns its own temp project on disk, written
     // via the gui's own ProjectManager so the test exercises the real
-    // save path. Cleanup runs after engine drains.
+    // save path. Cleanup runs after engine drains. Honors $TMPDIR
+    // (macOS sets it; most Unix shells respect it) with a /tmp fallback.
+    const tmp_base = std.process.getEnvVarOwned(allocator, "TMPDIR") catch try allocator.dupe(u8, "/tmp");
+    defer allocator.free(tmp_base);
     var prng = std.Random.DefaultPrng.init(@intCast(std.time.nanoTimestamp()));
-    var tmp_buf: [64]u8 = undefined;
-    const tmp = try std.fmt.bufPrint(&tmp_buf, "/tmp/labelle_gui_te_{x}", .{prng.random().int(u64)});
+    const dir_name = try std.fmt.allocPrint(allocator, "labelle_gui_te_{x}", .{prng.random().int(u64)});
+    defer allocator.free(dir_name);
+    const tmp = try std.fs.path.join(allocator, &.{
+        std.mem.trimRight(u8, tmp_base, "/\\"),
+        dir_name,
+    });
+    defer allocator.free(tmp);
     try std.fs.cwd().makePath(tmp);
     defer std.fs.cwd().deleteTree(tmp) catch {};
 
@@ -90,7 +98,8 @@ pub fn main() !void {
 
     _ = engine.registerTest("phase3", "view_compiler_output_toggle", @src(), struct {
         fn gui(_: *zgui.te.TestContext) !void {
-            if (g_app) |a| a.renderFrame();
+            // Synthetic dt; tests don't observe status_timer decay.
+            if (g_app) |a| a.renderFrame(1.0 / 60.0);
         }
         fn run(ctx: *zgui.te.TestContext) !void {
             const a = g_app orelse {
@@ -117,7 +126,8 @@ pub fn main() !void {
 
     _ = engine.registerTest("phase3", "resources_add_and_save", @src(), struct {
         fn gui(_: *zgui.te.TestContext) !void {
-            if (g_app) |a| a.renderFrame();
+            // Synthetic dt; tests don't observe status_timer decay.
+            if (g_app) |a| a.renderFrame(1.0 / 60.0);
         }
         fn run(ctx: *zgui.te.TestContext) !void {
             const a = g_app orelse {
@@ -159,7 +169,8 @@ pub fn main() !void {
 
     _ = engine.registerTest("phase3", "project_settings_edit_save", @src(), struct {
         fn gui(_: *zgui.te.TestContext) !void {
-            if (g_app) |a| a.renderFrame();
+            // Synthetic dt; tests don't observe status_timer decay.
+            if (g_app) |a| a.renderFrame(1.0 / 60.0);
         }
         fn run(ctx: *zgui.te.TestContext) !void {
             const a = g_app orelse {

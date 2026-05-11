@@ -11,9 +11,19 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    // Honor $TMPDIR (set on macOS by default, and respected on most Unix
+    // shells); fall back to /tmp. Windows isn't a target for this smoke
+    // runner but anyone can `set TMPDIR=...` before invoking if needed.
+    const tmp_base = std.process.getEnvVarOwned(allocator, "TMPDIR") catch try allocator.dupe(u8, "/tmp");
+    defer allocator.free(tmp_base);
     var prng = std.Random.DefaultPrng.init(@intCast(std.time.nanoTimestamp()));
-    var tmp_buf: [64]u8 = undefined;
-    const tmp = try std.fmt.bufPrint(&tmp_buf, "/tmp/labelle_gui_smoke_{x}", .{prng.random().int(u64)});
+    const dir_name = try std.fmt.allocPrint(allocator, "labelle_gui_smoke_{x}", .{prng.random().int(u64)});
+    defer allocator.free(dir_name);
+    const tmp = try std.fs.path.join(allocator, &.{
+        std.mem.trimRight(u8, tmp_base, "/\\"),
+        dir_name,
+    });
+    defer allocator.free(tmp);
     try std.fs.cwd().makePath(tmp);
     defer std.fs.cwd().deleteTree(tmp) catch {};
 

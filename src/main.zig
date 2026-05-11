@@ -91,6 +91,8 @@ pub fn main() !void {
 
     std.log.info("Labelle started", .{});
 
+    var prev_time = zglfw.getTime();
+
     while (!window.shouldClose()) {
         zglfw.pollEvents();
 
@@ -101,6 +103,10 @@ pub fn main() !void {
             }
         }
 
+        const now = zglfw.getTime();
+        const dt_seconds: f32 = @floatCast(now - prev_time);
+        prev_time = now;
+
         const win_size = window.getSize();
         const fb_size = window.getFramebufferSize();
         zgui.backend.newFrame(@intCast(win_size[0]), @intCast(win_size[1]));
@@ -109,7 +115,7 @@ pub fn main() !void {
         const fb_scale_y = @as(f32, @floatFromInt(fb_size[1])) / @as(f32, @floatFromInt(win_size[1]));
         zgui.io.setDisplayFramebufferScale(fb_scale_x, fb_scale_y);
 
-        app.renderFrame();
+        app.renderFrame(dt_seconds);
 
         gl.viewport(0, 0, fb_size[0], fb_size[1]);
         gl.clearColor(0.1, 0.1, 0.1, 1.0);

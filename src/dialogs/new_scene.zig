@@ -52,15 +52,23 @@ fn createScene(app: *App, scene_name: []const u8) void {
     const proj = app.project_manager.current_project orelse return;
     const proj_dir = proj.getProjectDir() orelse return;
 
-    var path_buf: [512]u8 = undefined;
-    const scene_path = std.fmt.bufPrint(&path_buf, "{s}/{s}/{s}.jsonc", .{
-        proj_dir,
-        project.ProjectFolders.scenes,
-        scene_name,
-    }) catch {
-        app.setStatus("Path too long!");
+    // Allocate via std.fs.path.join — handles arbitrary-length project
+    // dirs and uses the platform's native separator.
+    // App.new_scene_name is 128 bytes; ".jsonc" + slack lands inside 160.
+    var file_name_buf: [160]u8 = undefined;
+    const file_name = std.fmt.bufPrint(&file_name_buf, "{s}.jsonc", .{scene_name}) catch {
+        app.setStatus("Scene name too long!");
         return;
     };
+    const scene_path = std.fs.path.join(app.allocator, &.{
+        proj_dir,
+        project.ProjectFolders.scenes,
+        file_name,
+    }) catch {
+        app.setStatus("Out of memory!");
+        return;
+    };
+    defer app.allocator.free(scene_path);
 
     const file = std.fs.cwd().createFile(scene_path, .{ .exclusive = true }) catch |err| {
         app.setStatus(if (err == error.PathAlreadyExists) "Scene already exists!" else "Error creating scene!");

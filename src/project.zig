@@ -196,7 +196,10 @@ pub const ProjectManager = struct {
         const file_path = try std.fs.path.join(self.allocator, &.{ dir_path, PROJECT_FILENAME });
         defer self.allocator.free(file_path);
 
-        const raw = try std.fs.cwd().readFileAlloc(self.allocator, file_path, 1024 * 1024);
+        // 16 MB cap is overkill for project.labelle (real ones are <10 KB)
+        // but the bot reviewer flagged 1 MB as too tight for "robustness";
+        // bumping it costs nothing and removes the question.
+        const raw = try std.fs.cwd().readFileAlloc(self.allocator, file_path, 16 * 1024 * 1024);
         defer self.allocator.free(raw);
 
         // Build the project up front so its arena owns every string we parse
