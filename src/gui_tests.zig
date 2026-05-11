@@ -1,20 +1,23 @@
-//! UI test runner — Phase 1 hello-world for Dear ImGui Test Engine integration.
+//! UI test runner — drives the real `App` against the ImGui Test Engine.
 //!
-//! Spins up a hidden GLFW window, initializes zgui with the bundled
-//! Test Engine (`with_te = true`), registers a single trivial check,
-//! drives the frame loop until the test queue drains, and exits with
-//! the engine's pass/fail tally.
-//!
-//! Phase 2 will refactor `main.zig` so the real App can be driven from
-//! here. For now this only proves the build wiring works end-to-end.
+//! Boots a hidden GLFW window, constructs an `App`, registers TE tests
+//! that drive menu actions and assert on App state, runs the frame loop
+//! until the test queue drains. Exit code reflects pass/fail.
 
 const std = @import("std");
 const zglfw = @import("zglfw");
 const zopengl = @import("zopengl");
 const zgui = @import("zgui");
 
+const App = @import("app.zig").App;
+
 const gl_major = 4;
 const gl_minor = 1;
+
+/// Test callbacks run via a C ABI, so they reach the App through a
+/// module-local pointer rather than a parameter. Set this once in `main`
+/// before queueing tests, clear in the deferred teardown.
+var g_app: ?*App = null;
 
 pub fn main() !void {
     try zglfw.init();
@@ -26,10 +29,9 @@ pub fn main() !void {
     zglfw.windowHint(.opengl_forward_compat, true);
     zglfw.windowHint(.client_api, .opengl_api);
     zglfw.windowHint(.doublebuffer, true);
-    // Hidden window — we need a real GL context but no on-screen presentation.
     zglfw.windowHint(.visible, false);
 
-    const window = try zglfw.createWindow(640, 480, "labelle-gui tests", null, null);
+    const window = try zglfw.createWindow(1280, 720, "labelle-gui tests", null, null);
     defer zglfw.destroyWindow(window);
 
     zglfw.makeContextCurrent(window);
@@ -42,11 +44,6 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // zgui.init() also brings up the Test Engine when zgui was built with
-    // `with_te = true` (gui.zig: init() → te.init()). Calling te.init() a
-    // second time here double-registers the "TestEnginePerfTool" settings
-    // handler and trips an imgui assertion. So we just grab the engine
-    // zgui already created.
     zgui.init(allocator);
     defer zgui.deinit();
     zgui.io.setIniFilename(null);
@@ -54,29 +51,63 @@ pub fn main() !void {
     zgui.backend.init(window);
     defer zgui.backend.deinit();
 
+    // zgui.init() already started the Test Engine because the test runner
+    // builds zgui with `with_te = true`. Don't call te.init() again — it
+    // double-registers settings handlers and trips an imgui assertion.
     const engine = zgui.te.getTestEngine().?;
     engine.setRunSpeed(.fast);
 
+    const app = try App.init(allocator, window);
+    defer app.deinit();
+    g_app = app;
+    defer g_app = null;
+
     _ = engine.registerTest("phase1", "hello_world", @src(), struct {
-        // No `gui` callback — this test doesn't need to render any widgets.
-        // The `run` callback drives the assertions.
-        fn run(ctx: *zgui.te.TestContext) !void {
-            _ = ctx;
+        fn run(_: *zgui.te.TestContext) !void {
             _ = zgui.te.check(@src(), .{}, true, "trivially true");
         }
     });
 
+    _ = engine.registerTest("phase3", "view_compiler_output_toggle", @src(), struct {
+        fn gui(_: *zgui.te.TestContext) !void {
+            if (g_app) |a| a.renderFrame();
+        }
+        fn run(ctx: *zgui.te.TestContext) !void {
+            const a = g_app orelse {
+                _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
+                return;
+            };
+
+            // Sanity: panel starts closed.
+            _ = zgui.te.check(@src(), .{}, !a.show_compiler_output, "panel starts closed");
+
+            // Drive View > Compiler Output.
+            ctx.menuAction(.click, "View/Compiler Output");
+
+            // The toggle flips the same `bool` the panel reads, so the
+            // assertion below sees the update without waiting on another
+            // frame.
+            _ = zgui.te.check(@src(), .{}, a.show_compiler_output, "View/Compiler Output opens panel");
+
+            // Toggle off again to confirm the menu reflects current state.
+            ctx.menuAction(.click, "View/Compiler Output");
+            _ = zgui.te.check(@src(), .{}, !a.show_compiler_output, "View/Compiler Output closes panel");
+        }
+    });
+
+    // `"all"` is the canonical match-everything filter — passing "" matches
+    // nothing because the filter parser treats it as "no include rule".
     engine.queueTests(.tests, "all", .{});
 
-    // Frame loop — drive imgui + the test engine until the queue drains.
-    // 600 frames is ~10s at 60Hz; ample for any sensible Phase-1 test
-    // and a guardrail against hangs.
+    // Frame loop. 1500 frames ≈ ample for any reasonable Phase-3 test;
+    // the queue-empty check below is the real terminator.
     var frame: usize = 0;
-    while (frame < 600) : (frame += 1) {
+    while (frame < 1500) : (frame += 1) {
         zglfw.pollEvents();
 
         const fb = window.getFramebufferSize();
         gl.viewport(0, 0, fb[0], fb[1]);
+        gl.clearColor(0.1, 0.1, 0.1, 1.0);
         gl.clear(gl.COLOR_BUFFER_BIT);
 
         zgui.backend.newFrame(@intCast(fb[0]), @intCast(fb[1]));

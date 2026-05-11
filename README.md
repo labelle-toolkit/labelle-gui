@@ -40,13 +40,17 @@ Version pins (`core_version`, `engine_version`, `gfx_version`, `assembler_versio
 
 ```
 src/
-  main.zig         # GLFW + zgui main loop, menu/dialog handling
-  project.zig      # ProjectConfig, ProjectManager, project.labelle ZON I/O
-  compiler.zig    # Launches `labelle generate/build/run` and polls the child
-  tree_view.zig    # Project tree view widget
-  config.zig       # UI constants
-  icons.zig        # FontAwesome icon codepoints
-  tests.zig        # zspec test entry point
-  gui_tests.zig    # ImGui Test Engine harness (gui-test target)
-  smoke.zig        # End-to-end launcher integration check (smoke target)
+  main.zig                       # GLFW + zgui setup, swaps frame loop into App.renderFrame
+  app.zig                        # App struct: per-instance state + per-frame rendering
+  module.zig                     # Module + Registry — togglable panels and View menu (issue #22)
+  modules/
+    compiler_output.zig          # Bottom-dock compiler output panel
+  project.zig                    # ProjectConfig, ProjectManager, project.labelle ZON I/O
+  compiler.zig                   # Launches `labelle generate/build/run` and polls the child
+  tree_view.zig                  # Project tree view widget
+  config.zig                     # UI constants
+  icons.zig                      # FontAwesome icon codepoints
+  tests.zig                      # zspec test entry point
+  gui_tests.zig                  # ImGui Test Engine harness (gui-test target)
+  smoke.zig                      # End-to-end launcher integration check (smoke target)
 ```
