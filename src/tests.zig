@@ -1217,6 +1217,153 @@ pub const SceneIoTests = struct {
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"g\": 64") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"filled\": false") != null);
     }
+
+    test "insertEntity appends to entities and extras in lockstep" {
+        // Right-click → "Add entity here" path: the new entity must
+        // grow both arrays so the writer never reads past
+        // entity_components when emitting verbatim component blocks.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "x",
+            \\    "entities": [
+            \\        { "components": { "Position": { "x": 1, "y": 2 } } }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+        try expect.equal(loaded.scene.entities.len, 1);
+        try expect.equal(loaded.extras.entity_components.len, 1);
+
+        try scene_io.insertEntity(&loaded, .{
+            .position = .{ .x = 50, .y = 75 },
+        });
+
+        try expect.equal(loaded.scene.entities.len, 2);
+        try expect.equal(loaded.extras.entity_components.len, 2);
+        try expect.equal(loaded.extras.entity_components[1].len, 0);
+        try expect.toBeTrue(loaded.scene.entities[1].position != null);
+        try expect.equal(loaded.scene.entities[1].position.?.x, 50);
+        try expect.equal(loaded.scene.entities[1].position.?.y, 75);
+        try expect.toBeTrue(loaded.scene.entities[1].prefab == null);
+    }
+
+    test "insertEntity with prefab name (arena-owned) round-trips" {
+        // "Add entity from prefab" path: the prefab slice must
+        // survive across renders because it lives in the LoadedScene's
+        // arena. Saving and reparsing exercises the same lifetime
+        // contract the editor relies on.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "x",
+            \\    "entities": []
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+
+        const prefab_name = try loaded.arena.allocator().dupe(u8, "coin");
+        try scene_io.insertEntity(&loaded, .{
+            .prefab = prefab_name,
+            .position = .{ .x = 12, .y = 34 },
+        });
+
+        const text = try scene_io.renderSceneJsonc(allocator, loaded);
+        defer allocator.free(text);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"prefab\": \"coin\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"x\": 12") != null);
+
+        var loaded2 = try scene_io.parseScene(allocator, text);
+        defer loaded2.deinit();
+        try expect.equal(loaded2.scene.entities.len, 1);
+        try expect.toBeTrue(loaded2.scene.entities[0].prefab != null);
+        try expect.toBeTrue(std.mem.eql(u8, loaded2.scene.entities[0].prefab.?, "coin"));
+    }
+
+    test "removeEntity pops entities and extras together" {
+        // Delete-key path: dropping entity at idx 1 must also drop the
+        // parallel extras[1], otherwise the writer would splice the
+        // wrong unmodeled components onto the now-shifted entity.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "x",
+            \\    "entities": [
+            \\        { "components": { "Position": { "x": 1, "y": 2 } } },
+            \\        { "components": { "Position": { "x": 3, "y": 4 }, "Coin": {} } },
+            \\        { "components": { "Position": { "x": 5, "y": 6 } } }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+        try expect.equal(loaded.scene.entities.len, 3);
+        try expect.equal(loaded.extras.entity_components.len, 3);
+        try expect.equal(loaded.extras.entity_components[1].len, 1);
+
+        try scene_io.removeEntity(&loaded, 1);
+
+        try expect.equal(loaded.scene.entities.len, 2);
+        try expect.equal(loaded.extras.entity_components.len, 2);
+        // After removal, the survivors must be the entities with x=1 and x=5.
+        try expect.equal(loaded.scene.entities[0].position.?.x, 1);
+        try expect.equal(loaded.scene.entities[1].position.?.x, 5);
+        // And their extras must be the parallel-array versions — neither
+        // should now reference the dropped Coin slot.
+        try expect.equal(loaded.extras.entity_components[0].len, 0);
+        try expect.equal(loaded.extras.entity_components[1].len, 0);
+    }
+
+    test "removeEntity returns error on out-of-bounds index" {
+        // Defensive: the editor's selected_index can in principle drift
+        // (project switch, undo replay later). Out-of-bounds removal
+        // must surface as an error, not silently corrupt the slice.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{ "name": "x", "entities": [] }
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+
+        try std.testing.expectError(error.IndexOutOfBounds, scene_io.removeEntity(&loaded, 0));
+        try std.testing.expectError(error.IndexOutOfBounds, scene_io.removeEntity(&loaded, 42));
+    }
+
+    test "insertEntity then removeEntity round-trip through save / load" {
+        // The full editor add-and-delete cycle: add a prefab entity,
+        // then remove it again, then save. The output should match
+        // the original empty-entities form (modulo writer-driven
+        // formatting). Reparsing must yield zero entities.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "x",
+            \\    "entities": []
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+
+        const name = try loaded.arena.allocator().dupe(u8, "wall");
+        try scene_io.insertEntity(&loaded, .{
+            .prefab = name,
+            .position = .{ .x = 7, .y = 8 },
+        });
+        try expect.equal(loaded.scene.entities.len, 1);
+        try scene_io.removeEntity(&loaded, 0);
+        try expect.equal(loaded.scene.entities.len, 0);
+        try expect.equal(loaded.extras.entity_components.len, 0);
+
+        const text = try scene_io.renderSceneJsonc(allocator, loaded);
+        defer allocator.free(text);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"wall\"") == null);
+
+        var loaded2 = try scene_io.parseScene(allocator, text);
+        defer loaded2.deinit();
+        try expect.equal(loaded2.scene.entities.len, 0);
+    }
 };
 
 pub const AtlasJsonTests = struct {
