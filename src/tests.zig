@@ -47,8 +47,8 @@ pub const ProjectFoldersTests = struct {
         return false;
     }
 
-    test "has 8 default folders" {
-        try expect.equal(project.ProjectFolders.all.len, 8);
+    test "has 9 default folders" {
+        try expect.equal(project.ProjectFolders.all.len, 9);
     }
 
     test "contains assets folder" {
