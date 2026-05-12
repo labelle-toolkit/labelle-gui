@@ -6,6 +6,7 @@ const zstbi = @import("zstbi");
 
 const icons = @import("icons.zig");
 const config = @import("config.zig");
+const prefs_mod = @import("prefs.zig");
 const App = @import("app.zig").App;
 
 const gl = zopengl.bindings;
@@ -71,7 +72,12 @@ pub fn main() !void {
     g_initial_scale = scale_factor;
     g_current_scale.store(scale_factor, .release);
     _ = window.setContentScaleCallback(contentScaleCallback);
-    const font_size = config.ui.base_font_size * scale_factor;
+
+    // Load user preferences before sizing fonts — `font_scale` rides on
+    // top of the DPI factor (see `src/prefs.zig`). On first run or any
+    // read error this falls back to defaults, so the GUI always starts.
+    const user_prefs = prefs_mod.loadOrDefault(allocator);
+    const font_size = config.ui.base_font_size * scale_factor * user_prefs.font_scale;
 
     var default_config = zgui.FontConfig.init();
     default_config.size_pixels = font_size;
@@ -93,7 +99,7 @@ pub fn main() !void {
     zgui.backend.init(window);
     defer zgui.backend.deinit();
 
-    const app = try App.init(allocator, window);
+    const app = try App.init(allocator, window, user_prefs);
     defer app.deinit();
 
     std.log.info("Labelle started", .{});
