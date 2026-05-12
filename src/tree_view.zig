@@ -110,12 +110,24 @@ pub const TreeView = struct {
             self.needs_refresh = false;
         }
 
+        // Precompute absolute paths of every managed top-level folder. The
+        // recursive walker uses these to skip subdirectories that are
+        // ALREADY rendered as separate top-level entries — namely
+        // `scripts/flows`, which appears in `ProjectFolders.all` as a
+        // sibling of `scripts`. Without this, recursing into `scripts`
+        // would surface `flows/` a second time with the wrong icon.
+        var managed_storage: [project.ProjectFolders.all.len][std.fs.max_path_bytes]u8 = undefined;
+        var managed_paths: [project.ProjectFolders.all.len][]const u8 = undefined;
+        for (project.ProjectFolders.all, 0..) |fname, i| {
+            managed_paths[i] = std.fmt.bufPrint(&managed_storage[i], "{s}/{s}", .{ base_path, fname }) catch "";
+        }
+
         // Render each project folder (using stack buffers to avoid heap allocations per frame)
         for (project.ProjectFolders.all) |folder_name| {
             const icon = FolderIcons.forFolder(folder_name);
 
             // Build folder path on stack
-            var folder_path_buf: [512]u8 = undefined;
+            var folder_path_buf: [std.fs.max_path_bytes]u8 = undefined;
             const folder_path = std.fmt.bufPrint(&folder_path_buf, "{s}/{s}", .{ base_path, folder_name }) catch continue;
 
             // Create tree node label directly on stack
@@ -125,44 +137,88 @@ pub const TreeView = struct {
             const node_open = zgui.treeNodeFlags(&node_label, .{});
 
             if (node_open) {
-                // Load and display files in this folder
-                const files = self.getFilesForFolder(folder_path) catch {
-                    zgui.textDisabled("  (error reading folder)", .{});
-                    zgui.treePop();
-                    continue;
-                };
+                if (self.renderFolder(folder_path, &managed_paths)) {
+                    file_selected = true;
+                }
+                zgui.treePop();
+            }
+        }
 
-                if (files.len == 0) {
-                    zgui.textDisabled("  (empty)", .{});
-                } else {
-                    for (files) |file_entry| {
-                        const file_icon = if (file_entry.is_directory) FolderIcons.folder_closed else FolderIcons.file;
+        return file_selected;
+    }
 
-                        // Create file label directly on stack
-                        var file_label: [256:0]u8 = undefined;
-                        _ = std.fmt.bufPrintZ(&file_label, "{s} {s}", .{ file_icon, file_entry.name }) catch continue;
+    /// Render the contents of a single directory. Recurses into subdirectories
+    /// (each becomes its own `treeNodeFlags`) so the user can drill arbitrarily
+    /// deep. Files at any depth render as `zgui.selectable` and route through
+    /// `self.selected_path` exactly like top-level files do. Subdirectories
+    /// whose absolute path matches a `managed_paths` entry are suppressed —
+    /// they're already rendered at top level (see `render`).
+    fn renderFolder(self: *Self, folder_path: []const u8, managed_paths: []const []const u8) bool {
+        var file_selected = false;
 
-                        // Build full path on stack for selection check
-                        var full_path_buf: [1024]u8 = undefined;
-                        const full_path = std.fmt.bufPrint(&full_path_buf, "{s}/{s}", .{ folder_path, file_entry.name }) catch continue;
+        const files = self.getFilesForFolder(folder_path) catch {
+            zgui.textDisabled("  (error reading folder)", .{});
+            return false;
+        };
 
-                        const is_selected = if (self.selected_path) |sel|
-                            std.mem.eql(u8, sel, full_path)
-                        else
-                            false;
+        if (files.len == 0) {
+            zgui.textDisabled("  (empty)", .{});
+            return false;
+        }
 
-                        if (zgui.selectable(&file_label, .{ .selected = is_selected })) {
-                            // Update selected path (only allocate when selection changes)
-                            if (self.selected_path) |old_path| {
-                                self.allocator.free(old_path);
-                            }
-                            self.selected_path = self.allocator.dupe(u8, full_path) catch null;
-                            file_selected = true;
-                        }
+        for (files) |file_entry| {
+            // Build full path on stack — both for routing (selected_path)
+            // and as the ImGui ID prefix so identically named items in
+            // different parents (e.g. scenes/enemies + prefabs/enemies)
+            // don't share open/closed state.
+            var full_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const full_path = std.fmt.bufPrint(&full_path_buf, "{s}/{s}", .{ folder_path, file_entry.name }) catch continue;
+
+            // Skip subdirectories that are already top-level entries.
+            if (file_entry.is_directory) {
+                var is_managed = false;
+                for (managed_paths) |mp| {
+                    if (mp.len != 0 and std.mem.eql(u8, mp, full_path)) {
+                        is_managed = true;
+                        break;
                     }
                 }
+                if (is_managed) continue;
+            }
 
-                zgui.treePop();
+            var label_buf: [512:0]u8 = undefined;
+            const file_icon = if (file_entry.is_directory) FolderIcons.folder_closed else FolderIcons.file;
+            const label = std.fmt.bufPrintZ(&label_buf, "{s} {s}", .{ file_icon, file_entry.name }) catch continue;
+
+            // Disambiguate via a pushed string ID so the visible label
+            // stays short. The full path is unique per node, so two
+            // siblings with the same leaf name (or same-named subfolders
+            // under different top-level folders) get distinct IDs.
+            var id_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+            const id_str = std.fmt.bufPrintZ(&id_buf, "{s}", .{full_path}) catch continue;
+            zgui.pushStrIdZ(id_str);
+            defer zgui.popId();
+
+            if (file_entry.is_directory) {
+                if (zgui.treeNodeFlags(label, .{})) {
+                    if (self.renderFolder(full_path, managed_paths)) {
+                        file_selected = true;
+                    }
+                    zgui.treePop();
+                }
+            } else {
+                const is_selected = if (self.selected_path) |sel|
+                    std.mem.eql(u8, sel, full_path)
+                else
+                    false;
+
+                if (zgui.selectable(label, .{ .selected = is_selected })) {
+                    if (self.selected_path) |old_path| {
+                        self.allocator.free(old_path);
+                    }
+                    self.selected_path = self.allocator.dupe(u8, full_path) catch null;
+                    file_selected = true;
+                }
             }
         }
 
