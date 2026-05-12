@@ -3123,7 +3123,7 @@ pub const PreferencesTests = struct {
         const path = try tmpPath(std.testing.allocator, tmp);
         defer std.testing.allocator.free(path);
 
-        try prefs.saveToPath(path, .{ .font_scale = 1.5 });
+        try prefs.saveToPath(std.testing.allocator, path, .{ .font_scale = 1.5 });
 
         const loaded = prefs.loadFromPath(std.testing.allocator, path);
         try expect.equal(loaded.font_scale, @as(f32, 1.5));
@@ -3135,7 +3135,7 @@ pub const PreferencesTests = struct {
         const path = try tmpPath(std.testing.allocator, tmp);
         defer std.testing.allocator.free(path);
 
-        try prefs.saveToPath(path, .{ .font_scale = 9.0 });
+        try prefs.saveToPath(std.testing.allocator, path, .{ .font_scale = 9.0 });
 
         const loaded = prefs.loadFromPath(std.testing.allocator, path);
         try expect.equal(loaded.font_scale, prefs.max_font_scale);

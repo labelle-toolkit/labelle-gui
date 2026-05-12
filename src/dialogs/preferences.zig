@@ -66,7 +66,19 @@ pub fn render(app: *App) void {
     zgui.separator();
     zgui.spacing();
 
-    if (app.prefs.font_scale != app.startup_prefs.font_scale) {
+    // `approxEqAbs` instead of `!=` so tiny float drift from the slider
+    // doesn't surface a "Restart to apply" hint when the live value is
+    // visually identical to the startup value (gemini #72 medium). The
+    // slider's display format is `%.2fx`, so anything closer than 0.001
+    // is indistinguishable to the user.
+    const drift_epsilon: f32 = 0.001;
+    const has_pending = !std.math.approxEqAbs(
+        f32,
+        app.prefs.font_scale,
+        app.startup_prefs.font_scale,
+        drift_epsilon,
+    );
+    if (has_pending) {
         zgui.textColored(
             .{ 1.0, 0.78, 0.25, 1.0 },
             "Restart the app for changes to take effect.",

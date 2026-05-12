@@ -66,9 +66,13 @@ pub fn loadOrDefault(allocator: std.mem.Allocator) Preferences {
 }
 
 /// Path-injectable variant of `loadOrDefault`. Used by tests to point
-/// at a temp file; production callers go through `loadOrDefault`.
+/// at a temp file; production callers go through `loadOrDefault`. The
+/// path must be absolute — `getAppDataDir` returns one, and tests
+/// build one from `realpathAlloc`. `openFileAbsolute` over
+/// `cwd().openFile` so a Windows path on a different drive than CWD
+/// resolves correctly (gemini #72 medium).
 pub fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) Preferences {
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+    const file = std.fs.openFileAbsolute(path, .{}) catch |err| {
         if (err == error.FileNotFound) {
             std.log.info("prefs: no preferences file at {s}; using defaults", .{path});
         } else {
@@ -116,12 +120,18 @@ pub fn save(allocator: std.mem.Allocator, prefs: Preferences) !void {
     const path = try std.fs.path.join(allocator, &.{ dir, PREFS_FILENAME });
     defer allocator.free(path);
 
-    try saveToPath(path, prefs);
+    try saveToPath(allocator, path, prefs);
 }
 
 /// Path-injectable variant of `save`. The parent directory must already
 /// exist; production callers go through `save` which makePath's first.
-pub fn saveToPath(path: []const u8, prefs: Preferences) !void {
+///
+/// Writes atomically: emits to `<path>.tmp` first, then renames over the
+/// real path. A crash mid-write leaves the previous-good preferences
+/// intact (or no file at all on first run) rather than corrupting the
+/// real file (gemini #72 medium). Uses absolute-path APIs so a Windows
+/// path on a different drive than CWD resolves correctly.
+pub fn saveToPath(allocator: std.mem.Allocator, path: []const u8, prefs: Preferences) !void {
     const clamped: Preferences = .{
         .font_scale = std.math.clamp(prefs.font_scale, min_font_scale, max_font_scale),
     };
@@ -137,8 +147,14 @@ pub fn saveToPath(path: []const u8, prefs: Preferences) !void {
         \\
     , .{clamped.font_scale});
 
-    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(body);
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(tmp_path);
+
+    {
+        var file = try std.fs.createFileAbsolute(tmp_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(body);
+    }
+    try std.fs.renameAbsolute(tmp_path, path);
 }
 
