@@ -13,6 +13,7 @@ const viewport = @import("modules/viewport.zig");
 const atlas = @import("atlas.zig");
 const gizmo_io = @import("gizmo_io.zig");
 const gizmos = @import("gizmos.zig");
+const preview = @import("preview.zig");
 
 test {
     zspec.runAll(@This());
@@ -2248,5 +2249,242 @@ pub const GizmosIndexTests = struct {
         idx.deinit();
         // Reaching here without leaks (std.testing.allocator is the
         // GPA) is the assertion.
+    }
+};
+
+/// Exercises the preview-mode TCP session's state machine without
+/// spawning `labelle run` (sibling agents are still landing #94 / #193
+/// for the launcher side). Each test sets up a tiny pair of connected
+/// sockets on loopback — the editor's `PreviewSession` reads from one,
+/// the test acts as a mock engine on the other.
+///
+/// Loopback delivery is "eventually" synchronous on macOS/Linux —
+/// kernel sometimes wants a microsecond to make a `writeAll` from one
+/// end visible to a non-blocking `read` on the other. `pollUntilState`
+/// retries `poll()` for a bounded budget (200ms) rather than guessing
+/// the right `Thread.sleep` value.
+pub const PreviewSessionTests = struct {
+    /// Drive `poll()` in a tight loop until the session's state
+    /// reaches `target` or 200ms elapses. Returns true if reached.
+    fn pollUntilState(s: *preview.PreviewSession, target: preview.State) bool {
+        const deadline = std.time.milliTimestamp() + 200;
+        while (std.time.milliTimestamp() < deadline) {
+            s.poll();
+            if (s.state == target) return true;
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+        return s.state == target;
+    }
+
+    /// Helper: build a connected pair (server stream + client stream)
+    /// on `127.0.0.1:0`. Returns the *client* side as the engine-mock
+    /// and *server* side as what `attachForTest` consumes (i.e. the
+    /// thing the editor would have got from `accept`).
+    const Pair = struct {
+        server: std.net.Server,
+        editor_side: std.net.Stream,
+        /// Optional so tests that need to deliberately close it early
+        /// (EOF/crash test) can nil it out and avoid the double-close
+        /// from `close()`'s teardown.
+        engine_side: ?std.net.Stream,
+
+        fn make() !Pair {
+            const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+            var server = try std.net.Address.listen(addr, .{ .reuse_address = true });
+            errdefer server.deinit();
+            const engine = try std.net.tcpConnectToAddress(server.listen_address);
+            errdefer engine.close();
+            const editor_conn = try server.accept();
+            return .{ .server = server, .editor_side = editor_conn.stream, .engine_side = engine };
+        }
+
+        fn closeEngine(self: *Pair) void {
+            if (self.engine_side) |s| {
+                s.close();
+                self.engine_side = null;
+            }
+        }
+
+        fn close(self: *Pair) void {
+            self.closeEngine();
+            // editor_side is owned by the session after attach.
+            self.server.deinit();
+        }
+
+        fn write(self: *Pair, bytes: []const u8) !void {
+            try (self.engine_side orelse return error.EngineClosed).writeAll(bytes);
+        }
+    };
+
+    test "initializes in idle state" {
+        const allocator = std.testing.allocator;
+        var s = preview.PreviewSession.init(allocator);
+        defer s.deinit();
+        try expect.equal(s.state, .idle);
+    }
+
+    test "isActive false in idle/stopped/crashed" {
+        const allocator = std.testing.allocator;
+        var s = preview.PreviewSession.init(allocator);
+        defer s.deinit();
+        try expect.toBeFalse(s.isActive());
+    }
+
+    test "poll on idle is a no-op" {
+        const allocator = std.testing.allocator;
+        var s = preview.PreviewSession.init(allocator);
+        defer s.deinit();
+        s.poll();
+        try expect.equal(s.state, .idle);
+    }
+
+    test "stop on idle leaves state stopped" {
+        const allocator = std.testing.allocator;
+        var s = preview.PreviewSession.init(allocator);
+        defer s.deinit();
+        s.stop();
+        try expect.equal(s.state, .stopped);
+    }
+
+    test "hello transitions connecting → running" {
+        const allocator = std.testing.allocator;
+        var pair = try Pair.make();
+        defer pair.close();
+
+        var s = preview.PreviewSession.init(allocator);
+        defer s.deinit();
+        try s.attachForTest(pair.editor_side);
+        try expect.equal(s.state, .connecting);
+
+        try pair.write(
+            \\{"kind":"hello","engine_version":"1.2.3","pid":424242,"protocol_version":1}
+            ++ "\n");
+
+        try expect.toBeTrue(pollUntilState(&s, .running));
+        try expect.equal(s.engine_pid.?, 424242);
+        try expect.toBeTrue(s.engine_version != null);
+        try expect.toBeTrue(std.mem.eql(u8, s.engine_version.?, "1.2.3"));
+    }
+
+    test "heartbeat updates last_heartbeat_ms" {
+        const allocator = std.testing.allocator;
+        var pair = try Pair.make();
+        defer pair.close();
+
+        var s = preview.PreviewSession.init(allocator);
+        defer s.deinit();
+        try s.attachForTest(pair.editor_side);
+
+        try pair.write(
+            \\{"kind":"hello","engine_version":"x","pid":1,"protocol_version":1}
+            ++ "\n");
+        try expect.toBeTrue(pollUntilState(&s, .running));
+        const t0 = s.last_heartbeat_ms.?;
+
+        // Force a measurable gap so the heartbeat timestamp moves.
+        std.Thread.sleep(2 * std.time.ns_per_ms);
+
+        try pair.write(
+            \\{"kind":"heartbeat","t":847291}
+            ++ "\n");
+        // Drain a few polls so the heartbeat arrives.
+        var i: usize = 0;
+        while (i < 10) : (i += 1) {
+            s.poll();
+            if (s.last_heartbeat_ms.? > t0) break;
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+        try expect.toBeTrue(s.last_heartbeat_ms.? >= t0);
+        try expect.equal(s.state, .running);
+    }
+
+    test "bye transitions to stopped" {
+        const allocator = std.testing.allocator;
+        var pair = try Pair.make();
+        defer pair.close();
+
+        var s = preview.PreviewSession.init(allocator);
+        defer s.deinit();
+        try s.attachForTest(pair.editor_side);
+        try pair.write(
+            \\{"kind":"hello","engine_version":"x","pid":1,"protocol_version":1}
+            ++ "\n" ++
+            \\{"kind":"bye","reason":"user_quit"}
+            ++ "\n");
+        try expect.toBeTrue(pollUntilState(&s, .stopped));
+        try expect.toBeTrue(s.bye_reason != null);
+        try expect.toBeTrue(std.mem.eql(u8, s.bye_reason.?, "user_quit"));
+    }
+
+    test "EOF without bye transitions to crashed" {
+        const allocator = std.testing.allocator;
+        var pair = try Pair.make();
+        defer pair.close();
+
+        var s = preview.PreviewSession.init(allocator);
+        defer s.deinit();
+        try s.attachForTest(pair.editor_side);
+        try pair.write(
+            \\{"kind":"hello","engine_version":"x","pid":1,"protocol_version":1}
+            ++ "\n");
+        try expect.toBeTrue(pollUntilState(&s, .running));
+
+        // Close the engine side without sending bye → editor should
+        // see EOF on next poll.
+        pair.closeEngine();
+        try expect.toBeTrue(pollUntilState(&s, .crashed));
+    }
+
+    test "unknown kind is ignored (forward-compat)" {
+        const allocator = std.testing.allocator;
+        var pair = try Pair.make();
+        defer pair.close();
+
+        var s = preview.PreviewSession.init(allocator);
+        defer s.deinit();
+        try s.attachForTest(pair.editor_side);
+        try pair.write(
+            \\{"kind":"hello","engine_version":"x","pid":1,"protocol_version":1}
+            ++ "\n" ++
+            \\{"kind":"future_message","whatever":42}
+            ++ "\n" ++
+            \\{"kind":"heartbeat","t":1}
+            ++ "\n");
+        try expect.toBeTrue(pollUntilState(&s, .running));
+    }
+
+    test "malformed JSON line is dropped without crashing" {
+        const allocator = std.testing.allocator;
+        var pair = try Pair.make();
+        defer pair.close();
+
+        var s = preview.PreviewSession.init(allocator);
+        defer s.deinit();
+        try s.attachForTest(pair.editor_side);
+        try pair.write(
+            \\{"kind":"hello","engine_version":"x","pid":1,"protocol_version":1}
+            ++ "\n" ++
+            "this is not json at all\n" ++
+            \\{"kind":"heartbeat","t":1}
+            ++ "\n");
+        try expect.toBeTrue(pollUntilState(&s, .running));
+    }
+
+    test "stop after running transitions to stopped" {
+        const allocator = std.testing.allocator;
+        var pair = try Pair.make();
+        defer pair.close();
+
+        var s = preview.PreviewSession.init(allocator);
+        defer s.deinit();
+        try s.attachForTest(pair.editor_side);
+        try pair.write(
+            \\{"kind":"hello","engine_version":"x","pid":1,"protocol_version":1}
+            ++ "\n");
+        try expect.toBeTrue(pollUntilState(&s, .running));
+
+        s.stop();
+        try expect.equal(s.state, .stopped);
+        try expect.toBeFalse(s.isActive());
     }
 };

@@ -13,12 +13,14 @@ const nfd = @import("nfd");
 const project = @import("project.zig");
 const tree_view = @import("tree_view.zig");
 const compiler = @import("compiler.zig");
+const preview = @import("preview.zig");
 const config = @import("config.zig");
 const module = @import("module.zig");
 const compiler_output = @import("modules/compiler_output.zig");
 const project_settings_mod = @import("modules/project_settings.zig");
 const project_tree_mod = @import("modules/project_tree.zig");
 const resources_mod = @import("modules/resources.zig");
+const preview_mod = @import("modules/preview.zig");
 const scene_mod = @import("modules/scene.zig");
 const prefab_mod = @import("modules/prefab.zig");
 const flow_mod = @import("modules/flow.zig");
@@ -109,6 +111,10 @@ pub const App = struct {
     project_manager: project.ProjectManager,
     tree_view: tree_view.TreeView,
     compiler: compiler.Compiler,
+    /// Preview-mode session (issue #61). Lifetime spans the App; `start`/
+    /// `stop` drive transitions, `poll` is ticked every frame. The
+    /// `preview` panel module reads its state for the status line.
+    preview: preview.PreviewSession,
 
     status_message: [STATUS_BUF_LEN]u8 = [_]u8{0} ** STATUS_BUF_LEN,
     status_timer: f32 = 0,
@@ -123,6 +129,11 @@ pub const App = struct {
 
     show_resources: bool = false,
     resources_editor: resources_mod.ResourcesEditor = .{},
+
+    /// Toggled by the View menu and the Build menu's "Run preview"
+    /// action. The Preview panel reads this via its `Module.is_open`
+    /// pointer; clicking Run preview also force-opens it.
+    show_preview: bool = false,
 
     /// Open editor tabs — scenes and prefabs share this list as
     /// `OpenTab` variants. Populated when the user clicks an
@@ -168,7 +179,7 @@ pub const App = struct {
 
     /// Fixed-size storage for registered modules. Grow the array literal
     /// when adding modules; Zig will tell you if it overflows.
-    modules: [4]module.Module = undefined,
+    modules: [5]module.Module = undefined,
     registry: module.Registry = .{ .modules = &.{} },
 
     const Self = @This();
@@ -183,12 +194,14 @@ pub const App = struct {
             .project_manager = project.ProjectManager.init(allocator),
             .tree_view = tree_view.TreeView.init(allocator),
             .compiler = compiler.Compiler.init(allocator),
+            .preview = preview.PreviewSession.init(allocator),
         };
 
         app.modules[0] = project_tree_mod.makeModule(app);
         app.modules[1] = compiler_output.makeModule(app);
         app.modules[2] = project_settings_mod.makeModule(app);
         app.modules[3] = resources_mod.makeModule(app);
+        app.modules[4] = preview_mod.makeModule(app);
         app.registry = .{ .modules = &app.modules };
 
         return app;
@@ -202,6 +215,7 @@ pub const App = struct {
         self.project_manager.deinit();
         self.tree_view.deinit();
         self.compiler.deinit();
+        self.preview.deinit();
         self.allocator.destroy(self);
     }
 
@@ -412,6 +426,7 @@ pub const App = struct {
 
         self.renderMenuBar();
         self.pollCompiler();
+        self.preview.poll();
         self.renderMainContent();
         self.registry.renderAllPanels(self);
         self.renderStatusBar();
@@ -472,6 +487,13 @@ pub const App = struct {
         zgui.separator();
         if (zgui.menuItem("Build", .{ .enabled = can_build })) self.startBuildOrRun(.build);
         if (zgui.menuItem("Run", .{ .enabled = can_build })) self.startBuildOrRun(.run);
+        zgui.separator();
+        // Preview mode (#61). Disabled while an existing preview session
+        // is alive — the session is single-instance (multi-session is
+        // punted in the #59 umbrella).
+        const preview_active = self.preview.isActive();
+        if (zgui.menuItem("Run preview", .{ .enabled = can_build and !preview_active })) self.startPreview();
+        if (zgui.menuItem("Stop preview", .{ .enabled = preview_active })) self.stopPreview();
     }
 
     fn renderHelpMenu(_: *Self) void {
@@ -580,6 +602,31 @@ pub const App = struct {
             self.setStatus(if (result.success) "Build successful!" else "Build failed!");
             self.compiler_output_scroll_to_bottom = true;
         }
+    }
+
+    /// Spawn a preview-mode child process and surface the Preview
+    /// panel. Mirrors `startBuildOrRun` shape: sync project files,
+    /// hand off to the session, surface a status message. The session
+    /// drives state from there via `poll()`.
+    pub fn startPreview(self: *Self) void {
+        const proj = self.project_manager.current_project orelse return;
+        self.compiler.syncProjectFiles(&self.project_manager) catch |err| {
+            std.log.err("Error syncing project files: {}", .{err});
+            self.setStatus("Error syncing project files!");
+            return;
+        };
+        self.preview.start(proj) catch |err| {
+            std.log.err("Error starting preview: {}", .{err});
+            self.setStatus("Error starting preview!");
+            return;
+        };
+        self.setStatus("Preview starting...");
+        self.show_preview = true;
+    }
+
+    pub fn stopPreview(self: *Self) void {
+        self.preview.stop();
+        self.setStatus("Preview stopped.");
     }
 
     // ─── Panels ─────────────────────────────────────────────────────────

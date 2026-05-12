@@ -311,6 +311,44 @@ pub fn main() !void {
         }
     });
 
+    // Preview panel — toggle from View menu and drive the Stop button
+    // path. We deliberately don't drive Run preview here because that
+    // would spawn the real `labelle` launcher (sibling repos #94/#193
+    // haven't landed --preview-mode yet). Hand-injecting a state via
+    // the public API keeps this test hermetic — same pattern the
+    // scene/prefab tests use to avoid touching nfd.
+    _ = engine.registerTest("phase3", "preview_panel_toggle_and_stop", @src(), struct {
+        fn gui(_: *zgui.te.TestContext) !void {
+            if (g_app) |a| a.renderFrame(1.0 / 60.0);
+        }
+        fn run(ctx: *zgui.te.TestContext) !void {
+            const a = g_app orelse {
+                _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
+                return;
+            };
+
+            // Sanity: panel starts closed.
+            _ = zgui.te.check(@src(), .{}, !a.show_preview, "Preview panel starts closed");
+
+            // View menu toggle.
+            ctx.menuAction(.click, "View/Preview");
+            _ = zgui.te.check(@src(), .{}, a.show_preview, "View/Preview opens panel");
+
+            // From idle, isActive must be false and Stop is a no-op
+            // (state stays at .stopped after a stop call).
+            _ = zgui.te.check(@src(), .{}, !a.preview.isActive(), "preview starts inactive");
+
+            // Drive the Stop path through the App method — exercises
+            // the same code the panel button hits.
+            a.stopPreview();
+            _ = zgui.te.check(@src(), .{}, a.preview.state == .stopped, "Stop preview lands at .stopped");
+
+            // Toggle off again.
+            ctx.menuAction(.click, "View/Preview");
+            _ = zgui.te.check(@src(), .{}, !a.show_preview, "View/Preview closes panel");
+        }
+    });
+
     _ = engine.registerTest("phase3", "project_settings_edit_save", @src(), struct {
         fn gui(_: *zgui.te.TestContext) !void {
             // Synthetic dt; tests don't observe status_timer decay.
