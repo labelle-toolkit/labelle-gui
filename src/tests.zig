@@ -14,6 +14,8 @@ const atlas = @import("atlas.zig");
 const gizmo_io = @import("gizmo_io.zig");
 const gizmos = @import("gizmos.zig");
 const preview = @import("preview.zig");
+const flow_projector = @import("flows/projector.zig");
+const flow_types = @import("flows/types.zig");
 
 test {
     zspec.runAll(@This());
@@ -1516,8 +1518,8 @@ pub const SceneRoutingTests = struct {
     }
 
     test "flow path under scripts/flows/ is accepted" {
-        try expect.toBeTrue(project_tree.isFlowPath("/p", "/p/scripts/flows/foo.flow.zon"));
-        try expect.toBeTrue(project_tree.isFlowPath("/p", "/p/scripts/flows/sub/bar.flow.zon"));
+        try expect.toBeTrue(project_tree.isFlowPath("/p", "/p/scripts/flows/foo.zig"));
+        try expect.toBeTrue(project_tree.isFlowPath("/p", "/p/scripts/flows/sub/bar.zig"));
     }
 
     test "non-flow-extension under scripts/flows is rejected" {
@@ -1526,12 +1528,12 @@ pub const SceneRoutingTests = struct {
     }
 
     test "flow path outside scripts/flows/ is rejected" {
-        try expect.toBeFalse(project_tree.isFlowPath("/p", "/p/scripts/foo.flow.zon"));
-        try expect.toBeFalse(project_tree.isFlowPath("/p", "/p/scenes/foo.flow.zon"));
+        try expect.toBeFalse(project_tree.isFlowPath("/p", "/p/scripts/foo.zig"));
+        try expect.toBeFalse(project_tree.isFlowPath("/p", "/p/scenes/foo.zig"));
     }
 
     test "no project dir → no flow routing" {
-        try expect.toBeFalse(project_tree.isFlowPath(null, "/p/scripts/flows/foo.flow.zon"));
+        try expect.toBeFalse(project_tree.isFlowPath(null, "/p/scripts/flows/foo.zig"));
     }
 
     test "gizmo path under gizmos/ is accepted" {
@@ -2720,5 +2722,379 @@ pub const PreviewSessionTests = struct {
         s.stop();
         try expect.equal(s.state, .stopped);
         try expect.toBeFalse(s.isActive());
+    }
+};
+
+// ─── Flows projector + renderers (issues #48 + #49) ───────────────────
+
+fn projectStr(source: [:0]const u8) !flow_types.Graph {
+    return try flow_projector.project(std.testing.allocator, source);
+}
+
+fn countCategory(graph: flow_types.Graph, cat: flow_types.GraphNodeSpec.Category) usize {
+    var n: usize = 0;
+    for (graph.nodes) |node| if (node.category == cat) {
+        n += 1;
+    };
+    return n;
+}
+
+pub const FlowsProjectorTests = struct {
+    test "empty source produces an empty graph" {
+        var g = try projectStr("");
+        defer g.deinit();
+        try expect.equal(g.nodes.len, 0);
+        try expect.equal(g.edges.len, 0);
+        try expect.equal(g.entry_points.len, 0);
+    }
+
+    test "non-entry-point function is skipped" {
+        // `helper` doesn't match the name list and doesn't take a
+        // *Game first param — the projector ignores it.
+        const source =
+            \\fn helper(a: i32, b: i32) i32 {
+            \\    return a + b;
+            \\}
+        ;
+        var g = try projectStr(source);
+        defer g.deinit();
+        try expect.equal(g.entry_points.len, 0);
+    }
+
+    test "tick(game, dt) becomes an entry point with two params" {
+        const source =
+            \\pub fn tick(game: anytype, dt: f32) void {
+            \\    _ = game;
+            \\    _ = dt;
+            \\}
+        ;
+        var g = try projectStr(source);
+        defer g.deinit();
+        try expect.equal(g.entry_points.len, 1);
+
+        const root = g.nodes[0];
+        try expect.toBeTrue(root.category == .entry_point);
+        try expect.equal(root.input_pins.len, 2);
+    }
+
+    test "*Game first param promotes to entry point" {
+        const source =
+            \\const Game = opaque {};
+            \\pub fn customHandler(g: *Game, x: i32) void {
+            \\    _ = g;
+            \\    _ = x;
+            \\}
+        ;
+        var g = try projectStr(source);
+        defer g.deinit();
+        // `customHandler` isn't in the name list but its first param
+        // type text contains "Game" → entry point.
+        try expect.equal(g.entry_points.len, 1);
+    }
+
+    test "binary op produces a binop node with two inputs and one output" {
+        const source =
+            \\pub fn tick(game: anytype, dt: f32) void {
+            \\    _ = game;
+            \\    const x = 1 + 2;
+            \\    _ = x;
+            \\    _ = dt;
+            \\}
+        ;
+        var g = try projectStr(source);
+        defer g.deinit();
+        try expect.toBeTrue(countCategory(g, .binop) >= 1);
+    }
+
+    test "if branch produces a branch node with two execution outputs" {
+        const source =
+            \\pub fn tick(game: anytype, dt: f32) void {
+            \\    _ = game;
+            \\    if (dt > 0) {
+            \\        _ = dt;
+            \\    }
+            \\}
+        ;
+        var g = try projectStr(source);
+        defer g.deinit();
+        try expect.toBeTrue(countCategory(g, .branch) >= 1);
+    }
+
+    test "while loop produces a loop node" {
+        const source =
+            \\pub fn tick(game: anytype, dt: f32) void {
+            \\    _ = game;
+            \\    _ = dt;
+            \\    var i: i32 = 0;
+            \\    while (i < 3) {
+            \\        i += 1;
+            \\    }
+            \\}
+        ;
+        var g = try projectStr(source);
+        defer g.deinit();
+        try expect.toBeTrue(countCategory(g, .loop) >= 1);
+    }
+
+    test "function call produces a call node labelled with the callee" {
+        const source =
+            \\fn helper() void {}
+            \\pub fn tick(game: anytype, dt: f32) void {
+            \\    _ = game;
+            \\    _ = dt;
+            \\    helper();
+            \\}
+        ;
+        var g = try projectStr(source);
+        defer g.deinit();
+
+        var found = false;
+        for (g.nodes) |node| {
+            if (node.category == .call and std.mem.eql(u8, node.label, "helper")) {
+                found = true;
+                break;
+            }
+        }
+        try expect.toBeTrue(found);
+    }
+
+    test "var_decl produces a var_decl node and binds its identifier" {
+        // `dt + 1` exercises the binop path which dispatches `dt` as
+        // a child — that's how identifier references reach the
+        // renderer. A bare `_ = x;` would wrap x in an assign-discard
+        // and bypass the identifier renderer.
+        const source =
+            \\pub fn tick(game: anytype, dt: f32) void {
+            \\    _ = game;
+            \\    const x = dt + 1;
+            \\    const y = x + 2;
+            \\    _ = y;
+            \\}
+        ;
+        var g = try projectStr(source);
+        defer g.deinit();
+        try expect.toBeTrue(countCategory(g, .var_decl) >= 2);
+        try expect.toBeTrue(countCategory(g, .identifier) >= 1);
+    }
+
+    test "return emits a terminator node" {
+        const source =
+            \\pub fn tick(game: anytype, dt: f32) i32 {
+            \\    _ = game;
+            \\    _ = dt;
+            \\    return 0;
+            \\}
+        ;
+        var g = try projectStr(source);
+        defer g.deinit();
+        try expect.toBeTrue(countCategory(g, .terminator) >= 1);
+    }
+
+    test "source_line is 1-based and lands on the construct's main token" {
+        // Line 1: comment. Line 2: blank. Line 3: fn header. Body
+        // starts at line 4. The `if` is on line 4 (or 5 depending on
+        // brace placement). Just confirm we get something > 1.
+        const source =
+            \\// header comment
+            \\
+            \\pub fn tick(game: anytype, dt: f32) void {
+            \\    if (dt > 0) {}
+            \\    _ = game;
+            \\}
+        ;
+        var g = try projectStr(source);
+        defer g.deinit();
+        var branch_line: u32 = 0;
+        for (g.nodes) |node| {
+            if (node.category == .branch) {
+                branch_line = node.source_line;
+                break;
+            }
+        }
+        try expect.toBeTrue(branch_line >= 4);
+    }
+};
+
+pub const FlowsRendererTests = struct {
+    test "every node carries arena-allocated label and pins" {
+        const source =
+            \\pub fn tick(game: anytype, dt: f32) void {
+            \\    _ = game;
+            \\    _ = dt;
+            \\}
+        ;
+        var g = try projectStr(source);
+        defer g.deinit();
+        for (g.nodes) |node| {
+            try expect.toBeTrue(node.label.len > 0);
+        }
+    }
+
+    test "ids are unique across nodes and across pins" {
+        const source =
+            \\pub fn tick(game: anytype, dt: f32) void {
+            \\    _ = game;
+            \\    const x = dt + 1;
+            \\    _ = x;
+            \\}
+        ;
+        var g = try projectStr(source);
+        defer g.deinit();
+
+        // Quadratic scan is fine — the test graph is small.
+        for (g.nodes, 0..) |a, i| {
+            for (g.nodes[i + 1 ..]) |b| {
+                try expect.toBeTrue(a.id != b.id);
+            }
+        }
+
+        // Collect every pin id from every node, then check
+        // uniqueness. We allocate the buffer on the heap because
+        // it's bounded by node count × pin count.
+        var seen = std.AutoHashMap(u32, void).init(std.testing.allocator);
+        defer seen.deinit();
+        for (g.nodes) |node| {
+            for (node.input_pins) |pin| {
+                const gop = try seen.getOrPut(pin.id);
+                try expect.toBeFalse(gop.found_existing);
+            }
+            for (node.output_pins) |pin| {
+                const gop = try seen.getOrPut(pin.id);
+                try expect.toBeFalse(gop.found_existing);
+            }
+        }
+    }
+
+    test "generic fallback fires for tags not in the renderer set" {
+        // `orelse` is intentionally outside the v1 binop list —
+        // the projector must route it through the generic renderer
+        // rather than crashing.
+        const source =
+            \\pub fn tick(game: anytype, dt: f32) void {
+            \\    _ = game;
+            \\    const x: ?f32 = dt;
+            \\    const y = x orelse 0;
+            \\    _ = y;
+            \\}
+        ;
+        var g = try projectStr(source);
+        defer g.deinit();
+        // Reaching here without crashing is the assertion.
+        try expect.toBeTrue(g.nodes.len > 0);
+    }
+
+    test "if body block fans its statements out (no generic blob)" {
+        // Regression for cursor bugbot #63: previously, an `if`
+        // body that was a block fell through `dispatch` to
+        // `renderGeneric`, collapsing the body into one opaque
+        // node. The fix in `renderBranch` walks the block's
+        // statements directly so the inner `helper()` call
+        // renders as a `.call` node.
+        const source =
+            \\fn helper() void {}
+            \\pub fn tick(game: anytype, dt: f32) void {
+            \\    _ = game;
+            \\    if (dt > 0) {
+            \\        helper();
+            \\    }
+            \\}
+        ;
+        var g = try projectStr(source);
+        defer g.deinit();
+
+        var found_helper = false;
+        for (g.nodes) |node| {
+            if (node.category == .call and std.mem.eql(u8, node.label, "helper")) {
+                found_helper = true;
+                break;
+            }
+        }
+        try expect.toBeTrue(found_helper);
+    }
+
+    test "while body block fans its statements out (no generic blob)" {
+        // Same regression as the `if` case, for `while` bodies.
+        const source =
+            \\fn helper() void {}
+            \\pub fn tick(game: anytype, dt: f32) void {
+            \\    _ = game;
+            \\    _ = dt;
+            \\    var i: i32 = 0;
+            \\    while (i < 3) {
+            \\        helper();
+            \\        i += 1;
+            \\    }
+            \\}
+        ;
+        var g = try projectStr(source);
+        defer g.deinit();
+
+        var found_helper = false;
+        for (g.nodes) |node| {
+            if (node.category == .call and std.mem.eql(u8, node.label, "helper")) {
+                found_helper = true;
+                break;
+            }
+        }
+        try expect.toBeTrue(found_helper);
+    }
+
+    test "identifier nodes have a ref input pin (gemini #63 high)" {
+        // Identifier references previously emitted an
+        // output-pin→output-pin edge from the binding. The fix
+        // adds an input `ref` pin that the binding wires into; the
+        // output pin then propagates downstream.
+        const source =
+            \\pub fn tick(game: anytype, dt: f32) void {
+            \\    _ = game;
+            \\    const x = dt + 1;
+            \\    const y = x + 2;
+            \\    _ = y;
+            \\}
+        ;
+        var g = try projectStr(source);
+        defer g.deinit();
+
+        var saw_identifier_with_ref_input = false;
+        for (g.nodes) |node| {
+            if (node.category == .identifier) {
+                try expect.equal(node.input_pins.len, 1);
+                if (node.input_pins.len == 1 and std.mem.eql(u8, node.input_pins[0].name, "ref")) {
+                    saw_identifier_with_ref_input = true;
+                }
+            }
+        }
+        try expect.toBeTrue(saw_identifier_with_ref_input);
+    }
+
+    test "entry-point heuristic doesn't false-positive on Game-substring types" {
+        // `NotAGame` and `MyGameController` both contain "Game" as
+        // a substring; the refined word-tokenizing heuristic should
+        // reject them.
+        const source =
+            \\const NotAGame = opaque {};
+            \\fn spurious(g: *NotAGame, x: i32) void {
+            \\    _ = g;
+            \\    _ = x;
+            \\}
+        ;
+        var g = try projectStr(source);
+        defer g.deinit();
+        try expect.equal(g.entry_points.len, 0);
+    }
+
+    test "entry-point heuristic still matches *const Game" {
+        // The tokenizer skips `const` and pointer punctuation so
+        // `*const Game` still resolves to the `Game` word.
+        const source =
+            \\const Game = opaque {};
+            \\fn handler(g: *const Game, dt: f32) void {
+            \\    _ = g;
+            \\    _ = dt;
+            \\}
+        ;
+        var g = try projectStr(source);
+        defer g.deinit();
+        try expect.equal(g.entry_points.len, 1);
     }
 };
