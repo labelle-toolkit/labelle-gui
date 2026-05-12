@@ -24,6 +24,14 @@ pub const State = struct {
     selected_idx: *?usize,
     is_dirty: *bool,
     drag_armed: *bool,
+    /// Optional sink for right-click world coordinates. The viewport
+    /// writes the world-space point when the user right-clicks an
+    /// empty area of the canvas (no entity under the cursor); the
+    /// caller is then responsible for opening its own context menu
+    /// (e.g. via `zgui.openPopup`). Null when the caller doesn't
+    /// care about right-clicks — the prefab editor sets this to
+    /// null today.
+    right_click_world: ?*?[2]f32 = null,
 };
 
 /// Pixel radius around an entity marker that counts as a click.
@@ -121,6 +129,19 @@ pub fn render(
         state.drag_armed.* = hit != null;
     }
     if (!zgui.isMouseDown(.left)) state.drag_armed.* = false;
+
+    // Right-click on empty canvas → caller-driven context menu. We
+    // only fire when the click misses every entity marker; clicks
+    // *on* an entity stay free for a future per-entity menu.
+    if (state.right_click_world) |sink| {
+        if (zgui.isItemHovered(.{}) and zgui.isMouseClicked(.right)) {
+            const mouse = zgui.getMousePos();
+            const hit = hitTestEntity(entities, mouse, canvas_min, state.pan.*, state.zoom.*);
+            if (hit == null) {
+                sink.* = worldFromScreen(mouse, canvas_min, state.pan.*, state.zoom.*);
+            }
+        }
+    }
 
     if (zgui.isItemActive()) {
         if (zgui.isMouseDragging(.middle, 0)) {
@@ -415,6 +436,23 @@ fn pivotOffset(name: []const u8) [2]f32 {
     if (std.mem.eql(u8, name, "left_center")) return .{ 0.0, 0.5 };
     if (std.mem.eql(u8, name, "right_center")) return .{ 1.0, 0.5 };
     return .{ 0.5, 0.5 };
+}
+
+/// Convert a screen-space point (`mouse`) back into world space using
+/// the viewport's current pan/zoom + canvas origin. Inverse of the
+/// `cmin + pan + pos * zoom` projection `drawEntities` does (with Y
+/// flipped because world +y is up, screen +y is down). Pure so zspec
+/// can exercise the round-trip.
+pub fn worldFromScreen(
+    mouse: [2]f32,
+    canvas_min: [2]f32,
+    pan: [2]f32,
+    zoom: f32,
+) [2]f32 {
+    return .{
+        (mouse[0] - canvas_min[0] - pan[0]) / zoom,
+        -(mouse[1] - canvas_min[1] - pan[1]) / zoom,
+    };
 }
 
 /// Return the index of the closest entity whose screen-space marker

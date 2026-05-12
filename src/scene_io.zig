@@ -185,6 +185,61 @@ pub const LoadedScene = struct {
     }
 };
 
+/// Append `entity` to `loaded.scene.entities` and grow the parallel
+/// `extras.entity_components` list with an empty per-entity extras
+/// slice so the two arrays stay lock-step on save.
+///
+/// **Arena lifetime**: `entity.prefab` (if non-null) must outlive the
+/// `LoadedScene`. Pass an already-arena-allocated slice, or use the
+/// arena directly: `try loaded.arena.allocator().dupe(u8, name)`.
+/// `Position` and other scalar component buffers are by-value so they
+/// move into the array without further allocation.
+pub fn insertEntity(loaded: *LoadedScene, entity: Entity) !void {
+    const a = loaded.arena.allocator();
+    const old_entities = loaded.scene.entities;
+    const new_entities = try a.alloc(Entity, old_entities.len + 1);
+    @memcpy(new_entities[0..old_entities.len], old_entities);
+    new_entities[old_entities.len] = entity;
+    loaded.scene.entities = new_entities;
+
+    // Grow extras.entity_components in lockstep. Old entries copy
+    // through by value (they're slices pointing into the parse arena);
+    // the new tail is an empty extras list.
+    const old_extras = loaded.extras.entity_components;
+    const new_extras = try a.alloc([]const ComponentExtra, old_extras.len + 1);
+    @memcpy(new_extras[0..old_extras.len], old_extras);
+    new_extras[old_extras.len] = &.{};
+    loaded.extras.entity_components = new_extras;
+}
+
+/// Remove the entity at `idx` from `loaded.scene.entities` and the
+/// parallel `extras.entity_components` entry (when present). Returns
+/// `error.IndexOutOfBounds` if `idx` is past the end of either array.
+///
+/// Memory: the removed entries are simply skipped — the parse arena
+/// keeps holding their bytes until the whole `LoadedScene` is freed.
+/// That's fine for the editor's lifetime; a long-running session that
+/// adds + removes many entities would still bound to the file size
+/// because saves arena-reset on the next reload.
+pub fn removeEntity(loaded: *LoadedScene, idx: usize) !void {
+    const entities = loaded.scene.entities;
+    if (idx >= entities.len) return error.IndexOutOfBounds;
+
+    const a = loaded.arena.allocator();
+    const new_entities = try a.alloc(Entity, entities.len - 1);
+    @memcpy(new_entities[0..idx], entities[0..idx]);
+    @memcpy(new_entities[idx..], entities[idx + 1 ..]);
+    loaded.scene.entities = new_entities;
+
+    const old_extras = loaded.extras.entity_components;
+    if (idx < old_extras.len) {
+        const new_extras = try a.alloc([]const ComponentExtra, old_extras.len - 1);
+        @memcpy(new_extras[0..idx], old_extras[0..idx]);
+        @memcpy(new_extras[idx..], old_extras[idx + 1 ..]);
+        loaded.extras.entity_components = new_extras;
+    }
+}
+
 pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !LoadedScene {
     const raw = try std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024);
     defer allocator.free(raw);
