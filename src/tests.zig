@@ -12,6 +12,7 @@ const project_tree = @import("modules/project_tree.zig");
 const viewport = @import("modules/viewport.zig");
 const atlas = @import("atlas.zig");
 const gizmo_io = @import("gizmo_io.zig");
+const gizmos = @import("gizmos.zig");
 
 test {
     zspec.runAll(@This());
@@ -2164,5 +2165,88 @@ pub const GizmoIoTests = struct {
         try expect.toBeTrue(std.mem.eql(u8, reparsed.gizmo.match[0], hostile));
         try expect.equal(reparsed.gizmo.exclude.len, 1);
         try expect.toBeTrue(std.mem.eql(u8, reparsed.gizmo.exclude[0], "Tab\there"));
+    }
+};
+
+pub const GizmoMatchTests = struct {
+    test "match accepts an entity whose components include a match name" {
+        const present = [_][]const u8{ "Position", "Workstation" };
+        const m = [_][]const u8{"Workstation"};
+        const x: [0][]const u8 = .{};
+        try expect.toBeTrue(gizmos.entityMatches(&m, &x, &present));
+    }
+
+    test "match rejects when none of the match names are present" {
+        const present = [_][]const u8{ "Position", "Sprite" };
+        const m = [_][]const u8{"Workstation"};
+        const x: [0][]const u8 = .{};
+        try expect.toBeFalse(gizmos.entityMatches(&m, &x, &present));
+    }
+
+    test "exclude vetoes an otherwise-matching entity" {
+        const present = [_][]const u8{ "Item", "Stored" };
+        const m = [_][]const u8{"Item"};
+        const x = [_][]const u8{"Stored"};
+        try expect.toBeFalse(gizmos.entityMatches(&m, &x, &present));
+    }
+
+    test "empty match matches every non-excluded entity" {
+        // Mirrors the engine convention: an absent `.match` field is
+        // treated as a catch-all.
+        const present = [_][]const u8{ "Position", "Sprite" };
+        const m: [0][]const u8 = .{};
+        const x: [0][]const u8 = .{};
+        try expect.toBeTrue(gizmos.entityMatches(&m, &x, &present));
+    }
+};
+
+pub const GizmosIndexTests = struct {
+    test "build against a missing gizmos/ dir returns an empty index" {
+        // Regression: the loader has to tolerate projects without a
+        // gizmos/ subtree (the common case). `Index.deinit` must be
+        // safe on the resulting empty struct.
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+        defer std.testing.allocator.free(dir_path);
+
+        var idx = gizmos.Index.build(std.testing.allocator, dir_path, 1);
+        defer idx.deinit();
+        try expect.toBeEmpty(idx.entries.items);
+        try expect.toBeEmpty(idx.arenas.items);
+        try expect.equal(idx.generation, @as(u64, 1));
+    }
+
+    test "deinit frees per-entry arenas without double-free" {
+        // Regression for PR #41 review: prior to the fix, an OOM
+        // between `arenas.append` and `entries.append` left a dangling
+        // arena pointer; the errdefer for the loop arena and the
+        // index's own deinit would each free it. We can't easily
+        // force an OOM here, but we can stand up an Index manually
+        // with one valid arena+entry and prove deinit walks the
+        // arena list and frees cleanly.
+        var idx: gizmos.Index = .{
+            .allocator = std.testing.allocator,
+            .generation = 7,
+        };
+        const arena = try std.testing.allocator.create(std.heap.ArenaAllocator);
+        arena.* = std.heap.ArenaAllocator.init(std.testing.allocator);
+        const a = arena.allocator();
+
+        const match_one = try a.alloc([]const u8, 1);
+        match_one[0] = try a.dupe(u8, "Workstation");
+        const empty: [][]const u8 = &.{};
+        const source_owned = try a.dupe(u8, "/dev/null/test.zon");
+
+        try idx.arenas.append(std.testing.allocator, arena);
+        try idx.entries.append(std.testing.allocator, .{
+            .source = source_owned,
+            .match = match_one,
+            .exclude = empty,
+            .shape = .{ .circle = .{ .radius = 8 } },
+        });
+        idx.deinit();
+        // Reaching here without leaks (std.testing.allocator is the
+        // GPA) is the assertion.
     }
 };

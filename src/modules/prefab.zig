@@ -86,6 +86,8 @@ pub fn render(s: *PrefabState, app: *App) void {
     zgui.sameLine(.{});
     zgui.text("zoom: {d:.2}x", .{s.zoom});
     zgui.sameLine(.{});
+    _ = zgui.checkbox("gizmos", .{ .v = &app.show_gizmos });
+    zgui.sameLine(.{});
     if (zgui.button("Save", .{})) savePrefab(s, app);
     zgui.separator();
 
@@ -94,15 +96,23 @@ pub fn render(s: *PrefabState, app: *App) void {
     const viewport_w = @max(120.0, total_w - inspector_w - split_gap);
 
     const atlas_index_ptr: ?*const @import("../atlas.zig").Index = if (app.atlas_index) |*ix| ix else null;
+    const gizmo_index_ptr: ?*const @import("../gizmos.zig").Index = if (app.gizmo_index) |*ix| ix else null;
 
     if (zgui.beginChild("##prefab_viewport_col", .{ .w = viewport_w, .h = 0 })) {
-        viewport.render(.{
-            .pan = &s.pan,
-            .zoom = &s.zoom,
-            .selected_idx = &s.selected_child_idx,
-            .is_dirty = &s.is_dirty,
-            .drag_armed = &s.drag_armed,
-        }, s.loaded.children, atlas_index_ptr);
+        viewport.render(
+            .{
+                .pan = &s.pan,
+                .zoom = &s.zoom,
+                .selected_idx = &s.selected_child_idx,
+                .is_dirty = &s.is_dirty,
+                .drag_armed = &s.drag_armed,
+            },
+            s.loaded.children,
+            s.loaded.children_extras,
+            atlas_index_ptr,
+            gizmo_index_ptr,
+            app.show_gizmos,
+        );
     }
     zgui.endChild();
     zgui.sameLine(.{});
