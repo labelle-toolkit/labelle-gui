@@ -79,6 +79,11 @@ pub const SceneState = struct {
     /// Filter buffer for the picker's search box. Stays sticky across
     /// reopenings — same convenience the resources panel has.
     prefab_picker_filter: [64:0]u8 = [_:0]u8{0} ** 64,
+    /// Snap-to-grid: when enabled, drag-to-move rounds the dragged
+    /// entity's world position to multiples of `snap_step`. Off by
+    /// default so existing behavior is preserved.
+    snap_enabled: bool = false,
+    snap_step: f32 = 16,
 
     /// Load a scene from disk and wrap it in a fresh SceneState. The
     /// returned state owns an arena holding the path + display name,
@@ -140,6 +145,14 @@ pub fn render(s: *SceneState, app: *App) void {
     zgui.text("zoom: {d:.2}x", .{s.zoom});
     zgui.sameLine(.{});
     _ = zgui.checkbox("gizmos", .{ .v = &app.show_gizmos });
+    zgui.sameLine(.{});
+    _ = zgui.checkbox("snap", .{ .v = &s.snap_enabled });
+    if (s.snap_enabled) {
+        zgui.sameLine(.{});
+        zgui.setNextItemWidth(64);
+        _ = zgui.inputFloat("##snap_step", .{ .v = &s.snap_step });
+        if (s.snap_step <= 0) s.snap_step = 1;
+    }
     zgui.sameLine(.{});
     if (zgui.button("Save", .{})) saveScene(s, app);
     zgui.separator();
@@ -221,6 +234,7 @@ fn renderViewport(
             .is_dirty = &s.is_dirty,
             .drag_armed = &s.drag_armed,
             .right_click_world = &right_click,
+            .snap_step = if (s.snap_enabled) s.snap_step else null,
         },
         s.loaded.scene.entities,
         s.loaded.extras.entity_components,

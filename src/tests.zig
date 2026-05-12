@@ -1682,6 +1682,47 @@ pub const ViewportRenderPlanTests = struct {
     }
 };
 
+pub const ViewportSnapTests = struct {
+    // Snap-to-grid math — exercised independently of the imgui draw
+    // path. Drag-to-move calls `snapValue` once per axis with the
+    // user's step and origin; the formula is
+    //   snapped = origin + round((value - origin) / step) * step
+    // so the snap grid is aligned to `origin` (defaults to world 0).
+
+    test "rounds to nearest multiple of step at origin 0" {
+        try expect.equal(viewport.snapValue(0, 0, 16), 0);
+        try expect.equal(viewport.snapValue(7, 0, 16), 0);
+        try expect.equal(viewport.snapValue(8, 0, 16), 16); // ties-away (zig @round)
+        try expect.equal(viewport.snapValue(9, 0, 16), 16);
+        try expect.equal(viewport.snapValue(23, 0, 16), 16);
+        try expect.equal(viewport.snapValue(24, 0, 16), 32);
+    }
+
+    test "negative values snap symmetrically" {
+        try expect.equal(viewport.snapValue(-7, 0, 16), 0);
+        try expect.equal(viewport.snapValue(-9, 0, 16), -16);
+        try expect.equal(viewport.snapValue(-16, 0, 16), -16);
+    }
+
+    test "non-zero origin shifts the grid" {
+        // origin=5, step=10 → grid is { ..., -5, 5, 15, 25, ... }.
+        try expect.equal(viewport.snapValue(6, 5, 10), 5);
+        try expect.equal(viewport.snapValue(11, 5, 10), 15);
+        try expect.equal(viewport.snapValue(0, 5, 10), -5);
+    }
+
+    test "values already on a grid line stay put" {
+        try expect.equal(viewport.snapValue(32, 0, 16), 32);
+        try expect.equal(viewport.snapValue(-48, 0, 16), -48);
+    }
+
+    test "non-integer step rounds to that step" {
+        // Use loose tolerance: 0.5 floating ops are exact in f32.
+        try expect.equal(viewport.snapValue(1.2, 0, 0.5), 1.0);
+        try expect.equal(viewport.snapValue(1.3, 0, 0.5), 1.5);
+    }
+};
+
 pub const SceneTemplateTests = struct {
     /// Strip `//`-to-end-of-line comments so the JSONC template can be
     /// fed to std.json (which doesn't accept comments). Replaces the

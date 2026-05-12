@@ -38,6 +38,9 @@ pub const PrefabState = struct {
     drag_armed: bool = false,
     pan: [2]f32 = .{ 320, 240 },
     zoom: f32 = 1.0,
+    /// Snap-to-grid for child drag-to-move. Off by default.
+    snap_enabled: bool = false,
+    snap_step: f32 = 16,
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !PrefabState {
         const arena = try allocator.create(std.heap.ArenaAllocator);
@@ -88,6 +91,14 @@ pub fn render(s: *PrefabState, app: *App) void {
     zgui.sameLine(.{});
     _ = zgui.checkbox("gizmos", .{ .v = &app.show_gizmos });
     zgui.sameLine(.{});
+    _ = zgui.checkbox("snap", .{ .v = &s.snap_enabled });
+    if (s.snap_enabled) {
+        zgui.sameLine(.{});
+        zgui.setNextItemWidth(64);
+        _ = zgui.inputFloat("##snap_step", .{ .v = &s.snap_step });
+        if (s.snap_step <= 0) s.snap_step = 1;
+    }
+    zgui.sameLine(.{});
     if (zgui.button("Save", .{})) savePrefab(s, app);
     zgui.separator();
 
@@ -106,6 +117,7 @@ pub fn render(s: *PrefabState, app: *App) void {
                 .selected_idx = &s.selected_child_idx,
                 .is_dirty = &s.is_dirty,
                 .drag_armed = &s.drag_armed,
+                .snap_step = if (s.snap_enabled) s.snap_step else null,
             },
             s.loaded.children,
             s.loaded.children_extras,

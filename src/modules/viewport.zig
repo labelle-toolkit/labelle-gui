@@ -32,7 +32,24 @@ pub const State = struct {
     /// care about right-clicks — the prefab editor sets this to
     /// null today.
     right_click_world: ?*?[2]f32 = null,
+    /// Optional snap step in world units. When non-null and a drag is
+    /// in progress, the dragged entity's running position is rounded to
+    /// the nearest multiple of `snap_step` (relative to `snap_origin`)
+    /// before being written back. Null disables snapping.
+    snap_step: ?f32 = null,
+    /// World-space origin for the snap grid. The default keeps the grid
+    /// aligned to the world origin; callers can shift it later (no UI
+    /// for this yet).
+    snap_origin: [2]f32 = .{ 0, 0 },
 };
+
+/// Round a single 1-D world coordinate to the nearest snap step relative
+/// to `origin`. Pulled out so zspec can exercise the math without an
+/// imgui draw context. `step` must be > 0; callers guard with the
+/// optional `snap_step` field of `State`.
+pub fn snapValue(value: f32, origin: f32, step: f32) f32 {
+    return origin + @round((value - origin) / step) * step;
+}
 
 /// Pixel radius around an entity marker that counts as a click.
 pub const hit_radius: f32 = 10.0;
@@ -159,6 +176,12 @@ pub fn render(
                         pos.x += d[0] / state.zoom.*;
                         // World +y is up; screen +y is down.
                         pos.y -= d[1] / state.zoom.*;
+                        if (state.snap_step) |step| {
+                            if (step > 0) {
+                                pos.x = snapValue(pos.x, state.snap_origin[0], step);
+                                pos.y = snapValue(pos.y, state.snap_origin[1], step);
+                            }
+                        }
                         state.is_dirty.* = true;
                         zgui.resetMouseDragDelta(.left);
                     }
