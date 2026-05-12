@@ -16,12 +16,23 @@
 //! + Sprite as the second-step target). The framework is here: the
 //! call renderer slots in component-aware specializations by call
 //! target name when those land.
+//!
+//! TODO(#63 gemini high, projector data-flow vs execution-flow):
+//! statement-level renderers (`renderCall`, `renderVarDecl`,
+//! `renderReturn`) don't yet emit execution-flow edges between
+//! sequential statements within a block. The projector's
+//! `walkBlock` could thread an exec pin from one stmt to the next
+//! once these renderers grow `exec_in` / `exec_out` pins. Deferred
+//! to Phase 2 — Phase 1's read-only viewer is informative without
+//! the explicit chain, and adding it touches every statement
+//! renderer plus the block walker.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
 
 const types = @import("types.zig");
-const Projector = @import("projector.zig").Projector;
+const projector_mod = @import("projector.zig");
+const Projector = projector_mod.Projector;
 
 const GraphNodeSpec = types.GraphNodeSpec;
 const PinSpec = types.PinSpec;
@@ -315,28 +326,52 @@ fn renderBranch(p: *Projector, node: Ast.Node.Index, parent_id: u32) !?u32 {
             .kind = .data,
         });
     }
-    if (try dispatch(p, branch.ast.then_expr, id)) |then_id| {
-        try p.emitEdge(.{
-            .from_node = id,
-            .from_pin = then_out.id,
-            .to_node = then_id,
-            .to_pin = firstInputPinOrSynthetic(p, then_id),
-            .kind = .execution,
-        });
-    }
+    try wireBodyExec(p, branch.ast.then_expr, id, then_out.id);
     if (branch.ast.else_expr.unwrap()) |else_expr| {
-        if (try dispatch(p, else_expr, id)) |else_id| {
-            try p.emitEdge(.{
-                .from_node = id,
-                .from_pin = else_out.id,
-                .to_node = else_id,
-                .to_pin = firstInputPinOrSynthetic(p, else_id),
-                .kind = .execution,
-            });
-        }
+        try wireBodyExec(p, else_expr, id, else_out.id);
     }
     _ = parent_id;
     return id;
+}
+
+/// Walk a control-flow body — `then_expr` for if/else, `body_expr`
+/// for while/for — and emit a single exec edge from
+/// `(parent_id, exec_pin)` to its first rendered child node.
+///
+/// When `body` is a block (`{ ... }`) we fan its statements out
+/// individually so nested calls / branches don't collapse into a
+/// `renderGeneric` blob (cursor bugbot #63 — top-level fn body
+/// already worked via `walkBlock`; control-flow bodies need the
+/// same treatment).
+fn wireBodyExec(p: *Projector, body: Ast.Node.Index, parent_id: u32, exec_pin: u32) !void {
+    const ast = p.ast;
+    if (projector_mod.isBlockTag(ast.nodeTag(body))) {
+        const first_idx_before = p.nodes.items.len;
+        try projector_mod.walkBlock(p, body, parent_id);
+        // Wire the exec edge to whatever the block's first emitted
+        // node was. If the block was empty / produced nothing, the
+        // edge is silently dropped — nothing to point at.
+        if (p.nodes.items.len > first_idx_before) {
+            const first_child = p.nodes.items[first_idx_before];
+            try p.emitEdge(.{
+                .from_node = parent_id,
+                .from_pin = exec_pin,
+                .to_node = first_child.id,
+                .to_pin = firstInputPinOrSynthetic(p, first_child.id),
+                .kind = .execution,
+            });
+        }
+        return;
+    }
+    if (try dispatch(p, body, parent_id)) |child_id| {
+        try p.emitEdge(.{
+            .from_node = parent_id,
+            .from_pin = exec_pin,
+            .to_node = child_id,
+            .to_pin = firstInputPinOrSynthetic(p, child_id),
+            .kind = .execution,
+        });
+    }
 }
 
 // ─── while / for ───────────────────────────────────────────────────
@@ -390,15 +425,7 @@ fn renderLoop(p: *Projector, node: Ast.Node.Index, parent_id: u32) !?u32 {
         }
     }
     if (body_node) |b| {
-        if (try dispatch(p, b, id)) |b_id| {
-            try p.emitEdge(.{
-                .from_node = id,
-                .from_pin = body_out.id,
-                .to_node = b_id,
-                .to_pin = firstInputPinOrSynthetic(p, b_id),
-                .kind = .execution,
-            });
-        }
+        try wireBodyExec(p, b, id, body_out.id);
     }
     _ = parent_id;
     return id;
@@ -453,7 +480,14 @@ fn renderIdentifier(p: *Projector, node: Ast.Node.Index, parent_id: u32) !?u32 {
     // reference node that wires back to the producing pin. Otherwise
     // (param, module-level decl) we still surface an identifier node
     // so the caller has something to connect to.
+    //
+    // The reference node has an input pin (`ref`) that the binding
+    // wires *into* and an output pin (the identifier's own name)
+    // that downstream nodes connect to. Previously the binding edge
+    // pointed to the identifier's *output* pin, which is unusual for
+    // data-flow graphs (gemini #63 high).
     const id = p.newNodeId();
+    const ref_in: PinSpec = .{ .id = p.newPinId(), .name = try p.arena.dupe(u8, "ref"), .type_name = try p.arena.dupe(u8, "?unknown") };
     const out: PinSpec = .{ .id = p.newPinId(), .name = try p.arena.dupe(u8, name), .type_name = try p.arena.dupe(u8, "?unknown") };
 
     try p.emitNode(.{
@@ -461,7 +495,7 @@ fn renderIdentifier(p: *Projector, node: Ast.Node.Index, parent_id: u32) !?u32 {
         .label = try p.arena.dupe(u8, name),
         .source_line = p.sourceLineOf(node),
         .category = .identifier,
-        .input_pins = try p.arena.alloc(PinSpec, 0),
+        .input_pins = try p.arena.dupe(PinSpec, &[_]PinSpec{ref_in}),
         .output_pins = try p.arena.dupe(PinSpec, &[_]PinSpec{out}),
     });
 
@@ -470,7 +504,7 @@ fn renderIdentifier(p: *Projector, node: Ast.Node.Index, parent_id: u32) !?u32 {
             .from_node = binding.node,
             .from_pin = binding.pin,
             .to_node = id,
-            .to_pin = out.id, // synthetic input: identifier nodes have no real inputs
+            .to_pin = ref_in.id,
             .kind = .data,
         });
     }
@@ -622,22 +656,24 @@ fn renderGeneric(p: *Projector, node: Ast.Node.Index, parent_id: u32) !?u32 {
 /// targets need *something* so the node-editor can draw a line; we
 /// reuse the node's own id as the pin id in that case, since
 /// node-editor never sees the synthetic edge as a real connection.
+///
+/// Node IDs are allocated sequentially starting at 1 by
+/// `Projector.newNodeId` and pushed into `p.nodes` in the same
+/// order, so `nodes.items[id - 1]` is the matching entry. The
+/// assert guards against future allocators that break that
+/// invariant (gemini #63 high — replaces the O(N) scan).
 fn lastOutputPinOf(p: *const Projector, node_id: u32) u32 {
-    for (p.nodes.items) |n| {
-        if (n.id == node_id) {
-            if (n.output_pins.len == 0) return node_id;
-            return n.output_pins[n.output_pins.len - 1].id;
-        }
-    }
-    return node_id;
+    if (node_id == 0 or node_id > p.nodes.items.len) return node_id;
+    const n = p.nodes.items[node_id - 1];
+    std.debug.assert(n.id == node_id);
+    if (n.output_pins.len == 0) return node_id;
+    return n.output_pins[n.output_pins.len - 1].id;
 }
 
 fn firstInputPinOrSynthetic(p: *const Projector, node_id: u32) u32 {
-    for (p.nodes.items) |n| {
-        if (n.id == node_id) {
-            if (n.input_pins.len == 0) return node_id;
-            return n.input_pins[0].id;
-        }
-    }
-    return node_id;
+    if (node_id == 0 or node_id > p.nodes.items.len) return node_id;
+    const n = p.nodes.items[node_id - 1];
+    std.debug.assert(n.id == node_id);
+    if (n.input_pins.len == 0) return node_id;
+    return n.input_pins[0].id;
 }

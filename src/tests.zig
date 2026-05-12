@@ -2722,6 +2722,9 @@ pub const PreviewSessionTests = struct {
         s.stop();
         try expect.equal(s.state, .stopped);
         try expect.toBeFalse(s.isActive());
+    }
+};
+
 // ─── Flows projector + renderers (issues #48 + #49) ───────────────────
 
 fn projectStr(source: [:0]const u8) !flow_types.Graph {
@@ -2978,5 +2981,120 @@ pub const FlowsRendererTests = struct {
         defer g.deinit();
         // Reaching here without crashing is the assertion.
         try expect.toBeTrue(g.nodes.len > 0);
+    }
+
+    test "if body block fans its statements out (no generic blob)" {
+        // Regression for cursor bugbot #63: previously, an `if`
+        // body that was a block fell through `dispatch` to
+        // `renderGeneric`, collapsing the body into one opaque
+        // node. The fix in `renderBranch` walks the block's
+        // statements directly so the inner `helper()` call
+        // renders as a `.call` node.
+        const source =
+            \\fn helper() void {}
+            \\pub fn tick(game: anytype, dt: f32) void {
+            \\    _ = game;
+            \\    if (dt > 0) {
+            \\        helper();
+            \\    }
+            \\}
+        ;
+        var g = try projectStr(source);
+        defer g.deinit();
+
+        var found_helper = false;
+        for (g.nodes) |node| {
+            if (node.category == .call and std.mem.eql(u8, node.label, "helper")) {
+                found_helper = true;
+                break;
+            }
+        }
+        try expect.toBeTrue(found_helper);
+    }
+
+    test "while body block fans its statements out (no generic blob)" {
+        // Same regression as the `if` case, for `while` bodies.
+        const source =
+            \\fn helper() void {}
+            \\pub fn tick(game: anytype, dt: f32) void {
+            \\    _ = game;
+            \\    _ = dt;
+            \\    var i: i32 = 0;
+            \\    while (i < 3) {
+            \\        helper();
+            \\        i += 1;
+            \\    }
+            \\}
+        ;
+        var g = try projectStr(source);
+        defer g.deinit();
+
+        var found_helper = false;
+        for (g.nodes) |node| {
+            if (node.category == .call and std.mem.eql(u8, node.label, "helper")) {
+                found_helper = true;
+                break;
+            }
+        }
+        try expect.toBeTrue(found_helper);
+    }
+
+    test "identifier nodes have a ref input pin (gemini #63 high)" {
+        // Identifier references previously emitted an
+        // output-pin→output-pin edge from the binding. The fix
+        // adds an input `ref` pin that the binding wires into; the
+        // output pin then propagates downstream.
+        const source =
+            \\pub fn tick(game: anytype, dt: f32) void {
+            \\    _ = game;
+            \\    const x = dt + 1;
+            \\    const y = x + 2;
+            \\    _ = y;
+            \\}
+        ;
+        var g = try projectStr(source);
+        defer g.deinit();
+
+        var saw_identifier_with_ref_input = false;
+        for (g.nodes) |node| {
+            if (node.category == .identifier) {
+                try expect.equal(node.input_pins.len, 1);
+                if (node.input_pins.len == 1 and std.mem.eql(u8, node.input_pins[0].name, "ref")) {
+                    saw_identifier_with_ref_input = true;
+                }
+            }
+        }
+        try expect.toBeTrue(saw_identifier_with_ref_input);
+    }
+
+    test "entry-point heuristic doesn't false-positive on Game-substring types" {
+        // `NotAGame` and `MyGameController` both contain "Game" as
+        // a substring; the refined word-tokenizing heuristic should
+        // reject them.
+        const source =
+            \\const NotAGame = opaque {};
+            \\fn spurious(g: *NotAGame, x: i32) void {
+            \\    _ = g;
+            \\    _ = x;
+            \\}
+        ;
+        var g = try projectStr(source);
+        defer g.deinit();
+        try expect.equal(g.entry_points.len, 0);
+    }
+
+    test "entry-point heuristic still matches *const Game" {
+        // The tokenizer skips `const` and pointer punctuation so
+        // `*const Game` still resolves to the `Game` word.
+        const source =
+            \\const Game = opaque {};
+            \\fn handler(g: *const Game, dt: f32) void {
+            \\    _ = g;
+            \\    _ = dt;
+            \\}
+        ;
+        var g = try projectStr(source);
+        defer g.deinit();
+        try expect.equal(g.entry_points.len, 1);
     }
 };

@@ -142,9 +142,14 @@ pub fn loadAndProject(s: *FlowState, allocator: std.mem.Allocator) !void {
     @memcpy(src[0..raw.len], raw);
 
     s.source = src;
-    s.last_mtime = stat.mtime;
 
+    // Project first, then commit the mtime. If projection fails the
+    // mtime stays at its previous value so `maybeReparse` will
+    // retry next time the file changes — otherwise we'd silently
+    // freeze in the failed-parse state until a manual Reparse click
+    // (cursor bugbot #63 low).
     s.graph = try projector.project(allocator, src);
+    s.last_mtime = stat.mtime;
 }
 
 /// Per-frame mtime check. Cheap — `stat` is one syscall and we
@@ -180,7 +185,7 @@ pub fn render(s: *FlowState, app: *App) void {
     const canvas_w = @max(120.0, total_w - inspector_w - split_gap);
 
     if (zgui.beginChild("##flow_canvas_col", .{ .w = canvas_w, .h = 0 })) {
-        renderCanvas(s);
+        renderCanvas(s, app.allocator);
     }
     zgui.endChild();
     zgui.sameLine(.{});
@@ -194,7 +199,7 @@ pub fn render(s: *FlowState, app: *App) void {
     zgui.endChild();
 }
 
-fn renderCanvas(s: *FlowState) void {
+fn renderCanvas(s: *FlowState, allocator: std.mem.Allocator) void {
     // Bind the per-tab editor before any node-editor call. The
     // library threads its state through a global; nested editors
     // would clobber each other.
@@ -212,9 +217,11 @@ fn renderCanvas(s: *FlowState) void {
 
     // Top-down layout: lay nodes out by depth in the graph DAG.
     // Computed once per frame — graphs are small enough that the
-    // O(N * E) pass is invisible.
-    var pos_buf: [256][2]f32 = undefined;
-    const positions = layoutNodes(graph, pos_buf[0..]);
+    // O(N * E) pass is invisible. Buffers are heap-allocated off
+    // the App allocator so graphs larger than the previous 256-node
+    // ceiling render correctly (gemini #63 medium).
+    const positions = layoutNodes(allocator, graph) catch &[_][2]f32{};
+    defer if (positions.len > 0) allocator.free(positions);
 
     for (graph.nodes, 0..) |gn, i| {
         const node_id: u64 = @intCast(gn.id);
@@ -342,11 +349,22 @@ fn lineAt(source: []const u8, line_1based: u32) []const u8 {
     return "";
 }
 
+/// Look up a node by id. The projector allocates ids sequentially
+/// starting at 1 and pushes them into `graph.nodes` in the same
+/// order, so `nodes[id - 1]` is the matching entry. The assert
+/// guards against future allocators that violate that invariant
+/// (gemini #63 critical — replaces the O(N) scan that ran in the
+/// layout inner loop).
 fn findNode(graph: Graph, id: u32) ?*const GraphNodeSpec {
-    for (graph.nodes) |*n| {
-        if (n.id == id) return n;
-    }
-    return null;
+    const idx = indexOfNode(graph, id) orelse return null;
+    return &graph.nodes[idx];
+}
+
+fn indexOfNode(graph: Graph, id: u32) ?usize {
+    if (id == 0 or id > graph.nodes.len) return null;
+    const i: usize = @as(usize, id) - 1;
+    std.debug.assert(graph.nodes[i].id == id);
+    return i;
 }
 
 /// Top-down DAG layout. We picked the simpler of the two options
@@ -355,23 +373,25 @@ fn findNode(graph: Graph, id: u32) ?*const GraphNodeSpec {
 ///
 /// Algorithm:
 ///   1. Walk the edges, propagating "longest path from any root"
-///      depths into a stack buffer. Bounded by node count.
+///      depths into a heap-allocated buffer. Bounded by node count.
 ///   2. Emit positions on a simple grid: x = depth * column_w,
 ///      y = order_in_layer * row_h.
 ///
-/// `out` is a caller-supplied buffer (stack-allocated in
-/// `renderCanvas`) sized at 256 — enough for any single-file
-/// projection we expect this frame. Larger graphs would need a
-/// heap allocation, but a 256-node script is already huge for our
-/// use case.
-fn layoutNodes(graph: Graph, out: [][2]f32) [][2]f32 {
+/// Allocates `depths`, `layer_counts`, and the returned `positions`
+/// slice off `allocator`. Caller owns and frees the returned slice
+/// when non-empty.
+fn layoutNodes(allocator: std.mem.Allocator, graph: Graph) ![][2]f32 {
     const column_w: f32 = 260.0;
     const row_h: f32 = 110.0;
-    const n = @min(graph.nodes.len, out.len);
-    if (n == 0) return out[0..0];
+    const n = graph.nodes.len;
+    if (n == 0) return &[_][2]f32{};
 
-    var depths: [256]u32 = undefined;
-    @memset(depths[0..n], 0);
+    const positions = try allocator.alloc([2]f32, n);
+    errdefer allocator.free(positions);
+
+    const depths = try allocator.alloc(u32, n);
+    defer allocator.free(depths);
+    @memset(depths, 0);
 
     // Iterate until depths stop changing or we hit a pass cap. A
     // DAG of N nodes converges in ≤ N passes; cycles (from
@@ -382,7 +402,6 @@ fn layoutNodes(graph: Graph, out: [][2]f32) [][2]f32 {
         for (graph.edges) |e| {
             const from_idx = indexOfNode(graph, e.from_node) orelse continue;
             const to_idx = indexOfNode(graph, e.to_node) orelse continue;
-            if (from_idx >= n or to_idx >= n) continue;
             const candidate = depths[from_idx] + 1;
             if (depths[to_idx] < candidate) {
                 depths[to_idx] = candidate;
@@ -393,27 +412,22 @@ fn layoutNodes(graph: Graph, out: [][2]f32) [][2]f32 {
     }
 
     // Count how many nodes have already been placed at each depth
-    // so we can stack rows without rescanning the depth array.
-    var layer_counts: [256]u32 = undefined;
-    @memset(layer_counts[0..], 0);
+    // so we can stack rows without rescanning the depth array. Max
+    // depth is bounded by node count, so n slots is always enough.
+    const layer_counts = try allocator.alloc(u32, n);
+    defer allocator.free(layer_counts);
+    @memset(layer_counts, 0);
 
-    for (graph.nodes[0..n], 0..) |_, i| {
+    for (graph.nodes, 0..) |_, i| {
         const d = depths[i];
-        const slot = if (d < layer_counts.len) layer_counts[d] else 0;
-        out[i] = .{
+        const slot = layer_counts[d];
+        positions[i] = .{
             @as(f32, @floatFromInt(d)) * column_w + 40.0,
             @as(f32, @floatFromInt(slot)) * row_h + 40.0,
         };
-        if (d < layer_counts.len) layer_counts[d] += 1;
+        layer_counts[d] += 1;
     }
-    return out[0..n];
-}
-
-fn indexOfNode(graph: Graph, id: u32) ?usize {
-    for (graph.nodes, 0..) |n, i| {
-        if (n.id == id) return i;
-    }
-    return null;
+    return positions;
 }
 
 /// No-op — flows are derived, not authored. Kept so `OpenTab.save`

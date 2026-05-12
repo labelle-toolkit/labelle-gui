@@ -212,11 +212,20 @@ fn isEntryPointFn(ast: *const Ast, decl: Ast.Node.Index) bool {
     // `pub fn tick(game: anytype, dt: f32) void` slip past the name
     // check (`tick` is in the list), but bespoke handler names like
     // `kitchenGate(game: anytype, ...)` are picked up here.
+    //
+    // We tokenize the type-expr source on whitespace + the pointer /
+    // const decorators so we match `Game` as a whole word — naive
+    // substring matched `NotAGame` / `MyGameController` (gemini #63
+    // medium).
     var it = proto.iterate(ast);
     if (it.next()) |first_param| {
         if (first_param.type_expr) |type_node| {
             const text = ast.getNodeSource(type_node);
-            if (std.mem.indexOf(u8, text, "Game") != null) return true;
+            var tok = std.mem.tokenizeAny(u8, text, " \t\r\n*?!&[](),.");
+            while (tok.next()) |word| {
+                if (std.mem.eql(u8, word, "const")) continue;
+                if (std.mem.eql(u8, word, "Game")) return true;
+            }
             // `anytype` params are encoded as `anytype_ellipsis3`, no
             // type_expr. We treat them as entry-point candidates
             // because in practice that's what scripts use.
@@ -245,7 +254,7 @@ fn walkFnBody(p: *Projector, decl: Ast.Node.Index, entry_id: u32) !void {
 /// Visit `node` and decide whether to recurse into its children.
 /// Blocks fan out their statements; expressions delegate to the
 /// renderer dispatch table.
-fn walkStatement(p: *Projector, node: Ast.Node.Index, parent_id: u32) anyerror!void {
+pub fn walkStatement(p: *Projector, node: Ast.Node.Index, parent_id: u32) anyerror!void {
     const ast = p.ast;
     const tag = ast.nodeTag(node);
 
@@ -262,7 +271,17 @@ fn walkStatement(p: *Projector, node: Ast.Node.Index, parent_id: u32) anyerror!v
     }
 }
 
-fn walkBlock(p: *Projector, block: Ast.Node.Index, parent_id: u32) anyerror!void {
+/// True when `tag` is one of the block flavours we fan out per-stmt.
+/// Renderers consult this when wiring exec edges into a body that
+/// might be a `{...}` block rather than a single expression.
+pub fn isBlockTag(tag: std.zig.Ast.Node.Tag) bool {
+    return switch (tag) {
+        .block, .block_semicolon, .block_two, .block_two_semicolon => true,
+        else => false,
+    };
+}
+
+pub fn walkBlock(p: *Projector, block: Ast.Node.Index, parent_id: u32) anyerror!void {
     const ast = p.ast;
     const tag = ast.nodeTag(block);
 

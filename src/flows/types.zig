@@ -85,10 +85,9 @@ pub const Graph = struct {
     arena: std.heap.ArenaAllocator,
     nodes: []GraphNodeSpec,
     edges: []EdgeSpec,
-    /// Indexes into `nodes` of every node whose `category ==
-    /// .entry_point`. The sidebar uses this for the "scroll to root"
-    /// list. Stored separately so the sidebar doesn't re-scan every
-    /// frame.
+    /// Node IDs of every node whose `category == .entry_point`. The
+    /// sidebar uses this for the "scroll to root" list. Stored
+    /// separately so the sidebar doesn't re-scan every frame.
     entry_points: []u32,
 
     pub fn deinit(self: *Graph) void {
