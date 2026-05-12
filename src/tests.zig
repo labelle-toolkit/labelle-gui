@@ -580,6 +580,99 @@ pub const SceneIoTests = struct {
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"z_index\": -5") != null);
     }
 
+    test "Rectangle round-trips with all fields through a prefab" {
+        // Geometry slice 1 (issue #6): a prefab carrying a Rectangle
+        // component must parse into the typed model with every field
+        // populated, and the writer must emit it back in the same
+        // shape — width/height as numbers, color as nested object,
+        // filled as bool.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "components": {
+            \\        "Rectangle": { "width": 32, "height": 18, "color": { "r": 200, "g": 50, "b": 25, "a": 240 }, "filled": false }
+            \\    }
+            \\}
+        ;
+        var loaded = try scene_io.parsePrefab(allocator, src);
+        defer loaded.deinit();
+
+        const rect = loaded.entity.rectangle orelse return error.MissingRectangle;
+        try expect.equal(rect.width, 32);
+        try expect.equal(rect.height, 18);
+        try expect.equal(rect.r, 200);
+        try expect.equal(rect.g, 50);
+        try expect.equal(rect.b, 25);
+        try expect.equal(rect.a, 240);
+        try expect.toBeFalse(rect.filled);
+
+        // Rectangle is managed → must NOT end up in component_extras.
+        try expect.equal(loaded.component_extras.len, 0);
+
+        const text = try scene_io.renderPrefabJsonc(allocator, loaded);
+        defer allocator.free(text);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Rectangle\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"width\": 32") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"filled\": false") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"r\": 200") != null);
+
+        // Re-parse the rendered output — same shape, same values.
+        var loaded2 = try scene_io.parsePrefab(allocator, text);
+        defer loaded2.deinit();
+        const rect2 = loaded2.entity.rectangle orelse return error.MissingRectangle;
+        try expect.equal(rect2.width, 32);
+        try expect.equal(rect2.b, 25);
+        try expect.toBeFalse(rect2.filled);
+    }
+
+    test "Rectangle alongside Sprite and Position on a scene entity" {
+        // Multiple managed components on the same entity must all
+        // round-trip; none of them should leak into component_extras.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "x",
+            \\    "entities": [
+            \\        {
+            \\            "components": {
+            \\                "Position": { "x": 10, "y": 20 },
+            \\                "Sprite": { "sprite_name": "coin" },
+            \\                "Rectangle": { "width": 64, "height": 64, "color": { "r": 0, "g": 0, "b": 255, "a": 255 }, "filled": true }
+            \\            }
+            \\        }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+
+        const e = &loaded.scene.entities[0];
+        try expect.toBeTrue(e.position != null);
+        try expect.toBeTrue(e.sprite != null);
+        try expect.toBeTrue(e.rectangle != null);
+        try expect.equal(loaded.extras.entity_components[0].len, 0);
+        try expect.equal(e.rectangle.?.b, 255);
+    }
+
+    test "edit Rectangle in memory; saved output reflects it" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{ "components": { "Rectangle": { "width": 0, "height": 0, "color": { "r": 0, "g": 0, "b": 0, "a": 0 }, "filled": true } } }
+        ;
+        var loaded = try scene_io.parsePrefab(allocator, src);
+        defer loaded.deinit();
+        const rect = loaded.entity.rectangle orelse return error.MissingRectangle;
+        rect.width = 99;
+        rect.r = 128;
+        rect.filled = false;
+
+        const text = try scene_io.renderPrefabJsonc(allocator, loaded);
+        defer allocator.free(text);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"width\": 99") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"r\": 128") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"filled\": false") != null);
+    }
+
     test "Sprite string fields are JSON-escaped on emit" {
         // Regression for gemini PR #32 review: sprite_name/pivot/layer
         // come from inspector text buffers and may contain `"` or `\`.

@@ -46,6 +46,21 @@ pub const Sprite = struct {
     has_z_index: bool = false,
 };
 
+/// Typed model of the `Rectangle` geometry component (issue #6).
+/// Shape on disk:
+/// `{ "width": N, "height": N, "color": { "r": .., "g": .., "b": .., "a": .. }, "filled": bool }`
+/// Color matches labelle-gfx's u8 RGBA convention so values flow
+/// straight through to the engine's renderer.
+pub const Rectangle = struct {
+    width: f32 = 0,
+    height: f32 = 0,
+    r: u8 = 255,
+    g: u8 = 255,
+    b: u8 = 255,
+    a: u8 = 255,
+    filled: bool = true,
+};
+
 pub const Entity = struct {
     prefab: ?[]const u8 = null,
     /// Parsed once on load; viewport reads it when drawing the entity
@@ -57,6 +72,9 @@ pub const Entity = struct {
     /// otherwise. Heap-allocated in the LoadedScene/LoadedPrefab
     /// arena so the inspector can edit the buffers in place.
     sprite: ?*Sprite = null,
+    /// Typed `Rectangle` geometry component (issue #6). Same
+    /// arena-ownership story as `sprite`.
+    rectangle: ?*Rectangle = null,
     /// Leading `//` comments captured from the source file, attached
     /// to the first entity that follows them — same rule we use for
     /// project.labelle pass-through. Lines keep their `//` markers and
@@ -190,12 +208,12 @@ pub fn parsePrefab(allocator: std.mem.Allocator, raw: []const u8) !LoadedPrefab 
     const entity: Entity = .{
         .position = readPosition(parsed.value.components),
         .sprite = try readSprite(arena.allocator(), parsed.value.components),
+        .rectangle = try readRectangle(arena.allocator(), parsed.value.components),
     };
 
     // Re-use the entity-body scanner — walks `{ ... }`, finds the
-    // `components` key, captures every non-Position / non-Sprite
-    // entry as verbatim extras. Works the same for prefab body and
-    // child bodies.
+    // `components` key, captures every non-managed entry as verbatim
+    // extras. Works the same for prefab body and child bodies.
     const component_extras = try extractComponentExtras(arena.allocator(), raw);
 
     // Children: mutable so the editor can drag-to-move them. Each
@@ -209,6 +227,7 @@ pub fn parsePrefab(allocator: std.mem.Allocator, raw: []const u8) !LoadedPrefab 
             .prefab = if (c.prefab) |p| try arena.allocator().dupe(u8, p) else null,
             .position = readPosition(c.components),
             .sprite = try readSprite(arena.allocator(), c.components),
+            .rectangle = try readRectangle(arena.allocator(), c.components),
         };
         if (i < child_comments.len) {
             buf.writeZeroed(&children[i].comment, child_comments[i]);
@@ -260,6 +279,11 @@ pub fn renderPrefabJsonc(allocator: std.mem.Allocator, loaded: LoadedPrefab) ![]
         _ = try emitSprite(&w, sp.*);
         first = false;
     }
+    if (loaded.entity.rectangle) |re| {
+        if (!first) try w.writeAll(",");
+        _ = try emitRectangle(&w, re.*);
+        first = false;
+    }
     for (loaded.component_extras) |extra| {
         if (!first) try w.writeAll(",");
         try w.print(" \"{s}\": {s}", .{ extra.name, extra.value_text });
@@ -290,7 +314,10 @@ pub fn renderPrefabJsonc(allocator: std.mem.Allocator, loaded: LoadedPrefab) ![]
                 loaded.children_extras[i]
             else
                 &[_]ComponentExtra{};
-            const has_components = child.position != null or child.sprite != null or cextras.len > 0;
+            const has_components = child.position != null or
+                child.sprite != null or
+                child.rectangle != null or
+                cextras.len > 0;
             if (has_components) {
                 if (!c_first) try w.writeAll(",");
                 try w.writeAll(" \"components\": {");
@@ -302,6 +329,11 @@ pub fn renderPrefabJsonc(allocator: std.mem.Allocator, loaded: LoadedPrefab) ![]
                 if (child.sprite) |sp| {
                     if (!cc_first) try w.writeAll(",");
                     _ = try emitSprite(&w, sp.*);
+                    cc_first = false;
+                }
+                if (child.rectangle) |re| {
+                    if (!cc_first) try w.writeAll(",");
+                    _ = try emitRectangle(&w, re.*);
                     cc_first = false;
                 }
                 for (cextras) |extra| {
@@ -370,6 +402,7 @@ pub fn parseScene(allocator: std.mem.Allocator, raw: []const u8) !LoadedScene {
             .prefab = if (e.prefab) |p| try arena.allocator().dupe(u8, p) else null,
             .position = readPosition(e.components),
             .sprite = try readSprite(arena.allocator(), e.components),
+            .rectangle = try readRectangle(arena.allocator(), e.components),
         };
         // Comments are extracted on a best-effort basis: if the scanner
         // landed fewer entries than parser saw entities (recovery from
@@ -439,6 +472,37 @@ fn jsonNumberAsF32(v: ?std.json.Value) ?f32 {
     };
 }
 
+fn jsonNumberAsU8(v: ?std.json.Value) ?u8 {
+    const value = v orelse return null;
+    return switch (value) {
+        .integer => |i| if (i >= 0 and i <= 255) @intCast(i) else null,
+        .float => |f| if (f >= 0 and f <= 255) @intFromFloat(f) else null,
+        else => null,
+    };
+}
+
+fn readRectangle(arena: std.mem.Allocator, components: ?std.json.Value) !?*Rectangle {
+    const c = components orelse return null;
+    if (c != .object) return null;
+    const r_val = c.object.get("Rectangle") orelse return null;
+    if (r_val != .object) return null;
+
+    const out = try arena.create(Rectangle);
+    out.* = .{};
+    if (jsonNumberAsF32(r_val.object.get("width"))) |w| out.width = w;
+    if (jsonNumberAsF32(r_val.object.get("height"))) |h| out.height = h;
+    if (r_val.object.get("color")) |col| if (col == .object) {
+        if (jsonNumberAsU8(col.object.get("r"))) |x| out.r = x;
+        if (jsonNumberAsU8(col.object.get("g"))) |x| out.g = x;
+        if (jsonNumberAsU8(col.object.get("b"))) |x| out.b = x;
+        if (jsonNumberAsU8(col.object.get("a"))) |x| out.a = x;
+    };
+    if (r_val.object.get("filled")) |v| if (v == .bool) {
+        out.filled = v.bool;
+    };
+    return out;
+}
+
 /// Emit `s` as a JSON-escaped string literal (`"..."`) into `writer`.
 /// Handles the escapes the JSON spec requires for byte values < 0x20
 /// plus the two embeddable bytes (`"` and `\`); leaves the rest of
@@ -503,6 +567,23 @@ fn emitSprite(writer: anytype, sprite: Sprite) !bool {
         first = false;
     }
     if (first) try writer.writeAll(" ");
+    try writer.writeAll(" }");
+    return true;
+}
+
+/// Emit `"Rectangle": { ... }` into `writer` from the typed
+/// geometry fields. Same comma-management contract as `emitSprite`.
+/// The struct's defaults match the engine's defaults — width 0,
+/// height 0, white opaque, filled — so we still emit all fields
+/// every time. That keeps the file self-describing and lets the
+/// inspector show what was actually saved without inferring.
+fn emitRectangle(writer: anytype, rect: Rectangle) !bool {
+    try writer.writeAll(" \"Rectangle\": {");
+    try writer.print(" \"width\": {d}, \"height\": {d},", .{ rect.width, rect.height });
+    try writer.print(" \"color\": {{ \"r\": {d}, \"g\": {d}, \"b\": {d}, \"a\": {d} }},", .{
+        rect.r, rect.g, rect.b, rect.a,
+    });
+    try writer.print(" \"filled\": {s}", .{if (rect.filled) "true" else "false"});
     try writer.writeAll(" }");
     return true;
 }
@@ -864,7 +945,9 @@ fn extractComponentExtras(arena: std.mem.Allocator, entity_body: []const u8) ![]
         // Skip components the gui models structurally; their fields
         // are re-emitted by the writer from the typed Entity, so
         // capturing them as extras would round-trip them twice.
-        const is_managed = std.mem.eql(u8, key, "Position") or std.mem.eql(u8, key, "Sprite");
+        const is_managed = std.mem.eql(u8, key, "Position") or
+            std.mem.eql(u8, key, "Sprite") or
+            std.mem.eql(u8, key, "Rectangle");
         if (!is_managed) {
             try out.append(arena, .{
                 .name = try arena.dupe(u8, key),
@@ -1036,7 +1119,10 @@ pub fn renderSceneJsonc(allocator: std.mem.Allocator, loaded: LoadedScene) ![]u8
             loaded.extras.entity_components[i]
         else
             &[_]ComponentExtra{};
-        const has_components = e.position != null or e.sprite != null or extras.len > 0;
+        const has_components = e.position != null or
+            e.sprite != null or
+            e.rectangle != null or
+            extras.len > 0;
         if (has_components) {
             if (!first) try w.writeAll(",");
             try w.writeAll(" \"components\": {");
@@ -1048,6 +1134,11 @@ pub fn renderSceneJsonc(allocator: std.mem.Allocator, loaded: LoadedScene) ![]u8
             if (e.sprite) |sp| {
                 if (!c_first) try w.writeAll(",");
                 _ = try emitSprite(&w, sp.*);
+                c_first = false;
+            }
+            if (e.rectangle) |re| {
+                if (!c_first) try w.writeAll(",");
+                _ = try emitRectangle(&w, re.*);
                 c_first = false;
             }
             for (extras) |extra| {

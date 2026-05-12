@@ -144,13 +144,17 @@ fn drawEntities(
         const py = cmin[1] + state.pan[1] - pos.y * state.zoom.*;
         const selected = state.selected_idx.* == i;
 
-        // Try to render the sprite texture if one is declared and the
-        // current atlas index can resolve it; otherwise fall through
-        // to the colored-circle marker. A declared-but-unresolved
-        // sprite gets a `?` overlay so it's distinguishable from
-        // entities that simply don't have a Sprite.
+        // Render priority: sprite (when it resolves against the
+        // atlas) > rectangle geometry > colored-circle marker.
+        // A declared-but-unresolved sprite still gets a `?` overlay
+        // on whatever fallback it falls into.
         const drew_sprite = drawSpriteIfResolved(dl, e, px, py, state.zoom.*, atlas_index);
-        if (!drew_sprite) {
+        var drew_visual = drew_sprite;
+        if (!drew_visual and e.rectangle != null) {
+            drawRectangle(dl, e.rectangle.?.*, px, py, state.zoom.*);
+            drew_visual = true;
+        }
+        if (!drew_visual) {
             const col = colorForPrefab(e.prefab);
             dl.addCircleFilled(.{
                 .p = .{ px, py },
@@ -158,9 +162,9 @@ fn drawEntities(
                 .col = col,
                 .num_segments = 16,
             });
-            if (e.sprite != null) {
-                dl.addText(.{ px - 3, py - 7 }, 0xff_ff_ff_ff, "?", .{});
-            }
+        }
+        if (!drew_sprite and e.sprite != null) {
+            dl.addText(.{ px - 3, py - 7 }, 0xff_ff_ff_ff, "?", .{});
         }
 
         if (selected) {
@@ -240,6 +244,27 @@ fn drawSpriteIfResolved(
         .uvmax = uv1,
     });
     return true;
+}
+
+/// Draw a `Rectangle` geometry component centered on `(px, py)` in
+/// screen space, scaled by `zoom`. Rectangle has no pivot in its
+/// own component schema, so we center it on the entity's position —
+/// same convention the engine uses for unconfigured shape pivots.
+fn drawRectangle(dl: zgui.DrawList, rect: scene_io.Rectangle, px: f32, py: f32, zoom: f32) void {
+    const half_w = rect.width * zoom * 0.5;
+    const half_h = rect.height * zoom * 0.5;
+    const pmin: [2]f32 = .{ px - half_w, py - half_h };
+    const pmax: [2]f32 = .{ px + half_w, py + half_h };
+    // ImGui colors are 0xAABBGGRR. Build it from the u8 RGBA fields.
+    const col: u32 = (@as(u32, rect.a) << 24) |
+        (@as(u32, rect.b) << 16) |
+        (@as(u32, rect.g) << 8) |
+        @as(u32, rect.r);
+    if (rect.filled) {
+        dl.addRectFilled(.{ .pmin = pmin, .pmax = pmax, .col = col });
+    } else {
+        dl.addRect(.{ .pmin = pmin, .pmax = pmax, .col = col, .thickness = 1.5 });
+    }
 }
 
 /// Convert a pivot name (matching labelle-gfx pivot enums) to a
