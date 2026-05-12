@@ -53,6 +53,16 @@ pub const TreeView = struct {
 
     const Self = @This();
 
+    /// Max bytes for the on-stack path buffers used during render +
+    /// recursion. We deliberately do NOT use `std.fs.max_path_bytes`
+    /// here — it's ~96 KiB on Windows (vs 4 KiB on POSIX), and the
+    /// recursive walker plus the per-folder `managed_storage` array
+    /// would blow the default 1 MiB Windows thread stack the moment
+    /// any subfolder expanded (bugbot #70 high). 4 KiB covers any
+    /// realistic project path on every platform; longer paths get
+    /// skipped rather than crashing.
+    const path_buf_size: usize = 4096;
+
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
             .allocator = allocator,
@@ -116,7 +126,7 @@ pub const TreeView = struct {
         // `scripts/flows`, which appears in `ProjectFolders.all` as a
         // sibling of `scripts`. Without this, recursing into `scripts`
         // would surface `flows/` a second time with the wrong icon.
-        var managed_storage: [project.ProjectFolders.all.len][std.fs.max_path_bytes]u8 = undefined;
+        var managed_storage: [project.ProjectFolders.all.len][path_buf_size]u8 = undefined;
         var managed_paths: [project.ProjectFolders.all.len][]const u8 = undefined;
         for (project.ProjectFolders.all, 0..) |fname, i| {
             managed_paths[i] = std.fmt.bufPrint(&managed_storage[i], "{s}/{s}", .{ base_path, fname }) catch "";
@@ -127,7 +137,7 @@ pub const TreeView = struct {
             const icon = FolderIcons.forFolder(folder_name);
 
             // Build folder path on stack
-            var folder_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            var folder_path_buf: [path_buf_size]u8 = undefined;
             const folder_path = std.fmt.bufPrint(&folder_path_buf, "{s}/{s}", .{ base_path, folder_name }) catch continue;
 
             // Create tree node label directly on stack
@@ -167,12 +177,13 @@ pub const TreeView = struct {
         }
 
         for (files) |file_entry| {
-            // Build full path on stack — both for routing (selected_path)
-            // and as the ImGui ID prefix so identically named items in
-            // different parents (e.g. scenes/enemies + prefabs/enemies)
-            // don't share open/closed state.
-            var full_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const full_path = std.fmt.bufPrint(&full_path_buf, "{s}/{s}", .{ folder_path, file_entry.name }) catch continue;
+            // Single null-terminated full-path buffer covers all three
+            // uses: routing (`selected_path`), the managed-path dedup
+            // check, and the ImGui string ID (so identically named
+            // children of different parents — e.g. scenes/enemies vs
+            // prefabs/enemies — get distinct open/closed state).
+            var full_path_buf: [path_buf_size:0]u8 = undefined;
+            const full_path = std.fmt.bufPrintZ(&full_path_buf, "{s}/{s}", .{ folder_path, file_entry.name }) catch continue;
 
             // Skip subdirectories that are already top-level entries.
             if (file_entry.is_directory) {
@@ -190,13 +201,7 @@ pub const TreeView = struct {
             const file_icon = if (file_entry.is_directory) FolderIcons.folder_closed else FolderIcons.file;
             const label = std.fmt.bufPrintZ(&label_buf, "{s} {s}", .{ file_icon, file_entry.name }) catch continue;
 
-            // Disambiguate via a pushed string ID so the visible label
-            // stays short. The full path is unique per node, so two
-            // siblings with the same leaf name (or same-named subfolders
-            // under different top-level folders) get distinct IDs.
-            var id_buf: [std.fs.max_path_bytes:0]u8 = undefined;
-            const id_str = std.fmt.bufPrintZ(&id_buf, "{s}", .{full_path}) catch continue;
-            zgui.pushStrIdZ(id_str);
+            zgui.pushStrIdZ(full_path);
             defer zgui.popId();
 
             if (file_entry.is_directory) {
