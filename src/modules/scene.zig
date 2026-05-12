@@ -79,6 +79,16 @@ pub const SceneState = struct {
     /// Filter buffer for the picker's search box. Stays sticky across
     /// reopenings — same convenience the resources panel has.
     prefab_picker_filter: [64:0]u8 = [_:0]u8{0} ** 64,
+    /// World-space spacing for the viewport's visual grid. When
+    /// `snap_enabled` is on, drag-to-move also rounds to multiples of
+    /// this value — one number, both behaviors. Default 16 works for
+    /// most pixel-tile setups; flying-platform-labelle uses a much
+    /// finer step so users will typically dial this down per tab.
+    /// Per-tab today; per-project persistence is a follow-up.
+    grid_step: f32 = 16,
+    /// When true, drag-to-move snaps to the grid above. Off by default
+    /// so existing behavior is preserved.
+    snap_enabled: bool = false,
 
     /// Load a scene from disk and wrap it in a fresh SceneState. The
     /// returned state owns an arena holding the path + display name,
@@ -140,6 +150,17 @@ pub fn render(s: *SceneState, app: *App) void {
     zgui.text("zoom: {d:.2}x", .{s.zoom});
     zgui.sameLine(.{});
     _ = zgui.checkbox("gizmos", .{ .v = &app.show_gizmos });
+    zgui.sameLine(.{});
+    // Grid step drives the visual grid and (when snap is on) the snap
+    // step. Always editable so the user can dial in the world units
+    // their project uses without having to enable snap first.
+    zgui.text("grid", .{});
+    zgui.sameLine(.{});
+    zgui.setNextItemWidth(64);
+    _ = zgui.inputFloat("##grid_step", .{ .v = &s.grid_step });
+    if (s.grid_step <= 0) s.grid_step = 1;
+    zgui.sameLine(.{});
+    _ = zgui.checkbox("snap", .{ .v = &s.snap_enabled });
     zgui.sameLine(.{});
     if (zgui.button("Save", .{})) saveScene(s, app);
     zgui.separator();
@@ -221,6 +242,8 @@ fn renderViewport(
             .is_dirty = &s.is_dirty,
             .drag_armed = &s.drag_armed,
             .right_click_world = &right_click,
+            .grid_step = s.grid_step,
+            .snap_enabled = s.snap_enabled,
         },
         s.loaded.scene.entities,
         s.loaded.extras.entity_components,

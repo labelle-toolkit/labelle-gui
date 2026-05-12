@@ -32,7 +32,30 @@ pub const State = struct {
     /// care about right-clicks — the prefab editor sets this to
     /// null today.
     right_click_world: ?*?[2]f32 = null,
+    /// World-space spacing for the visual grid AND, when snapping is on,
+    /// the snap step. One number drives both so the grid the user sees
+    /// is the grid their drags land on. Default 16 matches what most 2D
+    /// engines treat as a pixel-tile baseline; flying-platform-labelle's
+    /// world is much smaller-stepped so users will typically dial this
+    /// down. Must be > 0.
+    grid_step: f32 = 16,
+    /// When true, the dragged entity's running position is rounded to
+    /// the nearest multiple of `grid_step` (relative to `snap_origin`)
+    /// before being written back. The visual grid is always drawn.
+    snap_enabled: bool = false,
+    /// World-space origin for the grid. The default keeps the grid
+    /// aligned to the world origin; callers can shift it later (no UI
+    /// for this yet).
+    snap_origin: [2]f32 = .{ 0, 0 },
 };
+
+/// Round a single 1-D world coordinate to the nearest snap step relative
+/// to `origin`. Pulled out so zspec can exercise the math without an
+/// imgui draw context. `step` must be > 0; callers guard with the
+/// optional `snap_step` field of `State`.
+pub fn snapValue(value: f32, origin: f32, step: f32) f32 {
+    return origin + @round((value - origin) / step) * step;
+}
 
 /// Pixel radius around an entity marker that counts as a click.
 pub const hit_radius: f32 = 10.0;
@@ -111,7 +134,7 @@ pub fn render(
         .col = 0xff202225,
     });
 
-    drawGrid(dl, canvas_min, canvas_max, state.pan.*, state.zoom.*);
+    drawGrid(dl, canvas_min, canvas_max, state.pan.*, state.zoom.*, state.grid_step);
     drawEntities(dl, canvas_min, state, entities, atlas_index);
     if (show_gizmos) if (gizmo_index) |gi| {
         drawGizmoOverlay(dl, canvas_min, state, entities, entity_extras, gi);
@@ -159,6 +182,10 @@ pub fn render(
                         pos.x += d[0] / state.zoom.*;
                         // World +y is up; screen +y is down.
                         pos.y -= d[1] / state.zoom.*;
+                        if (state.snap_enabled and state.grid_step > 0) {
+                            pos.x = snapValue(pos.x, state.snap_origin[0], state.grid_step);
+                            pos.y = snapValue(pos.y, state.snap_origin[1], state.grid_step);
+                        }
                         state.is_dirty.* = true;
                         zgui.resetMouseDragDelta(.left);
                     }
@@ -168,8 +195,8 @@ pub fn render(
     }
 }
 
-fn drawGrid(dl: zgui.DrawList, cmin: [2]f32, cmax: [2]f32, pan: [2]f32, zoom: f32) void {
-    const grid_world: f32 = 64;
+fn drawGrid(dl: zgui.DrawList, cmin: [2]f32, cmax: [2]f32, pan: [2]f32, zoom: f32, grid_world: f32) void {
+    if (grid_world <= 0) return;
     const step = grid_world * zoom;
     if (step <= 4) return;
 
