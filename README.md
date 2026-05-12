@@ -2,7 +2,7 @@
 
 Desktop GUI for authoring [labelle-toolkit](https://github.com/labelle-toolkit) game projects.
 
-Edits `project.labelle`, scaffolds the project tree, and drives the `labelle` CLI launcher to generate / build / run the project.
+Edits `project.labelle`, scaffolds the project tree, and drives the `labelle` CLI launcher to generate / build / run the project. Scenes and prefabs open as tabs from the project tree, with a shared pan/zoom viewport that resolves `Sprite` components against the project's atlases and renders the real frames.
 
 ## Requirements
 
@@ -57,7 +57,8 @@ src/
     dpi_warning.zig              # One-shot DPI-changed warning modal
     close_scene.zig              # Unsaved-scene "Save and close / Discard / Cancel" modal
   project.zig                    # ProjectConfig, ProjectManager, project.labelle ZON I/O
-  scene_io.zig                   # JSONC scene loader (used by modules/scene.zig)
+  scene_io.zig                   # JSONC scene + prefab loader/writer; typed Sprite/Position, verbatim extras
+  atlas.zig                      # Per-project sprite atlas index (TexturePacker JSON + PNG → GL texture)
   compiler.zig                   # Launches `labelle generate/build/run` and polls the child
   tree_view.zig                  # Project tree view widget
   config.zig                     # UI constants
