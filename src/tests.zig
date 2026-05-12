@@ -16,6 +16,7 @@ const gizmos = @import("gizmos.zig");
 const preview = @import("preview.zig");
 const flow_projector = @import("flows/projector.zig");
 const flow_types = @import("flows/types.zig");
+const prefs = @import("prefs.zig");
 
 test {
     zspec.runAll(@This());
@@ -3096,5 +3097,79 @@ pub const FlowsRendererTests = struct {
         var g = try projectStr(source);
         defer g.deinit();
         try expect.equal(g.entry_points.len, 1);
+    }
+};
+
+pub const PreferencesTests = struct {
+    fn tmpPath(allocator: std.mem.Allocator, tmp: std.testing.TmpDir) ![]u8 {
+        const dir = try tmp.dir.realpathAlloc(allocator, ".");
+        defer allocator.free(dir);
+        return std.fs.path.join(allocator, &.{ dir, prefs.PREFS_FILENAME });
+    }
+
+    test "defaults when file is missing" {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try tmpPath(std.testing.allocator, tmp);
+        defer std.testing.allocator.free(path);
+
+        const loaded = prefs.loadFromPath(std.testing.allocator, path);
+        try expect.equal(loaded.font_scale, prefs.default_font_scale);
+    }
+
+    test "round-trip preserves value" {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try tmpPath(std.testing.allocator, tmp);
+        defer std.testing.allocator.free(path);
+
+        try prefs.saveToPath(path, .{ .font_scale = 1.5 });
+
+        const loaded = prefs.loadFromPath(std.testing.allocator, path);
+        try expect.equal(loaded.font_scale, @as(f32, 1.5));
+    }
+
+    test "save clamps oversized values" {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try tmpPath(std.testing.allocator, tmp);
+        defer std.testing.allocator.free(path);
+
+        try prefs.saveToPath(path, .{ .font_scale = 9.0 });
+
+        const loaded = prefs.loadFromPath(std.testing.allocator, path);
+        try expect.equal(loaded.font_scale, prefs.max_font_scale);
+    }
+
+    test "load clamps undersized values" {
+        // Simulates a hand-edited prefs file with an out-of-bounds value
+        // — load is expected to clamp on the way in so the rest of the
+        // app sees only valid scales.
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try tmpPath(std.testing.allocator, tmp);
+        defer std.testing.allocator.free(path);
+
+        const hand_edited = ".{ .font_scale = 0.1 }\n";
+        const file = try std.fs.cwd().createFile(path, .{});
+        defer file.close();
+        try file.writeAll(hand_edited);
+
+        const loaded = prefs.loadFromPath(std.testing.allocator, path);
+        try expect.equal(loaded.font_scale, prefs.min_font_scale);
+    }
+
+    test "malformed file falls back to defaults" {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try tmpPath(std.testing.allocator, tmp);
+        defer std.testing.allocator.free(path);
+
+        const file = try std.fs.cwd().createFile(path, .{});
+        defer file.close();
+        try file.writeAll("this is not zon");
+
+        const loaded = prefs.loadFromPath(std.testing.allocator, path);
+        try expect.equal(loaded.font_scale, prefs.default_font_scale);
     }
 };

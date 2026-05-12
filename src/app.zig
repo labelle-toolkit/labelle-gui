@@ -30,6 +30,8 @@ const atlas = @import("atlas.zig");
 const gizmos = @import("gizmos.zig");
 const new_scene_dialog = @import("dialogs/new_scene.zig");
 const dpi_warning_dialog = @import("dialogs/dpi_warning.zig");
+const preferences_dialog = @import("dialogs/preferences.zig");
+const prefs_mod = @import("prefs.zig");
 
 const STATUS_BUF_LEN = 256;
 const SCENE_NAME_BUF_LEN = 128;
@@ -177,6 +179,18 @@ pub const App = struct {
     new_scene_name: [SCENE_NAME_BUF_LEN:0]u8 = [_:0]u8{0} ** SCENE_NAME_BUF_LEN,
     show_dpi_warning: bool = false,
 
+    show_preferences: bool = false,
+    /// Live preferences edited by the Preferences dialog. Changes are
+    /// persisted to disk on every slider/stepper edit; the ImGui font
+    /// atlas isn't rebuilt mid-session so values take effect on the
+    /// next launch (the dialog surfaces a "Restart to apply" notice
+    /// when `prefs.font_scale != startup_font_scale`).
+    prefs: prefs_mod.Preferences = .{},
+    /// Snapshot of `prefs` at startup. Drives the "Restart to apply"
+    /// hint: when `prefs` diverges from this we know the user changed
+    /// something that won't take effect until next launch.
+    startup_prefs: prefs_mod.Preferences = .{},
+
     /// Fixed-size storage for registered modules. Grow the array literal
     /// when adding modules; Zig will tell you if it overflows.
     modules: [5]module.Module = undefined,
@@ -184,7 +198,7 @@ pub const App = struct {
 
     const Self = @This();
 
-    pub fn init(allocator: std.mem.Allocator, window: *zglfw.Window) !*Self {
+    pub fn init(allocator: std.mem.Allocator, window: *zglfw.Window, user_prefs: prefs_mod.Preferences) !*Self {
         const app = try allocator.create(Self);
         errdefer allocator.destroy(app);
 
@@ -195,6 +209,8 @@ pub const App = struct {
             .tree_view = tree_view.TreeView.init(allocator),
             .compiler = compiler.Compiler.init(allocator),
             .preview = preview.PreviewSession.init(allocator),
+            .prefs = user_prefs,
+            .startup_prefs = user_prefs,
         };
 
         app.modules[0] = project_tree_mod.makeModule(app);
@@ -435,6 +451,7 @@ pub const App = struct {
         new_scene_dialog.render(self);
         close_scene_dialog.render(self);
         dpi_warning_dialog.render(self);
+        preferences_dialog.render(self);
     }
 
     // ─── Menu bar ───────────────────────────────────────────────────────
@@ -468,6 +485,8 @@ pub const App = struct {
             self.project_manager.closeProject();
             self.setStatus("Project closed");
         }
+        zgui.separator();
+        if (zgui.menuItem("Preferences...", .{})) self.show_preferences = true;
         zgui.separator();
         if (zgui.menuItem("Exit", .{})) self.window.setShouldClose(true);
     }

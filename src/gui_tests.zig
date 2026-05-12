@@ -65,7 +65,7 @@ pub fn main() !void {
     const engine = zgui.te.getTestEngine().?;
     engine.setRunSpeed(.fast);
 
-    const app = try App.init(allocator, window);
+    const app = try App.init(allocator, window, .{});
     defer app.deinit();
     g_app = app;
     defer g_app = null;
