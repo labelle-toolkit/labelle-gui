@@ -7,6 +7,7 @@ const icons = @import("icons.zig");
 pub const FolderIcons = struct {
     pub const components = icons.FA_CUBE; // 3D cube for components
     pub const fixtures = icons.FA_WRENCH; // Wrench for fixtures
+    pub const gizmos = icons.FA_BULLSEYE; // Bullseye for gizmos
     pub const prefabs = icons.FA_BOX; // Box for prefabs
     pub const scenes = icons.FA_FILM; // Film for scenes
     pub const scripts = icons.FA_SCROLL; // Scroll for scripts
@@ -18,6 +19,7 @@ pub const FolderIcons = struct {
     pub fn forFolder(name: []const u8) []const u8 {
         if (std.mem.eql(u8, name, project.ProjectFolders.components)) return components;
         if (std.mem.eql(u8, name, project.ProjectFolders.fixtures)) return fixtures;
+        if (std.mem.eql(u8, name, project.ProjectFolders.gizmos)) return gizmos;
         if (std.mem.eql(u8, name, project.ProjectFolders.prefabs)) return prefabs;
         if (std.mem.eql(u8, name, project.ProjectFolders.scenes)) return scenes;
         if (std.mem.eql(u8, name, project.ProjectFolders.scripts)) return scripts;

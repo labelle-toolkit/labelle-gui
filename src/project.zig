@@ -6,6 +6,7 @@ pub const ProjectFolders = struct {
     pub const assets = "assets";
     pub const components = "components";
     pub const fixtures = "fixtures";
+    pub const gizmos = "gizmos";
     pub const prefabs = "prefabs";
     pub const scenes = "scenes";
     pub const scripts = "scripts";
@@ -15,6 +16,7 @@ pub const ProjectFolders = struct {
         assets,
         components,
         fixtures,
+        gizmos,
         prefabs,
         scenes,
         scripts,

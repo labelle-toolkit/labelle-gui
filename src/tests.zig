@@ -47,8 +47,8 @@ pub const ProjectFoldersTests = struct {
         return false;
     }
 
-    test "has 7 default folders" {
-        try expect.equal(project.ProjectFolders.all.len, 7);
+    test "has 8 default folders" {
+        try expect.equal(project.ProjectFolders.all.len, 8);
     }
 
     test "contains assets folder" {
@@ -61,6 +61,10 @@ pub const ProjectFoldersTests = struct {
 
     test "contains fixtures folder" {
         try expect.toBeTrue(containsFolder("fixtures"));
+    }
+
+    test "contains gizmos folder" {
+        try expect.toBeTrue(containsFolder("gizmos"));
     }
 
     test "contains prefabs folder" {
@@ -198,6 +202,11 @@ pub const FolderIconsTests = struct {
     test "fixtures folder has wrench icon" {
         const icon = tree_view.FolderIcons.forFolder("fixtures");
         try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.fixtures));
+    }
+
+    test "gizmos folder has bullseye icon" {
+        const icon = tree_view.FolderIcons.forFolder("gizmos");
+        try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.gizmos));
     }
 
     test "prefabs folder has box icon" {
