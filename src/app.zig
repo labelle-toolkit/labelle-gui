@@ -308,10 +308,12 @@ pub const App = struct {
         self.focus_tab_idx = new_idx;
     }
 
-    /// Open a `.flow.zon` file (under `<project>/scripts/flows/`)
-    /// as a tab. Spike behavior — the file isn't actually parsed
-    /// yet, the editor renders an empty canvas with one
-    /// placeholder node. See `src/modules/flow.zig` and issue #45.
+    /// Open a `.zig` file (under `<project>/scripts/flows/`) as a
+    /// read-only Flow viewer tab. The file is parsed via
+    /// `std.zig.Ast` and projected into a node graph by
+    /// `src/flows/projector.zig`; the tab body draws the graph in
+    /// the imgui-node-editor canvas. See `src/modules/flow.zig` and
+    /// issues #48 + #49.
     pub fn openFlow(self: *Self, path: []const u8) !void {
         for (self.open_tabs.items, 0..) |t, i| {
             if (std.mem.eql(u8, t.path(), path)) {

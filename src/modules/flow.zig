@@ -1,22 +1,30 @@
-//! Flow editor — per-tab state and rendering for visual-scripting
-//! "flow graph" `.flow.zon` files under `<project>/scripts/flows/`.
+//! Flow viewer — per-tab state and rendering for the Flows
+//! visualization layer (issues #48 + #49, umbrella #42).
 //!
-//! Phase 0 (spike — issue #45 / umbrella #42): prove we can embed
-//! [thedmd/imgui-node-editor](https://github.com/thedmd/imgui-node-editor)
-//! as a tab inside labelle-gui. This file is intentionally minimal:
+//! Phase 1: parses a `.zig` file from `<project>/scripts/flows/` via
+//! `std.zig.Ast`, projects every entry-point function body into a
+//! `Graph` (`src/flows/projector.zig`), and draws the graph in an
+//! imgui-node-editor canvas. **Read-only** — save/dirty are no-ops.
 //!
-//!   - One `EditorContext` per tab (owned by `FlowState`, destroyed
-//!     in `deinit`).
-//!   - A single placeholder node with one input + one output pin.
-//!     The user can drag it; nothing else is wired up.
+//! Layout:
+//!   - Top bar: the loaded file's display name + "Reparse" button.
+//!   - Left column: the node-editor canvas. Each `GraphNodeSpec`
+//!     emits one editor node; positions come from a top-down DAG
+//!     layout computed once per (re)derivation.
+//!   - Right column: inspector showing the selected node's source
+//!     line + raw Zig snippet and a sidebar list of every
+//!     `entry_point` node (click → centre the canvas on that root).
 //!
-//! Save / dirty tracking are no-ops for the spike — Phase 1 (issues
-//! #46–#52) lands a real `.flow.zon` schema, a node catalog, and
-//! serialization. The acceptance criterion here is: linker is
-//! happy, canvas renders, node drags.
+//! `FlowState` owns:
+//!   - an arena for path/display name + source bytes
+//!   - the `EditorContext` (visual layout state)
+//!   - the loaded source (0-terminated, off arena)
+//!   - the current `Graph` (its own arena)
 //!
-//! Not registered as a togglable panel; opens as a tab via tree
-//! click on a `.flow.zon` file (`project_tree.isFlowPath`).
+//! Mtime-keyed re-derivation: every render checks the source
+//! file's mtime; when it changes the source is reread and the
+//! graph is reprojected. Cheap (the Ast parse is fast and the file
+//! is small).
 
 const std = @import("std");
 const zgui = @import("zgui");
@@ -24,31 +32,39 @@ const ne = zgui.node_editor;
 
 const App = @import("../app.zig").App;
 const scene_io = @import("../scene_io.zig");
+const projector = @import("../flows/projector.zig");
+const flow_types = @import("../flows/types.zig");
 
-/// Pin IDs are global within an editor context; tag the placeholder
-/// node's pins with distinct constants so the editor can tell them
-/// apart. NodeId is `u64` per the zgui binding — 0 is reserved
-/// internally as "no node", so start at 1.
-const placeholder_node_id: u64 = 1;
-const placeholder_input_pin_id: u64 = 100;
-const placeholder_output_pin_id: u64 = 101;
+const Graph = flow_types.Graph;
+const GraphNodeSpec = flow_types.GraphNodeSpec;
+
+const inspector_w: f32 = 320;
+const split_gap: f32 = 8;
 
 pub const FlowState = struct {
-    /// Owns `path` and `display_name`. No parsed-source arena for
-    /// the spike — the file isn't actually read.
     arena: *std.heap.ArenaAllocator,
-    /// Absolute path on disk. Used for dedup when opening another
-    /// tab on the same file. Not actually read or written.
+    /// Absolute path on disk. Read-only; used for tab dedup and for
+    /// reparses.
     path: []const u8,
-    /// Filename stem without `.flow.zon`. Used for the tab label.
+    /// Filename stem without `.zig`. Used for the tab label.
     display_name: []const u8,
-    /// imgui-node-editor's per-canvas state. Holds the visual
-    /// position of every node, current selection, view transform,
-    /// etc. Owned by this tab; destroyed in `deinit`.
+    /// imgui-node-editor's per-canvas state. Holds positions,
+    /// selection, view transform.
     editor: *ne.EditorContext,
-    /// Spike has no real edits to dirty-flag. Always false so the
-    /// close-tab modal never fires. Phase 1 will wire this up to
-    /// real edits.
+    /// Last-observed mtime of `path` (in nanoseconds since the unix
+    /// epoch — `std.fs.File.Stat.mtime`). Render reparses when this
+    /// changes. Null until the first read succeeds.
+    last_mtime: ?i128 = null,
+    /// 0-terminated source text. Re-allocated off `arena` on every
+    /// (re)read. `std.zig.Ast.parse` requires the `[:0]const u8`
+    /// shape so we keep a sentinel here rather than re-terminating
+    /// on each parse.
+    source: ?[:0]const u8 = null,
+    /// Currently-projected graph. Has its own arena which is freed
+    /// + replaced on every reparse.
+    graph: ?Graph = null,
+    /// `false` always — flows are derived from Zig, never authored
+    /// here. Kept to satisfy `OpenTab.isDirty`.
     is_dirty: bool = false,
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !FlowState {
@@ -61,73 +77,347 @@ pub const FlowState = struct {
         const path_dup = try a.dupe(u8, path);
         const display_name = displayNameFromPath(path_dup);
 
-        // Spike: don't persist the node layout — pass a null
-        // `settings_file` so the editor keeps its layout in memory
-        // only. Phase 1 will route the layout through our own ZON
-        // save callbacks.
+        // No node-editor settings file — we don't persist layout
+        // across sessions yet. Phase 4 may revisit.
         const config: ne.Config = .{};
         const editor = ne.EditorContext.create(config);
+        errdefer editor.destroy();
 
-        return .{
+        var state: FlowState = .{
             .arena = arena,
             .path = path_dup,
             .display_name = display_name,
             .editor = editor,
         };
+        // First load + parse. Failures here don't propagate — the
+        // file might not exist yet, the user might delete it, etc.
+        // We surface that as an empty graph + a status line.
+        loadAndProject(&state, allocator) catch |err| {
+            std.log.warn("flow {s}: initial parse failed: {s}", .{ path_dup, @errorName(err) });
+        };
+        return state;
     }
 
     pub fn deinit(self: *FlowState, allocator: std.mem.Allocator) void {
+        if (self.graph) |*g| g.deinit();
         self.editor.destroy();
         self.arena.deinit();
         allocator.destroy(self.arena);
     }
 };
 
-/// `foo.flow.zon` → `foo`. Strip both extensions so the tab label
-/// matches the user's mental file name. Falls back to the basename
-/// when the path doesn't end in our expected suffix.
-fn displayNameFromPath(path: []const u8) []const u8 {
+/// `foo.zig` → `foo`. Matches the convention used by `scene.zig`'s
+/// `displayNameFromPath` so the tab label looks consistent.
+pub fn displayNameFromPath(path: []const u8) []const u8 {
     const base = std.fs.path.basename(path);
-    const ext = ".flow.zon";
+    const ext = ".zig";
     if (std.mem.endsWith(u8, base, ext)) return base[0 .. base.len - ext.len];
     return scene_io.displayNameFromPath(path);
 }
 
+/// (Re)load the source from disk and project it into a graph. Frees
+/// the previous source + graph (if any). On failure leaves the
+/// state's source/graph cleared so the caller can render an empty
+/// canvas.
+pub fn loadAndProject(s: *FlowState, allocator: std.mem.Allocator) !void {
+    // Drop the old graph first so its arena is reclaimed before the
+    // new one gets allocated.
+    if (s.graph) |*g| {
+        g.deinit();
+        s.graph = null;
+    }
+
+    const file = try std.fs.cwd().openFile(s.path, .{});
+    defer file.close();
+    const stat = try file.stat();
+    const max_bytes: usize = 1 << 20; // 1 MiB — scripts are tiny.
+    const raw = try file.readToEndAlloc(allocator, max_bytes);
+    defer allocator.free(raw);
+
+    // Duplicate into the arena with an explicit 0 sentinel for
+    // `std.zig.Ast.parse`. Source must outlive the parse but not
+    // the graph (which keeps its own arena).
+    const a = s.arena.allocator();
+    const src = try a.allocSentinel(u8, raw.len, 0);
+    @memcpy(src[0..raw.len], raw);
+
+    s.source = src;
+    s.last_mtime = stat.mtime;
+
+    s.graph = try projector.project(allocator, src);
+}
+
+/// Per-frame mtime check. Cheap — `stat` is one syscall and we
+/// only reparse on change. Errors are swallowed (logged once) to
+/// keep the UI responsive when the file disappears mid-session.
+fn maybeReparse(s: *FlowState, allocator: std.mem.Allocator) void {
+    const file = std.fs.cwd().openFile(s.path, .{}) catch return;
+    defer file.close();
+    const stat = file.stat() catch return;
+    if (s.last_mtime) |prev| {
+        if (prev == stat.mtime) return;
+    }
+    loadAndProject(s, allocator) catch |err| {
+        std.log.warn("flow {s}: reparse failed: {s}", .{ s.path, @errorName(err) });
+    };
+}
+
 pub fn render(s: *FlowState, app: *App) void {
-    _ = app;
+    maybeReparse(s, app.allocator);
+
     zgui.text("Flow: {s}", .{s.display_name});
     zgui.sameLine(.{});
-    zgui.textDisabled("(spike — no save, no schema, no node catalog yet)", .{});
+    zgui.textDisabled("(read-only — derived from Zig source)", .{});
+    zgui.sameLine(.{});
+    if (zgui.button("Reparse", .{})) {
+        loadAndProject(s, app.allocator) catch |err| {
+            std.log.warn("flow {s}: manual reparse failed: {s}", .{ s.path, @errorName(err) });
+        };
+    }
     zgui.separator();
 
-    // Bind the per-tab editor context for the duration of this
-    // frame. SetCurrentEditor must wrap every Begin/End — the
-    // editor is global state inside thedmd's library.
+    const total_w = zgui.getContentRegionAvail()[0];
+    const canvas_w = @max(120.0, total_w - inspector_w - split_gap);
+
+    if (zgui.beginChild("##flow_canvas_col", .{ .w = canvas_w, .h = 0 })) {
+        renderCanvas(s);
+    }
+    zgui.endChild();
+    zgui.sameLine(.{});
+    if (zgui.beginChild("##flow_sidebar", .{
+        .w = 0,
+        .h = 0,
+        .child_flags = .{ .border = true },
+    })) {
+        renderSidebar(s);
+    }
+    zgui.endChild();
+}
+
+fn renderCanvas(s: *FlowState) void {
+    // Bind the per-tab editor before any node-editor call. The
+    // library threads its state through a global; nested editors
+    // would clobber each other.
     ne.setCurrentEditor(s.editor);
     defer ne.setCurrentEditor(null);
 
-    // size = {0,0} → fill the parent's content region.
     ne.begin("##flow_canvas", .{ 0, 0 });
     defer ne.end();
 
-    // Single placeholder node: input pin on the left, output pin
-    // on the right. The editor places the node on first frame; the
-    // user can drag it after that.
-    ne.beginNode(placeholder_node_id);
-    zgui.text("Placeholder", .{});
-    ne.beginPin(placeholder_input_pin_id, .input);
-    zgui.text("-> in", .{});
-    ne.endPin();
-    zgui.sameLine(.{});
-    ne.beginPin(placeholder_output_pin_id, .output);
-    zgui.text("out ->", .{});
-    ne.endPin();
-    ne.endNode();
+    const graph = s.graph orelse {
+        return; // Empty canvas — first parse failed or file missing.
+    };
+
+    if (graph.nodes.len == 0) return;
+
+    // Top-down layout: lay nodes out by depth in the graph DAG.
+    // Computed once per frame — graphs are small enough that the
+    // O(N * E) pass is invisible.
+    var pos_buf: [256][2]f32 = undefined;
+    const positions = layoutNodes(graph, pos_buf[0..]);
+
+    for (graph.nodes, 0..) |gn, i| {
+        const node_id: u64 = @intCast(gn.id);
+        // Apply the computed position only on the first frame the
+        // node appears (when its current x is exactly 0 0 — the
+        // node-editor's "uninitialized" sentinel) so user drags
+        // stick.
+        const current = ne.getNodePosition(node_id);
+        if (current[0] == 0 and current[1] == 0 and i < positions.len) {
+            ne.setNodePosition(node_id, positions[i]);
+        }
+
+        ne.beginNode(node_id);
+        zgui.text("{s}", .{gn.label});
+        zgui.textDisabled("L{d}", .{gn.source_line});
+
+        // Render input pins, then output pins. Same row works at
+        // this scale; the editor's auto-layout takes care of the
+        // visual gap.
+        for (gn.input_pins) |pin| {
+            ne.beginPin(@intCast(pin.id), .input);
+            zgui.text("> {s}", .{pin.name});
+            ne.endPin();
+        }
+        for (gn.output_pins) |pin| {
+            ne.beginPin(@intCast(pin.id), .output);
+            zgui.text("{s} >", .{pin.name});
+            ne.endPin();
+        }
+        ne.endNode();
+    }
+
+    // Edges: stable ids keyed by from_pin + to_pin so the editor
+    // doesn't see them as new links each frame. The top 32 bits of
+    // the u64 hold from_pin, the bottom 32 hold to_pin.
+    for (graph.edges) |e| {
+        const link_id: u64 = (@as(u64, e.from_pin) << 32) | @as(u64, e.to_pin);
+        const colour: [4]f32 = switch (e.kind) {
+            .data => .{ 0.4, 0.8, 1.0, 1.0 },
+            .execution => .{ 1.0, 0.7, 0.2, 1.0 },
+        };
+        _ = ne.link(link_id, @intCast(e.from_pin), @intCast(e.to_pin), colour, 1.5);
+    }
 }
 
-/// No-op for the spike. The Flow tab is never dirty, so the close
-/// modal never reaches this path; but `OpenTab.save` still needs
-/// a function to dispatch to.
+fn renderSidebar(s: *FlowState) void {
+    zgui.text("Entry points", .{});
+    zgui.separator();
+
+    const graph = s.graph orelse {
+        zgui.textDisabled("No graph — file not parsed.", .{});
+        return;
+    };
+
+    if (graph.entry_points.len == 0) {
+        zgui.textDisabled("No matching entry points found.", .{});
+    } else {
+        for (graph.entry_points) |eid| {
+            const node = findNode(graph, eid) orelse continue;
+            // Buttons act as the click-to-scroll mechanism. ImGui
+            // labels need null termination — use a temp buffer.
+            var label_buf: [192]u8 = undefined;
+            const label = std.fmt.bufPrintZ(&label_buf, "{s}  (L{d})", .{ node.label, node.source_line }) catch continue;
+            if (zgui.button(label, .{ .w = -1 })) {
+                ne.setCurrentEditor(s.editor);
+                ne.selectNode(@intCast(eid), false);
+                ne.navigateToSelection(false, 0.0);
+                ne.setCurrentEditor(null);
+            }
+        }
+    }
+
+    zgui.separator();
+    zgui.text("Selection", .{});
+    zgui.separator();
+    renderSelectedInspector(s);
+}
+
+fn renderSelectedInspector(s: *FlowState) void {
+    const graph = s.graph orelse return;
+    // Read the editor's current selection. We need to bind the
+    // editor first because `getSelectedNodes` is global state.
+    ne.setCurrentEditor(s.editor);
+    defer ne.setCurrentEditor(null);
+
+    var ids: [4]u64 = undefined;
+    const count = ne.getSelectedNodes(ids[0..]);
+    if (count <= 0) {
+        zgui.textDisabled("Click a node to inspect.", .{});
+        return;
+    }
+    const selected_id: u32 = @intCast(ids[0]);
+    const node = findNode(graph, selected_id) orelse {
+        zgui.textDisabled("Selection lost (graph re-derived).", .{});
+        return;
+    };
+
+    zgui.text("{s}", .{node.label});
+    zgui.textDisabled("category: {s}", .{@tagName(node.category)});
+    zgui.textDisabled("source line: {d}", .{node.source_line});
+    zgui.separator();
+
+    if (s.source) |src| {
+        const line_text = lineAt(src, node.source_line);
+        zgui.textWrapped("{s}", .{line_text});
+    }
+}
+
+/// Return the n-th 1-based line of `source`, trimmed of its
+/// trailing newline. Falls back to an empty slice when out of
+/// range. Cheap linear scan — the inspector calls this at most once
+/// per frame.
+fn lineAt(source: []const u8, line_1based: u32) []const u8 {
+    var line: u32 = 1;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < source.len) : (i += 1) {
+        if (source[i] == '\n') {
+            if (line == line_1based) return source[start..i];
+            line += 1;
+            start = i + 1;
+        }
+    }
+    if (line == line_1based) return source[start..source.len];
+    return "";
+}
+
+fn findNode(graph: Graph, id: u32) ?*const GraphNodeSpec {
+    for (graph.nodes) |*n| {
+        if (n.id == id) return n;
+    }
+    return null;
+}
+
+/// Top-down DAG layout. We picked the simpler of the two options
+/// mentioned in the issue (force-directed vs DAG): a deterministic
+/// depth-vs-order grid keyed off longest-path depth.
+///
+/// Algorithm:
+///   1. Walk the edges, propagating "longest path from any root"
+///      depths into a stack buffer. Bounded by node count.
+///   2. Emit positions on a simple grid: x = depth * column_w,
+///      y = order_in_layer * row_h.
+///
+/// `out` is a caller-supplied buffer (stack-allocated in
+/// `renderCanvas`) sized at 256 — enough for any single-file
+/// projection we expect this frame. Larger graphs would need a
+/// heap allocation, but a 256-node script is already huge for our
+/// use case.
+fn layoutNodes(graph: Graph, out: [][2]f32) [][2]f32 {
+    const column_w: f32 = 260.0;
+    const row_h: f32 = 110.0;
+    const n = @min(graph.nodes.len, out.len);
+    if (n == 0) return out[0..0];
+
+    var depths: [256]u32 = undefined;
+    @memset(depths[0..n], 0);
+
+    // Iterate until depths stop changing or we hit a pass cap. A
+    // DAG of N nodes converges in ≤ N passes; cycles (from
+    // identifier back-refs) just freeze the depth at the cap.
+    var pass: usize = 0;
+    while (pass < n) : (pass += 1) {
+        var changed = false;
+        for (graph.edges) |e| {
+            const from_idx = indexOfNode(graph, e.from_node) orelse continue;
+            const to_idx = indexOfNode(graph, e.to_node) orelse continue;
+            if (from_idx >= n or to_idx >= n) continue;
+            const candidate = depths[from_idx] + 1;
+            if (depths[to_idx] < candidate) {
+                depths[to_idx] = candidate;
+                changed = true;
+            }
+        }
+        if (!changed) break;
+    }
+
+    // Count how many nodes have already been placed at each depth
+    // so we can stack rows without rescanning the depth array.
+    var layer_counts: [256]u32 = undefined;
+    @memset(layer_counts[0..], 0);
+
+    for (graph.nodes[0..n], 0..) |_, i| {
+        const d = depths[i];
+        const slot = if (d < layer_counts.len) layer_counts[d] else 0;
+        out[i] = .{
+            @as(f32, @floatFromInt(d)) * column_w + 40.0,
+            @as(f32, @floatFromInt(slot)) * row_h + 40.0,
+        };
+        if (d < layer_counts.len) layer_counts[d] += 1;
+    }
+    return out[0..n];
+}
+
+fn indexOfNode(graph: Graph, id: u32) ?usize {
+    for (graph.nodes, 0..) |n, i| {
+        if (n.id == id) return i;
+    }
+    return null;
+}
+
+/// No-op — flows are derived, not authored. Kept so `OpenTab.save`
+/// has a function to dispatch to.
 pub fn saveFlow(s: *FlowState, app: *App) void {
     _ = s;
     _ = app;

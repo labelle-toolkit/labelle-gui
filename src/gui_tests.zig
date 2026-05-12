@@ -144,6 +144,26 @@ pub fn main() !void {
         sf.close();
     }
 
+    // Drop a tiny Zig script into `scripts/flows/` so the Flow
+    // viewer's open path has a real file to parse. The script is
+    // intentionally minimal — one entry-point fn with an `if` —
+    // because the assertion below only confirms the graph rendered,
+    // not its exact topology.
+    {
+        var flow_path_buf: [512]u8 = undefined;
+        const flow_path = try std.fmt.bufPrint(&flow_path_buf, "{s}/scripts/flows/sample.zig", .{tmp});
+        const ff = try std.fs.cwd().createFile(flow_path, .{});
+        try ff.writeAll(
+            \\pub fn tick(game: anytype, dt: f32) void {
+            \\    _ = game;
+            \\    if (dt > 0) {
+            \\        _ = dt;
+            \\    }
+            \\}
+        );
+        ff.close();
+    }
+
     // And a prefab with both top-level components and a children
     // array so the prefab editor's children-editing path has
     // something to test against (mirrors hydroponics-style prefabs
@@ -346,6 +366,47 @@ pub fn main() !void {
             // Toggle off again.
             ctx.menuAction(.click, "View/Preview");
             _ = zgui.te.check(@src(), .{}, !a.show_preview, "View/Preview closes panel");
+        }
+    });
+
+    _ = engine.registerTest("phase3", "flow_opens_and_renders_graph", @src(), struct {
+        fn gui(_: *zgui.te.TestContext) !void {
+            if (g_app) |a| a.renderFrame(1.0 / 60.0);
+        }
+        fn run(ctx: *zgui.te.TestContext) !void {
+            const a = g_app orelse {
+                _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
+                return;
+            };
+
+            const dir = g_settings_project_dir.?;
+            var path_buf: [512]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buf, "{s}/scripts/flows/sample.zig", .{dir}) catch return;
+
+            a.openFlow(path) catch {
+                _ = zgui.te.check(@src(), .{}, false, "openFlow must succeed");
+                return;
+            };
+            ctx.yield(2);
+
+            const opened_ok = a.open_tabs.items.len == 1 and a.open_tabs.items[0] == .flow;
+            _ = zgui.te.check(@src(), .{}, opened_ok, "flow tab opened");
+            if (!opened_ok) return;
+
+            const tab = &a.open_tabs.items[0].flow;
+            const has_graph = tab.graph != null;
+            _ = zgui.te.check(@src(), .{}, has_graph, "graph derived from source");
+            if (has_graph) {
+                const g = tab.graph.?;
+                _ = zgui.te.check(@src(), .{}, g.entry_points.len >= 1, "at least one entry point");
+                _ = zgui.te.check(@src(), .{}, g.nodes.len >= 1, "at least one node");
+            }
+
+            // save/isDirty are no-ops for flows — just confirm they
+            // don't blow up.
+            _ = zgui.te.check(@src(), .{}, !a.open_tabs.items[0].isDirty(), "flow is never dirty");
+
+            a.closeTab(0);
         }
     });
 

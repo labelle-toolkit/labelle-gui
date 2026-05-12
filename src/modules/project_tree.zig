@@ -37,18 +37,18 @@ pub fn isPrefabPath(proj_dir: ?[]const u8, path: []const u8) bool {
     return isUnderFolder(proj_dir, path, project.ProjectFolders.prefabs, ".jsonc");
 }
 
-/// Return true when `path` is a `.flow.zon` file under the
-/// project's `scripts/flows/` directory. Drives routing of tree
-/// clicks into the Flow editor (spike — issue #45).
+/// Return true when `path` is a `.zig` file under the project's
+/// `scripts/flows/` directory. Drives routing of tree clicks into
+/// the Flow viewer (issues #48 + #49, umbrella #42).
 ///
-/// Schema choice: `.flow.zon` (rather than reusing `.jsonc`)
-/// keeps Flow files out of the scene/prefab path predicates and
-/// makes the file's purpose obvious in the tree. The toolkit's
-/// other config files (`project.labelle`, prefab metadata) are
-/// already ZON; reusing the parser is convenient.
+/// Schema choice: the visualization layer is *derived* from Zig
+/// scripts. There is no `.flow.*` file format — the source of
+/// truth is the underlying Zig the engine actually compiles. The
+/// gui's projector (`src/flows/projector.zig`) parses the file via
+/// `std.zig.Ast` and renders it as a node graph.
 pub fn isFlowPath(proj_dir: ?[]const u8, path: []const u8) bool {
     const dir = proj_dir orelse return false;
-    if (!std.mem.endsWith(u8, path, ".flow.zon")) return false;
+    if (!std.mem.endsWith(u8, path, ".zig")) return false;
     var prefix_buf: [std.fs.max_path_bytes]u8 = undefined;
     const prefix = std.fmt.bufPrint(
         &prefix_buf,
