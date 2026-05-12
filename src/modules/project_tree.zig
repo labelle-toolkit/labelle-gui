@@ -27,14 +27,14 @@ pub fn makeModule(app: *App) module.Module {
 /// elsewhere in the project return false; the caller skips opening
 /// them as scenes.
 pub fn isScenePath(proj_dir: ?[]const u8, path: []const u8) bool {
-    return isUnderFolder(proj_dir, path, project.ProjectFolders.scenes);
+    return isUnderFolder(proj_dir, path, project.ProjectFolders.scenes, ".jsonc");
 }
 
 /// Mirror of `isScenePath` for `prefabs/*.jsonc`. Used to route a
 /// tree click on a prefab file into the prefab editor rather than
 /// the scene editor.
 pub fn isPrefabPath(proj_dir: ?[]const u8, path: []const u8) bool {
-    return isUnderFolder(proj_dir, path, project.ProjectFolders.prefabs);
+    return isUnderFolder(proj_dir, path, project.ProjectFolders.prefabs, ".jsonc");
 }
 
 /// Return true when `path` is a `.flow.zon` file under the
@@ -58,9 +58,19 @@ pub fn isFlowPath(proj_dir: ?[]const u8, path: []const u8) bool {
     return std.mem.startsWith(u8, path, prefix);
 }
 
-fn isUnderFolder(proj_dir: ?[]const u8, path: []const u8, folder: []const u8) bool {
+/// Return true when `path` is a `.zon` file under the project's
+/// `gizmos/` directory. Gizmos are ZON, not JSONC, so this is the
+/// one router arm that uses a different extension. The folder name
+/// is hardcoded here rather than pulled from `project.ProjectFolders`
+/// to keep this PR independent of the parallel scaffold/folder-listing
+/// change a sibling PR is making — both PRs can land in either order.
+pub fn isGizmoPath(proj_dir: ?[]const u8, path: []const u8) bool {
+    return isUnderFolder(proj_dir, path, "gizmos", ".zon");
+}
+
+fn isUnderFolder(proj_dir: ?[]const u8, path: []const u8, folder: []const u8, ext: []const u8) bool {
     const dir = proj_dir orelse return false;
-    if (!std.mem.endsWith(u8, path, ".jsonc")) return false;
+    if (!std.mem.endsWith(u8, path, ext)) return false;
     var prefix_buf: [std.fs.max_path_bytes]u8 = undefined;
     const prefix = std.fmt.bufPrint(&prefix_buf, "{s}/{s}/", .{ dir, folder }) catch return false;
     return std.mem.startsWith(u8, path, prefix);
@@ -85,9 +95,10 @@ fn render(app: *App) void {
             // Tree returns true on the frame a file is newly clicked.
             // `.jsonc` files under `scenes/` route to the scene
             // editor; `.jsonc` files under `prefabs/` route to the
-            // prefab editor. The two paths are mutually exclusive
-            // (see `isScenePath` / `isPrefabPath`) so a single click
-            // never opens both.
+            // prefab editor; `.zon` files under `gizmos/` route to
+            // the gizmo editor. The three are mutually exclusive
+            // (different folders and/or extensions) so a single
+            // click never opens more than one.
             if (app.tree_view.render(proj.getProjectDir())) {
                 if (app.tree_view.getSelectedPath()) |path| {
                     const proj_dir = proj.getProjectDir();
@@ -105,6 +116,11 @@ fn render(app: *App) void {
                         app.openFlow(path) catch |err| {
                             std.log.err("Failed to open flow {s}: {s}", .{ path, @errorName(err) });
                             app.setStatus("Error opening flow!");
+                        };
+                    } else if (isGizmoPath(proj_dir, path)) {
+                        app.openGizmo(path) catch |err| {
+                            std.log.err("Failed to open gizmo {s}: {s}", .{ path, @errorName(err) });
+                            app.setStatus("Error opening gizmo!");
                         };
                     }
                 }

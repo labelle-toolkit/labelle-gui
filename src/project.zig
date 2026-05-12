@@ -1,4 +1,5 @@
 const std = @import("std");
+const zon_scan = @import("zon_scan.zig");
 
 pub const PROJECT_FILENAME = "project.labelle";
 
@@ -332,7 +333,7 @@ fn isManaged(name: []const u8) bool {
 /// schema, this scanner will need to grow.
 fn extractUnmodeledFields(arena: std.mem.Allocator, raw: []const u8) ![]const []const u8 {
     var i: usize = 0;
-    skipWsAndComments(raw, &i);
+    zon_scan.skipWsAndComments(raw, &i);
     // Top-level shape is `.{ ... }`. Bail quietly on anything else; the
     // caller treats a missing extras list as "no preservation possible".
     if (i + 1 >= raw.len or raw[i] != '.' or raw[i + 1] != '{') return &.{};
@@ -368,18 +369,18 @@ fn extractUnmodeledFields(arena: std.mem.Allocator, raw: []const u8) ![]const []
         const name = raw[name_start..i];
         if (name.len == 0) break;
 
-        skipWsAndComments(raw, &i);
+        zon_scan.skipWsAndComments(raw, &i);
         if (i >= raw.len or raw[i] != '=') break;
         i += 1; // past '='
 
         // Scan the value up to (but not including) the next top-level
         // `,` or the outer `}`. Brace/string/comment aware.
-        scanValue(raw, &i);
+        zon_scan.scanValue(raw, &i);
         const field_end = i;
 
         // Consume optional trailing comma.
         const save = i;
-        skipWsAndComments(raw, &i);
+        zon_scan.skipWsAndComments(raw, &i);
         if (i < raw.len and raw[i] == ',') {
             i += 1;
         } else {
@@ -407,50 +408,6 @@ fn skipWhitespace(raw: []const u8, i: *usize) void {
         const c = raw[i.*];
         if (c != ' ' and c != '\t' and c != '\n' and c != '\r') break;
         i.* += 1;
-    }
-}
-
-fn skipWsAndComments(raw: []const u8, i: *usize) void {
-    while (i.* < raw.len) {
-        const c = raw[i.*];
-        if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
-            i.* += 1;
-        } else if (c == '/' and i.* + 1 < raw.len and raw[i.* + 1] == '/') {
-            while (i.* < raw.len and raw[i.*] != '\n') i.* += 1;
-        } else break;
-    }
-}
-
-fn scanValue(raw: []const u8, i: *usize) void {
-    var depth: usize = 0;
-    while (i.* < raw.len) {
-        const c = raw[i.*];
-        if (c == '"') {
-            i.* += 1;
-            while (i.* < raw.len) {
-                if (raw[i.*] == '\\' and i.* + 1 < raw.len) {
-                    i.* += 2;
-                } else if (raw[i.*] == '"') {
-                    i.* += 1;
-                    break;
-                } else {
-                    i.* += 1;
-                }
-            }
-        } else if (c == '/' and i.* + 1 < raw.len and raw[i.* + 1] == '/') {
-            while (i.* < raw.len and raw[i.*] != '\n') i.* += 1;
-        } else if (c == '{' or c == '[' or c == '(') {
-            depth += 1;
-            i.* += 1;
-        } else if (c == '}' or c == ']' or c == ')') {
-            if (depth == 0) return; // outer `}` — stop without consuming
-            depth -= 1;
-            i.* += 1;
-        } else if (c == ',' and depth == 0) {
-            return;
-        } else {
-            i.* += 1;
-        }
     }
 }
 
