@@ -1,5 +1,6 @@
 //! Circle inspector section. Only renders when `entity.circle != null`.
 
+const std = @import("std");
 const zgui = @import("zgui");
 
 const scene_io = @import("../../scene_io.zig");
@@ -25,10 +26,14 @@ fn render(
         @as(f32, @floatFromInt(circle.a)) / 255.0,
     };
     if (zgui.colorEdit4("color", .{ .col = &col4 })) {
-        circle.r = @intFromFloat(@round(col4[0] * 255.0));
-        circle.g = @intFromFloat(@round(col4[1] * 255.0));
-        circle.b = @intFromFloat(@round(col4[2] * 255.0));
-        circle.a = @intFromFloat(@round(col4[3] * 255.0));
+        // Clamp before casting: `@intFromFloat` is safety-checked
+        // in Debug/ReleaseSafe and panics on out-of-range input.
+        // The colorEdit4 picker can produce slightly-out-of-[0,1]
+        // floats on some platforms; the clamp keeps that safe.
+        circle.r = @intFromFloat(@round(std.math.clamp(col4[0] * 255.0, 0.0, 255.0)));
+        circle.g = @intFromFloat(@round(std.math.clamp(col4[1] * 255.0, 0.0, 255.0)));
+        circle.b = @intFromFloat(@round(std.math.clamp(col4[2] * 255.0, 0.0, 255.0)));
+        circle.a = @intFromFloat(@round(std.math.clamp(col4[3] * 255.0, 0.0, 255.0)));
         is_dirty.* = true;
     }
     if (zgui.checkbox("filled", .{ .v = &circle.filled })) is_dirty.* = true;

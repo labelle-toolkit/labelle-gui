@@ -1,5 +1,6 @@
 //! Polygon inspector section. Only renders when `entity.polygon != null`.
 
+const std = @import("std");
 const zgui = @import("zgui");
 
 const scene_io = @import("../../scene_io.zig");
@@ -74,10 +75,11 @@ fn render(
         @as(f32, @floatFromInt(poly.a)) / 255.0,
     };
     if (zgui.colorEdit4("color", .{ .col = &col4 })) {
-        poly.r = @intFromFloat(@round(col4[0] * 255.0));
-        poly.g = @intFromFloat(@round(col4[1] * 255.0));
-        poly.b = @intFromFloat(@round(col4[2] * 255.0));
-        poly.a = @intFromFloat(@round(col4[3] * 255.0));
+        // Clamp before casting — see comment in inspector/rectangle.zig.
+        poly.r = @intFromFloat(@round(std.math.clamp(col4[0] * 255.0, 0.0, 255.0)));
+        poly.g = @intFromFloat(@round(std.math.clamp(col4[1] * 255.0, 0.0, 255.0)));
+        poly.b = @intFromFloat(@round(std.math.clamp(col4[2] * 255.0, 0.0, 255.0)));
+        poly.a = @intFromFloat(@round(std.math.clamp(col4[3] * 255.0, 0.0, 255.0)));
         is_dirty.* = true;
     }
     if (zgui.checkbox("filled", .{ .v = &poly.filled })) is_dirty.* = true;
