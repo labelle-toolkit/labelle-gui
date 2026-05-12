@@ -14,7 +14,7 @@
 //!      engine sent (`heartbeat`, `bye`, or unknown — which we ignore on
 //!      purpose so Phase 2+ kinds don't break the editor). EOF without a
 //!      `bye` → `crashed`. `bye` → `stopped`.
-//!   4. `stop()` closes the stream, SIGTERMs the child, waits, transitions
+//!   4. `stop()` closes the stream, SIGKILLs the child, waits, transitions
 //!      to `stopped`.
 //!
 //! Mock-friendly by design: the JSON message types live in `Message` so
@@ -197,9 +197,9 @@ pub const PreviewSession = struct {
         self.state = .listening;
     }
 
-    /// Cooperatively shut down: close stream, SIGTERM child, wait. Safe
-    /// to call from any non-`idle` state. After this returns the session
-    /// is in `.stopped` (or stays in `.crashed` if it was already crashed).
+    /// Cooperatively shut down: close stream, SIGKILL child, wait. Safe
+    /// to call from any state. After this returns the session is in
+    /// `.stopped` (or stays in `.crashed` if it was already crashed).
     pub fn stop(self: *Self) void {
         self.teardownChildAndIo();
         if (self.state != .crashed) self.state = .stopped;
@@ -443,27 +443,15 @@ const Message = union(enum) {
     unknown,
 };
 
-/// Parse-time mirrors of the wire structs — fields are `?[]const u8`
-/// because the JSON parser hands back arena-owned slices. We dupe out
-/// of the parse arena into `allocator` before returning the `Message`.
-const HelloRaw = struct {
-    engine_version: ?[]const u8 = null,
-    pid: ?i64 = null,
-    protocol_version: ?i64 = null,
-};
-const ByeRaw = struct {
-    reason: ?[]const u8 = null,
-};
-
 fn parseKind(allocator: std.mem.Allocator, raw: []const u8) !Message {
-    // Peek the `kind` field via Value so a missing-or-typo `kind` gives
-    // us a structured error rather than a parse failure that aborts.
-    // The body fields are then parsed via typed structs with
-    // `ignore_unknown_fields = true`.
-    var parsed_dyn = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
-    defer parsed_dyn.deinit();
+    // Single parse to `Value`; `kind` and all body fields are read from
+    // the same object so we avoid a second `parseFromSlice` per message.
+    // String fields that the session needs to own across the parse-arena
+    // teardown are duped into `allocator` before we return.
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
 
-    const obj = switch (parsed_dyn.value) {
+    const obj = switch (parsed.value) {
         .object => |o| o,
         else => return error.UnexpectedToken,
     };
@@ -474,18 +462,30 @@ fn parseKind(allocator: std.mem.Allocator, raw: []const u8) !Message {
     };
 
     if (std.mem.eql(u8, kind_str, "hello")) {
-        const p = try std.json.parseFromSlice(HelloRaw, allocator, raw, .{ .ignore_unknown_fields = true });
-        defer p.deinit();
-        const ev: ?[]u8 = if (p.value.engine_version) |v| try allocator.dupe(u8, v) else null;
-        return .{ .hello = .{ .engine_version = ev, .pid = p.value.pid, .protocol_version = p.value.protocol_version } };
+        const ev: ?[]u8 = if (obj.get("engine_version")) |v| switch (v) {
+            .string => |s| try allocator.dupe(u8, s),
+            else => null,
+        } else null;
+        const pid: ?i64 = if (obj.get("pid")) |v| switch (v) {
+            .integer => |n| n,
+            else => null,
+        } else null;
+        const protocol_version: ?i64 = if (obj.get("protocol_version")) |v| switch (v) {
+            .integer => |n| n,
+            else => null,
+        } else null;
+        return .{ .hello = .{ .engine_version = ev, .pid = pid, .protocol_version = protocol_version } };
     } else if (std.mem.eql(u8, kind_str, "heartbeat")) {
-        const p = try std.json.parseFromSlice(Heartbeat, allocator, raw, .{ .ignore_unknown_fields = true });
-        defer p.deinit();
-        return .{ .heartbeat = .{ .t = p.value.t } };
+        const t: ?i64 = if (obj.get("t")) |v| switch (v) {
+            .integer => |n| n,
+            else => null,
+        } else null;
+        return .{ .heartbeat = .{ .t = t } };
     } else if (std.mem.eql(u8, kind_str, "bye")) {
-        const p = try std.json.parseFromSlice(ByeRaw, allocator, raw, .{ .ignore_unknown_fields = true });
-        defer p.deinit();
-        const r: ?[]u8 = if (p.value.reason) |v| try allocator.dupe(u8, v) else null;
+        const r: ?[]u8 = if (obj.get("reason")) |v| switch (v) {
+            .string => |s| try allocator.dupe(u8, s),
+            else => null,
+        } else null;
         return .{ .bye = .{ .reason = r } };
     }
     return .unknown;
