@@ -48,6 +48,11 @@ pub const State = enum {
 pub const PreviewError = error{
     NoProjectPath,
     LauncherNotFound,
+    /// The loopback listener couldn't bind a port (kernel out of
+    /// ephemeral ports, permission denied, etc.) — distinct from
+    /// `LauncherNotFound` so the UI can surface "OS resources" vs
+    /// "labelle not on PATH" without guessing.
+    ListenFailed,
     AlreadyRunning,
     OutOfMemory,
 };
@@ -161,7 +166,7 @@ pub const PreviewSession = struct {
             .force_nonblocking = true,
         }) catch |err| {
             std.log.err("preview: listen failed: {s}", .{@errorName(err)});
-            return error.LauncherNotFound;
+            return error.ListenFailed;
         };
         errdefer server.deinit();
 
@@ -280,9 +285,16 @@ pub const PreviewSession = struct {
                 },
             };
             if (n == 0) {
-                // EOF. If we've already seen a `bye` (`bye_reason` set
-                // and we transitioned to .stopped), nothing to do.
-                if (self.state == .running) {
+                // EOF. Flush whatever's already buffered first — the
+                // engine's common shutdown path is "write `bye`, then
+                // close the socket", so we must parse that `bye`
+                // before deciding the session crashed. After
+                // `consumeFrames`, state will be `.stopped` (clean bye)
+                // or unchanged. If we're still `.running` or
+                // `.connecting`, treat the EOF as a crash; staying in
+                // `.connecting` would just spin until the 2s timeout.
+                self.consumeFrames();
+                if (self.state == .running or self.state == .connecting) {
                     self.failWithCrash();
                 }
                 return;
@@ -391,7 +403,12 @@ pub const PreviewSession = struct {
             self.server = null;
         }
         if (self.child) |*c| {
+            // SIGKILL + reap. `wait()` is required after `kill()` to
+            // collect the exit status — otherwise the child becomes a
+            // zombie until the editor exits, and a long-running editor
+            // that runs many preview sessions would accumulate them.
             _ = c.kill() catch {};
+            _ = c.wait() catch {};
             self.child = null;
         }
     }

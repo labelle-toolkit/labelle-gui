@@ -2416,6 +2416,52 @@ pub const PreviewSessionTests = struct {
         try expect.toBeTrue(std.mem.eql(u8, s.bye_reason.?, "user_quit"));
     }
 
+    test "bye followed by EOF still lands in stopped (regression #62)" {
+        // Engines commonly write `bye` and then immediately close the
+        // socket. If the EOF branch returns early without draining the
+        // already-buffered `bye`, the session lands in `.crashed`.
+        const allocator = std.testing.allocator;
+        var pair = try Pair.make();
+        defer pair.close();
+
+        var s = preview.PreviewSession.init(allocator);
+        defer s.deinit();
+        try s.attachForTest(pair.editor_side);
+        try pair.write(
+            \\{"kind":"hello","engine_version":"x","pid":1,"protocol_version":1}
+            ++ "\n" ++
+            \\{"kind":"bye","reason":"user_quit"}
+            ++ "\n");
+        // Close the engine side right after writing bye — depending on
+        // kernel scheduling, the editor's first `read` may return both
+        // the buffered bytes and trigger EOF on the next read in the
+        // same `tickStream` call.
+        pair.closeEngine();
+        try expect.toBeTrue(pollUntilState(&s, .stopped));
+        try expect.toBeTrue(s.bye_reason != null);
+        try expect.toBeTrue(std.mem.eql(u8, s.bye_reason.?, "user_quit"));
+    }
+
+    test "EOF during connecting transitions to crashed without timeout wait (regression #62)" {
+        // Engine connects then drops the socket before sending `hello`.
+        // Previously the session would stay `.connecting` and spin on
+        // EOF until the 2s connect-timeout fired. Now it should crash
+        // on the first EOF.
+        const allocator = std.testing.allocator;
+        var pair = try Pair.make();
+        defer pair.close();
+
+        var s = preview.PreviewSession.init(allocator);
+        defer s.deinit();
+        try s.attachForTest(pair.editor_side);
+        try expect.equal(s.state, .connecting);
+
+        pair.closeEngine();
+        // 200ms budget is well under the 2s connect timeout, so if this
+        // passes we know we didn't fall through to `checkConnectTimeout`.
+        try expect.toBeTrue(pollUntilState(&s, .crashed));
+    }
+
     test "EOF without bye transitions to crashed" {
         const allocator = std.testing.allocator;
         var pair = try Pair.make();
