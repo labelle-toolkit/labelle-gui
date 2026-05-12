@@ -145,13 +145,17 @@ fn drawEntities(
         const selected = state.selected_idx.* == i;
 
         // Render priority: sprite (when it resolves against the
-        // atlas) > rectangle geometry > colored-circle marker.
-        // A declared-but-unresolved sprite still gets a `?` overlay
-        // on whatever fallback it falls into.
+        // atlas) > rectangle geometry > circle geometry > colored-
+        // circle marker. A declared-but-unresolved sprite still gets
+        // a `?` overlay on whatever fallback it falls into.
         const drew_sprite = drawSpriteIfResolved(dl, e, px, py, state.zoom.*, atlas_index);
         var drew_visual = drew_sprite;
         if (!drew_visual and e.rectangle != null) {
             drawRectangle(dl, e.rectangle.?.*, px, py, state.zoom.*);
+            drew_visual = true;
+        }
+        if (!drew_visual and e.circle != null) {
+            drawCircle(dl, e.circle.?.*, px, py, state.zoom.*);
             drew_visual = true;
         }
         if (!drew_visual) {
@@ -264,6 +268,35 @@ fn drawRectangle(dl: zgui.DrawList, rect: scene_io.Rectangle, px: f32, py: f32, 
         dl.addRectFilled(.{ .pmin = pmin, .pmax = pmax, .col = col });
     } else {
         dl.addRect(.{ .pmin = pmin, .pmax = pmax, .col = col, .thickness = 1.5 });
+    }
+}
+
+/// Draw a `Circle` geometry component centered on `(px, py)` in
+/// screen space, scaled by `zoom`. Circle's pivot is implicitly its
+/// center — same convention the engine uses for unconfigured shape
+/// pivots.
+fn drawCircle(dl: zgui.DrawList, circle: scene_io.Circle, px: f32, py: f32, zoom: f32) void {
+    const r = circle.radius * zoom;
+    // ImGui colors are 0xAABBGGRR. Build it from the u8 RGBA fields.
+    const col: u32 = (@as(u32, circle.a) << 24) |
+        (@as(u32, circle.b) << 16) |
+        (@as(u32, circle.g) << 8) |
+        @as(u32, circle.r);
+    if (circle.filled) {
+        dl.addCircleFilled(.{
+            .p = .{ px, py },
+            .r = r,
+            .col = col,
+            .num_segments = 32,
+        });
+    } else {
+        dl.addCircle(.{
+            .p = .{ px, py },
+            .r = r,
+            .col = col,
+            .num_segments = 32,
+            .thickness = 1.5,
+        });
     }
 }
 

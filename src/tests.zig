@@ -673,6 +673,98 @@ pub const SceneIoTests = struct {
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"filled\": false") != null);
     }
 
+    test "Circle round-trips with all fields through a prefab" {
+        // Geometry slice 2 (issue #6): a prefab carrying a Circle
+        // component must parse into the typed model with every field
+        // populated, and the writer must emit it back in the same
+        // shape — radius as number, color as nested object, filled
+        // as bool.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "components": {
+            \\        "Circle": { "radius": 24, "color": { "r": 200, "g": 50, "b": 25, "a": 240 }, "filled": false }
+            \\    }
+            \\}
+        ;
+        var loaded = try scene_io.parsePrefab(allocator, src);
+        defer loaded.deinit();
+
+        const circle = loaded.entity.circle orelse return error.MissingCircle;
+        try expect.equal(circle.radius, 24);
+        try expect.equal(circle.r, 200);
+        try expect.equal(circle.g, 50);
+        try expect.equal(circle.b, 25);
+        try expect.equal(circle.a, 240);
+        try expect.toBeFalse(circle.filled);
+
+        // Circle is managed → must NOT end up in component_extras.
+        try expect.equal(loaded.component_extras.len, 0);
+
+        const text = try scene_io.renderPrefabJsonc(allocator, loaded);
+        defer allocator.free(text);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Circle\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"radius\": 24") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"filled\": false") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"r\": 200") != null);
+
+        // Re-parse the rendered output — same shape, same values.
+        var loaded2 = try scene_io.parsePrefab(allocator, text);
+        defer loaded2.deinit();
+        const circle2 = loaded2.entity.circle orelse return error.MissingCircle;
+        try expect.equal(circle2.radius, 24);
+        try expect.equal(circle2.b, 25);
+        try expect.toBeFalse(circle2.filled);
+    }
+
+    test "Circle alongside Sprite and Position on a scene entity" {
+        // Multiple managed components on the same entity must all
+        // round-trip; none of them should leak into component_extras.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "x",
+            \\    "entities": [
+            \\        {
+            \\            "components": {
+            \\                "Position": { "x": 10, "y": 20 },
+            \\                "Sprite": { "sprite_name": "coin" },
+            \\                "Circle": { "radius": 12, "color": { "r": 0, "g": 0, "b": 255, "a": 255 }, "filled": true }
+            \\            }
+            \\        }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+
+        const e = &loaded.scene.entities[0];
+        try expect.toBeTrue(e.position != null);
+        try expect.toBeTrue(e.sprite != null);
+        try expect.toBeTrue(e.circle != null);
+        try expect.equal(loaded.extras.entity_components[0].len, 0);
+        try expect.equal(e.circle.?.b, 255);
+    }
+
+    test "edit Circle in memory; saved output reflects it" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{ "components": { "Circle": { "radius": 0, "color": { "r": 0, "g": 0, "b": 0, "a": 0 }, "filled": true } } }
+        ;
+        var loaded = try scene_io.parsePrefab(allocator, src);
+        defer loaded.deinit();
+        const circle = loaded.entity.circle orelse return error.MissingCircle;
+        circle.radius = 99;
+        circle.r = 128;
+        circle.filled = false;
+
+        const text = try scene_io.renderPrefabJsonc(allocator, loaded);
+        defer allocator.free(text);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"radius\": 99") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"r\": 128") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"filled\": false") != null);
+    }
+
     test "Sprite string fields are JSON-escaped on emit" {
         // Regression for gemini PR #32 review: sprite_name/pivot/layer
         // come from inspector text buffers and may contain `"` or `\`.
