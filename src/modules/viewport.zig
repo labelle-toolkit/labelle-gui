@@ -195,7 +195,13 @@ pub fn render(
     if (state.double_click_entity) |sink| {
         if (zgui.isItemHovered(.{}) and zgui.isMouseDoubleClicked(.left)) {
             const mouse = zgui.getMousePos();
-            sink.* = hitTestEntityAabb(entities, mouse, canvas_min, state.pan.*, state.zoom.*, atlas_index, prefab_index);
+            // Same fallback chain the single + right-click handlers
+            // use: AABB first, then radial. Without the radial chain a
+            // degenerate entity (no AABB resolves) would be
+            // single-clickable but un-double-clickable, even though
+            // its `prefab` field may still be set and openable.
+            sink.* = hitTestEntityAabb(entities, mouse, canvas_min, state.pan.*, state.zoom.*, atlas_index, prefab_index) orelse
+                hitTestEntity(entities, mouse, canvas_min, state.pan.*, state.zoom.*);
         }
     }
 
@@ -671,10 +677,6 @@ pub fn hitTestEntity(
 pub const WorldAabb = struct {
     min: [2]f32,
     max: [2]f32,
-
-    pub fn fromPoint(p: [2]f32) WorldAabb {
-        return .{ .min = p, .max = p };
-    }
 
     pub fn expandToInclude(self: *WorldAabb, p: [2]f32) void {
         self.min[0] = @min(self.min[0], p[0]);
