@@ -64,6 +64,15 @@ pub fn renderEntity(
     /// as a tab. The scene editor wires this; the prefab editor passes
     /// null because there's no further level to descend into.
     request_open_prefab: ?*?[]const u8,
+    /// Optional sink: when non-null, the inspector renders a small
+    /// "Delete" button below the entity header. Clicking it flips the
+    /// flag; the caller (the scene editor) opens its own confirmation
+    /// modal and removes the entity on accept. Decoupled so the
+    /// inspector doesn't need to know about modal state or
+    /// scene-vs-prefab routing — the prefab editor passes null
+    /// because per-child delete inside a prefab is handled by the
+    /// prefab editor's own UI flow.
+    request_delete: ?*bool,
 ) void {
     if (entity_index) |n| {
         zgui.text("Entity #{d}", .{n});
@@ -82,6 +91,11 @@ pub fn renderEntity(
         }
     } else {
         zgui.textDisabled("(no prefab)", .{});
+    }
+    if (request_delete) |sink| {
+        if (zgui.smallButton("Delete##inspector_delete_entity")) {
+            sink.* = true;
+        }
     }
     zgui.spacing();
 

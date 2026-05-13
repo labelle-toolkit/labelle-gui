@@ -189,14 +189,14 @@ fn renderInspector(s: *PrefabState, atlas_index: ?*const @import("../atlas.zig")
         else
             &[_]scene_io.ComponentExtra{};
 
-        inspector.renderEntity(child, extras, &s.is_dirty, idx, atlas_index, null);
+        inspector.renderEntity(child, extras, &s.is_dirty, idx, atlas_index, null, null);
         return;
     }
 
     // Nothing selected → show the prefab's own components.
     zgui.text("Prefab body", .{});
     zgui.spacing();
-    inspector.renderEntity(&s.loaded.entity, s.loaded.component_extras, &s.is_dirty, null, atlas_index, null);
+    inspector.renderEntity(&s.loaded.entity, s.loaded.component_extras, &s.is_dirty, null, atlas_index, null, null);
 
     if (s.loaded.children.len > 0) {
         zgui.spacing();
