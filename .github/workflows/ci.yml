@@ -100,8 +100,10 @@ jobs:
         run: |
           export DISPLAY=:99
           Xvfb :99 -screen 0 1280x720x24 &
-          sleep 1
+          XVFB_PID=$!
+          sleep 2
           ./zig-out/bin/gui-tests
+          kill $XVFB_PID 2>/dev/null || true
 
   # Process-launch sanity check — confirms the production binary starts,
   # doesn't crash for a few seconds, and renders something. Separate from
