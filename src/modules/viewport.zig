@@ -762,11 +762,12 @@ fn prefabWorldAabb(
     return box;
 }
 
-/// World-space AABB of a single scene entity, accounting for its
-/// own typed Sprite, its referenced prefab tree (when applicable),
-/// and falling back to a small point-radius box otherwise. Returns
-/// null when the entity has no Position (we don't draw it then —
-/// matches the `drawEntities` skip).
+/// World-space AABB of a single scene entity. Matches the visual
+/// priority `drawEntities` uses (sprite → rectangle → circle →
+/// polygon → expanded prefab tree → degenerate marker box), so the
+/// selection outline + hit-test region always agree with what's
+/// actually painted on the canvas. Returns null when the entity has
+/// no Position — same skip `drawEntities` applies.
 pub fn entityWorldAabb(
     entity: scene_io.Entity,
     atlas_idx: ?*const atlas.Index,
@@ -786,17 +787,60 @@ pub fn entityWorldAabb(
         }
     }
 
+    // Rectangle is centered on the anchor (see `drawRectangle`).
+    if (entity.rectangle) |r| {
+        const half_w = r.width * 0.5;
+        const half_h = r.height * 0.5;
+        return .{
+            .min = .{ anchor[0] - half_w, anchor[1] - half_h },
+            .max = .{ anchor[0] + half_w, anchor[1] + half_h },
+        };
+    }
+
+    // Circle is centered on the anchor with `radius` (see `drawCircle`).
+    if (entity.circle) |c| {
+        const rad = c.radius;
+        return .{
+            .min = .{ anchor[0] - rad, anchor[1] - rad },
+            .max = .{ anchor[0] + rad, anchor[1] + rad },
+        };
+    }
+
+    // Polygon points are world-space offsets from the anchor; bounds
+    // come from the actual point set rather than a constructed
+    // rectangle (see `drawPolygon`'s `px + points[i].x * zoom` map).
+    if (entity.polygon) |p| {
+        if (p.point_count > 0) {
+            const first = p.points[0];
+            var box: WorldAabb = .{
+                .min = .{ anchor[0] + first.x, anchor[1] + first.y },
+                .max = .{ anchor[0] + first.x, anchor[1] + first.y },
+            };
+            var i: u32 = 1;
+            while (i < p.point_count) : (i += 1) {
+                const pt = p.points[i];
+                box.expandToInclude(.{ anchor[0] + pt.x, anchor[1] + pt.y });
+            }
+            return box;
+        }
+    }
+
     if (entity.prefab) |p| {
         if (atlas_idx) |ai| if (pfx_index) |pi| {
             if (prefabWorldAabb(p, anchor, ai, pi, 0)) |b| return b;
         };
     }
 
-    // Fallback: a small box around the anchor so degenerate entities
-    // (no sprite, no resolved prefab) still get a clickable target the
-    // same size as the marker dot.
-    const r: f32 = hit_radius;
-    return .{ .min = .{ anchor[0] - r, anchor[1] - r }, .max = .{ anchor[0] + r, anchor[1] + r } };
+    // No drawable shape resolved: return null rather than a fake
+    // world-space radius. The screen-pixel `hit_radius` constant is
+    // not a world quantity, so using it here scaled the hit region
+    // wildly with zoom (huge at 10×, sub-marker at 0.1×) and made
+    // the circle-fallback selection draw dead code. Caller chains
+    // `hitTestEntityAabb(...) orelse hitTestEntity(...)`, so a null
+    // here cleanly hands these degenerate entities back to the
+    // existing radial hit test, and the `else` branch in the
+    // selection draw renders the small circle around the anchor.
+    return null;
 }
 
 /// AABB hit-test: pick the topmost (last in iteration order) entity
