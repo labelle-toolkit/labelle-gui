@@ -214,7 +214,13 @@ pub const PreviewSession = struct {
         // fails. Without this the user sees only "Preview crashed"
         // and has to re-run the editor from a terminal to learn
         // anything actionable.
-        child.stderr_behavior = .Pipe;
+        //
+        // Windows: we don't have a non-blocking-read story for the
+        // pipe yet, and a blocking `read` on `drainStderr` would
+        // freeze the gui's render thread. Fall back to inherit there
+        // — capture stays POSIX-only until a Windows-safe IOCP path
+        // lands.
+        child.stderr_behavior = if (builtin.os.tag == .windows) .Inherit else .Pipe;
 
         child.spawn() catch |err| switch (err) {
             error.FileNotFound => return error.LauncherNotFound,
@@ -226,11 +232,16 @@ pub const PreviewSession = struct {
 
         // Non-block the captured stderr so `drainStderr` can pull
         // whatever the child has produced so far without ever blocking
-        // the render thread. POSIX-only — the helper short-circuits on
-        // Windows (see `setNonBlock`).
+        // the render thread. If NONBLOCK fails we close the pipe and
+        // null `child.stderr` *before* assigning into `self.child`, so
+        // `drainStderr` can't accidentally land on a blocking fd and
+        // freeze the gui. Failure here means no stderr capture, not a
+        // crash.
         if (child.stderr) |se_file| {
             setNonBlock(se_file.handle) catch |err| {
-                std.log.warn("preview: NONBLOCK on stderr pipe failed: {s}", .{@errorName(err)});
+                std.log.warn("preview: NONBLOCK on stderr pipe failed; capture disabled: {s}", .{@errorName(err)});
+                se_file.close();
+                child.stderr = null;
             };
         }
 
@@ -279,18 +290,33 @@ pub const PreviewSession = struct {
     /// Appends every available byte into `stderr_buf` (capped so a
     /// runaway child can't OOM the editor). Safe to call from any
     /// active state — silently no-ops when the child or pipe is
-    /// absent. Errors other than `WouldBlock` (EOF, broken pipe)
-    /// also exit cleanly; the captured tail stays in `stderr_buf`.
+    /// absent. On EOF or a non-`WouldBlock` read error we close the
+    /// pipe and clear `child.stderr` so subsequent frames don't keep
+    /// retrying a broken / drained fd. We pin a pointer into the
+    /// optional rather than copying the Child struct so those
+    /// modifications actually stick on the session.
     fn drainStderr(self: *Self) void {
-        const child = self.child orelse return;
+        if (self.child == null) return;
+        const child = &self.child.?;
         const stderr = child.stderr orelse return;
         var buf: [stderr_read_chunk]u8 = undefined;
         while (true) {
             const n = stderr.read(&buf) catch |err| switch (err) {
                 error.WouldBlock => return,
-                else => return,
+                else => {
+                    std.log.warn("preview: stderr read failed; capture disabled: {s}", .{@errorName(err)});
+                    stderr.close();
+                    child.stderr = null;
+                    return;
+                },
             };
-            if (n == 0) return;
+            if (n == 0) {
+                // EOF — child closed its stderr (typical on a clean
+                // exit). Stop trying so we don't spin on a dead pipe.
+                stderr.close();
+                child.stderr = null;
+                return;
+            }
             self.appendStderrCapped(buf[0..n]);
         }
     }
