@@ -604,9 +604,13 @@ fn handleDeleteKey(s: *SceneState) void {
     if (!zgui.isWindowHovered(.{ .child_windows = true })) return;
     if (!zgui.isKeyPressed(.delete, false)) return;
     const idx = s.selected_index orelse return;
-    scene_io.removeEntity(&s.loaded, idx) catch return;
-    s.selected_index = null;
-    s.is_dirty = true;
+    // Skip the confirmation modal here intentionally — the
+    // keyboard path is opt-in (the user has to know about it),
+    // matches the editor's pre-confirmation behaviour, and
+    // a per-press confirmation would feel intrusive on the
+    // power-user shortcut. Inspector + right-click trigger the
+    // modal via `requestDeleteEntity`.
+    performDelete(s, idx);
 }
 
 /// Re-exported so existing zspec tests (and any other caller of
