@@ -174,6 +174,13 @@ pub const App = struct {
     show_gizmos: bool = true,
 
     show_project_tree: bool = true,
+    /// Current width of the Project Tree sidebar (in screen px). The
+    /// user can resize the sidebar by dragging its right edge; the new
+    /// width is read back from ImGui each frame and stored here. Main
+    /// content's left position + width derives from this value so the
+    /// editor area follows the drag. Initialized from
+    /// `config.ui.sidebar_width`.
+    sidebar_width: f32 = config.ui.sidebar_width,
 
     show_new_scene_dialog: bool = false,
     new_scene_name: [SCENE_NAME_BUF_LEN:0]u8 = [_:0]u8{0} ** SCENE_NAME_BUF_LEN,
@@ -656,8 +663,9 @@ pub const App = struct {
         const viewport = zgui.getMainViewport();
         const work_pos = viewport.getWorkPos();
         const work_size = viewport.getWorkSize();
-        zgui.setNextWindowPos(.{ .x = work_pos[0] + config.ui.sidebar_width, .y = work_pos[1] });
-        zgui.setNextWindowSize(.{ .w = work_size[0] - config.ui.sidebar_width, .h = work_size[1] - config.ui.status_bar_height });
+        const sidebar_w = if (self.show_project_tree) self.sidebar_width else 0.0;
+        zgui.setNextWindowPos(.{ .x = work_pos[0] + sidebar_w, .y = work_pos[1] });
+        zgui.setNextWindowSize(.{ .w = work_size[0] - sidebar_w, .h = work_size[1] - config.ui.status_bar_height });
 
         if (!zgui.begin("##main", .{ .flags = .{
             .no_title_bar = true,

@@ -87,6 +87,14 @@ pub fn main() !void {
     fa_config.merge_mode = true;
     fa_config.pixel_snap_h = true;
     fa_config.glyph_min_advance_x = font_size;
+    // FontAwesome glyphs sit above the default text baseline because the
+    // icon designs center on the glyph box's visual middle while letters
+    // hang from the cap line. Push the merged icon range down by ~25 %
+    // of the active font size so folder/file icons sit centered against
+    // the x-height of their accompanying text (in the tree view and
+    // elsewhere). Proportional to font_size, so it scales correctly with
+    // DPI and the user's font-scale preference.
+    fa_config.glyph_offset = .{ 0.0, font_size * 0.1 };
     _ = zgui.io.addFontFromFileWithConfig(
         "assets/fonts/fa-solid-900.ttf",
         font_size,
