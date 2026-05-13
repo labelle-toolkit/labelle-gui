@@ -28,6 +28,7 @@ const gizmo_mod = @import("modules/gizmo.zig");
 const close_scene_dialog = @import("dialogs/close_scene.zig");
 const atlas = @import("atlas.zig");
 const gizmos = @import("gizmos.zig");
+const prefab_index = @import("prefab_index.zig");
 const new_scene_dialog = @import("dialogs/new_scene.zig");
 const dpi_warning_dialog = @import("dialogs/dpi_warning.zig");
 const preferences_dialog = @import("dialogs/preferences.zig");
@@ -155,6 +156,13 @@ pub const App = struct {
     /// the close-confirmation dialog is shown and other tabs can't be
     /// closed.
     pending_close_idx: ?usize = null,
+    /// Deferred "open prefab as a tab" path used by the scene editor's
+    /// double-click + Edit-prefab affordance. The act of opening a
+    /// prefab mutates `open_tabs`, which would invalidate the scene
+    /// tab's `SceneState *s` pointer mid-render. Setting this field
+    /// during render and processing it on the next frame keeps the
+    /// list stable for the rest of the current frame.
+    pending_open_prefab_path: ?[]u8 = null,
     /// Last seen `ProjectManager.generation`. Compared each frame so
     /// `closeAllTabs` runs the frame the active project changes.
     last_project_generation: ?u64 = null,
@@ -169,6 +177,12 @@ pub const App = struct {
     /// on project new/load; viewport queries it when `show_gizmos`
     /// is true to draw debug visualizations over matched entities.
     gizmo_index: ?gizmos.Index = null,
+    /// Per-project prefab cache (name → parsed prefab). Built alongside
+    /// `atlas_index` and `gizmo_index`; the scene viewport uses it to
+    /// resolve `{ "prefab": "canteen" }` references into renderable
+    /// sprites when the scene entity has no Sprite component of its
+    /// own. Invalidated when the project generation bumps.
+    prefab_index: ?prefab_index.Index = null,
     /// User toggle for the gizmo overlay; on by default so the
     /// overlay shows up immediately when a project with gizmos opens.
     show_gizmos: bool = true,
@@ -235,6 +249,8 @@ pub const App = struct {
         self.open_tabs.deinit(self.allocator);
         if (self.atlas_index) |*idx| idx.deinit();
         if (self.gizmo_index) |*idx| idx.deinit();
+        if (self.prefab_index) |*idx| idx.deinit();
+        if (self.pending_open_prefab_path) |p| self.allocator.free(p);
         self.project_manager.deinit();
         self.tree_view.deinit();
         self.compiler.deinit();
@@ -291,6 +307,23 @@ pub const App = struct {
         );
     }
 
+    /// Rebuild the prefab cache by walking `<project_dir>/prefabs/`
+    /// recursively and parsing every `.jsonc`. Same generation-keyed
+    /// invalidation rule the atlas + gizmo indexes use.
+    pub fn rebuildPrefabIndex(self: *Self) void {
+        if (self.prefab_index) |*idx| {
+            idx.deinit();
+            self.prefab_index = null;
+        }
+        const proj = self.project_manager.current_project orelse return;
+        const dir = proj.dir orelse return;
+        self.prefab_index = prefab_index.Index.build(
+            self.allocator,
+            dir,
+            self.project_manager.generation,
+        );
+    }
+
     // ─── Scene tabs ─────────────────────────────────────────────────────
 
     /// Open a `.jsonc` scene file (under `<project>/scenes/`) as a
@@ -329,6 +362,35 @@ pub const App = struct {
         const new_idx = self.open_tabs.items.len - 1;
         self.active_tab_idx = new_idx;
         self.focus_tab_idx = new_idx;
+    }
+
+    /// Queue a `openPrefab` call to run at the start of the next
+    /// frame. Used by the scene editor's double-click + Edit-prefab
+    /// affordance, which fires mid-render — opening a tab right then
+    /// would realloc `open_tabs` and invalidate the scene's
+    /// `SceneState` pointer the caller is still using. Path is dup'd
+    /// onto the heap; ownership transfers to App until the request
+    /// is flushed in `flushPendingOpens`.
+    pub fn requestOpenPrefab(self: *Self, path: []const u8) void {
+        if (self.pending_open_prefab_path) |existing| {
+            // A pending request from earlier in the same frame was
+            // never flushed (would only happen if this is called
+            // twice in one frame). Drop the older one.
+            self.allocator.free(existing);
+            self.pending_open_prefab_path = null;
+        }
+        self.pending_open_prefab_path = self.allocator.dupe(u8, path) catch return;
+    }
+
+    fn flushPendingOpens(self: *Self) void {
+        if (self.pending_open_prefab_path) |path| {
+            self.pending_open_prefab_path = null;
+            defer self.allocator.free(path);
+            self.openPrefab(path) catch |err| {
+                std.log.err("Failed to open prefab {s}: {s}", .{ path, @errorName(err) });
+                self.setStatus("Error opening prefab!");
+            };
+        }
     }
 
     /// Open a `.zig` file (under `<project>/scripts/flows/`) as a
@@ -431,6 +493,14 @@ pub const App = struct {
     pub fn renderFrame(self: *Self, dt_seconds: f32) void {
         if (self.status_timer > 0) self.status_timer -= dt_seconds;
 
+        // Process deferred actions from the previous frame BEFORE
+        // touching the project/tab structures. Mid-frame "open this
+        // prefab" requests (scene editor double-click + Edit prefab
+        // button) queue here so the act of mutating `open_tabs`
+        // doesn't invalidate the SceneState pointer the requester is
+        // still rendering against.
+        self.flushPendingOpens();
+
         // Project transitions close all open scene tabs so the next
         // frame doesn't read into freed memory belonging to the old
         // project. Detected via ProjectManager.generation, which is
@@ -442,10 +512,12 @@ pub const App = struct {
                 self.closeAllTabs();
                 self.rebuildAtlasIndex();
                 self.rebuildGizmoIndex();
+                self.rebuildPrefabIndex();
             }
         } else {
             self.rebuildAtlasIndex();
             self.rebuildGizmoIndex();
+            self.rebuildPrefabIndex();
         }
         self.last_project_generation = gen;
 

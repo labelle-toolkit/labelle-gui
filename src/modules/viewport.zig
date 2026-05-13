@@ -14,6 +14,7 @@ const zgui = @import("zgui");
 const scene_io = @import("../scene_io.zig");
 const atlas = @import("../atlas.zig");
 const gizmos = @import("../gizmos.zig");
+const prefab_index_mod = @import("../prefab_index.zig");
 
 pub const min_h: f32 = 240;
 
@@ -24,6 +25,14 @@ pub const State = struct {
     selected_idx: *?usize,
     is_dirty: *bool,
     drag_armed: *bool,
+    /// World-space position of the dragged entity at the moment the
+    /// drag was armed. The drag handler computes the live target as
+    /// `drag_start_world + total_drag_delta / zoom` (snapped when
+    /// applicable) rather than accumulating incremental deltas onto
+    /// the entity's running position; the accumulated approach
+    /// silently breaks snap because the running position keeps
+    /// rounding back to the same cell while the cursor drifts.
+    drag_start_world: *[2]f32,
     /// Optional sink for right-click world coordinates. The viewport
     /// writes the world-space point when the user right-clicks an
     /// empty area of the canvas (no entity under the cursor); the
@@ -32,6 +41,15 @@ pub const State = struct {
     /// care about right-clicks — the prefab editor sets this to
     /// null today.
     right_click_world: ?*?[2]f32 = null,
+    /// Optional sink for "double-click on a scene entity that
+    /// references a prefab". The viewport writes the entity index
+    /// when the user double-clicks inside the AABB of a prefab-
+    /// referencing scene entity; the caller is then responsible for
+    /// opening the prefab editor for `entities[idx].prefab`. Null
+    /// when the caller doesn't want the descend-into-prefab path
+    /// (the prefab editor itself sets this to null — there's no
+    /// further level to descend into).
+    double_click_entity: ?*?usize = null,
     /// World-space spacing for the visual grid AND, when snapping is on,
     /// the snap step. One number drives both so the grid the user sees
     /// is the grid their drags land on. Default 16 matches what most 2D
@@ -107,6 +125,7 @@ pub fn render(
     /// (gizmo matching against unmodeled components is skipped).
     entity_extras: []const []const scene_io.ComponentExtra,
     atlas_index: ?*const atlas.Index,
+    prefab_index: ?*const prefab_index_mod.Index,
     gizmo_index: ?*const gizmos.Index,
     show_gizmos: bool,
 ) void {
@@ -135,23 +154,50 @@ pub fn render(
     });
 
     drawGrid(dl, canvas_min, canvas_max, state.pan.*, state.zoom.*, state.grid_step);
-    drawEntities(dl, canvas_min, state, entities, atlas_index);
+    drawEntities(dl, canvas_min, state, entities, atlas_index, prefab_index);
     if (show_gizmos) if (gizmo_index) |gi| {
         drawGizmoOverlay(dl, canvas_min, state, entities, entity_extras, gi);
     };
 
     _ = zgui.invisibleButton("##canvas_drag", .{ .w = canvas_size[0], .h = canvas_size[1], .flags = .{} });
 
-    // Mouse-down: hit-test markers, arm drag-to-move only when the
-    // click landed on an entity (otherwise drag in empty space
-    // would drift the previously-selected entity).
+    // Mouse-down: hit-test entity AABBs first (so a click anywhere on
+    // an expanded prefab's visual footprint grabs the whole room),
+    // fall back to the radial marker hit-test for degenerate cases
+    // (no sprite, no prefab — the AABB collapses to a point and
+    // `entityWorldAabb` returns the radial-equivalent box). Arm
+    // drag-to-move only when the click landed on something.
     if (zgui.isItemHovered(.{}) and zgui.isMouseClicked(.left)) {
         const mouse = zgui.getMousePos();
-        const hit = hitTestEntity(entities, mouse, canvas_min, state.pan.*, state.zoom.*);
+        const hit = hitTestEntityAabb(entities, mouse, canvas_min, state.pan.*, state.zoom.*, atlas_index, prefab_index) orelse
+            hitTestEntity(entities, mouse, canvas_min, state.pan.*, state.zoom.*);
         state.selected_idx.* = hit;
         state.drag_armed.* = hit != null;
+        // Snapshot the entity's starting world position so the drag
+        // handler can compute the live target from total delta. ImGui
+        // also begins accumulating mouse-drag delta from this click,
+        // so the math lines up: position = start + delta/zoom.
+        if (hit) |idx| {
+            if (idx < entities.len) {
+                if (entities[idx].position) |p| {
+                    state.drag_start_world.* = .{ p.x, p.y };
+                }
+            }
+        }
     }
     if (!zgui.isMouseDown(.left)) state.drag_armed.* = false;
+
+    // Double-click on a scene entity whose AABB contains the cursor
+    // surfaces the index to the caller, which opens the entity's
+    // referenced prefab as a tab (only the scene editor wires this —
+    // the prefab editor passes null because there's no further level
+    // to descend into).
+    if (state.double_click_entity) |sink| {
+        if (zgui.isItemHovered(.{}) and zgui.isMouseDoubleClicked(.left)) {
+            const mouse = zgui.getMousePos();
+            sink.* = hitTestEntityAabb(entities, mouse, canvas_min, state.pan.*, state.zoom.*, atlas_index, prefab_index);
+        }
+    }
 
     // Right-click on empty canvas → caller-driven context menu. We
     // only fire when the click misses every entity marker; clicks
@@ -159,7 +205,8 @@ pub fn render(
     if (state.right_click_world) |sink| {
         if (zgui.isItemHovered(.{}) and zgui.isMouseClicked(.right)) {
             const mouse = zgui.getMousePos();
-            const hit = hitTestEntity(entities, mouse, canvas_min, state.pan.*, state.zoom.*);
+            const hit = hitTestEntityAabb(entities, mouse, canvas_min, state.pan.*, state.zoom.*, atlas_index, prefab_index) orelse
+                hitTestEntity(entities, mouse, canvas_min, state.pan.*, state.zoom.*);
             if (hit == null) {
                 sink.* = worldFromScreen(mouse, canvas_min, state.pan.*, state.zoom.*);
             }
@@ -178,16 +225,26 @@ pub fn render(
                 if (idx < entities.len and zgui.isMouseDragging(.left, 0)) {
                     const e = &entities[idx];
                     if (e.position) |*pos| {
+                        // Total delta in screen pixels since the
+                        // drag started — NOT incremental. We DON'T
+                        // reset it, so each frame we compute the
+                        // live target from the snapshot, which makes
+                        // snap behave (the running position would
+                        // otherwise round back to its cell every
+                        // frame while the cursor drifted away).
                         const d = zgui.getMouseDragDelta(.left, .{});
-                        pos.x += d[0] / state.zoom.*;
+                        var nx = state.drag_start_world[0] + d[0] / state.zoom.*;
                         // World +y is up; screen +y is down.
-                        pos.y -= d[1] / state.zoom.*;
+                        var ny = state.drag_start_world[1] - d[1] / state.zoom.*;
                         if (state.snap_enabled and state.grid_step > 0) {
-                            pos.x = snapValue(pos.x, state.snap_origin[0], state.grid_step);
-                            pos.y = snapValue(pos.y, state.snap_origin[1], state.grid_step);
+                            nx = snapValue(nx, state.snap_origin[0], state.grid_step);
+                            ny = snapValue(ny, state.snap_origin[1], state.grid_step);
                         }
-                        state.is_dirty.* = true;
-                        zgui.resetMouseDragDelta(.left);
+                        if (pos.x != nx or pos.y != ny) {
+                            pos.x = nx;
+                            pos.y = ny;
+                            state.is_dirty.* = true;
+                        }
                     }
                 }
             }
@@ -235,6 +292,7 @@ fn drawEntities(
     state: State,
     entities: []scene_io.Entity,
     atlas_index: ?*const atlas.Index,
+    prefab_index: ?*const prefab_index_mod.Index,
 ) void {
     for (entities, 0..) |e, i| {
         const pos = e.position orelse continue;
@@ -244,7 +302,8 @@ fn drawEntities(
 
         // Render priority: sprite (when it resolves against the
         // atlas) > rectangle geometry > circle geometry > polygon
-        // geometry > colored-circle marker. A declared-but-unresolved
+        // geometry > expanded prefab tree (if the entity references a
+        // prefab) > colored-circle marker. A declared-but-unresolved
         // sprite still gets a `?` overlay on whatever fallback it
         // falls into.
         const drew_sprite = drawSpriteIfResolved(dl, e, px, py, state.zoom.*, atlas_index);
@@ -261,6 +320,18 @@ fn drawEntities(
             drawPolygon(dl, e.polygon.?.*, px, py, state.zoom.*);
             drew_visual = true;
         }
+        if (!drew_visual and e.prefab != null and atlas_index != null and prefab_index != null) {
+            drew_visual = drawPrefabAtPosition(
+                dl,
+                e.prefab.?,
+                px,
+                py,
+                state.zoom.*,
+                atlas_index.?,
+                prefab_index.?,
+                0,
+            );
+        }
         if (!drew_visual) {
             const col = colorForPrefab(e.prefab);
             dl.addCircleFilled(.{
@@ -275,13 +346,30 @@ fn drawEntities(
         }
 
         if (selected) {
-            dl.addCircle(.{
-                .p = .{ px, py },
-                .r = 12,
-                .col = 0xff_ff_d2_40,
-                .num_segments = 24,
-                .thickness = 2.0,
-            });
+            // Outline the entity's full footprint (AABB of its sprite
+            // or expanded prefab tree) so the user can see the whole
+            // grabbable region. Falls back to a circle around the
+            // anchor when no AABB resolves (point-only entities).
+            if (entityWorldAabb(e, atlas_index, prefab_index)) |aabb| {
+                const sx0 = cmin[0] + state.pan[0] + aabb.min[0] * state.zoom.*;
+                const sy0 = cmin[1] + state.pan[1] - aabb.max[1] * state.zoom.*; // world y_max → screen y_min
+                const sx1 = cmin[0] + state.pan[0] + aabb.max[0] * state.zoom.*;
+                const sy1 = cmin[1] + state.pan[1] - aabb.min[1] * state.zoom.*;
+                dl.addRect(.{
+                    .pmin = .{ sx0, sy0 },
+                    .pmax = .{ sx1, sy1 },
+                    .col = 0xff_ff_d2_40,
+                    .thickness = 2.0,
+                });
+            } else {
+                dl.addCircle(.{
+                    .p = .{ px, py },
+                    .r = 12,
+                    .col = 0xff_ff_d2_40,
+                    .num_segments = 24,
+                    .thickness = 2.0,
+                });
+            }
         }
         if (e.prefab) |p| {
             dl.addText(.{ px + 8, py - 8 }, 0xff_e0_e0_e0, "{s}", .{p});
@@ -302,7 +390,20 @@ fn drawSpriteIfResolved(
 ) bool {
     const sprite = e.sprite orelse return false;
     const idx = atlas_index orelse return false;
+    return drawSpriteValueAt(dl, sprite.*, px, py, zoom, idx);
+}
 
+/// Lower-level sprite draw: takes the Sprite value directly so callers
+/// that aren't iterating `Entity`s (e.g. the prefab-child walker) can
+/// reuse the atlas resolve + UV math. Returns true on a hit.
+fn drawSpriteValueAt(
+    dl: zgui.DrawList,
+    sprite: scene_io.Sprite,
+    px: f32,
+    py: f32,
+    zoom: f32,
+    idx: *const atlas.Index,
+) bool {
     const name = std.mem.sliceTo(&sprite.sprite_name, 0);
     if (name.len == 0) return false;
     const ref = idx.find(name) orelse return false;
@@ -351,6 +452,62 @@ fn drawSpriteIfResolved(
         .uvmax = uv1,
     });
     return true;
+}
+
+/// Walk a prefab tree starting at `(px, py)` (screen space), drawing
+/// every Sprite encountered at its child-offset position. When a child
+/// itself references another prefab (no Sprite of its own), recurses
+/// into that prefab using the child's Position as the offset. Returns
+/// true if at least one sprite was actually drawn — caller uses that
+/// to decide whether the generic colored marker is still needed.
+///
+/// The depth limit is a guard against pathological cycles
+/// (`prefab A` referencing `B` referencing `A`). Real prefab trees in
+/// the example projects bottom out in 2–3 levels.
+const max_prefab_depth: u32 = 8;
+
+fn drawPrefabAtPosition(
+    dl: zgui.DrawList,
+    prefab_name: []const u8,
+    px: f32,
+    py: f32,
+    zoom: f32,
+    atlas_index: *const atlas.Index,
+    pfx_index: *const prefab_index_mod.Index,
+    depth: u32,
+) bool {
+    if (depth >= max_prefab_depth) return false;
+    const pfx = pfx_index.find(prefab_name) orelse return false;
+
+    var drew_any = false;
+
+    // 1. Root sprite (most prefabs that visually represent a single
+    // object live here — e.g. `background_sky`).
+    if (pfx.entity.sprite) |s| {
+        if (drawSpriteValueAt(dl, s.*, px, py, zoom, atlas_index)) drew_any = true;
+    }
+
+    // 2. Children: each one has its own Position offset relative to
+    // the prefab root. Render its Sprite if present, otherwise recurse
+    // into its referenced prefab.
+    for (pfx.children) |child| {
+        const off = child.position orelse continue;
+        const cx = px + off.x * zoom;
+        const cy = py - off.y * zoom;
+        if (child.sprite) |cs| {
+            if (drawSpriteValueAt(dl, cs.*, cx, cy, zoom, atlas_index)) {
+                drew_any = true;
+                continue;
+            }
+        }
+        if (child.prefab) |sub_name| {
+            if (drawPrefabAtPosition(dl, sub_name, cx, cy, zoom, atlas_index, pfx_index, depth + 1)) {
+                drew_any = true;
+            }
+        }
+    }
+
+    return drew_any;
 }
 
 /// Draw a `Rectangle` geometry component centered on `(px, py)` in
@@ -507,6 +664,174 @@ pub fn hitTestEntity(
         }
     }
     return best;
+}
+
+/// Axis-aligned bounding box in *world* coordinates. World +y is up
+/// (same convention `drawEntities` uses for the world→screen map).
+pub const WorldAabb = struct {
+    min: [2]f32,
+    max: [2]f32,
+
+    pub fn fromPoint(p: [2]f32) WorldAabb {
+        return .{ .min = p, .max = p };
+    }
+
+    pub fn expandToInclude(self: *WorldAabb, p: [2]f32) void {
+        self.min[0] = @min(self.min[0], p[0]);
+        self.min[1] = @min(self.min[1], p[1]);
+        self.max[0] = @max(self.max[0], p[0]);
+        self.max[1] = @max(self.max[1], p[1]);
+    }
+
+    pub fn merge(self: *WorldAabb, other: WorldAabb) void {
+        self.expandToInclude(other.min);
+        self.expandToInclude(other.max);
+    }
+};
+
+/// Sprite footprint in world coordinates around `anchor_world`,
+/// respecting the named pivot. `pivot.x` is the fraction of the
+/// sprite to the right of the anchor; `pivot.y` is the fraction
+/// above the anchor (world +y up). E.g. `bottom_center` →
+/// `(0.5, 0)` puts the anchor at the sprite's bottom midpoint, so
+/// the sprite extends `w/2` left, `w/2` right, `h` up, `0` down.
+fn spriteWorldAabb(sprite: scene_io.Sprite, anchor_world: [2]f32, ref: atlas.SpriteRef) WorldAabb {
+    const w: f32 = @floatFromInt(ref.frame.w);
+    const h: f32 = @floatFromInt(ref.frame.h);
+    const pivot_name = std.mem.sliceTo(&sprite.pivot, 0);
+    const pivot = pivotOffset(pivot_name);
+    return .{
+        .min = .{
+            anchor_world[0] - pivot[0] * w,
+            anchor_world[1] - pivot[1] * h,
+        },
+        .max = .{
+            anchor_world[0] + (1.0 - pivot[0]) * w,
+            anchor_world[1] + (1.0 - pivot[1]) * h,
+        },
+    };
+}
+
+/// Walk the prefab tree the same way `drawPrefabAtPosition` does,
+/// but accumulate AABBs of every resolvable sprite instead of issuing
+/// draw calls. Returns null when nothing in the tree resolves to a
+/// drawable sprite — caller can then fall back to a point-radius
+/// AABB. Depth-limited by `max_prefab_depth` to guard against cycles.
+fn prefabWorldAabb(
+    prefab_name: []const u8,
+    anchor_world: [2]f32,
+    atlas_idx: *const atlas.Index,
+    pfx_index: *const prefab_index_mod.Index,
+    depth: u32,
+) ?WorldAabb {
+    if (depth >= max_prefab_depth) return null;
+    const pfx = pfx_index.find(prefab_name) orelse return null;
+
+    var box: ?WorldAabb = null;
+
+    if (pfx.entity.sprite) |s| {
+        const name = std.mem.sliceTo(&s.sprite_name, 0);
+        if (name.len > 0) {
+            if (atlas_idx.find(name)) |ref| {
+                const sub = spriteWorldAabb(s.*, anchor_world, ref);
+                if (box) |*b| b.merge(sub) else box = sub;
+            }
+        }
+    }
+
+    for (pfx.children) |child| {
+        const off = child.position orelse continue;
+        const child_anchor: [2]f32 = .{ anchor_world[0] + off.x, anchor_world[1] + off.y };
+        if (child.sprite) |cs| {
+            const cname = std.mem.sliceTo(&cs.sprite_name, 0);
+            if (cname.len > 0) {
+                if (atlas_idx.find(cname)) |cref| {
+                    const sub = spriteWorldAabb(cs.*, child_anchor, cref);
+                    if (box) |*b| b.merge(sub) else box = sub;
+                    continue;
+                }
+            }
+        }
+        if (child.prefab) |sub_name| {
+            if (prefabWorldAabb(sub_name, child_anchor, atlas_idx, pfx_index, depth + 1)) |sub| {
+                if (box) |*b| b.merge(sub) else box = sub;
+            }
+        }
+    }
+
+    return box;
+}
+
+/// World-space AABB of a single scene entity, accounting for its
+/// own typed Sprite, its referenced prefab tree (when applicable),
+/// and falling back to a small point-radius box otherwise. Returns
+/// null when the entity has no Position (we don't draw it then —
+/// matches the `drawEntities` skip).
+pub fn entityWorldAabb(
+    entity: scene_io.Entity,
+    atlas_idx: ?*const atlas.Index,
+    pfx_index: ?*const prefab_index_mod.Index,
+) ?WorldAabb {
+    const pos = entity.position orelse return null;
+    const anchor: [2]f32 = .{ pos.x, pos.y };
+
+    if (entity.sprite) |s| {
+        if (atlas_idx) |ai| {
+            const name = std.mem.sliceTo(&s.sprite_name, 0);
+            if (name.len > 0) {
+                if (ai.find(name)) |ref| {
+                    return spriteWorldAabb(s.*, anchor, ref);
+                }
+            }
+        }
+    }
+
+    if (entity.prefab) |p| {
+        if (atlas_idx) |ai| if (pfx_index) |pi| {
+            if (prefabWorldAabb(p, anchor, ai, pi, 0)) |b| return b;
+        };
+    }
+
+    // Fallback: a small box around the anchor so degenerate entities
+    // (no sprite, no resolved prefab) still get a clickable target the
+    // same size as the marker dot.
+    const r: f32 = hit_radius;
+    return .{ .min = .{ anchor[0] - r, anchor[1] - r }, .max = .{ anchor[0] + r, anchor[1] + r } };
+}
+
+/// AABB hit-test: pick the topmost (last in iteration order) entity
+/// whose world-AABB contains the mouse position. Used by the scene
+/// viewport so room-sized prefab footprints become clickable
+/// everywhere they paint, not just within `hit_radius` of the
+/// anchor.
+pub fn hitTestEntityAabb(
+    entities: []scene_io.Entity,
+    mouse: [2]f32,
+    canvas_min: [2]f32,
+    pan: [2]f32,
+    zoom: f32,
+    atlas_idx: ?*const atlas.Index,
+    pfx_index: ?*const prefab_index_mod.Index,
+) ?usize {
+    // World-space mouse so we compare in the same coords the AABB is
+    // computed in. World +y is up; screen +y is down, hence the flip.
+    const mouse_world: [2]f32 = .{
+        (mouse[0] - canvas_min[0] - pan[0]) / zoom,
+        -(mouse[1] - canvas_min[1] - pan[1]) / zoom,
+    };
+    // Reverse iter so overlapping rooms select the one drawn last
+    // (= the one painted on top).
+    var i: usize = entities.len;
+    while (i > 0) {
+        i -= 1;
+        const aabb = entityWorldAabb(entities[i], atlas_idx, pfx_index) orelse continue;
+        if (mouse_world[0] >= aabb.min[0] and mouse_world[0] <= aabb.max[0] and
+            mouse_world[1] >= aabb.min[1] and mouse_world[1] <= aabb.max[1])
+        {
+            return i;
+        }
+    }
+    return null;
 }
 
 /// Walk every entity, check every gizmo's predicates, draw the gizmo's

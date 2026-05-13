@@ -57,12 +57,29 @@ pub fn renderEntity(
     is_dirty: *bool,
     entity_index: ?usize,
     atlas_index: ?*const atlas.Index,
+    /// Optional sink: when non-null AND the entity references a
+    /// prefab, the inspector renders an "Edit prefab" button next to
+    /// the prefab name. Clicking it writes the prefab name into the
+    /// sink; the caller resolves the file path and opens the prefab
+    /// as a tab. The scene editor wires this; the prefab editor passes
+    /// null because there's no further level to descend into.
+    request_open_prefab: ?*?[]const u8,
 ) void {
     if (entity_index) |n| {
         zgui.text("Entity #{d}", .{n});
     }
     if (entity.prefab) |p| {
         zgui.text("prefab: {s}", .{p});
+        if (request_open_prefab) |sink| {
+            zgui.sameLine(.{});
+            // ImGui identifies buttons by label; the "##..." suffix is
+            // a hidden discriminator so the button's ID stays stable
+            // even if a future Sprite section also wants to surface
+            // an "Edit prefab" affordance.
+            if (zgui.smallButton("Edit prefab##inspector_edit_prefab")) {
+                sink.* = p;
+            }
+        }
     } else {
         zgui.textDisabled("(no prefab)", .{});
     }
