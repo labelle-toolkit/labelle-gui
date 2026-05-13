@@ -4,33 +4,13 @@ const project = @import("project.zig");
 const icons = @import("icons.zig");
 
 /// Icons for each folder type (FontAwesome icons)
+/// Centralized icon set for the tree view. Every folder — top-level or
+/// nested — renders with the same `folder` glyph so the icon column
+/// reads consistently across the whole tree (issue #73). The chevron is
+/// the sole open/closed indicator. File rows use a single `file` glyph.
 pub const FolderIcons = struct {
-    pub const components = icons.FA_CUBE; // 3D cube for components
-    pub const fixtures = icons.FA_WRENCH; // Wrench for fixtures
-    pub const gizmos = icons.FA_BULLSEYE; // Bullseye for gizmos
-    pub const prefabs = icons.FA_BOX; // Box for prefabs
-    pub const scenes = icons.FA_FILM; // Film for scenes
-    pub const scripts = icons.FA_SCROLL; // Scroll for scripts
-    pub const scripts_flows = icons.FA_PROJECT_DIAGRAM; // Graph icon for flows
-    pub const resources = icons.FA_DATABASE; // Database for resources
-    pub const file = icons.FA_FILE; // File icon
-    pub const folder_open = icons.FA_FOLDER_OPEN; // Open folder
-    pub const folder_closed = icons.FA_FOLDER; // Closed folder
-
-    pub fn forFolder(name: []const u8) []const u8 {
-        if (std.mem.eql(u8, name, project.ProjectFolders.components)) return components;
-        if (std.mem.eql(u8, name, project.ProjectFolders.fixtures)) return fixtures;
-        if (std.mem.eql(u8, name, project.ProjectFolders.gizmos)) return gizmos;
-        if (std.mem.eql(u8, name, project.ProjectFolders.prefabs)) return prefabs;
-        if (std.mem.eql(u8, name, project.ProjectFolders.scenes)) return scenes;
-        if (std.mem.eql(u8, name, project.ProjectFolders.scripts)) return scripts;
-        // The Flows folder is nested under `scripts/` and registered
-        // in `ProjectFolders.all` as the literal `"scripts/flows"`.
-        // Match the full path here so the lookup hits.
-        if (std.mem.eql(u8, name, project.ProjectFolders.scripts_flows)) return scripts_flows;
-        if (std.mem.eql(u8, name, project.ProjectFolders.resources)) return resources;
-        return folder_closed;
-    }
+    pub const file = icons.FA_FILE;
+    pub const folder = icons.FA_FOLDER;
 };
 
 /// Represents a file entry in the tree
@@ -49,6 +29,16 @@ pub const TreeView = struct {
     allocator: std.mem.Allocator,
     selected_path: ?[]const u8,
     cached_files: std.StringHashMap(CacheEntry),
+    /// Set of expanded directory paths (top-level + nested). All rows —
+    /// folders and files — render as `zgui.selectable`, which is the
+    /// only way to guarantee folder and file selection bars have
+    /// identical height. ImGui's `TreeNodeFlags` uses a different
+    /// height formula (`FontSize + 2*FramePadding.y`) than `Selectable`
+    /// (`FontSize + ItemSpacing.y` after the bb spacing extension), so
+    /// the two widget types render visibly different bars. Owning the
+    /// open/closed state here lets us draw the disclosure caret as part
+    /// of the selectable's label glyph run.
+    open_dirs: std.StringHashMap(void),
     needs_refresh: bool,
 
     const Self = @This();
@@ -68,6 +58,7 @@ pub const TreeView = struct {
             .allocator = allocator,
             .selected_path = null,
             .cached_files = std.StringHashMap(CacheEntry).init(allocator),
+            .open_dirs = std.StringHashMap(void).init(allocator),
             .needs_refresh = true,
         };
     }
@@ -78,6 +69,29 @@ pub const TreeView = struct {
         }
         self.clearCache();
         self.cached_files.deinit();
+        self.clearOpenDirs();
+        self.open_dirs.deinit();
+    }
+
+    fn clearOpenDirs(self: *Self) void {
+        var it = self.open_dirs.keyIterator();
+        while (it.next()) |key| {
+            self.allocator.free(key.*);
+        }
+        self.open_dirs.clearRetainingCapacity();
+    }
+
+    fn isOpen(self: *const Self, path: []const u8) bool {
+        return self.open_dirs.contains(path);
+    }
+
+    fn toggleOpen(self: *Self, path: []const u8) void {
+        if (self.open_dirs.fetchRemove(path)) |kv| {
+            self.allocator.free(kv.key);
+            return;
+        }
+        const owned = self.allocator.dupe(u8, path) catch return;
+        self.open_dirs.put(owned, {}) catch self.allocator.free(owned);
     }
 
     fn clearCache(self: *Self) void {
@@ -132,37 +146,94 @@ pub const TreeView = struct {
             managed_paths[i] = std.fmt.bufPrint(&managed_storage[i], "{s}/{s}", .{ base_path, fname }) catch "";
         }
 
-        // Render each project folder (using stack buffers to avoid heap allocations per frame)
+        // Render each project folder
         for (project.ProjectFolders.all) |folder_name| {
-            const icon = FolderIcons.forFolder(folder_name);
-
             // Build folder path on stack
-            var folder_path_buf: [path_buf_size]u8 = undefined;
-            const folder_path = std.fmt.bufPrint(&folder_path_buf, "{s}/{s}", .{ base_path, folder_name }) catch continue;
+            var folder_path_buf: [path_buf_size:0]u8 = undefined;
+            const folder_path = std.fmt.bufPrintZ(&folder_path_buf, "{s}/{s}", .{ base_path, folder_name }) catch continue;
 
-            // Create tree node label directly on stack
-            var node_label: [256:0]u8 = undefined;
-            _ = std.fmt.bufPrintZ(&node_label, "{s} {s}", .{ icon, folder_name }) catch continue;
-
-            const node_open = zgui.treeNodeFlags(&node_label, .{});
-
-            if (node_open) {
-                if (self.renderFolder(folder_path, &managed_paths)) {
-                    file_selected = true;
-                }
-                zgui.treePop();
+            if (self.renderDirectoryRow(folder_path, folder_name, &managed_paths)) {
+                file_selected = true;
             }
         }
 
         return file_selected;
     }
 
-    /// Render the contents of a single directory. Recurses into subdirectories
-    /// (each becomes its own `treeNodeFlags`) so the user can drill arbitrarily
-    /// deep. Files at any depth render as `zgui.selectable` and route through
-    /// `self.selected_path` exactly like top-level files do. Subdirectories
-    /// whose absolute path matches a `managed_paths` entry are suppressed —
-    /// they're already rendered at top level (see `render`).
+    /// Render one directory row (selectable with caret + folder icon) and
+    /// recurse into its contents when the directory is in `open_dirs`.
+    /// Drives both top-level project folders and nested subdirectories so
+    /// every directory row in the tree uses the same widget — no
+    /// height/spacing drift between depths. Click toggles open/closed
+    /// state; the row never becomes `selected_path` (only files do).
+    fn renderDirectoryRow(
+        self: *Self,
+        folder_path: [:0]const u8,
+        display_name: []const u8,
+        managed_paths: []const []const u8,
+    ) bool {
+        var file_selected = false;
+        const is_open_state = self.isOpen(folder_path);
+        const caret = if (is_open_state) icons.FA_CARET_DOWN else icons.FA_CARET_RIGHT;
+
+        var label_buf: [512:0]u8 = undefined;
+        const label = std.fmt.bufPrintZ(
+            &label_buf,
+            "{s}{s} {s}",
+            .{ caret, FolderIcons.folder, display_name },
+        ) catch return false;
+
+        zgui.pushStrIdZ(folder_path);
+        defer zgui.popId();
+
+        // Capture the row's leading screen-X *before* the selectable: this
+        // is the caret column, where the vertical guide line for the
+        // open-children block needs to drop from.
+        const parent_screen_x = zgui.getCursorScreenPos()[0];
+
+        if (zgui.selectable(label, .{})) {
+            self.toggleOpen(folder_path);
+        }
+
+        if (self.isOpen(folder_path)) {
+            zgui.indent(.{});
+            defer zgui.unindent(.{});
+
+            const line_top_y = zgui.getCursorScreenPos()[1];
+            if (self.renderFolder(folder_path, managed_paths)) {
+                file_selected = true;
+            }
+            const line_bottom_y = zgui.getCursorScreenPos()[1];
+
+            // Vertical guide line sits over the caret glyph itself.
+            // FA_CARET_RIGHT / FA_CARET_DOWN are drawn left-aligned
+            // within their `glyph_min_advance_x = font_size` advance box
+            // (see main.zig) and span roughly 35-40% of that box, so the
+            // caret's visual center sits ~0.3 * font_size from the row's
+            // leading edge. Color comes from the imgui theme so it
+            // tracks dark/light style switches.
+            const draw_list = zgui.getWindowDrawList();
+            const color_u32 = zgui.colorConvertFloat4ToU32(
+                zgui.getStyle().getColor(.tree_lines),
+            );
+            const line_x = parent_screen_x + zgui.getFontSize() * 0.4;
+            draw_list.addLine(.{
+                .p1 = .{ line_x, line_top_y },
+                .p2 = .{ line_x, line_bottom_y },
+                .col = color_u32,
+                .thickness = 1.0,
+            });
+        }
+
+        return file_selected;
+    }
+
+    /// Render the contents of an opened directory. Each child renders as
+    /// a single `selectable` — directories route through
+    /// `renderDirectoryRow` so they share the same widget + height as
+    /// files. Subdirectories whose absolute path matches a
+    /// `managed_paths` entry are suppressed because they're already
+    /// rendered at top level (e.g. `scripts/flows`).
     fn renderFolder(self: *Self, folder_path: []const u8, managed_paths: []const []const u8) bool {
         var file_selected = false;
 
@@ -197,21 +268,26 @@ pub const TreeView = struct {
                 if (is_managed) continue;
             }
 
-            var label_buf: [512:0]u8 = undefined;
-            const file_icon = if (file_entry.is_directory) FolderIcons.folder_closed else FolderIcons.file;
-            const label = std.fmt.bufPrintZ(&label_buf, "{s} {s}", .{ file_icon, file_entry.name }) catch continue;
-
-            zgui.pushStrIdZ(full_path);
-            defer zgui.popId();
-
             if (file_entry.is_directory) {
-                if (zgui.treeNodeFlags(label, .{})) {
-                    if (self.renderFolder(full_path, managed_paths)) {
-                        file_selected = true;
-                    }
-                    zgui.treePop();
+                if (self.renderDirectoryRow(full_path, file_entry.name, managed_paths)) {
+                    file_selected = true;
                 }
             } else {
+                var label_buf: [512:0]u8 = undefined;
+                // No leading space — files have no caret column, so their
+                // icon sits at the row's leading edge (where a directory's
+                // caret would be). Matches the VS Code-style file tree
+                // alignment: file icon column == directory caret column,
+                // file name column == directory folder-icon column.
+                const label = std.fmt.bufPrintZ(
+                    &label_buf,
+                    "{s} {s}",
+                    .{ FolderIcons.file, file_entry.name },
+                ) catch continue;
+
+                zgui.pushStrIdZ(full_path);
+                defer zgui.popId();
+
                 const is_selected = if (self.selected_path) |sel|
                     std.mem.eql(u8, sel, full_path)
                 else

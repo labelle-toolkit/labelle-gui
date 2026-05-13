@@ -80,17 +80,27 @@ fn render(app: *App) void {
     const viewport = zgui.getMainViewport();
     const work_pos = viewport.getWorkPos();
     const work_size = viewport.getWorkSize();
+    // Clamp the persisted width to a sane range every frame so a
+    // pathological resize (e.g. dragging past the editor area) recovers
+    // on the next frame.
+    const min_w: f32 = 120.0;
+    const max_w: f32 = work_size[0] * 0.6;
+    app.sidebar_width = std.math.clamp(app.sidebar_width, min_w, max_w);
     zgui.setNextWindowPos(.{ .x = work_pos[0], .y = work_pos[1] });
     zgui.setNextWindowSize(.{
-        .w = config.ui.sidebar_width,
+        .w = app.sidebar_width,
         .h = work_size[1] - config.ui.status_bar_height,
+        .cond = .always,
     });
 
     if (zgui.begin("Project", .{ .flags = .{
-        .no_resize = true,
         .no_move = true,
         .no_collapse = true,
     } })) {
+        // Read back the live window width — ImGui updates this in-place
+        // while the user drags the right edge — so the main content
+        // window can shift to follow on the same frame.
+        app.sidebar_width = zgui.getWindowSize()[0];
         if (app.project_manager.current_project) |proj| {
             // Tree returns true on the frame a file is newly clicked.
             // `.jsonc` files under `scenes/` route to the scene

@@ -205,49 +205,12 @@ pub const ConstantsTests = struct {
 };
 
 pub const FolderIconsTests = struct {
-    test "components folder has cube icon" {
-        const icon = tree_view.FolderIcons.forFolder("components");
-        try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.components));
+    test "folder constant is FA_FOLDER glyph" {
+        try expect.toBeTrue(std.mem.eql(u8, tree_view.FolderIcons.folder, "\u{f07b}"));
     }
 
-    test "fixtures folder has wrench icon" {
-        const icon = tree_view.FolderIcons.forFolder("fixtures");
-        try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.fixtures));
-    }
-
-    test "gizmos folder has bullseye icon" {
-        const icon = tree_view.FolderIcons.forFolder("gizmos");
-        try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.gizmos));
-    }
-
-    test "prefabs folder has box icon" {
-        const icon = tree_view.FolderIcons.forFolder("prefabs");
-        try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.prefabs));
-    }
-
-    test "scenes folder has film icon" {
-        const icon = tree_view.FolderIcons.forFolder("scenes");
-        try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.scenes));
-    }
-
-    test "scripts folder has scroll icon" {
-        const icon = tree_view.FolderIcons.forFolder("scripts");
-        try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.scripts));
-    }
-
-    test "scripts/flows has project-diagram icon" {
-        const icon = tree_view.FolderIcons.forFolder("scripts/flows");
-        try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.scripts_flows));
-    }
-
-    test "resources folder has database icon" {
-        const icon = tree_view.FolderIcons.forFolder("resources");
-        try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.resources));
-    }
-
-    test "unknown folder returns default folder icon" {
-        const icon = tree_view.FolderIcons.forFolder("unknown");
-        try expect.toBeTrue(std.mem.eql(u8, icon, tree_view.FolderIcons.folder_closed));
+    test "file constant is FA_FILE glyph" {
+        try expect.toBeTrue(std.mem.eql(u8, tree_view.FolderIcons.file, "\u{f15b}"));
     }
 };
 

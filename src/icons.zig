@@ -25,6 +25,10 @@ pub const FA_SCROLL = "\u{f70e}"; // scroll (for scripts)
 pub const FA_DATABASE = "\u{f1c0}"; // database (for resources)
 pub const FA_PROJECT_DIAGRAM = "\u{f046}"; // project-diagram / graph (for flows)
 
+// Disclosure chevrons (tree view)
+pub const FA_CARET_RIGHT = "\u{f0da}"; // caret-right (closed disclosure)
+pub const FA_CARET_DOWN = "\u{f0d7}"; // caret-down (open disclosure)
+
 // Common UI icons
 pub const FA_PLUS = "\u{f067}"; // plus
 pub const FA_MINUS = "\u{f068}"; // minus
