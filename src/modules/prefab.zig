@@ -36,6 +36,11 @@ pub const PrefabState = struct {
     selected_child_idx: ?usize = null,
     is_dirty: bool = false,
     drag_armed: bool = false,
+    /// Entity's world-space position at the moment a drag was armed.
+    /// The viewport uses this snapshot + the cumulative drag delta to
+    /// compute each frame's live target, so snap-to-grid doesn't fight
+    /// the running position (see comment on `viewport.State.drag_start_world`).
+    drag_start_world: [2]f32 = .{ 0, 0 },
     pan: [2]f32 = .{ 320, 240 },
     zoom: f32 = 1.0,
     /// World-space spacing for the viewport's visual grid. When
@@ -111,6 +116,7 @@ pub fn render(s: *PrefabState, app: *App) void {
 
     const atlas_index_ptr: ?*const @import("../atlas.zig").Index = if (app.atlas_index) |*ix| ix else null;
     const gizmo_index_ptr: ?*const @import("../gizmos.zig").Index = if (app.gizmo_index) |*ix| ix else null;
+    const prefab_index_ptr: ?*const @import("../prefab_index.zig").Index = if (app.prefab_index) |*ix| ix else null;
 
     if (zgui.beginChild("##prefab_viewport_col", .{ .w = viewport_w, .h = 0 })) {
         viewport.render(
@@ -120,12 +126,14 @@ pub fn render(s: *PrefabState, app: *App) void {
                 .selected_idx = &s.selected_child_idx,
                 .is_dirty = &s.is_dirty,
                 .drag_armed = &s.drag_armed,
+                .drag_start_world = &s.drag_start_world,
                 .grid_step = s.grid_step,
                 .snap_enabled = s.snap_enabled,
             },
             s.loaded.children,
             s.loaded.children_extras,
             atlas_index_ptr,
+            prefab_index_ptr,
             gizmo_index_ptr,
             app.show_gizmos,
         );
@@ -149,6 +157,13 @@ pub fn savePrefab(s: *PrefabState, app: *App) void {
         return;
     };
     s.is_dirty = false;
+    // Invalidate the project's prefab cache so scenes referencing
+    // this prefab pick up the new layout on their next render. The
+    // cache holds an independently-parsed copy of every prefab; the
+    // PrefabState we just saved is its own copy that lives only in
+    // this tab. Without a rebuild the scene viewport keeps drawing
+    // the pre-save geometry until the project is reopened.
+    app.rebuildPrefabIndex();
     app.setStatus("Prefab saved!");
 }
 
@@ -174,14 +189,14 @@ fn renderInspector(s: *PrefabState, atlas_index: ?*const @import("../atlas.zig")
         else
             &[_]scene_io.ComponentExtra{};
 
-        inspector.renderEntity(child, extras, &s.is_dirty, idx, atlas_index);
+        inspector.renderEntity(child, extras, &s.is_dirty, idx, atlas_index, null);
         return;
     }
 
     // Nothing selected → show the prefab's own components.
     zgui.text("Prefab body", .{});
     zgui.spacing();
-    inspector.renderEntity(&s.loaded.entity, s.loaded.component_extras, &s.is_dirty, null, atlas_index);
+    inspector.renderEntity(&s.loaded.entity, s.loaded.component_extras, &s.is_dirty, null, atlas_index, null);
 
     if (s.loaded.children.len > 0) {
         zgui.spacing();
