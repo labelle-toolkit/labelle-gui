@@ -139,6 +139,15 @@ pub fn build(b: *std.Build) void {
     const gui_test_step = b.step("gui-test", "Run the UI test runner");
     gui_test_step.dependOn(&run_gui_tests.step);
 
+    // Build-only step for CI: produces `zig-out/bin/gui-tests` without
+    // running it, so the artifact can be uploaded once by the `build`
+    // job and reused by the `ui-tests` job (which then only needs Xvfb
+    // and runtime libs, no Zig toolchain). Local dev still uses
+    // `zig build gui-test` to build + run in one shot.
+    const install_gui_tests = b.addInstallArtifact(gui_tests_exe, .{});
+    const gui_test_build_step = b.step("gui-test-build", "Build the UI test runner binary (no run)");
+    gui_test_build_step.dependOn(&install_gui_tests.step);
+
     // End-to-end smoke check ----------------------------------------------
     //
     // Drives the gui's project writer + Compiler.launcherGenerate against
