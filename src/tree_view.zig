@@ -144,7 +144,7 @@ pub const TreeView = struct {
             var node_label: [256:0]u8 = undefined;
             _ = std.fmt.bufPrintZ(&node_label, "{s} {s}", .{ icon, folder_name }) catch continue;
 
-            const node_open = zgui.treeNodeFlags(&node_label, .{});
+            const node_open = zgui.treeNodeFlags(&node_label, .{ .span_full_width = true });
 
             if (node_open) {
                 if (self.renderFolder(folder_path, &managed_paths)) {
@@ -205,13 +205,27 @@ pub const TreeView = struct {
             defer zgui.popId();
 
             if (file_entry.is_directory) {
-                if (zgui.treeNodeFlags(label, .{})) {
+                if (zgui.treeNodeFlags(label, .{ .span_full_width = true })) {
                     if (self.renderFolder(full_path, managed_paths)) {
                         file_selected = true;
                     }
                     zgui.treePop();
                 }
             } else {
+                // File rows render as `selectable`, which starts at the row's
+                // left edge. Subfolder rows above them use `treeNodeFlags`,
+                // whose label sits to the right of the chevron column
+                // (FontSize + 2*FramePadding.x). Without a matching indent
+                // here, the file icon column lands flush against the parent
+                // indent while subfolder icon columns sit one chevron-width
+                // further right — the chevron then looks "attached" to the
+                // file row above instead of belonging to its own subfolder.
+                // Issue #73 acceptance: file + subfolder icons aligned inside
+                // the same parent.
+                const indent_w = zgui.getFontSize() + zgui.getStyle().frame_padding[0] * 2.0;
+                zgui.indent(.{ .indent_w = indent_w });
+                defer zgui.unindent(.{ .indent_w = indent_w });
+
                 const is_selected = if (self.selected_path) |sel|
                     std.mem.eql(u8, sel, full_path)
                 else
