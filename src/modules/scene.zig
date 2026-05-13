@@ -84,6 +84,20 @@ pub const SceneState = struct {
     /// Filter buffer for the picker's search box. Stays sticky across
     /// reopenings — same convenience the resources panel has.
     prefab_picker_filter: [64:0]u8 = [_:0]u8{0} ** 64,
+    /// Index of an entity the user has requested to delete and which
+    /// requires confirmation before removal (prefab instances + any
+    /// entity carrying non-Position components or a comment). The
+    /// confirmation modal reads this; on accept, calls
+    /// `scene_io.removeEntity`. Bare-Position entities are deleted
+    /// immediately without a modal (cheap to add back via the
+    /// existing right-click menu).
+    pending_delete_idx: ?usize = null,
+    /// One-shot flag flipped by `requestDeleteEntity` so the parent
+    /// scope (`render`) can call `openPopup` from a common ID stack —
+    /// the delete may be triggered from inside either the viewport
+    /// child or the inspector child, but the modal lives at the
+    /// scene-tab level so both paths surface the same popup.
+    delete_modal_just_opened: bool = false,
     /// World-space spacing for the viewport's visual grid. When
     /// `snap_enabled` is on, drag-to-move also rounds to multiples of
     /// this value — one number, both behaviors. Default 16 works for
@@ -206,6 +220,20 @@ pub fn render(s: *SceneState, app: *App) void {
         renderInspector(s, app, atlas_index_ptr);
     }
     zgui.endChild();
+
+    // Delete-confirm popup lives at the scene-tab parent scope (not
+    // inside either child) so both trigger paths share the same ID
+    // stack: the inspector's Delete button (called from inside
+    // `##inspector_col`) and the viewport's right-click → Delete
+    // (called from inside `##viewport_col`). Both set
+    // `delete_modal_just_opened` instead of calling `openPopup`
+    // directly; the parent scope fires the `openPopup` here and
+    // renders the modal in the same ID stack.
+    if (s.delete_modal_just_opened) {
+        zgui.openPopup("##scene_delete_confirm", .{});
+        s.delete_modal_just_opened = false;
+    }
+    renderDeleteConfirmModal(s);
 }
 
 /// Write the current scene back to its source path. Clears the dirty
@@ -241,11 +269,103 @@ fn renderInspector(s: *SceneState, app: *App, atlas_index: ?*const @import("../a
         &[_]scene_io.ComponentExtra{};
 
     var open_prefab_request: ?[]const u8 = null;
-    inspector.renderEntity(entity, extras, &s.is_dirty, idx, atlas_index, &open_prefab_request);
+    var delete_request: bool = false;
+    inspector.renderEntity(entity, extras, &s.is_dirty, idx, atlas_index, &open_prefab_request, &delete_request);
     if (open_prefab_request) |_| {
         // The button was clicked — resolve via the prefab cache and
         // open the file. Same routing used by the double-click jump.
         openPrefabFromEntity(app, s, idx);
+    }
+    if (delete_request) {
+        requestDeleteEntity(s, idx);
+    }
+}
+
+/// Either delete the entity at `idx` immediately, or queue it for a
+/// confirmation modal (when the entity is non-trivial: prefab
+/// references, any non-Position component, a hand-authored comment,
+/// or unmodeled component_extras). The modal is rendered by
+/// `renderDeleteConfirmModal` at the scene-tab top scope so both the
+/// inspector + viewport context-menu triggers share one popup; the
+/// actual `openPopup` call happens there too via the
+/// `delete_modal_just_opened` one-shot.
+fn requestDeleteEntity(s: *SceneState, idx: usize) void {
+    if (idx >= s.loaded.scene.entities.len) return;
+    if (needsDeleteConfirm(&s.loaded.scene.entities[idx], idx, s)) {
+        s.pending_delete_idx = idx;
+        s.delete_modal_just_opened = true;
+    } else {
+        performDelete(s, idx);
+    }
+}
+
+fn needsDeleteConfirm(e: *const scene_io.Entity, idx: usize, s: *const SceneState) bool {
+    if (e.prefab != null) return true;
+    // Any typed component beyond Position counts as "non-trivial" —
+    // deleting silently would be the same kind of loss as the prefab
+    // case.
+    if (e.sprite != null) return true;
+    if (e.rectangle != null) return true;
+    if (e.circle != null) return true;
+    if (e.polygon != null) return true;
+    // Non-empty `comment` is hand-authored data; protect from silent
+    // loss the same as the typed components above.
+    if (e.comment[0] != 0) return true;
+    // Unmodeled component_extras attached to this entity? Then user
+    // probably has hand-authored data we shouldn't silently drop.
+    if (idx < s.loaded.extras.entity_components.len and
+        s.loaded.extras.entity_components[idx].len > 0)
+    {
+        return true;
+    }
+    return false;
+}
+
+fn performDelete(s: *SceneState, idx: usize) void {
+    scene_io.removeEntity(&s.loaded, idx) catch return;
+    // Selection clears so the inspector falls back to its
+    // "click an entity in the viewport to select" placeholder.
+    s.selected_index = null;
+    s.is_dirty = true;
+}
+
+/// Confirmation modal for a queued delete. No-op when nothing is
+/// pending — the popup machinery in imgui only opens when
+/// `openPopup` fires (we did that in `requestDeleteEntity`), so this
+/// just renders the body + buttons when active.
+fn renderDeleteConfirmModal(s: *SceneState) void {
+    if (!zgui.beginPopupModal("##scene_delete_confirm", .{ .flags = .{ .always_auto_resize = true } })) return;
+    defer zgui.endPopup();
+
+    const idx = s.pending_delete_idx orelse {
+        zgui.closeCurrentPopup();
+        return;
+    };
+    if (idx >= s.loaded.scene.entities.len) {
+        // Underlying list shifted under us — abort cleanly.
+        s.pending_delete_idx = null;
+        zgui.closeCurrentPopup();
+        return;
+    }
+    const entity = &s.loaded.scene.entities[idx];
+
+    zgui.text("Delete this entity?", .{});
+    if (entity.prefab) |p| {
+        zgui.textDisabled("prefab: {s} (entity #{d})", .{ p, idx });
+    } else {
+        zgui.textDisabled("entity #{d}", .{idx});
+    }
+    zgui.spacing();
+    zgui.separator();
+    if (zgui.button("Delete##scene_delete_confirm_ok", .{ .w = 96 })) {
+        performDelete(s, idx);
+        s.pending_delete_idx = null;
+        zgui.closeCurrentPopup();
+    }
+    zgui.sameLine(.{});
+    if (zgui.button("Cancel##scene_delete_confirm_cancel", .{ .w = 96 })) {
+        s.pending_delete_idx = null;
+        zgui.closeCurrentPopup();
     }
 }
 
@@ -257,10 +377,13 @@ fn renderViewport(
     gizmo_index: ?*const @import("../gizmos.zig").Index,
     show_gizmos: bool,
 ) void {
-    // Capture right-click world-pos + double-click entity index
-    // out-of-band; the viewport writes through these sinks during its
-    // render so we can react after it returns.
+    // Capture right-click sinks + double-click entity index out-of-
+    // band; the viewport writes through these during its render so
+    // we can react after it returns. Right-click on empty canvas
+    // fills `right_click_world`; right-click on an entity fills
+    // `right_click_entity` — never both for the same click.
     var right_click: ?[2]f32 = null;
+    var right_click_entity: ?usize = null;
     var double_click: ?usize = null;
     viewport.render(
         .{
@@ -271,6 +394,7 @@ fn renderViewport(
             .drag_armed = &s.drag_armed,
             .drag_start_world = &s.drag_start_world,
             .right_click_world = &right_click,
+            .right_click_entity = &right_click_entity,
             .double_click_entity = &double_click,
             .grid_step = s.grid_step,
             .snap_enabled = s.snap_enabled,
@@ -286,8 +410,33 @@ fn renderViewport(
         s.context_menu_world_pos = world;
         zgui.openPopup("##scene_context", .{});
     }
+    if (right_click_entity) |idx| {
+        // Select the clicked entity so the per-entity menu's Delete
+        // acts on the right target, then open the context menu.
+        s.selected_index = idx;
+        zgui.openPopup("##scene_entity_context", .{});
+    }
     if (double_click) |idx| {
         openPrefabFromEntity(app, s, idx);
+    }
+}
+
+/// Per-entity right-click context menu — currently just Delete, room
+/// to grow when #80 lands Unpack. Rendered in the same scope as the
+/// empty-canvas context menu so both popups share the viewport
+/// child's ID stack.
+fn renderEntityContextMenu(s: *SceneState) void {
+    if (!zgui.beginPopup("##scene_entity_context", .{})) return;
+    defer zgui.endPopup();
+    const idx = s.selected_index orelse {
+        zgui.closeCurrentPopup();
+        return;
+    };
+    if (zgui.menuItem("Delete", .{})) {
+        zgui.closeCurrentPopup();
+        // Delegate to the same path the inspector Delete button uses,
+        // which handles the confirm-or-not-confirm branch.
+        requestDeleteEntity(s, idx);
     }
 }
 
@@ -335,6 +484,7 @@ fn renderContextMenu(s: *SceneState, app: *App) void {
         if (!s.show_prefab_picker) s.context_menu_world_pos = null;
     }
     renderPrefabPicker(s, app);
+    renderEntityContextMenu(s);
 }
 
 fn renderPrefabPicker(s: *SceneState, app: *App) void {
@@ -454,9 +604,13 @@ fn handleDeleteKey(s: *SceneState) void {
     if (!zgui.isWindowHovered(.{ .child_windows = true })) return;
     if (!zgui.isKeyPressed(.delete, false)) return;
     const idx = s.selected_index orelse return;
-    scene_io.removeEntity(&s.loaded, idx) catch return;
-    s.selected_index = null;
-    s.is_dirty = true;
+    // Skip the confirmation modal here intentionally — the
+    // keyboard path is opt-in (the user has to know about it),
+    // matches the editor's pre-confirmation behaviour, and
+    // a per-press confirmation would feel intrusive on the
+    // power-user shortcut. Inspector + right-click trigger the
+    // modal via `requestDeleteEntity`.
+    performDelete(s, idx);
 }
 
 /// Re-exported so existing zspec tests (and any other caller of

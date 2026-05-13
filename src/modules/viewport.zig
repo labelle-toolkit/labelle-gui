@@ -50,6 +50,15 @@ pub const State = struct {
     /// (the prefab editor itself sets this to null — there's no
     /// further level to descend into).
     double_click_entity: ?*?usize = null,
+    /// Optional sink for "right-click on a scene entity". The
+    /// viewport writes the entity index when the right-click lands
+    /// on an entity (AABB or radial hit), so the caller can open a
+    /// per-entity context menu (e.g. Delete) at the click site.
+    /// `right_click_world` continues to fire for *empty-canvas* right-
+    /// clicks; the two sinks are mutually exclusive on any given
+    /// click — entity-hit goes to `right_click_entity`, miss goes to
+    /// `right_click_world`.
+    right_click_entity: ?*?usize = null,
     /// World-space spacing for the visual grid AND, when snapping is on,
     /// the snap step. One number drives both so the grid the user sees
     /// is the grid their drags land on. Default 16 matches what most 2D
@@ -205,17 +214,18 @@ pub fn render(
         }
     }
 
-    // Right-click on empty canvas → caller-driven context menu. We
-    // only fire when the click misses every entity marker; clicks
-    // *on* an entity stay free for a future per-entity menu.
-    if (state.right_click_world) |sink| {
-        if (zgui.isItemHovered(.{}) and zgui.isMouseClicked(.right)) {
-            const mouse = zgui.getMousePos();
-            const hit = hitTestEntityAabb(entities, mouse, canvas_min, state.pan.*, state.zoom.*, atlas_index, prefab_index) orelse
-                hitTestEntity(entities, mouse, canvas_min, state.pan.*, state.zoom.*);
-            if (hit == null) {
-                sink.* = worldFromScreen(mouse, canvas_min, state.pan.*, state.zoom.*);
-            }
+    // Right-click splits two ways: empty canvas → world-pos sink for
+    // the caller's "add entity here" menu; on-entity → entity-index
+    // sink for the caller's per-entity menu (Delete, etc.). Mutually
+    // exclusive — a single click fills only one sink.
+    if (zgui.isItemHovered(.{}) and zgui.isMouseClicked(.right)) {
+        const mouse = zgui.getMousePos();
+        const hit = hitTestEntityAabb(entities, mouse, canvas_min, state.pan.*, state.zoom.*, atlas_index, prefab_index) orelse
+            hitTestEntity(entities, mouse, canvas_min, state.pan.*, state.zoom.*);
+        if (hit) |idx| {
+            if (state.right_click_entity) |sink| sink.* = idx;
+        } else if (state.right_click_world) |sink| {
+            sink.* = worldFromScreen(mouse, canvas_min, state.pan.*, state.zoom.*);
         }
     }
 
