@@ -94,6 +94,18 @@ const max_frame_bytes: usize = 64 * 1024;
 /// re-allocating on every line.
 const read_chunk: usize = 1024;
 
+/// Cap on captured-child-stderr bytes. We keep the tail so the user
+/// sees the most recent (most diagnostic) output when a session fails.
+/// 8 KiB is enough for a CLI usage error + a small stack trace; tight
+/// enough that a misbehaving child spamming stderr can't OOM the
+/// editor.
+const max_stderr_bytes: usize = 8 * 1024;
+
+/// Read buffer for non-blocking stderr drains. Matches `read_chunk`
+/// in spirit; small enough to avoid stack pressure, big enough to
+/// pull a typical CLI error line in one syscall.
+const stderr_read_chunk: usize = 1024;
+
 pub const PreviewSession = struct {
     allocator: std.mem.Allocator,
     state: State,
@@ -124,6 +136,16 @@ pub const PreviewSession = struct {
     /// next frame.
     rx_buf: std.ArrayList(u8),
 
+    /// Captured child-stderr tail, drained non-blockingly each frame.
+    /// Surfaced verbatim by the preview panel when the session lands
+    /// in `crashed` so the user sees the CLI's actual error message
+    /// (e.g. "labelle run: unknown flag '--'" when the installed
+    /// launcher is too old to forward the preview-mode args) instead
+    /// of a generic "Preview crashed". Capped at `max_stderr_bytes`;
+    /// older bytes are dropped from the front so the most-recent (most
+    /// diagnostic) tail wins.
+    stderr_buf: std.ArrayList(u8),
+
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator) Self {
@@ -140,12 +162,14 @@ pub const PreviewSession = struct {
             .bye_reason = null,
             .started_ms = null,
             .rx_buf = .{},
+            .stderr_buf = .{},
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.teardown();
         self.rx_buf.deinit(self.allocator);
+        self.stderr_buf.deinit(self.allocator);
     }
 
     /// Spawn a preview run for `proj`. Mirrors `Compiler.buildOrRun`'s
@@ -185,7 +209,12 @@ pub const PreviewSession = struct {
         }, self.allocator);
         child.stdin_behavior = .Ignore;
         child.stdout_behavior = .Inherit;
-        child.stderr_behavior = .Inherit;
+        // Capture stderr so we can surface the launcher / engine's
+        // own error messages in the preview panel when a session
+        // fails. Without this the user sees only "Preview crashed"
+        // and has to re-run the editor from a terminal to learn
+        // anything actionable.
+        child.stderr_behavior = .Pipe;
 
         child.spawn() catch |err| switch (err) {
             error.FileNotFound => return error.LauncherNotFound,
@@ -194,6 +223,16 @@ pub const PreviewSession = struct {
                 return error.LauncherNotFound;
             },
         };
+
+        // Non-block the captured stderr so `drainStderr` can pull
+        // whatever the child has produced so far without ever blocking
+        // the render thread. POSIX-only — the helper short-circuits on
+        // Windows (see `setNonBlock`).
+        if (child.stderr) |se_file| {
+            setNonBlock(se_file.handle) catch |err| {
+                std.log.warn("preview: NONBLOCK on stderr pipe failed: {s}", .{@errorName(err)});
+            };
+        }
 
         self.server = server;
         self.child = child;
@@ -225,9 +264,53 @@ pub const PreviewSession = struct {
     pub fn poll(self: *Self) void {
         switch (self.state) {
             .idle, .stopped, .crashed => return,
-            .listening => self.tickListening(),
-            .connecting, .running => self.tickStream(),
+            .listening => {
+                self.drainStderr();
+                self.tickListening();
+            },
+            .connecting, .running => {
+                self.drainStderr();
+                self.tickStream();
+            },
         }
+    }
+
+    /// Non-blocking pull from the child's captured stderr pipe.
+    /// Appends every available byte into `stderr_buf` (capped so a
+    /// runaway child can't OOM the editor). Safe to call from any
+    /// active state — silently no-ops when the child or pipe is
+    /// absent. Errors other than `WouldBlock` (EOF, broken pipe)
+    /// also exit cleanly; the captured tail stays in `stderr_buf`.
+    fn drainStderr(self: *Self) void {
+        const child = self.child orelse return;
+        const stderr = child.stderr orelse return;
+        var buf: [stderr_read_chunk]u8 = undefined;
+        while (true) {
+            const n = stderr.read(&buf) catch |err| switch (err) {
+                error.WouldBlock => return,
+                else => return,
+            };
+            if (n == 0) return;
+            self.appendStderrCapped(buf[0..n]);
+        }
+    }
+
+    fn appendStderrCapped(self: *Self, data: []const u8) void {
+        self.stderr_buf.appendSlice(self.allocator, data) catch return;
+        if (self.stderr_buf.items.len <= max_stderr_bytes) return;
+        // Drop from the front to retain the tail — diagnostic output
+        // is most useful right before the failure, so the most-recent
+        // bytes are the ones we want to keep visible to the user.
+        const overflow = self.stderr_buf.items.len - max_stderr_bytes;
+        self.stderr_buf.replaceRange(self.allocator, 0, overflow, &.{}) catch {};
+    }
+
+    /// Read-only view of the captured-child stderr tail. The panel
+    /// renders this verbatim under the "Preview crashed" header.
+    /// Empty when the session never spawned a child or when nothing
+    /// has been read yet.
+    pub fn capturedStderr(self: *const Self) []const u8 {
+        return self.stderr_buf.items;
     }
 
     // ─── State driving ─────────────────────────────────────────────────
@@ -379,6 +462,10 @@ pub const PreviewSession = struct {
     }
 
     fn failWithCrash(self: *Self) void {
+        // Last chance to capture diagnostic output from the child
+        // before we SIGKILL it — anything queued in the kernel pipe
+        // buffer is lost otherwise.
+        self.drainStderr();
         self.teardownChildAndIo();
         self.state = .crashed;
     }
@@ -428,6 +515,7 @@ pub const PreviewSession = struct {
         self.teardownChildAndIo();
         self.freeStrings();
         self.rx_buf.clearRetainingCapacity();
+        self.stderr_buf.clearRetainingCapacity();
         self.port = null;
         self.engine_pid = null;
         self.last_heartbeat_ms = null;
