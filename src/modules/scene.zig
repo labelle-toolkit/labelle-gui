@@ -86,11 +86,18 @@ pub const SceneState = struct {
     prefab_picker_filter: [64:0]u8 = [_:0]u8{0} ** 64,
     /// Index of an entity the user has requested to delete and which
     /// requires confirmation before removal (prefab instances + any
-    /// entity carrying non-Position components). The confirmation
-    /// modal reads this; on accept, calls `scene_io.removeEntity`.
-    /// Bare-Position entities are deleted immediately without a modal
-    /// (cheap to add back via the existing right-click menu).
+    /// entity carrying non-Position components or a comment). The
+    /// confirmation modal reads this; on accept, calls
+    /// `scene_io.removeEntity`. Bare-Position entities are deleted
+    /// immediately without a modal (cheap to add back via the
+    /// existing right-click menu).
     pending_delete_idx: ?usize = null,
+    /// One-shot flag flipped by `requestDeleteEntity` so the parent
+    /// scope (`render`) can call `openPopup` from a common ID stack —
+    /// the delete may be triggered from inside either the viewport
+    /// child or the inspector child, but the modal lives at the
+    /// scene-tab level so both paths surface the same popup.
+    delete_modal_just_opened: bool = false,
     /// World-space spacing for the viewport's visual grid. When
     /// `snap_enabled` is on, drag-to-move also rounds to multiples of
     /// this value — one number, both behaviors. Default 16 works for
@@ -211,12 +218,22 @@ pub fn render(s: *SceneState, app: *App) void {
         .child_flags = .{ .border = true },
     })) {
         renderInspector(s, app, atlas_index_ptr);
-        // Modal lives in the same ID stack as the `openPopup` call
-        // that fires from inside the inspector's Delete button, so
-        // imgui can correlate the two.
-        renderDeleteConfirmModal(s);
     }
     zgui.endChild();
+
+    // Delete-confirm popup lives at the scene-tab parent scope (not
+    // inside either child) so both trigger paths share the same ID
+    // stack: the inspector's Delete button (called from inside
+    // `##inspector_col`) and the viewport's right-click → Delete
+    // (called from inside `##viewport_col`). Both set
+    // `delete_modal_just_opened` instead of calling `openPopup`
+    // directly; the parent scope fires the `openPopup` here and
+    // renders the modal in the same ID stack.
+    if (s.delete_modal_just_opened) {
+        zgui.openPopup("##scene_delete_confirm", .{});
+        s.delete_modal_just_opened = false;
+    }
+    renderDeleteConfirmModal(s);
 }
 
 /// Write the current scene back to its source path. Clears the dirty
@@ -266,14 +283,17 @@ fn renderInspector(s: *SceneState, app: *App, atlas_index: ?*const @import("../a
 
 /// Either delete the entity at `idx` immediately, or queue it for a
 /// confirmation modal (when the entity is non-trivial: prefab
-/// references, or any non-Position component on a vanilla entity).
-/// The modal is rendered by `renderDeleteConfirmModal` later in the
-/// same frame.
+/// references, any non-Position component, a hand-authored comment,
+/// or unmodeled component_extras). The modal is rendered by
+/// `renderDeleteConfirmModal` at the scene-tab top scope so both the
+/// inspector + viewport context-menu triggers share one popup; the
+/// actual `openPopup` call happens there too via the
+/// `delete_modal_just_opened` one-shot.
 fn requestDeleteEntity(s: *SceneState, idx: usize) void {
     if (idx >= s.loaded.scene.entities.len) return;
     if (needsDeleteConfirm(&s.loaded.scene.entities[idx], idx, s)) {
         s.pending_delete_idx = idx;
-        zgui.openPopup("##scene_delete_confirm", .{});
+        s.delete_modal_just_opened = true;
     } else {
         performDelete(s, idx);
     }
@@ -288,6 +308,9 @@ fn needsDeleteConfirm(e: *const scene_io.Entity, idx: usize, s: *const SceneStat
     if (e.rectangle != null) return true;
     if (e.circle != null) return true;
     if (e.polygon != null) return true;
+    // Non-empty `comment` is hand-authored data; protect from silent
+    // loss the same as the typed components above.
+    if (e.comment[0] != 0) return true;
     // Unmodeled component_extras attached to this entity? Then user
     // probably has hand-authored data we shouldn't silently drop.
     if (idx < s.loaded.extras.entity_components.len and
