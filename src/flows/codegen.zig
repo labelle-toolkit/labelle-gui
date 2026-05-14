@@ -141,12 +141,28 @@ pub fn renderFlowZig(
     // Function signature, derived from the event variant.
     try writeFnHeader(w, flow.event);
 
-    // OnUpdate has no inherent entity, so if any node needs one we
-    // emit a TODO stub binding. OnCreate/OnDestroy use the event's
-    // arg_entity directly — no extra binding required.
-    if (flow.event == .OnUpdate and anyNodeNeedsEntity(flow.nodes)) {
-        try w.writeAll("    // TODO(#42): real entity selection for OnUpdate flows.\n");
-        try w.writeAll("    const entity: EntityId = undefined;\n");
+    // Node templates reference a local `entity` binding. For OnUpdate
+    // there's no inherent entity, so we emit a TODO stub. For
+    // OnCreate/OnDestroy we alias the user-chosen `arg_entity` name
+    // to `entity` so the templates work regardless of whether the
+    // flow named the parameter `entity`, `self`, `victim`, etc.
+    if (anyNodeNeedsEntity(flow.nodes)) {
+        switch (flow.event) {
+            .OnUpdate => {
+                try w.writeAll("    // TODO(#42): real entity selection for OnUpdate flows.\n");
+                try w.writeAll("    const entity: EntityId = undefined;\n");
+            },
+            .OnCreate => |b| {
+                if (!std.mem.eql(u8, b.arg_entity, "entity")) {
+                    try w.print("    const entity = {s};\n", .{b.arg_entity});
+                }
+            },
+            .OnDestroy => |b| {
+                if (!std.mem.eql(u8, b.arg_entity, "entity")) {
+                    try w.print("    const entity = {s};\n", .{b.arg_entity});
+                }
+            },
+        }
     }
 
     // Walk in topo order, emitting preview pulse + node body for each.

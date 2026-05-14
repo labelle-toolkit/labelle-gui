@@ -2720,6 +2720,43 @@ pub const FlowCodegenTests = struct {
         try expect.toBeTrue(std.mem.indexOf(u8, out, "const n3_value = game.getComponent(Position, entity) orelse return;") != null);
     }
 
+    test "OnCreate with custom arg_entity aliases to entity in template scope" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\.{
+            \\    .event = .{ .OnCreate = .{ .arg_entity = "self" } },
+            \\    .nodes = .{
+            \\        .{ .id = 1, .pos = .{0, 0}, .kind = .{ .GetComponent = .{ .type = "Position" } } },
+            \\    },
+            \\    .links = .{},
+            \\}
+            \\
+        ;
+        const out = try renderFromZon(allocator, src, "alias");
+        defer allocator.free(out);
+        // The alias binds the user-chosen parameter name to `entity` so
+        // the GetComponent template (which always says `entity`) compiles.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const entity = self;") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "getComponent(Position, entity)") != null);
+    }
+
+    test "OnCreate with default arg_entity does not emit redundant alias" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\.{
+            \\    .event = .{ .OnCreate = .{ .arg_entity = "entity" } },
+            \\    .nodes = .{
+            \\        .{ .id = 1, .pos = .{0, 0}, .kind = .{ .GetComponent = .{ .type = "Position" } } },
+            \\    },
+            \\    .links = .{},
+            \\}
+            \\
+        ;
+        const out = try renderFromZon(allocator, src, "noalias");
+        defer allocator.free(out);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const entity =") == null);
+    }
+
     test "renders SetField node sourced from a Literal" {
         const allocator = std.testing.allocator;
         const src =
