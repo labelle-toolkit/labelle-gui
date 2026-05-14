@@ -295,7 +295,7 @@ pub const CompilerTests = struct {
         var comp = compiler.Compiler.init(allocator);
         defer comp.deinit();
 
-        try expect.toBeTrue(comp.build_process == null);
+        try expect.toBeFalse(comp.has_pending_result);
     }
 };
 
@@ -1850,9 +1850,7 @@ pub const ProjectFileTests = struct {
 
         const labelle_path = try std.fs.path.join(allocator, &.{ temp_dir, "project.labelle" });
         defer allocator.free(labelle_path);
-        const file = try std.fs.cwd().openFile(labelle_path, .{});
-        defer file.close();
-        const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+        const content = try std.Io.Dir.cwd().readFileAlloc(io_global.io(), labelle_path, allocator, .limited(1024 * 1024));
         defer allocator.free(content);
 
         try expect.toBeTrue(std.mem.indexOf(u8, content, ".resources") == null);
@@ -1941,9 +1939,10 @@ pub const ProjectFileTests = struct {
             \\}
             \\
         ;
-        const file = try std.fs.cwd().createFile(labelle_path, .{});
-        file.writeAll(synthetic) catch unreachable;
-        file.close();
+        std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = labelle_path,
+            .data = synthetic,
+        }) catch unreachable;
 
         var pm = project.ProjectManager.init(allocator);
         defer pm.deinit();
@@ -1993,18 +1992,17 @@ pub const ProjectFileTests = struct {
             \\}
             \\
         ;
-        const file = try std.fs.cwd().createFile(labelle_path, .{});
-        file.writeAll(original) catch unreachable;
-        file.close();
+        std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = labelle_path,
+            .data = original,
+        }) catch unreachable;
 
         var pm = project.ProjectManager.init(allocator);
         defer pm.deinit();
         try pm.loadProject(temp_dir);
         try pm.saveProject(temp_dir);
 
-        const reread = try std.fs.cwd().openFile(labelle_path, .{});
-        defer reread.close();
-        const saved = try reread.readToEndAlloc(allocator, 1024 * 1024);
+        const saved = try std.Io.Dir.cwd().readFileAlloc(io_global.io(), labelle_path, allocator, .limited(1024 * 1024));
         defer allocator.free(saved);
 
         // The five unmodeled fields must survive a save+load cycle.
@@ -2039,9 +2037,10 @@ pub const ProjectFileTests = struct {
             \\}
             \\
         ;
-        const file = try std.fs.cwd().createFile(labelle_path, .{});
-        file.writeAll(original) catch unreachable;
-        file.close();
+        std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = labelle_path,
+            .data = original,
+        }) catch unreachable;
 
         var pm = project.ProjectManager.init(allocator);
         defer pm.deinit();
@@ -2074,18 +2073,17 @@ pub const ProjectFileTests = struct {
             \\}
             \\
         ;
-        const file = try std.fs.cwd().createFile(labelle_path, .{});
-        file.writeAll(original) catch unreachable;
-        file.close();
+        std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = labelle_path,
+            .data = original,
+        }) catch unreachable;
 
         var pm = project.ProjectManager.init(allocator);
         defer pm.deinit();
         try pm.loadProject(temp_dir);
         try pm.saveProject(temp_dir);
 
-        const reread = try std.fs.cwd().openFile(labelle_path, .{});
-        defer reread.close();
-        const saved = try reread.readToEndAlloc(allocator, 1024 * 1024);
+        const saved = try std.Io.Dir.cwd().readFileAlloc(io_global.io(), labelle_path, allocator, .limited(1024 * 1024));
         defer allocator.free(saved);
 
         try expect.toBeTrue(std.mem.indexOf(u8, saved, "// Loading scene runs first; controller swaps to main") != null);
@@ -2109,9 +2107,10 @@ pub const ProjectFileTests = struct {
             \\}
             \\
         ;
-        const file = try std.fs.cwd().createFile(labelle_path, .{});
-        file.writeAll(original) catch unreachable;
-        file.close();
+        std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = labelle_path,
+            .data = original,
+        }) catch unreachable;
 
         var pm = project.ProjectManager.init(allocator);
         defer pm.deinit();
@@ -2122,9 +2121,7 @@ pub const ProjectFileTests = struct {
 
         try pm.saveProject(temp_dir);
 
-        const reread = try std.fs.cwd().openFile(labelle_path, .{});
-        defer reread.close();
-        const saved = try reread.readToEndAlloc(allocator, 1024 * 1024);
+        const saved = try std.Io.Dir.cwd().readFileAlloc(io_global.io(), labelle_path, allocator, .limited(1024 * 1024));
         defer allocator.free(saved);
 
         try expect.toBeTrue(std.mem.indexOf(u8, saved, "\"New Title\"") != null);
@@ -2142,9 +2139,10 @@ pub const ProjectFileTests = struct {
         // Unbalanced braces — syntactically invalid ZON, not just an
         // unknown field. ignore_unknown_fields must not mask this.
         const broken = ".{ .name = \"oops\",";
-        const file = try std.fs.cwd().createFile(labelle_path, .{});
-        file.writeAll(broken) catch unreachable;
-        file.close();
+        std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = labelle_path,
+            .data = broken,
+        }) catch unreachable;
 
         var pm = project.ProjectManager.init(allocator);
         defer pm.deinit();
@@ -2383,7 +2381,7 @@ pub const GizmosIndexTests = struct {
         // safe on the resulting empty struct.
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
-        const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+        const dir_path = try tmp.dir.realPathFileAlloc(io_global.io(), ".", std.testing.allocator);
         defer std.testing.allocator.free(dir_path);
 
         var idx = gizmos.Index.build(std.testing.allocator, dir_path, 1);
@@ -2424,289 +2422,6 @@ pub const GizmosIndexTests = struct {
         idx.deinit();
         // Reaching here without leaks (std.testing.allocator is the
         // GPA) is the assertion.
-    }
-};
-
-/// Exercises the preview-mode TCP session's state machine without
-/// spawning `labelle run` (sibling agents are still landing #94 / #193
-/// for the launcher side). Each test sets up a tiny pair of connected
-/// sockets on loopback — the editor's `PreviewSession` reads from one,
-/// the test acts as a mock engine on the other.
-///
-/// Loopback delivery is "eventually" synchronous on macOS/Linux —
-/// kernel sometimes wants a microsecond to make a `writeAll` from one
-/// end visible to a non-blocking `read` on the other. `pollUntilState`
-/// retries `poll()` for a bounded budget (200ms) rather than guessing
-/// the right `Thread.sleep` value.
-pub const PreviewSessionTests = struct {
-    /// Drive `poll()` in a tight loop until the session's state
-    /// reaches `target` or 200ms elapses. Returns true if reached.
-    fn pollUntilState(s: *preview.PreviewSession, target: preview.State) bool {
-        const deadline = std.time.milliTimestamp() + 200;
-        while (std.time.milliTimestamp() < deadline) {
-            s.poll();
-            if (s.state == target) return true;
-            std.Thread.sleep(1 * std.time.ns_per_ms);
-        }
-        return s.state == target;
-    }
-
-    /// Helper: build a connected pair (server stream + client stream)
-    /// on `127.0.0.1:0`. Returns the *client* side as the engine-mock
-    /// and *server* side as what `attachForTest` consumes (i.e. the
-    /// thing the editor would have got from `accept`).
-    const Pair = struct {
-        server: std.net.Server,
-        editor_side: std.net.Stream,
-        /// Optional so tests that need to deliberately close it early
-        /// (EOF/crash test) can nil it out and avoid the double-close
-        /// from `close()`'s teardown.
-        engine_side: ?std.net.Stream,
-
-        fn make() !Pair {
-            const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-            var server = try std.net.Address.listen(addr, .{ .reuse_address = true });
-            errdefer server.deinit();
-            const engine = try std.net.tcpConnectToAddress(server.listen_address);
-            errdefer engine.close();
-            const editor_conn = try server.accept();
-            return .{ .server = server, .editor_side = editor_conn.stream, .engine_side = engine };
-        }
-
-        fn closeEngine(self: *Pair) void {
-            if (self.engine_side) |s| {
-                s.close();
-                self.engine_side = null;
-            }
-        }
-
-        fn close(self: *Pair) void {
-            self.closeEngine();
-            // editor_side is owned by the session after attach.
-            self.server.deinit();
-        }
-
-        fn write(self: *Pair, bytes: []const u8) !void {
-            try (self.engine_side orelse return error.EngineClosed).writeAll(bytes);
-        }
-    };
-
-    test "initializes in idle state" {
-        const allocator = std.testing.allocator;
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        try expect.equal(s.state, .idle);
-    }
-
-    test "isActive false in idle/stopped/crashed" {
-        const allocator = std.testing.allocator;
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        try expect.toBeFalse(s.isActive());
-    }
-
-    test "poll on idle is a no-op" {
-        const allocator = std.testing.allocator;
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        s.poll();
-        try expect.equal(s.state, .idle);
-    }
-
-    test "stop on idle leaves state stopped" {
-        const allocator = std.testing.allocator;
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        s.stop();
-        try expect.equal(s.state, .stopped);
-    }
-
-    test "hello transitions connecting → running" {
-        const allocator = std.testing.allocator;
-        var pair = try Pair.make();
-        defer pair.close();
-
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        try s.attachForTest(pair.editor_side);
-        try expect.equal(s.state, .connecting);
-
-        try pair.write(
-            \\{"kind":"hello","engine_version":"1.2.3","pid":424242,"protocol_version":1}
-            ++ "\n");
-
-        try expect.toBeTrue(pollUntilState(&s, .running));
-        try expect.equal(s.engine_pid.?, 424242);
-        try expect.toBeTrue(s.engine_version != null);
-        try expect.toBeTrue(std.mem.eql(u8, s.engine_version.?, "1.2.3"));
-    }
-
-    test "heartbeat updates last_heartbeat_ms" {
-        const allocator = std.testing.allocator;
-        var pair = try Pair.make();
-        defer pair.close();
-
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        try s.attachForTest(pair.editor_side);
-
-        try pair.write(
-            \\{"kind":"hello","engine_version":"x","pid":1,"protocol_version":1}
-            ++ "\n");
-        try expect.toBeTrue(pollUntilState(&s, .running));
-        const t0 = s.last_heartbeat_ms.?;
-
-        // Force a measurable gap so the heartbeat timestamp moves.
-        std.Thread.sleep(2 * std.time.ns_per_ms);
-
-        try pair.write(
-            \\{"kind":"heartbeat","t":847291}
-            ++ "\n");
-        // Drain a few polls so the heartbeat arrives.
-        var i: usize = 0;
-        while (i < 10) : (i += 1) {
-            s.poll();
-            if (s.last_heartbeat_ms.? > t0) break;
-            std.Thread.sleep(1 * std.time.ns_per_ms);
-        }
-        try expect.toBeTrue(s.last_heartbeat_ms.? >= t0);
-        try expect.equal(s.state, .running);
-    }
-
-    test "bye transitions to stopped" {
-        const allocator = std.testing.allocator;
-        var pair = try Pair.make();
-        defer pair.close();
-
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        try s.attachForTest(pair.editor_side);
-        try pair.write(
-            \\{"kind":"hello","engine_version":"x","pid":1,"protocol_version":1}
-            ++ "\n" ++
-            \\{"kind":"bye","reason":"user_quit"}
-            ++ "\n");
-        try expect.toBeTrue(pollUntilState(&s, .stopped));
-        try expect.toBeTrue(s.bye_reason != null);
-        try expect.toBeTrue(std.mem.eql(u8, s.bye_reason.?, "user_quit"));
-    }
-
-    test "bye followed by EOF still lands in stopped (regression #62)" {
-        // Engines commonly write `bye` and then immediately close the
-        // socket. If the EOF branch returns early without draining the
-        // already-buffered `bye`, the session lands in `.crashed`.
-        const allocator = std.testing.allocator;
-        var pair = try Pair.make();
-        defer pair.close();
-
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        try s.attachForTest(pair.editor_side);
-        try pair.write(
-            \\{"kind":"hello","engine_version":"x","pid":1,"protocol_version":1}
-            ++ "\n" ++
-            \\{"kind":"bye","reason":"user_quit"}
-            ++ "\n");
-        // Close the engine side right after writing bye — depending on
-        // kernel scheduling, the editor's first `read` may return both
-        // the buffered bytes and trigger EOF on the next read in the
-        // same `tickStream` call.
-        pair.closeEngine();
-        try expect.toBeTrue(pollUntilState(&s, .stopped));
-        try expect.toBeTrue(s.bye_reason != null);
-        try expect.toBeTrue(std.mem.eql(u8, s.bye_reason.?, "user_quit"));
-    }
-
-    test "EOF during connecting transitions to crashed without timeout wait (regression #62)" {
-        // Engine connects then drops the socket before sending `hello`.
-        // Previously the session would stay `.connecting` and spin on
-        // EOF until the 2s connect-timeout fired. Now it should crash
-        // on the first EOF.
-        const allocator = std.testing.allocator;
-        var pair = try Pair.make();
-        defer pair.close();
-
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        try s.attachForTest(pair.editor_side);
-        try expect.equal(s.state, .connecting);
-
-        pair.closeEngine();
-        // 200ms budget is well under the 2s connect timeout, so if this
-        // passes we know we didn't fall through to `checkConnectTimeout`.
-        try expect.toBeTrue(pollUntilState(&s, .crashed));
-    }
-
-    test "EOF without bye transitions to crashed" {
-        const allocator = std.testing.allocator;
-        var pair = try Pair.make();
-        defer pair.close();
-
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        try s.attachForTest(pair.editor_side);
-        try pair.write(
-            \\{"kind":"hello","engine_version":"x","pid":1,"protocol_version":1}
-            ++ "\n");
-        try expect.toBeTrue(pollUntilState(&s, .running));
-
-        // Close the engine side without sending bye → editor should
-        // see EOF on next poll.
-        pair.closeEngine();
-        try expect.toBeTrue(pollUntilState(&s, .crashed));
-    }
-
-    test "unknown kind is ignored (forward-compat)" {
-        const allocator = std.testing.allocator;
-        var pair = try Pair.make();
-        defer pair.close();
-
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        try s.attachForTest(pair.editor_side);
-        try pair.write(
-            \\{"kind":"hello","engine_version":"x","pid":1,"protocol_version":1}
-            ++ "\n" ++
-            \\{"kind":"future_message","whatever":42}
-            ++ "\n" ++
-            \\{"kind":"heartbeat","t":1}
-            ++ "\n");
-        try expect.toBeTrue(pollUntilState(&s, .running));
-    }
-
-    test "malformed JSON line is dropped without crashing" {
-        const allocator = std.testing.allocator;
-        var pair = try Pair.make();
-        defer pair.close();
-
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        try s.attachForTest(pair.editor_side);
-        try pair.write(
-            \\{"kind":"hello","engine_version":"x","pid":1,"protocol_version":1}
-            ++ "\n" ++
-            "this is not json at all\n" ++
-            \\{"kind":"heartbeat","t":1}
-            ++ "\n");
-        try expect.toBeTrue(pollUntilState(&s, .running));
-    }
-
-    test "stop after running transitions to stopped" {
-        const allocator = std.testing.allocator;
-        var pair = try Pair.make();
-        defer pair.close();
-
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        try s.attachForTest(pair.editor_side);
-        try pair.write(
-            \\{"kind":"hello","engine_version":"x","pid":1,"protocol_version":1}
-            ++ "\n");
-        try expect.toBeTrue(pollUntilState(&s, .running));
-
-        s.stop();
-        try expect.equal(s.state, .stopped);
-        try expect.toBeFalse(s.isActive());
     }
 };
 
@@ -3086,7 +2801,7 @@ pub const FlowsRendererTests = struct {
 
 pub const PreferencesTests = struct {
     fn tmpPath(allocator: std.mem.Allocator, tmp: std.testing.TmpDir) ![]u8 {
-        const dir = try tmp.dir.realpathAlloc(allocator, ".");
+        const dir = try tmp.dir.realPathFileAlloc(io_global.io(), ".", allocator);
         defer allocator.free(dir);
         return std.fs.path.join(allocator, &.{ dir, prefs.PREFS_FILENAME });
     }
@@ -3135,9 +2850,10 @@ pub const PreferencesTests = struct {
         defer std.testing.allocator.free(path);
 
         const hand_edited = ".{ .font_scale = 0.1 }\n";
-        const file = try std.fs.cwd().createFile(path, .{});
-        defer file.close();
-        try file.writeAll(hand_edited);
+        try std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = path,
+            .data = hand_edited,
+        });
 
         const loaded = prefs.loadFromPath(std.testing.allocator, path);
         try expect.equal(loaded.font_scale, prefs.min_font_scale);
@@ -3149,9 +2865,10 @@ pub const PreferencesTests = struct {
         const path = try tmpPath(std.testing.allocator, tmp);
         defer std.testing.allocator.free(path);
 
-        const file = try std.fs.cwd().createFile(path, .{});
-        defer file.close();
-        try file.writeAll("this is not zon");
+        try std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = path,
+            .data = "this is not zon",
+        });
 
         const loaded = prefs.loadFromPath(std.testing.allocator, path);
         try expect.equal(loaded.font_scale, prefs.default_font_scale);

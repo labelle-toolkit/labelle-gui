@@ -113,7 +113,7 @@ pub fn renderFunctionEntry(p: *Projector, decl: Ast.Node.Index) !u32 {
     // One output exec pin so the body's first statement can hang off
     // it. Params land as input pins so the user sees the function's
     // surface area at a glance.
-    var params: std.ArrayList(PinSpec) = .{};
+    var params: std.ArrayList(PinSpec) = .empty;
     defer params.deinit(p.arena);
 
     var it = proto.iterate(ast);
@@ -175,7 +175,7 @@ fn renderCall(p: *Projector, node: Ast.Node.Index, parent_id: u32) !?u32 {
     // `engine.SpriteAnimation.config` style chains.
     const callee = try p.arena.dupe(u8, ast.getNodeSource(call.ast.fn_expr));
 
-    var input_pins: std.ArrayList(PinSpec) = .{};
+    var input_pins: std.ArrayList(PinSpec) = .empty;
     defer input_pins.deinit(p.arena);
     for (call.ast.params, 0..) |_, i| {
         const name = try std.fmt.allocPrint(p.arena, "arg{d}", .{i});
@@ -554,7 +554,7 @@ fn renderStructInit(p: *Projector, node: Ast.Node.Index, parent_id: u32) !?u32 {
     var buf: [2]Ast.Node.Index = undefined;
     const init_full = ast.fullStructInit(&buf, node) orelse return null;
 
-    var input_pins: std.ArrayList(PinSpec) = .{};
+    var input_pins: std.ArrayList(PinSpec) = .empty;
     defer input_pins.deinit(p.arena);
     for (init_full.ast.fields, 0..) |_, i| {
         const name = try std.fmt.allocPrint(p.arena, "f{d}", .{i});

@@ -10,6 +10,7 @@ const builtin = @import("builtin");
 /// is unnecessary.
 var _global_threaded: std.Io.Threaded = undefined;
 var _global_io: std.Io = undefined;
+var _global_environ: std.process.Environ = .empty;
 var _initialized: bool = false;
 
 /// Initialize the process-wide Io. Must be called once from `main()`
@@ -20,6 +21,7 @@ pub fn init(minimal: std.process.Init.Minimal) void {
         .environ = minimal.environ,
     });
     _global_io = _global_threaded.io();
+    _global_environ = minimal.environ;
     _initialized = true;
 }
 
@@ -39,4 +41,9 @@ pub fn io() std.Io {
     if (builtin.is_test) return std.testing.io;
     if (!_initialized) initLazy();
     return _global_io;
+}
+
+pub fn environ() std.process.Environ {
+    if (!_initialized) initLazy();
+    return _global_environ;
 }

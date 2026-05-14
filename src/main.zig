@@ -71,7 +71,7 @@ pub fn main(proc_init: std.process.Init.Minimal) !void {
     // stb_image needs a global allocator before any `Image.loadFromFile`.
     // The atlas module decodes PNGs through this, so init it once
     // at startup; the call is idempotent across the gui lifetime.
-    zstbi.init(allocator);
+    zstbi.init(io_global.io(), allocator);
     defer zstbi.deinit();
 
     const scale_factor = window.getContentScale()[0];

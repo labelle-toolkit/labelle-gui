@@ -13,6 +13,7 @@
 const std = @import("std");
 const zstbi = @import("zstbi");
 const zopengl = @import("zopengl");
+const io_global = @import("io_global.zig");
 
 const gl = zopengl.bindings;
 
@@ -38,7 +39,7 @@ pub const Atlas = struct {
     width: u32,
     height: u32,
     /// `name → Frame` for every entry in this atlas's JSON.
-    frames: std.StringHashMapUnmanaged(Frame) = .{},
+    frames: std.StringHashMapUnmanaged(Frame) = .empty,
 
     pub fn deinit(self: *Atlas, allocator: std.mem.Allocator) void {
         var it = self.frames.iterator();
@@ -57,8 +58,8 @@ pub const Atlas = struct {
 /// for the names.
 pub const Index = struct {
     allocator: std.mem.Allocator,
-    atlases: std.ArrayListUnmanaged(Atlas) = .{},
-    by_name: std.StringHashMapUnmanaged(SpriteRef) = .{},
+    atlases: std.ArrayListUnmanaged(Atlas) = .empty,
+    by_name: std.StringHashMapUnmanaged(SpriteRef) = .empty,
     /// `ProjectManager.generation` this index was built against;
     /// non-zero. App invalidates when the live generation changes.
     generation: u64,
@@ -188,7 +189,7 @@ fn loadOne(allocator: std.mem.Allocator, project_dir: []const u8, r: Resource) !
 /// size / trimmed are needed later for accurate placement but not
 /// for the first slice of viewport rendering.
 fn populateFramesFromJson(allocator: std.mem.Allocator, json_path: []const u8, atlas: *Atlas) !void {
-    const raw = try std.fs.cwd().readFileAlloc(allocator, json_path, 16 * 1024 * 1024);
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io_global.io(), json_path, allocator, .limited(16 * 1024 * 1024));
     defer allocator.free(raw);
     try parseFramesFromJsonText(allocator, raw, atlas);
 }

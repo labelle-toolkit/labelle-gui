@@ -256,7 +256,7 @@ pub const ProjectManager = struct {
         // the editor needs full pass-through before we lift that caveat.
         var diag: std.zon.parse.Diagnostics = .{};
         defer diag.deinit(arena_alloc);
-        const parsed = std.zon.parse.fromSlice(ProjectConfig, arena_alloc, source, &diag, .{
+        const parsed = std.zon.parse.fromSliceAlloc(ProjectConfig, arena_alloc, source, &diag, .{
             .ignore_unknown_fields = true,
         }) catch |err| {
             std.log.err("project.labelle parse failed at {s}: {s}", .{ file_path, @errorName(err) });

@@ -13,6 +13,29 @@
 
 const std = @import("std");
 const buf = @import("buf.zig");
+const io_global = @import("io_global.zig");
+
+/// Thin adapter that lets the per-component `emit*` helpers keep their
+/// existing `writer.writeAll(...) / writer.print(...) / writer.writeByte(...)`
+/// shape while writing into an unmanaged `std.ArrayList(u8)` — the
+/// 0.16 ArrayList API requires an allocator on each call, so we pin
+/// both here and forward.
+const ListWriter = struct {
+    list: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+
+    pub fn writeAll(self: ListWriter, bytes: []const u8) std.mem.Allocator.Error!void {
+        try self.list.appendSlice(self.allocator, bytes);
+    }
+
+    pub fn writeByte(self: ListWriter, byte: u8) std.mem.Allocator.Error!void {
+        try self.list.append(self.allocator, byte);
+    }
+
+    pub fn print(self: ListWriter, comptime fmt: []const u8, args: anytype) std.mem.Allocator.Error!void {
+        try self.list.print(self.allocator, fmt, args);
+    }
+};
 
 pub const Position = struct {
     x: f32 = 0,
@@ -241,7 +264,7 @@ pub fn removeEntity(loaded: *LoadedScene, idx: usize) !void {
 }
 
 pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !LoadedScene {
-    const raw = try std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024);
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io_global.io(), path, allocator, .limited(16 * 1024 * 1024));
     defer allocator.free(raw);
     return parseScene(allocator, raw);
 }
@@ -289,7 +312,7 @@ pub const LoadedPrefab = struct {
 };
 
 pub fn loadPrefabFromFile(allocator: std.mem.Allocator, path: []const u8) !LoadedPrefab {
-    const raw = try std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024);
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io_global.io(), path, allocator, .limited(16 * 1024 * 1024));
     defer allocator.free(raw);
     return parsePrefab(allocator, raw);
 }
@@ -366,9 +389,10 @@ pub fn parsePrefab(allocator: std.mem.Allocator, raw: []const u8) !LoadedPrefab 
 pub fn savePrefab(allocator: std.mem.Allocator, path: []const u8, loaded: LoadedPrefab) !void {
     const text = try renderPrefabJsonc(allocator, loaded);
     defer allocator.free(text);
-    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(text);
+    try std.Io.Dir.cwd().writeFile(io_global.io(), .{
+        .sub_path = path,
+        .data = text,
+    });
 }
 
 /// Emit the prefab as `{ "components": { ... }, "children": [ ... ] }`.
@@ -376,61 +400,61 @@ pub fn savePrefab(allocator: std.mem.Allocator, path: []const u8, loaded: Loaded
 /// array (omitted when empty) emits one entry per child with its
 /// modeled Position + verbatim component extras + leading comment.
 pub fn renderPrefabJsonc(allocator: std.mem.Allocator, loaded: LoadedPrefab) ![]u8 {
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    const w = out.writer(allocator);
+    const w: ListWriter = .{ .list = &out, .allocator = allocator };
 
-    try w.writeAll("{\n");
-    try w.writeAll("    \"components\": {");
+    try out.appendSlice(allocator, "{\n");
+    try out.appendSlice(allocator, "    \"components\": {");
     var first = true;
     if (loaded.entity.position) |p| {
-        try w.print(" \"Position\": {{ \"x\": {d}, \"y\": {d} }}", .{ p.x, p.y });
+        try out.print(allocator, " \"Position\": {{ \"x\": {d}, \"y\": {d} }}", .{ p.x, p.y });
         first = false;
     }
     if (loaded.entity.sprite) |sp| {
-        if (!first) try w.writeAll(",");
-        _ = try emitSprite(&w, sp.*);
+        if (!first) try out.appendSlice(allocator, ",");
+        _ = try emitSprite(w, sp.*);
         first = false;
     }
     if (loaded.entity.rectangle) |re| {
-        if (!first) try w.writeAll(",");
-        _ = try emitRectangle(&w, re.*);
+        if (!first) try out.appendSlice(allocator, ",");
+        _ = try emitRectangle(w, re.*);
         first = false;
     }
     if (loaded.entity.circle) |ci| {
-        if (!first) try w.writeAll(",");
-        _ = try emitCircle(&w, ci.*);
+        if (!first) try out.appendSlice(allocator, ",");
+        _ = try emitCircle(w, ci.*);
         first = false;
     }
     if (loaded.entity.polygon) |po| {
-        if (!first) try w.writeAll(",");
-        _ = try emitPolygon(&w, po.*);
+        if (!first) try out.appendSlice(allocator, ",");
+        _ = try emitPolygon(w, po.*);
         first = false;
     }
     for (loaded.component_extras) |extra| {
-        if (!first) try w.writeAll(",");
-        try w.print(" \"{s}\": {s}", .{ extra.name, extra.value_text });
+        if (!first) try out.appendSlice(allocator, ",");
+        try out.print(allocator, " \"{s}\": {s}", .{ extra.name, extra.value_text });
         first = false;
     }
-    if (first) try w.writeAll(" ");
-    try w.writeAll(" }");
+    if (first) try out.appendSlice(allocator, " ");
+    try out.appendSlice(allocator, " }");
 
     if (loaded.children.len > 0) {
-        try w.writeAll(",\n");
-        try w.writeAll("    \"children\": [\n");
+        try out.appendSlice(allocator, ",\n");
+        try out.appendSlice(allocator, "    \"children\": [\n");
         for (loaded.children, 0..) |child, i| {
             const comment = std.mem.sliceTo(&child.comment, 0);
             if (comment.len > 0) {
                 var lines = std.mem.splitScalar(u8, std.mem.trim(u8, comment, " \t\r\n"), '\n');
                 while (lines.next()) |line| {
-                    try w.print("        {s}\n", .{std.mem.trim(u8, line, " \t\r")});
+                    try out.print(allocator, "        {s}\n", .{std.mem.trim(u8, line, " \t\r")});
                 }
             }
 
-            try w.writeAll("        {");
+            try out.appendSlice(allocator, "        {");
             var c_first = true;
             if (child.prefab) |p| {
-                try w.print(" \"prefab\": \"{s}\"", .{p});
+                try out.print(allocator, " \"prefab\": \"{s}\"", .{p});
                 c_first = false;
             }
             const cextras = if (i < loaded.children_extras.len)
@@ -444,58 +468,58 @@ pub fn renderPrefabJsonc(allocator: std.mem.Allocator, loaded: LoadedPrefab) ![]
                 child.polygon != null or
                 cextras.len > 0;
             if (has_components) {
-                if (!c_first) try w.writeAll(",");
-                try w.writeAll(" \"components\": {");
+                if (!c_first) try out.appendSlice(allocator, ",");
+                try out.appendSlice(allocator, " \"components\": {");
                 var cc_first = true;
                 if (child.position) |p| {
-                    try w.print(" \"Position\": {{ \"x\": {d}, \"y\": {d} }}", .{ p.x, p.y });
+                    try out.print(allocator, " \"Position\": {{ \"x\": {d}, \"y\": {d} }}", .{ p.x, p.y });
                     cc_first = false;
                 }
                 if (child.sprite) |sp| {
-                    if (!cc_first) try w.writeAll(",");
-                    _ = try emitSprite(&w, sp.*);
+                    if (!cc_first) try out.appendSlice(allocator, ",");
+                    _ = try emitSprite(w, sp.*);
                     cc_first = false;
                 }
                 if (child.rectangle) |re| {
-                    if (!cc_first) try w.writeAll(",");
-                    _ = try emitRectangle(&w, re.*);
+                    if (!cc_first) try out.appendSlice(allocator, ",");
+                    _ = try emitRectangle(w, re.*);
                     cc_first = false;
                 }
                 if (child.circle) |ci| {
-                    if (!cc_first) try w.writeAll(",");
-                    _ = try emitCircle(&w, ci.*);
+                    if (!cc_first) try out.appendSlice(allocator, ",");
+                    _ = try emitCircle(w, ci.*);
                     cc_first = false;
                 }
                 if (child.polygon) |po| {
-                    if (!cc_first) try w.writeAll(",");
-                    _ = try emitPolygon(&w, po.*);
+                    if (!cc_first) try out.appendSlice(allocator, ",");
+                    _ = try emitPolygon(w, po.*);
                     cc_first = false;
                 }
                 for (cextras) |extra| {
-                    if (!cc_first) try w.writeAll(",");
-                    try w.print(" \"{s}\": {s}", .{ extra.name, extra.value_text });
+                    if (!cc_first) try out.appendSlice(allocator, ",");
+                    try out.print(allocator, " \"{s}\": {s}", .{ extra.name, extra.value_text });
                     cc_first = false;
                 }
-                try w.writeAll(" }");
+                try out.appendSlice(allocator, " }");
                 c_first = false;
             }
-            if (c_first) try w.writeAll(" ");
-            try w.writeAll(" }");
-            if (i + 1 < loaded.children.len) try w.writeAll(",");
-            try w.writeAll("\n");
+            if (c_first) try out.appendSlice(allocator, " ");
+            try out.appendSlice(allocator, " }");
+            if (i + 1 < loaded.children.len) try out.appendSlice(allocator, ",");
+            try out.appendSlice(allocator, "\n");
         }
-        try w.writeAll("    ]");
+        try out.appendSlice(allocator, "    ]");
     }
 
     // Splice unmodeled top-level keys back in, after the modeled
     // fields. Order shifts relative to the source (managed first)
     // but the content is faithful — same trade-off scenes make.
     for (loaded.top_level_extras) |kv| {
-        try w.writeAll(",\n");
-        try w.print("    \"{s}\": {s}", .{ kv.name, kv.value_text });
+        try out.appendSlice(allocator, ",\n");
+        try out.print(allocator, "    \"{s}\": {s}", .{ kv.name, kv.value_text });
     }
 
-    try w.writeAll("\n}\n");
+    try out.appendSlice(allocator, "\n}\n");
     return out.toOwnedSlice(allocator);
 }
 
@@ -861,7 +885,7 @@ fn extractArrayItemComments(
     raw: []const u8,
     array_lbracket: usize,
 ) ![]const []const u8 {
-    var out: std.ArrayList([]const u8) = .{};
+    var out: std.ArrayList([]const u8) = .empty;
     errdefer out.deinit(arena);
 
     var i: usize = array_lbracket + 1; // past '['
@@ -1042,7 +1066,7 @@ fn extractTopLevelExtrasFiltered(
     raw: []const u8,
     isManaged: *const fn ([]const u8) bool,
 ) ![]const TopLevelExtra {
-    var out: std.ArrayList(TopLevelExtra) = .{};
+    var out: std.ArrayList(TopLevelExtra) = .empty;
     errdefer out.deinit(arena);
 
     var i: usize = 0;
@@ -1120,7 +1144,7 @@ fn extractArrayItemComponentExtras(
     raw: []const u8,
     array_lbracket: usize,
 ) ![]const []const ComponentExtra {
-    var out: std.ArrayList([]const ComponentExtra) = .{};
+    var out: std.ArrayList([]const ComponentExtra) = .empty;
     errdefer out.deinit(arena);
 
     var i: usize = array_lbracket + 1; // past '['
@@ -1148,7 +1172,7 @@ fn extractArrayItemComponentExtras(
 }
 
 fn extractComponentExtras(arena: std.mem.Allocator, entity_body: []const u8) ![]const ComponentExtra {
-    var out: std.ArrayList(ComponentExtra) = .{};
+    var out: std.ArrayList(ComponentExtra) = .empty;
     errdefer out.deinit(arena);
 
     // Find `"components"` key inside the entity body.
@@ -1307,9 +1331,10 @@ fn isManagedPrefabTopLevelKey(name: []const u8) bool {
 pub fn saveScene(allocator: std.mem.Allocator, path: []const u8, loaded: LoadedScene) !void {
     const text = try renderSceneJsonc(allocator, loaded);
     defer allocator.free(text);
-    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(text);
+    try std.Io.Dir.cwd().writeFile(io_global.io(), .{
+        .sub_path = path,
+        .data = text,
+    });
 }
 
 /// Render the loaded scene back to JSONC. Managed fields (`name`,
@@ -1319,23 +1344,23 @@ pub fn saveScene(allocator: std.mem.Allocator, path: []const u8, loaded: LoadedS
 /// from the extras captured at load time. Per-entity comments are
 /// emitted at the entities-array indent above their owning entity.
 pub fn renderSceneJsonc(allocator: std.mem.Allocator, loaded: LoadedScene) ![]u8 {
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    const w = out.writer(allocator);
+    const w: ListWriter = .{ .list = &out, .allocator = allocator };
 
-    try w.writeAll("{\n");
-    try w.print("    \"name\": \"{s}\",\n", .{loaded.scene.name});
+    try out.appendSlice(allocator, "{\n");
+    try out.print(allocator, "    \"name\": \"{s}\",\n", .{loaded.scene.name});
 
     for (loaded.extras.top_level) |kv| {
-        try w.print("    \"{s}\": {s},\n", .{ kv.name, kv.value_text });
+        try out.print(allocator, "    \"{s}\": {s},\n", .{ kv.name, kv.value_text });
     }
 
-    try w.writeAll("    \"entities\": [");
+    try out.appendSlice(allocator, "    \"entities\": [");
     if (loaded.scene.entities.len == 0) {
-        try w.writeAll("]\n}\n");
+        try out.appendSlice(allocator, "]\n}\n");
         return out.toOwnedSlice(allocator);
     }
-    try w.writeAll("\n");
+    try out.appendSlice(allocator, "\n");
 
     for (loaded.scene.entities, 0..) |e, i| {
         // Comment lines first (each at the entities-array indent).
@@ -1343,14 +1368,14 @@ pub fn renderSceneJsonc(allocator: std.mem.Allocator, loaded: LoadedScene) ![]u8
         if (comment.len > 0) {
             var lines = std.mem.splitScalar(u8, std.mem.trim(u8, comment, " \t\r\n"), '\n');
             while (lines.next()) |line| {
-                try w.print("        {s}\n", .{std.mem.trim(u8, line, " \t\r")});
+                try out.print(allocator, "        {s}\n", .{std.mem.trim(u8, line, " \t\r")});
             }
         }
 
-        try w.writeAll("        {");
+        try out.appendSlice(allocator, "        {");
         var first = true;
         if (e.prefab) |p| {
-            try w.print(" \"prefab\": \"{s}\"", .{p});
+            try out.print(allocator, " \"prefab\": \"{s}\"", .{p});
             first = false;
         }
         const extras = if (i < loaded.extras.entity_components.len)
@@ -1364,47 +1389,47 @@ pub fn renderSceneJsonc(allocator: std.mem.Allocator, loaded: LoadedScene) ![]u8
             e.polygon != null or
             extras.len > 0;
         if (has_components) {
-            if (!first) try w.writeAll(",");
-            try w.writeAll(" \"components\": {");
+            if (!first) try out.appendSlice(allocator, ",");
+            try out.appendSlice(allocator, " \"components\": {");
             var c_first = true;
             if (e.position) |p| {
-                try w.print(" \"Position\": {{ \"x\": {d}, \"y\": {d} }}", .{ p.x, p.y });
+                try out.print(allocator, " \"Position\": {{ \"x\": {d}, \"y\": {d} }}", .{ p.x, p.y });
                 c_first = false;
             }
             if (e.sprite) |sp| {
-                if (!c_first) try w.writeAll(",");
-                _ = try emitSprite(&w, sp.*);
+                if (!c_first) try out.appendSlice(allocator, ",");
+                _ = try emitSprite(w, sp.*);
                 c_first = false;
             }
             if (e.rectangle) |re| {
-                if (!c_first) try w.writeAll(",");
-                _ = try emitRectangle(&w, re.*);
+                if (!c_first) try out.appendSlice(allocator, ",");
+                _ = try emitRectangle(w, re.*);
                 c_first = false;
             }
             if (e.circle) |ci| {
-                if (!c_first) try w.writeAll(",");
-                _ = try emitCircle(&w, ci.*);
+                if (!c_first) try out.appendSlice(allocator, ",");
+                _ = try emitCircle(w, ci.*);
                 c_first = false;
             }
             if (e.polygon) |po| {
-                if (!c_first) try w.writeAll(",");
-                _ = try emitPolygon(&w, po.*);
+                if (!c_first) try out.appendSlice(allocator, ",");
+                _ = try emitPolygon(w, po.*);
                 c_first = false;
             }
             for (extras) |extra| {
-                if (!c_first) try w.writeAll(",");
-                try w.print(" \"{s}\": {s}", .{ extra.name, extra.value_text });
+                if (!c_first) try out.appendSlice(allocator, ",");
+                try out.print(allocator, " \"{s}\": {s}", .{ extra.name, extra.value_text });
                 c_first = false;
             }
-            try w.writeAll(" }");
+            try out.appendSlice(allocator, " }");
             first = false;
         }
-        if (first) try w.writeAll(" "); // empty entity body — keep braces apart
-        try w.writeAll(" }");
-        if (i + 1 < loaded.scene.entities.len) try w.writeAll(",");
-        try w.writeAll("\n");
+        if (first) try out.appendSlice(allocator, " "); // empty entity body — keep braces apart
+        try out.appendSlice(allocator, " }");
+        if (i + 1 < loaded.scene.entities.len) try out.appendSlice(allocator, ",");
+        try out.appendSlice(allocator, "\n");
     }
-    try w.writeAll("    ]\n}\n");
+    try out.appendSlice(allocator, "    ]\n}\n");
 
     return out.toOwnedSlice(allocator);
 }

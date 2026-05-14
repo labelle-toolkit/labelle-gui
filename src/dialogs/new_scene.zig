@@ -13,6 +13,7 @@ const zgui = @import("zgui");
 
 const App = @import("../app.zig").App;
 const project = @import("../project.zig");
+const io_global = @import("../io_global.zig");
 
 pub fn render(app: *App) void {
     if (app.show_new_scene_dialog) zgui.openPopup("New Scene", .{});
@@ -70,20 +71,18 @@ fn createScene(app: *App, scene_name: []const u8) void {
     };
     defer app.allocator.free(scene_path);
 
-    const file = std.fs.cwd().createFile(scene_path, .{ .exclusive = true }) catch |err| {
-        app.setStatus(if (err == error.PathAlreadyExists) "Scene already exists!" else "Error creating scene!");
-        return;
-    };
-    defer file.close();
-
     const content = renderSceneJsonc(app.allocator, scene_name) catch {
         app.setStatus("Error formatting scene content!");
         return;
     };
     defer app.allocator.free(content);
 
-    file.writeAll(content) catch {
-        app.setStatus("Error writing scene file!");
+    std.Io.Dir.cwd().writeFile(io_global.io(), .{
+        .sub_path = scene_path,
+        .data = content,
+        .flags = .{ .exclusive = true },
+    }) catch |err| {
+        app.setStatus(if (err == error.PathAlreadyExists) "Scene already exists!" else "Error writing scene!");
         return;
     };
     app.setStatus("Scene created!");

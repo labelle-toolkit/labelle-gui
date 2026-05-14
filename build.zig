@@ -129,10 +129,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
     gui_tests_exe.root_module.addImport("zglfw", zglfw.module("root"));
-    gui_tests_exe.linkLibrary(zglfw.artifact("glfw"));
+    gui_tests_exe.root_module.linkLibrary(zglfw.artifact("glfw"));
     gui_tests_exe.root_module.addImport("zopengl", zopengl.module("root"));
     gui_tests_exe.root_module.addImport("zgui", zgui_te.module("root"));
-    gui_tests_exe.linkLibrary(zgui_te.artifact("imgui"));
+    gui_tests_exe.root_module.linkLibrary(zgui_te.artifact("imgui"));
     gui_tests_exe.root_module.addImport("zstbi", zstbi.module("root"));
 
     const run_gui_tests = b.addRunArtifact(gui_tests_exe);

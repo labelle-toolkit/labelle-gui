@@ -25,6 +25,7 @@
 const std = @import("std");
 
 const gizmo_io = @import("gizmo_io.zig");
+const io_global = @import("io_global.zig");
 
 pub const FillMode = enum {
     filled,
@@ -101,13 +102,13 @@ pub const Entry = struct {
 
 pub const Index = struct {
     allocator: std.mem.Allocator,
-    entries: std.ArrayListUnmanaged(Entry) = .{},
+    entries: std.ArrayListUnmanaged(Entry) = .empty,
     /// `ProjectManager.generation` this index was built against. App
     /// invalidates when the live generation changes.
     generation: u64,
     /// Per-entry arenas so each gizmo's string lifetimes are bounded
     /// to its own slot — same shape `atlas.Index` uses.
-    arenas: std.ArrayListUnmanaged(*std.heap.ArenaAllocator) = .{},
+    arenas: std.ArrayListUnmanaged(*std.heap.ArenaAllocator) = .empty,
 
     pub fn deinit(self: *Index) void {
         for (self.arenas.items) |a| {
@@ -131,11 +132,12 @@ pub const Index = struct {
         const gizmos_dir = std.fs.path.join(allocator, &.{ project_dir, "gizmos" }) catch return idx;
         defer allocator.free(gizmos_dir);
 
-        var dir = std.fs.cwd().openDir(gizmos_dir, .{ .iterate = true }) catch return idx;
-        defer dir.close();
+        const io = io_global.io();
+        var dir = std.Io.Dir.cwd().openDir(io, gizmos_dir, .{ .iterate = true }) catch return idx;
+        defer dir.close(io);
 
         var it = dir.iterate();
-        while (it.next() catch null) |dirent| {
+        while (it.next(io) catch null) |dirent| {
             if (dirent.kind != .file) continue;
             if (!std.mem.endsWith(u8, dirent.name, ".zon")) continue;
 

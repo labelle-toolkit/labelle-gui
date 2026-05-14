@@ -12,6 +12,7 @@ const zgui = @import("zgui");
 const App = @import("app.zig").App;
 const scene_mod = @import("modules/scene.zig");
 const prefab_mod = @import("modules/prefab.zig");
+const io_global = @import("io_global.zig");
 
 const gl_major = 4;
 const gl_minor = 1;
@@ -48,7 +49,7 @@ pub fn main() !void {
     try zopengl.loadCoreProfile(zglfw.getProcAddress, gl_major, gl_minor);
     const gl = zopengl.bindings;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -80,18 +81,20 @@ pub fn main() !void {
     // via the gui's own ProjectManager so the test exercises the real
     // save path. Cleanup runs after engine drains. Honors $TMPDIR
     // (macOS sets it; most Unix shells respect it) with a /tmp fallback.
-    const tmp_base = std.process.getEnvVarOwned(allocator, "TMPDIR") catch try allocator.dupe(u8, "/tmp");
+    const tmp_base = io_global.environ().getAlloc(allocator, "TMPDIR") catch try allocator.dupe(u8, "/tmp");
     defer allocator.free(tmp_base);
-    var prng = std.Random.DefaultPrng.init(@intCast(std.time.nanoTimestamp()));
+    var ts: std.posix.timespec = undefined;
+    _ = std.posix.system.clock_gettime(.REALTIME, &ts);
+    var prng = std.Random.DefaultPrng.init(@intCast(ts.nsec));
     const dir_name = try std.fmt.allocPrint(allocator, "labelle_gui_te_{x}", .{prng.random().int(u64)});
     defer allocator.free(dir_name);
     const tmp = try std.fs.path.join(allocator, &.{
-        std.mem.trimRight(u8, tmp_base, "/\\"),
+        std.mem.trimEnd(u8, tmp_base, "/\\"),
         dir_name,
     });
     defer allocator.free(tmp);
-    try std.fs.cwd().makePath(tmp);
-    defer std.fs.cwd().deleteTree(tmp) catch {};
+    try std.Io.Dir.cwd().createDirPath(io_global.io(), tmp);
+    defer std.Io.Dir.cwd().deleteTree(io_global.io(), tmp) catch {};
 
     try app.project_manager.newProject("settings_te");
     try app.project_manager.saveProject(tmp);
@@ -132,16 +135,17 @@ pub fn main() !void {
     {
         var scene_path_buf: [512]u8 = undefined;
         const scene_path = try std.fmt.bufPrint(&scene_path_buf, "{s}/scenes/scene_with_sprite.jsonc", .{tmp});
-        const sf = try std.fs.cwd().createFile(scene_path, .{});
-        try sf.writeAll(
+        try std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = scene_path,
+            .data = 
             \\{
             \\    "name": "scene_with_sprite",
             \\    "entities": [
             \\        { "prefab": "coin", "components": { "Position": { "x": 1, "y": 2 }, "Sprite": { "n": "coin" } } }
             \\    ]
             \\}
-        );
-        sf.close();
+        ,
+        });
     }
 
     // Drop a tiny Zig script into `scripts/flows/` so the Flow
@@ -152,16 +156,17 @@ pub fn main() !void {
     {
         var flow_path_buf: [512]u8 = undefined;
         const flow_path = try std.fmt.bufPrint(&flow_path_buf, "{s}/scripts/flows/sample.zig", .{tmp});
-        const ff = try std.fs.cwd().createFile(flow_path, .{});
-        try ff.writeAll(
+        try std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = flow_path,
+            .data =
             \\pub fn tick(game: anytype, dt: f32) void {
             \\    _ = game;
             \\    if (dt > 0) {
             \\        _ = dt;
             \\    }
             \\}
-        );
-        ff.close();
+        ,
+        });
     }
 
     // And a prefab with both top-level components and a children
@@ -171,8 +176,9 @@ pub fn main() !void {
     {
         var prefab_path_buf: [512]u8 = undefined;
         const prefab_path = try std.fmt.bufPrint(&prefab_path_buf, "{s}/prefabs/coin.jsonc", .{tmp});
-        const pf = try std.fs.cwd().createFile(prefab_path, .{});
-        try pf.writeAll(
+        try std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = prefab_path,
+            .data = 
             \\{
             \\    "components": {
             \\        "Sprite": { "sprite_name": "coin", "pivot": "center" },
@@ -182,8 +188,8 @@ pub fn main() !void {
             \\        { "components": { "Sprite": { "n": "deco" }, "Position": { "x": 1, "y": 2 } } }
             \\    ]
             \\}
-        );
-        pf.close();
+        ,
+        });
     }
 
     _ = engine.registerTest("phase3", "prefab_open_save_preserves_extras", @src(), struct {
@@ -221,11 +227,8 @@ pub fn main() !void {
             prefab_mod.savePrefab(tab, a);
             _ = zgui.te.check(@src(), .{}, !tab.is_dirty, "is_dirty cleared after Save");
 
-            var file_buf: [4096]u8 = undefined;
-            const file = std.fs.cwd().openFile(path, .{}) catch return;
-            defer file.close();
-            const n = file.read(&file_buf) catch return;
-            const content = file_buf[0..n];
+            const content = std.Io.Dir.cwd().readFileAlloc(io_global.io(), path, a.allocator, .limited(4096)) catch return;
+            defer a.allocator.free(content);
 
             _ = zgui.te.check(@src(), .{}, std.mem.indexOf(u8, content, "\"Sprite\"") != null, "Sprite preserved on disk");
             _ = zgui.te.check(@src(), .{}, std.mem.indexOf(u8, content, "\"Coin\"") != null, "Coin preserved on disk");
@@ -274,11 +277,8 @@ pub fn main() !void {
             scene_mod.saveScene(tab, a);
             _ = zgui.te.check(@src(), .{}, !tab.is_dirty, "is_dirty cleared after Save");
 
-            var file_buf: [4096]u8 = undefined;
-            const file = std.fs.cwd().openFile(path, .{}) catch return;
-            defer file.close();
-            const n = file.read(&file_buf) catch return;
-            const content = file_buf[0..n];
+            const content = std.Io.Dir.cwd().readFileAlloc(io_global.io(), path, a.allocator, .limited(4096)) catch return;
+            defer a.allocator.free(content);
 
             _ = zgui.te.check(@src(), .{}, std.mem.indexOf(u8, content, "\"Sprite\"") != null, "Sprite preserved on disk");
             _ = zgui.te.check(@src(), .{}, std.mem.indexOf(u8, content, "\"x\": 999") != null, "edited Position written");
@@ -321,12 +321,10 @@ pub fn main() !void {
             const dir = g_settings_project_dir.?;
             var path_buf: [512]u8 = undefined;
             const path = std.fmt.bufPrint(&path_buf, "{s}/project.labelle", .{dir}) catch return;
-            var file_buf: [4096]u8 = undefined;
-            const file = std.fs.cwd().openFile(path, .{}) catch return;
-            defer file.close();
-            const n = file.read(&file_buf) catch return;
-            const on_disk = std.mem.indexOf(u8, file_buf[0..n], "\"sprites\"") != null and
-                std.mem.indexOf(u8, file_buf[0..n], "assets/sprites.json") != null;
+            const content = std.Io.Dir.cwd().readFileAlloc(io_global.io(), path, a.allocator, .limited(4096)) catch return;
+            defer a.allocator.free(content);
+            const on_disk = std.mem.indexOf(u8, content, "\"sprites\"") != null and
+                std.mem.indexOf(u8, content, "assets/sprites.json") != null;
             _ = zgui.te.check(@src(), .{}, on_disk, "project.labelle on disk has the resource");
         }
     });
@@ -440,11 +438,9 @@ pub fn main() !void {
             const dir = g_settings_project_dir.?;
             var path_buf: [512]u8 = undefined;
             const path = std.fmt.bufPrint(&path_buf, "{s}/project.labelle", .{dir}) catch return;
-            var file_buf: [4096]u8 = undefined;
-            const file = std.fs.cwd().openFile(path, .{}) catch return;
-            defer file.close();
-            const n = file.read(&file_buf) catch return;
-            const on_disk = std.mem.indexOf(u8, file_buf[0..n], "Edited By TE") != null;
+            const content = std.Io.Dir.cwd().readFileAlloc(io_global.io(), path, a.allocator, .limited(4096)) catch return;
+            defer a.allocator.free(content);
+            const on_disk = std.mem.indexOf(u8, content, "Edited By TE") != null;
             _ = zgui.te.check(@src(), .{}, on_disk, "project.labelle on disk has new title");
         }
     });
