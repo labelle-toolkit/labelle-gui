@@ -21,8 +21,8 @@
             .hash = "nfd-0.1.0-y82kbsSLBgCxj9gDvxK7fxPFYnI3oe2wWx6M9ykp9Gio",
         },
         .zspec = .{
-            .url = "git+https://github.com/apotema/zspec.git?ref=feat/zig-0.16-migration#42e1e69e31a6971c93e6807d29eabe30d9f46bd6",
-            .hash = "zspec-0.8.0-jaKLbe3SAwDRIFxFJbSQvz_lr9Xn-trRT9KR16I8C5_P",
+            .url = "https://github.com/apotema/zspec/archive/v0.9.0.tar.gz",
+            .hash = "zspec-0.9.0-jaKLba73AwB5EK3YFyhpQ4roFBA_hhGbVvjSjur3KxZz",
         },
         .zstbi = .{
             .url = "git+https://github.com/zig-gamedev/zstbi?ref=main#3813f5f113b26f644cfa01a30155cc76b3526e91",
