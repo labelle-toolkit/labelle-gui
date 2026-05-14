@@ -221,10 +221,11 @@ pub fn renderFlowZon(allocator: std.mem.Allocator, loaded: LoadedFlow) ![]u8 {
     try writeEvent(w, loaded.flow.event);
     try w.writeAll(",\n");
 
-    // Sort nodes by id for stable output. The sort lives in a
-    // scratch slice so we don't mutate the caller's data.
-    const scratch_alloc = loaded.arena.allocator();
-    const sorted_nodes = try scratch_alloc.dupe(Node, loaded.flow.nodes);
+    // Sort nodes by id for stable output. Use caller's allocator for
+    // the scratch slices so the LoadedFlow's arena stays unmodified
+    // across multiple render calls (mirrors renderGizmoZon's pattern).
+    const sorted_nodes = try allocator.dupe(Node, loaded.flow.nodes);
+    defer allocator.free(sorted_nodes);
     std.mem.sort(Node, sorted_nodes, {}, lessThanNode);
 
     try w.writeAll("    .nodes = .{\n");
@@ -235,7 +236,8 @@ pub fn renderFlowZon(allocator: std.mem.Allocator, loaded: LoadedFlow) ![]u8 {
     }
     try w.writeAll("    },\n");
 
-    const sorted_links = try scratch_alloc.dupe(Link, loaded.flow.links);
+    const sorted_links = try allocator.dupe(Link, loaded.flow.links);
+    defer allocator.free(sorted_links);
     std.mem.sort(Link, sorted_links, {}, lessThanLink);
 
     try w.writeAll("    .links = .{\n");
