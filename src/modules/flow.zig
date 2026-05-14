@@ -490,7 +490,11 @@ fn renderPulse(s: *FlowState) void {
     const pos = ne.getNodePosition(@intCast(id));
     const size = ne.getNodeSize(@intCast(id));
     if (size[0] <= 0 or size[1] <= 0) return;
-    const dl = zgui.getWindowDrawList();
+    // Use the editor's hint foreground draw list so the pulse stays
+    // anchored in canvas-space when the user pans or zooms, and
+    // overlays node bodies. `getWindowDrawList` would draw in
+    // screen-space and drift relative to the nodes.
+    const dl: zgui.DrawList = @ptrCast(ne.getHintForegroundDrawList());
     const col = zgui.colorConvertFloat4ToU32(.{ 1.0, 0.8, 0.2, alpha });
     dl.addRect(.{
         .pmin = .{ pos[0], pos[1] },
