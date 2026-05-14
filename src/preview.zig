@@ -55,6 +55,21 @@ pub const Bye = struct {
 
 pub const connecting_timeout_ms: i64 = 2_000;
 
+/// Callback invoked on `component_changed` binary frames. Stubbed
+/// alongside the rest of the preview module during the Zig 0.16 migration —
+/// PreviewSession never actually fires it, but the field is preserved
+/// so consumer code that wires entity-inspector / flow-runtime listeners
+/// (added on main after the migration was cut) still compiles.
+pub const ComponentChangedCallback = struct {
+    ctx: *anyopaque,
+    func: *const fn (ctx: *anyopaque, entity_id: u64, name: []const u8, bytes: []const u8) void,
+};
+
+pub const NodeEnteredCallback = struct {
+    ctx: *anyopaque,
+    func: *const fn (ctx: *anyopaque, flow_name: []const u8, node_id: u32) void,
+};
+
 pub const PreviewSession = struct {
     allocator: std.mem.Allocator,
     state: State,
@@ -65,6 +80,10 @@ pub const PreviewSession = struct {
     bye_reason: ?[]u8,
     started_ms: ?i64,
     stderr_buf: std.ArrayList(u8),
+    /// Phase-3 callback slots — stubbed during 0.16 migration. App
+    /// wires these but the stubbed PreviewSession never invokes them.
+    on_component_changed: ?ComponentChangedCallback = null,
+    on_node_entered: ?NodeEnteredCallback = null,
 
     const Self = @This();
 
@@ -131,6 +150,37 @@ pub const PreviewSession = struct {
     /// in the stub.
     pub fn capturedStderr(self: *const Self) []const u8 {
         return self.stderr_buf.items;
+    }
+
+    // ── Phase-3 callback/subscription API (all stubbed) ───────────
+    pub fn watchEntity(self: *Self, entity_id: u64) !void {
+        _ = self;
+        _ = entity_id;
+    }
+
+    pub fn unwatchEntity(self: *Self, entity_id: u64) !void {
+        _ = self;
+        _ = entity_id;
+    }
+
+    pub fn subscribeComponent(self: *Self, name: []const u8) !void {
+        _ = self;
+        _ = name;
+    }
+
+    pub fn unsubscribeComponent(self: *Self, name: []const u8) !void {
+        _ = self;
+        _ = name;
+    }
+
+    pub fn subscribeFlow(self: *Self, flow_name: []const u8) !void {
+        _ = self;
+        _ = flow_name;
+    }
+
+    pub fn unsubscribeFlow(self: *Self, flow_name: []const u8) !void {
+        _ = self;
+        _ = flow_name;
     }
 };
 

@@ -1,0 +1,14 @@
+.{
+    .name = .nfd,
+    .fingerprint = 0xc47056586ea4cdcb,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "nativefiledialog",
+        "src",
+        "LICENSE",
+        "README.md",
+        "build.zig",
+        "build.zig.zon",
+    },
+}

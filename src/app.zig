@@ -25,6 +25,8 @@ const scene_mod = @import("modules/scene.zig");
 const prefab_mod = @import("modules/prefab.zig");
 const flow_mod = @import("modules/flow.zig");
 const gizmo_mod = @import("modules/gizmo.zig");
+const entity_inspector_mod = @import("modules/entity_inspector.zig");
+const flow_runtime_mod = @import("modules/flow_runtime.zig");
 const close_scene_dialog = @import("dialogs/close_scene.zig");
 const atlas = @import("atlas.zig");
 const gizmos = @import("gizmos.zig");
@@ -138,6 +140,19 @@ pub const App = struct {
     /// pointer; clicking Run preview also force-opens it.
     show_preview: bool = false,
 
+    /// Phase 3 (#84): Entity Inspector panel toggle.
+    show_entity_inspector: bool = false,
+    /// Entity Inspector state — fed by `PreviewSession`'s
+    /// `on_component_changed` callback (wired in `init`).
+    entity_inspector: entity_inspector_mod.EntityInspector = undefined,
+
+    /// Phase 3 (#84): Flow Runtime panel toggle.
+    show_flow_runtime: bool = false,
+    /// Flow Runtime state — tracks subscribed-to flows and the
+    /// rolling `node_entered` log. Fed by `PreviewSession`'s
+    /// `on_node_entered` callback (wired in `init`).
+    flow_runtime: flow_runtime_mod.FlowRuntime = .{},
+
     /// Open editor tabs — scenes and prefabs share this list as
     /// `OpenTab` variants. Populated when the user clicks an
     /// editable file in the project tree; closed via the × on a
@@ -214,7 +229,7 @@ pub const App = struct {
 
     /// Fixed-size storage for registered modules. Grow the array literal
     /// when adding modules; Zig will tell you if it overflows.
-    modules: [5]module.Module = undefined,
+    modules: [7]module.Module = undefined,
     registry: module.Registry = .{ .modules = &.{} },
 
     const Self = @This();
@@ -234,11 +249,55 @@ pub const App = struct {
             .startup_prefs = user_prefs,
         };
 
+        // The inspector keeps a `*PreviewSession` so it can call
+        // `watchEntity`/`unwatchEntity` from its own callbacks without
+        // routing through `App`. Initialize after `preview` so the
+        // pointer is stable for the lifetime of the App.
+        app.entity_inspector = entity_inspector_mod.EntityInspector.init(allocator, &app.preview);
+
+        // Wire the preview session's binary-frame listeners. Both are
+        // single-consumer in Phase 3; future panels that need the same
+        // stream will gain a multi-listener path.
+        app.preview.on_component_changed = .{
+            .ctx = app,
+            .func = struct {
+                fn cb(ctx: *anyopaque, entity_id: u64, name: []const u8, bytes: []const u8) void {
+                    const a: *App = @ptrCast(@alignCast(ctx));
+                    a.entity_inspector.onComponentChanged(entity_id, name, bytes);
+                }
+            }.cb,
+        };
+        app.preview.on_node_entered = .{
+            .ctx = app,
+            .func = struct {
+                fn cb(ctx: *anyopaque, flow_name: []const u8, node_id: u32) void {
+                    const a: *App = @ptrCast(@alignCast(ctx));
+                    a.flow_runtime.onNodeEntered(flow_name, node_id);
+                    // Pulse the matching flow editor tab if it's open
+                    // — display name matches the `.flow.zon` stem the
+                    // engine emits. Tabs that aren't flows or whose
+                    // names don't match are skipped silently.
+                    for (a.open_tabs.items) |*tab| {
+                        switch (tab.*) {
+                            .flow => |*f| {
+                                if (std.mem.eql(u8, f.display_name, flow_name)) {
+                                    flow_mod.pulseNode(f, node_id);
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                }
+            }.cb,
+        };
+
         app.modules[0] = project_tree_mod.makeModule(app);
         app.modules[1] = compiler_output.makeModule(app);
         app.modules[2] = project_settings_mod.makeModule(app);
         app.modules[3] = resources_mod.makeModule(app);
         app.modules[4] = preview_mod.makeModule(app);
+        app.modules[5] = entity_inspector_mod.makeModule(app);
+        app.modules[6] = flow_runtime_mod.makeModule(app);
         app.registry = .{ .modules = &app.modules };
 
         return app;
@@ -251,6 +310,10 @@ pub const App = struct {
         if (self.gizmo_index) |*idx| idx.deinit();
         if (self.prefab_index) |*idx| idx.deinit();
         if (self.pending_open_prefab_path) |p| self.allocator.free(p);
+        // Phase 3 state. Entity Inspector frees its component table;
+        // Flow Runtime frees its subscribed-flow name copies.
+        self.entity_inspector.deinit();
+        self.flow_runtime.deinit(self.allocator);
         self.project_manager.deinit();
         self.tree_view.deinit();
         self.compiler.deinit();

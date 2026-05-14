@@ -40,6 +40,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Pure-Zig `.flow.zon` parser + codegen, promoted into an in-tree
+    // sub-package so labelle-assembler can depend on it without
+    // pulling in the gui's imgui/zgui stack (issue #94).
+    const flow_codegen = b.dependency("flow_codegen", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const flow_codegen_module = flow_codegen.module("flow_codegen");
+
     // Main executable
     const exe = b.addExecutable(.{
         .name = "labelle-gui",
@@ -61,6 +70,8 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("nfd", nfd.module("nfd"));
 
     exe.root_module.addImport("zstbi", zstbi.module("root"));
+
+    exe.root_module.addImport("flow_codegen", flow_codegen_module);
 
     // Windows-specific: embed DPI awareness manifest
     if (target.result.os.tag == .windows) {
@@ -93,6 +104,7 @@ pub fn build(b: *std.Build) void {
                 // both modules to resolve at compile time.
                 .{ .name = "zopengl", .module = zopengl.module("root") },
                 .{ .name = "zstbi", .module = zstbi.module("root") },
+                .{ .name = "flow_codegen", .module = flow_codegen_module },
             },
         }),
         .test_runner = .{ .path = zspec.path("src/runner.zig"), .mode = .simple },
@@ -134,6 +146,7 @@ pub fn build(b: *std.Build) void {
     gui_tests_exe.root_module.addImport("zgui", zgui_te.module("root"));
     gui_tests_exe.root_module.linkLibrary(zgui_te.artifact("imgui"));
     gui_tests_exe.root_module.addImport("zstbi", zstbi.module("root"));
+    gui_tests_exe.root_module.addImport("flow_codegen", flow_codegen_module);
 
     const run_gui_tests = b.addRunArtifact(gui_tests_exe);
     const gui_test_step = b.step("gui-test", "Run the UI test runner");
