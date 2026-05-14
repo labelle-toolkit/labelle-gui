@@ -75,13 +75,21 @@ pub const FlowRuntime = struct {
 
     pub fn subscribe(self: *FlowRuntime, allocator: std.mem.Allocator, session: *preview.PreviewSession, flow_name: []const u8) !void {
         if (self.isSubscribed(flow_name)) return;
+        // Wire write first. If it fails, local state is unchanged —
+        // the engine isn't subscribed so keeping `subscribed` clean is
+        // the correct consistent view (and avoids the dangling-pointer
+        // risk of freeing `owned` via errdefer after it's been appended).
+        try session.subscribeFlow(flow_name);
         const owned = try allocator.dupe(u8, flow_name);
         errdefer allocator.free(owned);
         try self.subscribed.append(allocator, owned);
-        try session.subscribeFlow(flow_name);
     }
 
     pub fn unsubscribe(self: *FlowRuntime, allocator: std.mem.Allocator, session: *preview.PreviewSession, flow_name: []const u8) !void {
+        // Send the wire frame first. If it fails, leave local state
+        // unchanged — the engine is still subscribed, so keeping the
+        // name in `subscribed` is the correct consistent view.
+        try session.unsubscribeFlow(flow_name);
         for (self.subscribed.items, 0..) |n, i| {
             if (std.mem.eql(u8, n, flow_name)) {
                 allocator.free(n);
@@ -89,7 +97,6 @@ pub const FlowRuntime = struct {
                 break;
             }
         }
-        try session.unsubscribeFlow(flow_name);
     }
 };
 

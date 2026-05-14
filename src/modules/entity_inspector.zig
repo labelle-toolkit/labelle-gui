@@ -72,8 +72,13 @@ pub const EntityInspector = struct {
             self.session.unwatchEntity(prev) catch {};
         }
         self.clearComponents();
-        self.watched_entity = entity_id;
+        // Set watched_entity only after the wire write succeeds so the
+        // inspector never believes it is watching an entity the engine
+        // never heard about (which would silently drop every subsequent
+        // component_changed frame for that entity).
+        self.watched_entity = null;
         try self.session.watchEntity(entity_id);
+        self.watched_entity = entity_id;
     }
 
     /// Clear selection and tell the engine to stop emitting filtered
@@ -96,7 +101,6 @@ pub const EntityInspector = struct {
         if (watched != entity_id) return;
 
         const owned_bytes = self.allocator.dupe(u8, bytes) catch return;
-        errdefer self.allocator.free(owned_bytes);
 
         const gop = self.components.getOrPut(name) catch {
             self.allocator.free(owned_bytes);
