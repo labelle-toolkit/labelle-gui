@@ -270,7 +270,9 @@ fn renderInspector(s: *SceneState, app: *App, atlas_index: ?*const @import("../a
 
     var open_prefab_request: ?[]const u8 = null;
     var delete_request: bool = false;
-    inspector.renderEntity(entity, extras, &s.is_dirty, idx, atlas_index, &open_prefab_request, &delete_request);
+    const prefab_idx_ptr: ?*const @import("../prefab_index.zig").Index =
+        if (app.prefab_index) |*pi| pi else null;
+    inspector.renderEntity(entity, extras, &s.is_dirty, idx, atlas_index, &open_prefab_request, &delete_request, prefab_idx_ptr);
     if (open_prefab_request) |_| {
         // The button was clicked — resolve via the prefab cache and
         // open the file. Same routing used by the double-click jump.

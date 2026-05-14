@@ -17,6 +17,7 @@ const preview = @import("preview.zig");
 const flow_projector = @import("flows/projector.zig");
 const flow_types = @import("flows/types.zig");
 const prefs = @import("prefs.zig");
+const prefab_contents = @import("modules/inspector/prefab_contents.zig");
 const io_global = @import("io_global.zig");
 
 /// Wall-clock seconds since the Unix epoch; replacement for the
@@ -2898,5 +2899,34 @@ pub const PreferencesTests = struct {
 
         const loaded = prefs.loadFromPath(std.testing.allocator, path);
         try expect.equal(loaded.font_scale, prefs.default_font_scale);
+    }
+};
+
+pub const PrefabContentsTests = struct {
+    test "consecutivePrefabRunEnd groups consecutive same-prefab children" {
+        const children = [_]scene_io.Entity{
+            .{ .prefab = "seat" },
+            .{ .prefab = "seat" },
+            .{ .prefab = "seat" },
+            .{ .prefab = "table" },
+        };
+        try expect.equal(prefab_contents.consecutivePrefabRunEnd(&children, 0, "seat"), 3);
+        try expect.equal(prefab_contents.consecutivePrefabRunEnd(&children, 3, "table"), 4);
+    }
+
+    test "consecutivePrefabRunEnd stops at a child without a prefab" {
+        const children = [_]scene_io.Entity{
+            .{ .prefab = "seat" },
+            .{ .prefab = null },
+            .{ .prefab = "seat" },
+        };
+        try expect.equal(prefab_contents.consecutivePrefabRunEnd(&children, 0, "seat"), 1);
+    }
+
+    test "consecutivePrefabRunEnd returns end of slice for a single trailing run" {
+        const children = [_]scene_io.Entity{
+            .{ .prefab = "only" },
+        };
+        try expect.equal(prefab_contents.consecutivePrefabRunEnd(&children, 0, "only"), 1);
     }
 };

@@ -25,6 +25,8 @@ const zgui = @import("zgui");
 
 const scene_io = @import("../scene_io.zig");
 const atlas = @import("../atlas.zig");
+const prefab_index = @import("../prefab_index.zig");
+const prefab_contents = @import("inspector/prefab_contents.zig");
 
 pub const InspectorSection = @import("inspector/section.zig").InspectorSection;
 
@@ -73,6 +75,13 @@ pub fn renderEntity(
     /// because per-child delete inside a prefab is handled by the
     /// prefab editor's own UI flow.
     request_delete: ?*bool,
+    /// Optional prefab cache. When the entity references a prefab and
+    /// this is non-null, the inspector renders a read-only
+    /// "Prefab contents" section listing every component on the
+    /// referenced prefab tree (issue #86). The scene editor wires its
+    /// `app.prefab_index`; the prefab editor passes null — there's no
+    /// need to display "contents of yourself" inside the prefab tab.
+    prefab_idx: ?*const prefab_index.Index,
 ) void {
     if (entity_index) |n| {
         zgui.text("Entity #{d}", .{n});
@@ -105,6 +114,10 @@ pub fn renderEntity(
                 s.render(entity, is_dirty, atlas_index);
             }
         }
+    }
+
+    if (entity.prefab) |p| {
+        if (prefab_idx) |idx| prefab_contents.render(p, idx);
     }
 
     if (component_extras.len > 0) {
