@@ -411,7 +411,7 @@ pub const FlowCodegenTests = struct {
         ;
         const out = try renderFromZon(allocator, src, "get");
         defer allocator.free(out);
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n3_value = game.getComponent(Position, entity) orelse return;") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n3_value = game.getComponent(entity, Position) orelse return;") != null);
     }
 
     test "OnCreate with custom arg_entity aliases to entity in template scope" {
@@ -431,7 +431,7 @@ pub const FlowCodegenTests = struct {
         // The alias binds the user-chosen parameter name to `entity` so
         // the GetComponent template (which always says `entity`) compiles.
         try expect.toBeTrue(std.mem.indexOf(u8, out, "const entity = self;") != null);
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "getComponent(Position, entity)") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "getComponent(entity, Position)") != null);
     }
 
     test "OnCreate with default arg_entity does not emit redundant alias" {
@@ -658,7 +658,7 @@ pub const FlowCodegenTests = struct {
         // output. Position-sensitive -- catches any future regression
         // where a node ends up upstream of its dependencies.
         const expected_in_order = [_][]const u8{
-            "const n1_value = game.getComponent(Position, entity) orelse return;",
+            "const n1_value = game.getComponent(entity, Position) orelse return;",
             "const n2_result = n1_value.x + 0;",
             "game.setField(Position, .x, entity, n2_result);",
         };

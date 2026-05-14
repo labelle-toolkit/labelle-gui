@@ -359,7 +359,7 @@ fn writeNodeBody(
 ) (CodegenError || std.mem.Allocator.Error)!void {
     switch (node.kind) {
         .GetComponent => |b| try w.print(
-            "    const n{d}_value = game.getComponent({s}, entity) orelse return;\n",
+            "    const n{d}_value = game.getComponent(entity, {s}) orelse return;\n",
             .{ node.id, b.type },
         ),
         .SetField => |b| {
