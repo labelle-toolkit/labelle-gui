@@ -27,10 +27,14 @@
             .url = "https://github.com/zig-gamedev/zstbi/archive/664305dd5.tar.gz",
             .hash = "zstbi-0.11.0-dev-L0Ea_2yVBwA4uh-tHfgdhZcQaWRoZVYlNGs4Dl_WTeuR",
         },
+        .flow_codegen = .{
+            .path = "flow-codegen",
+        },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
+        "flow-codegen",
     },
 }
