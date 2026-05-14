@@ -676,6 +676,196 @@ pub const FlowCodegenTests = struct {
         try expect.toBeTrue(std.mem.indexOf(u8, out, "const entity: EntityId = undefined;") != null);
     }
 
+    test "GetComponent node emits component @import in prelude" {
+        // Issue #101: the codegen used to reference `Position` without
+        // importing it, so the emitted file failed to compile.
+        const allocator = std.testing.allocator;
+        const src =
+            \\.{
+            \\    .event = .{ .OnCreate = .{ .arg_entity = "entity" } },
+            \\    .nodes = .{
+            \\        .{ .id = 1, .pos = .{0, 0}, .kind = .{ .GetComponent = .{ .type = "Position" } } },
+            \\    },
+            \\    .links = .{},
+            \\}
+            \\
+        ;
+        const out = try renderFromZon(allocator, src, "imp_gc");
+        defer allocator.free(out);
+
+        const needle = "const Position = @import(\"components/Position.zig\").Position;";
+        try expect.toBeTrue(std.mem.indexOf(u8, out, needle) != null);
+        // Exactly once -- no duplicate emission.
+        var count: usize = 0;
+        var start: usize = 0;
+        while (std.mem.indexOfPos(u8, out, start, needle)) |at| {
+            count += 1;
+            start = at + 1;
+        }
+        try expect.equal(count, @as(usize, 1));
+
+        // And it lands in the prelude, before the function header.
+        const import_at = std.mem.indexOf(u8, out, needle).?;
+        const fn_at = std.mem.indexOf(u8, out, "pub fn onCreate").?;
+        try expect.toBeTrue(import_at < fn_at);
+    }
+
+    test "SetField target extracts type-name with the same split rule as the template" {
+        // The SetField template uses `lastIndexOfScalar('.')` to peel
+        // the type off `target`. The import collector must use the
+        // same split so a target like `Position.x` produces a single
+        // `Position` import that matches the symbol the template
+        // actually references.
+        const allocator = std.testing.allocator;
+        const src =
+            \\.{
+            \\    .event = .{ .OnCreate = .{ .arg_entity = "entity" } },
+            \\    .nodes = .{
+            \\        .{ .id = 1, .pos = .{0, 0}, .kind = .{ .Literal = .{ .value = "42" } } },
+            \\        .{ .id = 2, .pos = .{0, 0}, .kind = .{ .SetField = .{ .target = "Position.x" } } },
+            \\    },
+            \\    .links = .{
+            \\        .{ .from = .{ .node = 1, .pin = "value" }, .to = .{ .node = 2, .pin = "value" } },
+            \\    },
+            \\}
+            \\
+        ;
+        const out = try renderFromZon(allocator, src, "imp_sf");
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const Position = @import(\"components/Position.zig\").Position;") != null);
+        // And the SetField template still calls into the same name.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "game.setField(Position, .x, entity, n1_value);") != null);
+    }
+
+    test "duplicate component references emit exactly one @import" {
+        // Two GetComponent nodes for the same type used to risk
+        // emitting two import lines. The collector de-dupes via a
+        // string set.
+        const allocator = std.testing.allocator;
+        const src =
+            \\.{
+            \\    .event = .{ .OnCreate = .{ .arg_entity = "entity" } },
+            \\    .nodes = .{
+            \\        .{ .id = 1, .pos = .{0, 0}, .kind = .{ .GetComponent = .{ .type = "Position" } } },
+            \\        .{ .id = 2, .pos = .{0, 0}, .kind = .{ .GetComponent = .{ .type = "Position" } } },
+            \\        .{ .id = 3, .pos = .{0, 0}, .kind = .{ .SetField = .{ .target = "Position.x" } } },
+            \\        .{ .id = 4, .pos = .{0, 0}, .kind = .{ .Literal = .{ .value = "0" } } },
+            \\    },
+            \\    .links = .{
+            \\        .{ .from = .{ .node = 4, .pin = "value" }, .to = .{ .node = 3, .pin = "value" } },
+            \\    },
+            \\}
+            \\
+        ;
+        const out = try renderFromZon(allocator, src, "imp_dup");
+        defer allocator.free(out);
+
+        const needle = "const Position = @import(\"components/Position.zig\").Position;";
+        var count: usize = 0;
+        var start: usize = 0;
+        while (std.mem.indexOfPos(u8, out, start, needle)) |at| {
+            count += 1;
+            start = at + 1;
+        }
+        try expect.equal(count, @as(usize, 1));
+    }
+
+    test "multiple distinct component types emit sorted @import lines" {
+        // Alphabetical order keeps the output byte-stable across
+        // graph re-arrangements -- a `Velocity` node added before a
+        // `Position` node would otherwise flip the prelude.
+        const allocator = std.testing.allocator;
+        const src =
+            \\.{
+            \\    .event = .{ .OnCreate = .{ .arg_entity = "entity" } },
+            \\    .nodes = .{
+            \\        .{ .id = 1, .pos = .{0, 0}, .kind = .{ .GetComponent = .{ .type = "Velocity" } } },
+            \\        .{ .id = 2, .pos = .{0, 0}, .kind = .{ .GetComponent = .{ .type = "Position" } } },
+            \\    },
+            \\    .links = .{},
+            \\}
+            \\
+        ;
+        const out = try renderFromZon(allocator, src, "imp_sort");
+        defer allocator.free(out);
+
+        const pos_needle = "const Position = @import(\"components/Position.zig\").Position;";
+        const vel_needle = "const Velocity = @import(\"components/Velocity.zig\").Velocity;";
+        const pos_at = std.mem.indexOf(u8, out, pos_needle) orelse return error.TestExpectedSubstring;
+        const vel_at = std.mem.indexOf(u8, out, vel_needle) orelse return error.TestExpectedSubstring;
+        try expect.toBeTrue(pos_at < vel_at);
+    }
+
+    test "namespaced component type name surfaces NamespacedComponentType error" {
+        // Bare identifiers only in v1: `const foo.bar.Baz = @import(...);`
+        // isn't valid Zig, so the codegen must refuse rather than emit
+        // a broken prelude. Tracked for v2.
+        const allocator = std.testing.allocator;
+        const src =
+            \\.{
+            \\    .event = .{ .OnCreate = .{ .arg_entity = "entity" } },
+            \\    .nodes = .{
+            \\        .{ .id = 1, .pos = .{0, 0}, .kind = .{ .GetComponent = .{ .type = "foo.bar.Baz" } } },
+            \\    },
+            \\    .links = .{},
+            \\}
+            \\
+        ;
+        const result = renderFromZon(allocator, src, "ns");
+        try expect.toBeTrue(if (result) |out| blk: {
+            allocator.free(out);
+            break :blk false;
+        } else |err| err == error.NamespacedComponentType);
+    }
+
+    test "SetField target with multi-dot type name surfaces NamespacedComponentType" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\.{
+            \\    .event = .{ .OnCreate = .{ .arg_entity = "entity" } },
+            \\    .nodes = .{
+            \\        .{ .id = 1, .pos = .{0, 0}, .kind = .{ .Literal = .{ .value = "1.0" } } },
+            \\        .{ .id = 2, .pos = .{0, 0}, .kind = .{ .SetField = .{ .target = "foo.bar.Baz.x" } } },
+            \\    },
+            \\    .links = .{
+            \\        .{ .from = .{ .node = 1, .pin = "value" }, .to = .{ .node = 2, .pin = "value" } },
+            \\    },
+            \\}
+            \\
+        ;
+        const result = renderFromZon(allocator, src, "ns_sf");
+        try expect.toBeTrue(if (result) |out| blk: {
+            allocator.free(out);
+            break :blk false;
+        } else |err| err == error.NamespacedComponentType);
+    }
+
+    test "flow with no component references emits zero component @imports" {
+        // Don't leak imports into pure-arithmetic flows -- they'd
+        // reference files that don't exist on disk.
+        const allocator = std.testing.allocator;
+        const src =
+            \\.{
+            \\    .event = .{ .OnUpdate = .{ .arg_dt = "dt" } },
+            \\    .nodes = .{
+            \\        .{ .id = 1, .pos = .{0, 0}, .kind = .{ .Literal = .{ .value = "1.0" } } },
+            \\        .{ .id = 2, .pos = .{0, 0}, .kind = .{ .Identifier = .{ .name = "speed" } } },
+            \\        .{ .id = 3, .pos = .{0, 0}, .kind = .{ .BinOp = .{ .op = .mul } } },
+            \\    },
+            \\    .links = .{
+            \\        .{ .from = .{ .node = 1, .pin = "value" }, .to = .{ .node = 3, .pin = "a" } },
+            \\        .{ .from = .{ .node = 2, .pin = "value" }, .to = .{ .node = 3, .pin = "b" } },
+            \\    },
+            \\}
+            \\
+        ;
+        const out = try renderFromZon(allocator, src, "imp_none");
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "@import(\"components/") == null);
+    }
+
     test "output passes std.zig.Ast.parse without errors" {
         // The single strongest correctness signal -- anything we
         // emit must be syntactically valid Zig.
