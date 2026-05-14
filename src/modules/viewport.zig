@@ -218,7 +218,7 @@ pub fn render(
     // the prefab editor passes null because there's no further level
     // to descend into).
     if (state.double_click_entity) |sink| {
-        if (zgui.isItemHovered(.{}) and zgui.isMouseDoubleClicked(.left)) {
+        if (zgui.isItemHovered(.{}) and zgui.isMouseDoubleClicked(.left) and !space_held) {
             const mouse = zgui.getMousePos();
             // Same fallback chain the single + right-click handlers
             // use: AABB first, then radial. Without the radial chain a
