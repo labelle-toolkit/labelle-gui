@@ -68,6 +68,12 @@
 const std = @import("std");
 const flow_io = @import("flow_io.zig");
 
+/// Format string for `@import` paths to component type files in the
+/// assembler's project layout. Centralized so a future layout change
+/// (e.g. `src/components/<Name>.zig`) is a one-line edit. The `{s}`
+/// substitutes the component type name (`Position`, `Velocity`, …).
+const components_import_path_fmt = "components/{s}.zig";
+
 /// Caller-facing configuration. `flow_name` is the stem of the
 /// source `.flow.zon` file — used as the first argument to
 /// `Preview.emitNodeEntered` so the editor can correlate node-entered
@@ -136,7 +142,27 @@ pub fn renderFlowZig(
     try w.writeAll("const std = @import(\"std\");\n");
     try w.writeAll("const game_mod = @import(\"game\");\n");
     try w.writeAll("const Game = game_mod.Game;\n");
-    try w.writeAll("const EntityId = game_mod.EntityId;\n\n");
+    try w.writeAll("const EntityId = game_mod.EntityId;\n");
+
+    // Component imports: every type-name referenced by a
+    // `GetComponent` or `SetField` node needs a matching
+    // `@import("components/<Name>.zig").<Name>` so the generated
+    // file resolves under the assembler's project layout. We sort
+    // for deterministic output and de-duplicate so a single type
+    // referenced from multiple nodes emits only one import. See
+    // issue #101.
+    const component_types = try collectComponentTypes(allocator, flow);
+    defer allocator.free(component_types);
+    for (component_types) |type_name| {
+        try w.writeAll("const ");
+        try w.writeAll(type_name);
+        try w.writeAll(" = @import(\"");
+        try w.print(components_import_path_fmt, .{type_name});
+        try w.writeAll("\").");
+        try w.writeAll(type_name);
+        try w.writeAll(";\n");
+    }
+    try w.writeAll("\n");
 
     // Function signature, derived from the event variant.
     try writeFnHeader(w, flow.event);
@@ -504,6 +530,52 @@ fn countCallArgs(flow: flow_io.Flow, node_id: u32) usize {
         if (max_idx == null or idx > max_idx.?) max_idx = idx;
     }
     return if (max_idx) |m| m + 1 else 0;
+}
+
+/// Walk the flow's nodes and collect every component type-name
+/// referenced by `GetComponent` (verbatim `type` field) or
+/// `SetField` (the segment of `target` left of the LAST `.`, matching
+/// the split rule used by the `SetField` template — see
+/// `writeNodeBody`). The returned slice is allocated on `allocator`,
+/// is alphabetically sorted, and contains no duplicates so the
+/// caller can emit one `@import` per name with deterministic order.
+///
+/// `SetField.target` values without any `.` are skipped — they're
+/// rejected as `UnknownPin` further down the pipeline, and we don't
+/// want to crash building the import set on a flow that's about to
+/// fail validation anyway.
+fn collectComponentTypes(
+    allocator: std.mem.Allocator,
+    flow: flow_io.Flow,
+) std.mem.Allocator.Error![][]const u8 {
+    var seen = std.StringHashMap(void).init(allocator);
+    defer seen.deinit();
+    var list: std.ArrayList([]const u8) = .{};
+    errdefer list.deinit(allocator);
+
+    for (flow.nodes) |n| {
+        const type_name: ?[]const u8 = switch (n.kind) {
+            .GetComponent => |b| b.type,
+            .SetField => |b| blk: {
+                const dot = std.mem.lastIndexOfScalar(u8, b.target, '.') orelse break :blk null;
+                break :blk b.target[0..dot];
+            },
+            else => null,
+        };
+        if (type_name) |t| {
+            if (t.len == 0) continue;
+            const gop = try seen.getOrPut(t);
+            if (!gop.found_existing) try list.append(allocator, t);
+        }
+    }
+
+    const out = try list.toOwnedSlice(allocator);
+    std.mem.sort([]const u8, out, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    return out;
 }
 
 fn anyNodeNeedsEntity(nodes: []const flow_io.Node) bool {
