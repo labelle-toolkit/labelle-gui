@@ -797,6 +797,50 @@ pub const FlowCodegenTests = struct {
         try expect.toBeTrue(pos_at < vel_at);
     }
 
+    test "namespaced component type name surfaces NamespacedComponentType error" {
+        // Bare identifiers only in v1: `const foo.bar.Baz = @import(...);`
+        // isn't valid Zig, so the codegen must refuse rather than emit
+        // a broken prelude. Tracked for v2.
+        const allocator = std.testing.allocator;
+        const src =
+            \\.{
+            \\    .event = .{ .OnCreate = .{ .arg_entity = "entity" } },
+            \\    .nodes = .{
+            \\        .{ .id = 1, .pos = .{0, 0}, .kind = .{ .GetComponent = .{ .type = "foo.bar.Baz" } } },
+            \\    },
+            \\    .links = .{},
+            \\}
+            \\
+        ;
+        const result = renderFromZon(allocator, src, "ns");
+        try expect.toBeTrue(if (result) |out| blk: {
+            allocator.free(out);
+            break :blk false;
+        } else |err| err == error.NamespacedComponentType);
+    }
+
+    test "SetField target with multi-dot type name surfaces NamespacedComponentType" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\.{
+            \\    .event = .{ .OnCreate = .{ .arg_entity = "entity" } },
+            \\    .nodes = .{
+            \\        .{ .id = 1, .pos = .{0, 0}, .kind = .{ .Literal = .{ .value = "1.0" } } },
+            \\        .{ .id = 2, .pos = .{0, 0}, .kind = .{ .SetField = .{ .target = "foo.bar.Baz.x" } } },
+            \\    },
+            \\    .links = .{
+            \\        .{ .from = .{ .node = 1, .pin = "value" }, .to = .{ .node = 2, .pin = "value" } },
+            \\    },
+            \\}
+            \\
+        ;
+        const result = renderFromZon(allocator, src, "ns_sf");
+        try expect.toBeTrue(if (result) |out| blk: {
+            allocator.free(out);
+            break :blk false;
+        } else |err| err == error.NamespacedComponentType);
+    }
+
     test "flow with no component references emits zero component @imports" {
         // Don't leak imports into pure-arithmetic flows -- they'd
         // reference files that don't exist on disk.

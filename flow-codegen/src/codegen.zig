@@ -95,6 +95,12 @@ pub const CodegenError = error{
     /// A link names a `to.pin` that isn't part of the consumer
     /// node's input pin signature.
     UnknownPin,
+    /// A `GetComponent` / `SetField` references a type name that
+    /// contains a `.` (namespaced like `foo.bar.Baz`). v1 codegen
+    /// emits `const <Name> = @import(...);` lines for each referenced
+    /// type, and `const foo.bar.Baz = ...` isn't valid Zig. Bare
+    /// component names only for now; namespaced types are a follow-up.
+    NamespacedComponentType,
     /// Future-proofing for additional `NodeKind` variants. v1 never
     /// raises this — every shipped variant has a template.
     UnsupportedNodeKind,
@@ -547,7 +553,7 @@ fn countCallArgs(flow: flow_io.Flow, node_id: u32) usize {
 fn collectComponentTypes(
     allocator: std.mem.Allocator,
     flow: flow_io.Flow,
-) std.mem.Allocator.Error![][]const u8 {
+) (CodegenError || std.mem.Allocator.Error)![][]const u8 {
     var seen = std.StringHashMap(void).init(allocator);
     defer seen.deinit();
     var list: std.ArrayList([]const u8) = .{};
@@ -564,6 +570,11 @@ fn collectComponentTypes(
         };
         if (type_name) |t| {
             if (t.len == 0) continue;
+            // Bare identifiers only — namespaced types (`foo.bar.Baz`)
+            // would emit `const foo.bar.Baz = @import(...);`, which
+            // isn't valid Zig. Surface as a typed error so the
+            // assembler can give a useful diagnostic; tracked for v2.
+            if (std.mem.indexOfScalar(u8, t, '.') != null) return error.NamespacedComponentType;
             const gop = try seen.getOrPut(t);
             if (!gop.found_existing) try list.append(allocator, t);
         }
