@@ -23,10 +23,16 @@ const max_depth: u8 = 5;
 /// the gating in `inspector.renderEntity` stays a single boolean check.
 pub fn render(prefab_name: []const u8, idx: *const prefab_index.Index) void {
     if (!zgui.collapsingHeader("Prefab contents##prefab_contents_section", .{})) return;
-    renderNode(prefab_name, idx, 0, 1);
+    renderNode(prefab_name, idx, 0, 1, 0);
 }
 
-fn renderNode(name: []const u8, idx: *const prefab_index.Index, depth: u8, repeat_count: u32) void {
+/// `node_id` is appended as a hidden ImGui ID discriminator
+/// (`##{node_id}`) so siblings with the same prefab name get distinct
+/// tree-node identities — without it, non-consecutive children like
+/// `[seat, table, seat]` collide and expand/collapse in sync. The
+/// top-level call passes 0; recursive calls from `renderChildren` pass
+/// the child's loop index.
+fn renderNode(name: []const u8, idx: *const prefab_index.Index, depth: u8, repeat_count: u32, node_id: usize) void {
     if (depth >= max_depth) {
         zgui.bullet();
         zgui.textDisabled("… (max depth reached at {s})", .{name});
@@ -49,7 +55,7 @@ fn renderNode(name: []const u8, idx: *const prefab_index.Index, depth: u8, repea
     };
 
     var label_buf: [256:0]u8 = undefined;
-    const label = std.fmt.bufPrintZ(&label_buf, "{s}", .{name}) catch return;
+    const label = std.fmt.bufPrintZ(&label_buf, "{s}##{d}", .{ name, node_id }) catch return;
     if (!zgui.treeNode(label)) return;
     defer zgui.treePop();
 
@@ -105,7 +111,7 @@ fn renderChildren(
         if (child.prefab) |child_prefab| {
             const run_end = consecutivePrefabRunEnd(children, i, child_prefab);
             const count: u32 = @intCast(run_end - i);
-            renderNode(child_prefab, idx, depth, count);
+            renderNode(child_prefab, idx, depth, count, i);
             i = run_end;
         } else {
             // No prefab ref — render the child's own components inline.
