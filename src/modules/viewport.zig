@@ -168,15 +168,31 @@ pub fn render(
         drawGizmoOverlay(dl, canvas_min, state, entities, entity_extras, gi);
     };
 
-    _ = zgui.invisibleButton("##canvas_drag", .{ .w = canvas_size[0], .h = canvas_size[1], .flags = .{} });
+    // Accept middle-button as well as left so the middle-mouse pan
+    // handler below (`isItemActive()` block) is reachable. ImGui
+    // requires explicit opt-in for any non-left button on
+    // InvisibleButton — without `mouse_button_middle`, `isItemActive`
+    // never goes true under a middle-only drag.
+    _ = zgui.invisibleButton("##canvas_drag", .{
+        .w = canvas_size[0],
+        .h = canvas_size[1],
+        .flags = .{ .mouse_button_left = true, .mouse_button_middle = true },
+    });
+
+    // Holding Space turns left-click+drag into a pan grab — Figma /
+    // Photoshop convention, works on any input device (Mac trackpads
+    // have no middle button, so middle-mouse alone leaves panning
+    // unreachable for the majority of users on this platform).
+    const space_held = zgui.isKeyDown(.space);
 
     // Mouse-down: hit-test entity AABBs first (so a click anywhere on
     // an expanded prefab's visual footprint grabs the whole room),
     // fall back to the radial marker hit-test for degenerate cases
     // (no sprite, no prefab — the AABB collapses to a point and
     // `entityWorldAabb` returns the radial-equivalent box). Arm
-    // drag-to-move only when the click landed on something.
-    if (zgui.isItemHovered(.{}) and zgui.isMouseClicked(.left)) {
+    // drag-to-move only when the click landed on something AND Space
+    // isn't held — Space + left-click is reserved for panning.
+    if (zgui.isItemHovered(.{}) and zgui.isMouseClicked(.left) and !space_held) {
         const mouse = zgui.getMousePos();
         const hit = hitTestEntityAabb(entities, mouse, canvas_min, state.pan.*, state.zoom.*, atlas_index, prefab_index) orelse
             hitTestEntity(entities, mouse, canvas_min, state.pan.*, state.zoom.*);
@@ -235,6 +251,15 @@ pub fn render(
             state.pan[0] += d[0];
             state.pan[1] += d[1];
             zgui.resetMouseDragDelta(.middle);
+        }
+        // Space + left-drag pan. Mutually exclusive with drag-to-move
+        // because the click-time gate (`!space_held` above) leaves
+        // `drag_armed` false when the press began with Space held.
+        if (space_held and zgui.isMouseDragging(.left, 0)) {
+            const d = zgui.getMouseDragDelta(.left, .{});
+            state.pan[0] += d[0];
+            state.pan[1] += d[1];
+            zgui.resetMouseDragDelta(.left);
         }
         if (state.drag_armed.*) {
             if (state.selected_idx.*) |idx| {
