@@ -252,16 +252,26 @@ pub fn render(
             state.pan[1] += d[1];
             zgui.resetMouseDragDelta(.middle);
         }
-        // Space + left-drag pan. Mutually exclusive with drag-to-move
-        // because the click-time gate (`!space_held` above) leaves
-        // `drag_armed` false when the press began with Space held.
-        if (space_held and zgui.isMouseDragging(.left, 0)) {
+        // Space + left-drag pan. Part of the same if-else chain as
+        // drag-to-move below, so only one of the two left-drag
+        // handlers fires per frame. This covers two scenarios:
+        //
+        //  1. Space held at click-time: the click-time gate left
+        //     `drag_armed` false, so even this `else if` isn't
+        //     strictly needed — but the chain is the belt-and-
+        //     suspenders guarantee.
+        //  2. Space pressed mid-drag (after drag_armed was set):
+        //     this branch fires instead of the drag-to-move block,
+        //     so `resetMouseDragDelta(.left)` never corrupts the
+        //     accumulated delta that drag-to-move reads from
+        //     `drag_start_world`. Without the chain, that reset
+        //     would snap the entity back to its start position.
+        else if (space_held and zgui.isMouseDragging(.left, 0)) {
             const d = zgui.getMouseDragDelta(.left, .{});
             state.pan[0] += d[0];
             state.pan[1] += d[1];
             zgui.resetMouseDragDelta(.left);
-        }
-        if (state.drag_armed.*) {
+        } else if (state.drag_armed.*) {
             if (state.selected_idx.*) |idx| {
                 if (idx < entities.len and zgui.isMouseDragging(.left, 0)) {
                     const e = &entities[idx];
