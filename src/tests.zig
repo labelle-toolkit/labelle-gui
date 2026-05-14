@@ -17,6 +17,28 @@ const preview = @import("preview.zig");
 const flow_projector = @import("flows/projector.zig");
 const flow_types = @import("flows/types.zig");
 const prefs = @import("prefs.zig");
+const io_global = @import("io_global.zig");
+
+/// Wall-clock seconds since the Unix epoch; replacement for the
+/// `std.time.timestamp` helper removed in Zig 0.16. Used only to
+/// generate unique scratch directory names in tests.
+fn timestampSeconds() i64 {
+    const native_os = @import("builtin").os.tag;
+    switch (native_os) {
+        .windows => {
+            var ft: std.os.windows.FILETIME = undefined;
+            std.os.windows.kernel32.GetSystemTimeAsFileTime(&ft);
+            const ticks: i64 = (@as(i64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+            const unix_epoch_offset: i64 = 11644473600;
+            return @divTrunc(ticks, 10_000_000) - unix_epoch_offset;
+        },
+        else => {
+            var ts: std.posix.timespec = undefined;
+            _ = std.posix.system.clock_gettime(.REALTIME, &ts);
+            return ts.sec;
+        },
+    }
+}
 
 test {
     zspec.runAll(@This());
@@ -273,7 +295,7 @@ pub const CompilerTests = struct {
         var comp = compiler.Compiler.init(allocator);
         defer comp.deinit();
 
-        try expect.toBeTrue(comp.build_process == null);
+        try expect.toBeFalse(comp.has_pending_result);
     }
 };
 
@@ -1745,14 +1767,14 @@ pub const SceneTemplateTests = struct {
 pub const ProjectFileTests = struct {
     fn createTempDir(allocator: std.mem.Allocator) ![]const u8 {
         const tmp_base = "/tmp";
-        const ts = std.time.nanoTimestamp();
+        const ts = timestampSeconds();
         const dir_name = try std.fmt.allocPrint(allocator, "{s}/labelle_test_{d}", .{ tmp_base, ts });
-        try std.fs.cwd().makeDir(dir_name);
+        try std.Io.Dir.cwd().createDir(io_global.io(), dir_name, .default_dir);
         return dir_name;
     }
 
     fn deleteTempDir(allocator: std.mem.Allocator, dir_path: []const u8) void {
-        std.fs.cwd().deleteTree(dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(io_global.io(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
@@ -1769,9 +1791,7 @@ pub const ProjectFileTests = struct {
         const labelle_path = try std.fs.path.join(allocator, &.{ temp_dir, "project.labelle" });
         defer allocator.free(labelle_path);
 
-        const file = try std.fs.cwd().openFile(labelle_path, .{});
-        defer file.close();
-        const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+        const content = try std.Io.Dir.cwd().readFileAlloc(io_global.io(), labelle_path, allocator, .limited(1024 * 1024));
         defer allocator.free(content);
 
         try expect.toBeTrue(std.mem.indexOf(u8, content, ".name = \"test_project\"") != null);
@@ -1794,11 +1814,12 @@ pub const ProjectFileTests = struct {
             const folder_path = try std.fs.path.join(allocator, &.{ temp_dir, folder });
             defer allocator.free(folder_path);
 
-            var dir = std.fs.cwd().openDir(folder_path, .{}) catch {
+            const io = io_global.io();
+            var dir = std.Io.Dir.cwd().openDir(io, folder_path, .{}) catch {
                 std.debug.print("Missing folder: {s}\n", .{folder});
                 return error.MissingFolder;
             };
-            dir.close();
+            dir.close(io);
         }
     }
 
@@ -1829,9 +1850,7 @@ pub const ProjectFileTests = struct {
 
         const labelle_path = try std.fs.path.join(allocator, &.{ temp_dir, "project.labelle" });
         defer allocator.free(labelle_path);
-        const file = try std.fs.cwd().openFile(labelle_path, .{});
-        defer file.close();
-        const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+        const content = try std.Io.Dir.cwd().readFileAlloc(io_global.io(), labelle_path, allocator, .limited(1024 * 1024));
         defer allocator.free(content);
 
         try expect.toBeTrue(std.mem.indexOf(u8, content, ".resources") == null);
@@ -1920,9 +1939,10 @@ pub const ProjectFileTests = struct {
             \\}
             \\
         ;
-        const file = try std.fs.cwd().createFile(labelle_path, .{});
-        file.writeAll(synthetic) catch unreachable;
-        file.close();
+        std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = labelle_path,
+            .data = synthetic,
+        }) catch unreachable;
 
         var pm = project.ProjectManager.init(allocator);
         defer pm.deinit();
@@ -1972,18 +1992,17 @@ pub const ProjectFileTests = struct {
             \\}
             \\
         ;
-        const file = try std.fs.cwd().createFile(labelle_path, .{});
-        file.writeAll(original) catch unreachable;
-        file.close();
+        std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = labelle_path,
+            .data = original,
+        }) catch unreachable;
 
         var pm = project.ProjectManager.init(allocator);
         defer pm.deinit();
         try pm.loadProject(temp_dir);
         try pm.saveProject(temp_dir);
 
-        const reread = try std.fs.cwd().openFile(labelle_path, .{});
-        defer reread.close();
-        const saved = try reread.readToEndAlloc(allocator, 1024 * 1024);
+        const saved = try std.Io.Dir.cwd().readFileAlloc(io_global.io(), labelle_path, allocator, .limited(1024 * 1024));
         defer allocator.free(saved);
 
         // The five unmodeled fields must survive a save+load cycle.
@@ -2018,9 +2037,10 @@ pub const ProjectFileTests = struct {
             \\}
             \\
         ;
-        const file = try std.fs.cwd().createFile(labelle_path, .{});
-        file.writeAll(original) catch unreachable;
-        file.close();
+        std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = labelle_path,
+            .data = original,
+        }) catch unreachable;
 
         var pm = project.ProjectManager.init(allocator);
         defer pm.deinit();
@@ -2053,18 +2073,17 @@ pub const ProjectFileTests = struct {
             \\}
             \\
         ;
-        const file = try std.fs.cwd().createFile(labelle_path, .{});
-        file.writeAll(original) catch unreachable;
-        file.close();
+        std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = labelle_path,
+            .data = original,
+        }) catch unreachable;
 
         var pm = project.ProjectManager.init(allocator);
         defer pm.deinit();
         try pm.loadProject(temp_dir);
         try pm.saveProject(temp_dir);
 
-        const reread = try std.fs.cwd().openFile(labelle_path, .{});
-        defer reread.close();
-        const saved = try reread.readToEndAlloc(allocator, 1024 * 1024);
+        const saved = try std.Io.Dir.cwd().readFileAlloc(io_global.io(), labelle_path, allocator, .limited(1024 * 1024));
         defer allocator.free(saved);
 
         try expect.toBeTrue(std.mem.indexOf(u8, saved, "// Loading scene runs first; controller swaps to main") != null);
@@ -2088,9 +2107,10 @@ pub const ProjectFileTests = struct {
             \\}
             \\
         ;
-        const file = try std.fs.cwd().createFile(labelle_path, .{});
-        file.writeAll(original) catch unreachable;
-        file.close();
+        std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = labelle_path,
+            .data = original,
+        }) catch unreachable;
 
         var pm = project.ProjectManager.init(allocator);
         defer pm.deinit();
@@ -2101,9 +2121,7 @@ pub const ProjectFileTests = struct {
 
         try pm.saveProject(temp_dir);
 
-        const reread = try std.fs.cwd().openFile(labelle_path, .{});
-        defer reread.close();
-        const saved = try reread.readToEndAlloc(allocator, 1024 * 1024);
+        const saved = try std.Io.Dir.cwd().readFileAlloc(io_global.io(), labelle_path, allocator, .limited(1024 * 1024));
         defer allocator.free(saved);
 
         try expect.toBeTrue(std.mem.indexOf(u8, saved, "\"New Title\"") != null);
@@ -2121,9 +2139,10 @@ pub const ProjectFileTests = struct {
         // Unbalanced braces — syntactically invalid ZON, not just an
         // unknown field. ignore_unknown_fields must not mask this.
         const broken = ".{ .name = \"oops\",";
-        const file = try std.fs.cwd().createFile(labelle_path, .{});
-        file.writeAll(broken) catch unreachable;
-        file.close();
+        std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = labelle_path,
+            .data = broken,
+        }) catch unreachable;
 
         var pm = project.ProjectManager.init(allocator);
         defer pm.deinit();
@@ -2362,7 +2381,7 @@ pub const GizmosIndexTests = struct {
         // safe on the resulting empty struct.
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
-        const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+        const dir_path = try tmp.dir.realPathFileAlloc(io_global.io(), ".", std.testing.allocator);
         defer std.testing.allocator.free(dir_path);
 
         var idx = gizmos.Index.build(std.testing.allocator, dir_path, 1);
@@ -2403,652 +2422,6 @@ pub const GizmosIndexTests = struct {
         idx.deinit();
         // Reaching here without leaks (std.testing.allocator is the
         // GPA) is the assertion.
-    }
-};
-
-/// Exercises the preview-mode TCP session's state machine without
-/// spawning `labelle run` (sibling agents are still landing #94 / #193
-/// for the launcher side). Each test sets up a tiny pair of connected
-/// sockets on loopback — the editor's `PreviewSession` reads from one,
-/// the test acts as a mock engine on the other.
-///
-/// Loopback delivery is "eventually" synchronous on macOS/Linux —
-/// kernel sometimes wants a microsecond to make a `writeAll` from one
-/// end visible to a non-blocking `read` on the other. `pollUntilState`
-/// retries `poll()` for a bounded budget (200ms) rather than guessing
-/// the right `Thread.sleep` value.
-pub const PreviewSessionTests = struct {
-    /// Drive `poll()` in a tight loop until the session's state
-    /// reaches `target` or 200ms elapses. Returns true if reached.
-    fn pollUntilState(s: *preview.PreviewSession, target: preview.State) bool {
-        const deadline = std.time.milliTimestamp() + 200;
-        while (std.time.milliTimestamp() < deadline) {
-            s.poll();
-            if (s.state == target) return true;
-            std.Thread.sleep(1 * std.time.ns_per_ms);
-        }
-        return s.state == target;
-    }
-
-    /// Helper: build a connected pair (server stream + client stream)
-    /// on `127.0.0.1:0`. Returns the *client* side as the engine-mock
-    /// and *server* side as what `attachForTest` consumes (i.e. the
-    /// thing the editor would have got from `accept`).
-    const Pair = struct {
-        server: std.net.Server,
-        editor_side: std.net.Stream,
-        /// Optional so tests that need to deliberately close it early
-        /// (EOF/crash test) can nil it out and avoid the double-close
-        /// from `close()`'s teardown.
-        engine_side: ?std.net.Stream,
-
-        fn make() !Pair {
-            const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-            var server = try std.net.Address.listen(addr, .{ .reuse_address = true });
-            errdefer server.deinit();
-            const engine = try std.net.tcpConnectToAddress(server.listen_address);
-            errdefer engine.close();
-            const editor_conn = try server.accept();
-            return .{ .server = server, .editor_side = editor_conn.stream, .engine_side = engine };
-        }
-
-        fn closeEngine(self: *Pair) void {
-            if (self.engine_side) |s| {
-                s.close();
-                self.engine_side = null;
-            }
-        }
-
-        fn close(self: *Pair) void {
-            self.closeEngine();
-            // editor_side is owned by the session after attach.
-            self.server.deinit();
-        }
-
-        fn write(self: *Pair, bytes: []const u8) !void {
-            try (self.engine_side orelse return error.EngineClosed).writeAll(bytes);
-        }
-    };
-
-    test "initializes in idle state" {
-        const allocator = std.testing.allocator;
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        try expect.equal(s.state, .idle);
-    }
-
-    test "isActive false in idle/stopped/crashed" {
-        const allocator = std.testing.allocator;
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        try expect.toBeFalse(s.isActive());
-    }
-
-    test "poll on idle is a no-op" {
-        const allocator = std.testing.allocator;
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        s.poll();
-        try expect.equal(s.state, .idle);
-    }
-
-    test "stop on idle leaves state stopped" {
-        const allocator = std.testing.allocator;
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        s.stop();
-        try expect.equal(s.state, .stopped);
-    }
-
-    test "hello transitions connecting → running" {
-        const allocator = std.testing.allocator;
-        var pair = try Pair.make();
-        defer pair.close();
-
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        try s.attachForTest(pair.editor_side);
-        try expect.equal(s.state, .connecting);
-
-        try pair.write(
-            \\{"kind":"hello","engine_version":"1.2.3","pid":424242,"protocol_version":1}
-            ++ "\n");
-
-        try expect.toBeTrue(pollUntilState(&s, .running));
-        try expect.equal(s.engine_pid.?, 424242);
-        try expect.toBeTrue(s.engine_version != null);
-        try expect.toBeTrue(std.mem.eql(u8, s.engine_version.?, "1.2.3"));
-    }
-
-    test "heartbeat updates last_heartbeat_ms" {
-        const allocator = std.testing.allocator;
-        var pair = try Pair.make();
-        defer pair.close();
-
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        try s.attachForTest(pair.editor_side);
-
-        try pair.write(
-            \\{"kind":"hello","engine_version":"x","pid":1,"protocol_version":1}
-            ++ "\n");
-        try expect.toBeTrue(pollUntilState(&s, .running));
-        const t0 = s.last_heartbeat_ms.?;
-
-        // Force a measurable gap so the heartbeat timestamp moves.
-        std.Thread.sleep(2 * std.time.ns_per_ms);
-
-        try pair.write(
-            \\{"kind":"heartbeat","t":847291}
-            ++ "\n");
-        // Drain a few polls so the heartbeat arrives.
-        var i: usize = 0;
-        while (i < 10) : (i += 1) {
-            s.poll();
-            if (s.last_heartbeat_ms.? > t0) break;
-            std.Thread.sleep(1 * std.time.ns_per_ms);
-        }
-        try expect.toBeTrue(s.last_heartbeat_ms.? >= t0);
-        try expect.equal(s.state, .running);
-    }
-
-    test "bye transitions to stopped" {
-        const allocator = std.testing.allocator;
-        var pair = try Pair.make();
-        defer pair.close();
-
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        try s.attachForTest(pair.editor_side);
-        try pair.write(
-            \\{"kind":"hello","engine_version":"x","pid":1,"protocol_version":1}
-            ++ "\n" ++
-            \\{"kind":"bye","reason":"user_quit"}
-            ++ "\n");
-        try expect.toBeTrue(pollUntilState(&s, .stopped));
-        try expect.toBeTrue(s.bye_reason != null);
-        try expect.toBeTrue(std.mem.eql(u8, s.bye_reason.?, "user_quit"));
-    }
-
-    test "bye followed by EOF still lands in stopped (regression #62)" {
-        // Engines commonly write `bye` and then immediately close the
-        // socket. If the EOF branch returns early without draining the
-        // already-buffered `bye`, the session lands in `.crashed`.
-        const allocator = std.testing.allocator;
-        var pair = try Pair.make();
-        defer pair.close();
-
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        try s.attachForTest(pair.editor_side);
-        try pair.write(
-            \\{"kind":"hello","engine_version":"x","pid":1,"protocol_version":1}
-            ++ "\n" ++
-            \\{"kind":"bye","reason":"user_quit"}
-            ++ "\n");
-        // Close the engine side right after writing bye — depending on
-        // kernel scheduling, the editor's first `read` may return both
-        // the buffered bytes and trigger EOF on the next read in the
-        // same `tickStream` call.
-        pair.closeEngine();
-        try expect.toBeTrue(pollUntilState(&s, .stopped));
-        try expect.toBeTrue(s.bye_reason != null);
-        try expect.toBeTrue(std.mem.eql(u8, s.bye_reason.?, "user_quit"));
-    }
-
-    test "EOF during connecting transitions to crashed without timeout wait (regression #62)" {
-        // Engine connects then drops the socket before sending `hello`.
-        // Previously the session would stay `.connecting` and spin on
-        // EOF until the 2s connect-timeout fired. Now it should crash
-        // on the first EOF.
-        const allocator = std.testing.allocator;
-        var pair = try Pair.make();
-        defer pair.close();
-
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        try s.attachForTest(pair.editor_side);
-        try expect.equal(s.state, .connecting);
-
-        pair.closeEngine();
-        // 200ms budget is well under the 2s connect timeout, so if this
-        // passes we know we didn't fall through to `checkConnectTimeout`.
-        try expect.toBeTrue(pollUntilState(&s, .crashed));
-    }
-
-    test "EOF without bye transitions to crashed" {
-        const allocator = std.testing.allocator;
-        var pair = try Pair.make();
-        defer pair.close();
-
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        try s.attachForTest(pair.editor_side);
-        try pair.write(
-            \\{"kind":"hello","engine_version":"x","pid":1,"protocol_version":1}
-            ++ "\n");
-        try expect.toBeTrue(pollUntilState(&s, .running));
-
-        // Close the engine side without sending bye → editor should
-        // see EOF on next poll.
-        pair.closeEngine();
-        try expect.toBeTrue(pollUntilState(&s, .crashed));
-    }
-
-    test "unknown kind is ignored (forward-compat)" {
-        const allocator = std.testing.allocator;
-        var pair = try Pair.make();
-        defer pair.close();
-
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        try s.attachForTest(pair.editor_side);
-        try pair.write(
-            \\{"kind":"hello","engine_version":"x","pid":1,"protocol_version":1}
-            ++ "\n" ++
-            \\{"kind":"future_message","whatever":42}
-            ++ "\n" ++
-            \\{"kind":"heartbeat","t":1}
-            ++ "\n");
-        try expect.toBeTrue(pollUntilState(&s, .running));
-    }
-
-    test "malformed JSON line is dropped without crashing" {
-        const allocator = std.testing.allocator;
-        var pair = try Pair.make();
-        defer pair.close();
-
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        try s.attachForTest(pair.editor_side);
-        try pair.write(
-            \\{"kind":"hello","engine_version":"x","pid":1,"protocol_version":1}
-            ++ "\n" ++
-            "this is not json at all\n" ++
-            \\{"kind":"heartbeat","t":1}
-            ++ "\n");
-        try expect.toBeTrue(pollUntilState(&s, .running));
-    }
-
-    test "stop after running transitions to stopped" {
-        const allocator = std.testing.allocator;
-        var pair = try Pair.make();
-        defer pair.close();
-
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        try s.attachForTest(pair.editor_side);
-        try pair.write(
-            \\{"kind":"hello","engine_version":"x","pid":1,"protocol_version":1}
-            ++ "\n");
-        try expect.toBeTrue(pollUntilState(&s, .running));
-
-        s.stop();
-        try expect.equal(s.state, .stopped);
-        try expect.toBeFalse(s.isActive());
-    }
-};
-
-/// Phase 3 (#84): editor-side consumers of the engine's
-/// `watch_entity` / `component_changed` / `node_entered` plumbing.
-/// Each test drives a real loopback pair and asserts both directions:
-/// JSON frames written by the editor land on the mock-engine read
-/// side, and binary frames written by the mock dispatch into the
-/// editor's panel state.
-pub const Phase3Tests = struct {
-    /// Block until the mock-engine side has at least `n` bytes buffered.
-    /// Loopback delivery is "eventually" synchronous on macOS/Linux —
-    /// we may need a microsecond before the editor's `writeAll` is
-    /// visible to a non-blocking `read` on the other end.
-    fn readAtLeast(stream: std.net.Stream, buf: []u8, n: usize) !usize {
-        const deadline = std.time.milliTimestamp() + 200;
-        var total: usize = 0;
-        while (total < n and std.time.milliTimestamp() < deadline) {
-            const got = stream.read(buf[total..]) catch |err| switch (err) {
-                error.WouldBlock => {
-                    std.Thread.sleep(1 * std.time.ns_per_ms);
-                    continue;
-                },
-                else => return err,
-            };
-            if (got == 0) break;
-            total += got;
-        }
-        return total;
-    }
-
-    const Pair = struct {
-        server: std.net.Server,
-        editor_side: std.net.Stream,
-        engine_side: ?std.net.Stream,
-
-        fn make() !Pair {
-            const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-            var server = try std.net.Address.listen(addr, .{ .reuse_address = true });
-            errdefer server.deinit();
-            const engine = try std.net.tcpConnectToAddress(server.listen_address);
-            errdefer engine.close();
-            const editor_conn = try server.accept();
-            return .{ .server = server, .editor_side = editor_conn.stream, .engine_side = engine };
-        }
-
-        fn closeEngine(self: *Pair) void {
-            if (self.engine_side) |s| {
-                s.close();
-                self.engine_side = null;
-            }
-        }
-
-        fn close(self: *Pair) void {
-            self.closeEngine();
-            self.server.deinit();
-        }
-
-        fn write(self: *Pair, bytes: []const u8) !void {
-            try (self.engine_side orelse return error.EngineClosed).writeAll(bytes);
-        }
-    };
-
-    /// Build a `component_changed` binary payload — Phase 3 binary
-    /// telemetry frames are length-prefixed records led by an ESC
-    /// magic byte. Mirrors `Preview.writeComponentChangedFrame` in
-    /// labelle-engine/src/preview_mode.zig.
-    fn makeComponentChangedFrame(buf: []u8, entity_id: u64, name: []const u8, data: []const u8) usize {
-        const payload_len: usize = 8 + 2 + name.len + 4 + data.len;
-        const total = 6 + payload_len;
-        std.debug.assert(buf.len >= total);
-        buf[0] = preview.binary_magic;
-        buf[1] = @intFromEnum(preview.BinaryFrameKind.component_changed);
-        std.mem.writeInt(u32, buf[2..6], @intCast(payload_len), .little);
-        var off: usize = 6;
-        std.mem.writeInt(u64, buf[off..][0..8], entity_id, .little);
-        off += 8;
-        std.mem.writeInt(u16, buf[off..][0..2], @intCast(name.len), .little);
-        off += 2;
-        @memcpy(buf[off .. off + name.len], name);
-        off += name.len;
-        std.mem.writeInt(u32, buf[off..][0..4], @intCast(data.len), .little);
-        off += 4;
-        @memcpy(buf[off .. off + data.len], data);
-        off += data.len;
-        return off;
-    }
-
-    /// Build a `node_entered` binary payload.
-    fn makeNodeEnteredFrame(buf: []u8, flow_name: []const u8, node_id: u32) usize {
-        const payload_len: usize = 2 + flow_name.len + 4;
-        const total = 6 + payload_len;
-        std.debug.assert(buf.len >= total);
-        buf[0] = preview.binary_magic;
-        buf[1] = @intFromEnum(preview.BinaryFrameKind.node_entered);
-        std.mem.writeInt(u32, buf[2..6], @intCast(payload_len), .little);
-        var off: usize = 6;
-        std.mem.writeInt(u16, buf[off..][0..2], @intCast(flow_name.len), .little);
-        off += 2;
-        @memcpy(buf[off .. off + flow_name.len], flow_name);
-        off += flow_name.len;
-        std.mem.writeInt(u32, buf[off..][0..4], node_id, .little);
-        off += 4;
-        return off;
-    }
-
-    /// Plain struct standing in for `EntityInspector` so the test
-    /// doesn't pull in zgui (which the test binary doesn't link
-    /// against). Same shape, same callback semantics — fed by the
-    /// session's `on_component_changed`.
-    const InspectorStub = struct {
-        allocator: std.mem.Allocator,
-        watched_entity: ?u64 = null,
-        components: std.StringHashMap([]u8),
-
-        fn init(allocator: std.mem.Allocator) InspectorStub {
-            return .{
-                .allocator = allocator,
-                .components = std.StringHashMap([]u8).init(allocator),
-            };
-        }
-
-        fn deinit(self: *InspectorStub) void {
-            var it = self.components.iterator();
-            while (it.next()) |e| {
-                self.allocator.free(e.key_ptr.*);
-                self.allocator.free(e.value_ptr.*);
-            }
-            self.components.deinit();
-        }
-
-        fn onComponentChanged(ctx: *anyopaque, entity_id: u64, name: []const u8, bytes: []const u8) void {
-            const self: *InspectorStub = @ptrCast(@alignCast(ctx));
-            const watched = self.watched_entity orelse return;
-            if (watched != entity_id) return;
-            const owned_bytes = self.allocator.dupe(u8, bytes) catch return;
-            const gop = self.components.getOrPut(name) catch {
-                self.allocator.free(owned_bytes);
-                return;
-            };
-            if (gop.found_existing) {
-                self.allocator.free(gop.value_ptr.*);
-                gop.value_ptr.* = owned_bytes;
-            } else {
-                const owned_name = self.allocator.dupe(u8, name) catch {
-                    self.allocator.free(owned_bytes);
-                    return;
-                };
-                gop.key_ptr.* = owned_name;
-                gop.value_ptr.* = owned_bytes;
-            }
-        }
-    };
-
-    const PulseStub = struct {
-        calls: std.ArrayList(Call) = .{},
-        allocator: std.mem.Allocator,
-
-        const Call = struct {
-            flow_name: []u8,
-            node_id: u32,
-        };
-
-        fn init(allocator: std.mem.Allocator) PulseStub {
-            return .{ .allocator = allocator };
-        }
-
-        fn deinit(self: *PulseStub) void {
-            for (self.calls.items) |c| self.allocator.free(c.flow_name);
-            self.calls.deinit(self.allocator);
-        }
-
-        fn onNodeEntered(ctx: *anyopaque, flow_name: []const u8, node_id: u32) void {
-            const self: *PulseStub = @ptrCast(@alignCast(ctx));
-            const owned = self.allocator.dupe(u8, flow_name) catch return;
-            self.calls.append(self.allocator, .{ .flow_name = owned, .node_id = node_id }) catch {
-                self.allocator.free(owned);
-            };
-        }
-    };
-
-    fn driveToRunning(s: *preview.PreviewSession, pair: *Pair) !void {
-        try s.attachForTest(pair.editor_side);
-        try pair.write(
-            \\{"kind":"hello","engine_version":"x","pid":1,"protocol_version":1}
-            ++ "\n");
-        // Spin until the hello transitions us to running.
-        const deadline = std.time.milliTimestamp() + 200;
-        while (std.time.milliTimestamp() < deadline) {
-            s.poll();
-            if (s.state == .running) return;
-            std.Thread.sleep(1 * std.time.ns_per_ms);
-        }
-        return error.NeverRunning;
-    }
-
-    test "watchEntity writes a watch_entity JSON line to the engine" {
-        const allocator = std.testing.allocator;
-        var pair = try Pair.make();
-        defer pair.close();
-
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        try driveToRunning(&s, &pair);
-
-        try s.watchEntity(42);
-
-        var buf: [256]u8 = undefined;
-        const n = try readAtLeast(pair.engine_side.?, buf[0..], 1);
-        const got = buf[0..n];
-        // Expect a single newline-terminated frame with kind=watch_entity and id=42.
-        try expect.toBeTrue(std.mem.indexOf(u8, got, "\"kind\":\"watch_entity\"") != null);
-        try expect.toBeTrue(std.mem.indexOf(u8, got, "\"id\":42") != null);
-        try expect.equal(got[got.len - 1], '\n');
-    }
-
-    test "unwatchEntity writes a unwatch_entity JSON line to the engine" {
-        const allocator = std.testing.allocator;
-        var pair = try Pair.make();
-        defer pair.close();
-
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        try driveToRunning(&s, &pair);
-
-        try s.unwatchEntity(99);
-
-        var buf: [256]u8 = undefined;
-        const n = try readAtLeast(pair.engine_side.?, buf[0..], 1);
-        const got = buf[0..n];
-        try expect.toBeTrue(std.mem.indexOf(u8, got, "\"kind\":\"unwatch_entity\"") != null);
-        try expect.toBeTrue(std.mem.indexOf(u8, got, "\"id\":99") != null);
-    }
-
-    test "subscribeFlow writes a subscribe_flow JSON line" {
-        const allocator = std.testing.allocator;
-        var pair = try Pair.make();
-        defer pair.close();
-
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        try driveToRunning(&s, &pair);
-
-        try s.subscribeFlow("player_state_machine");
-
-        var buf: [256]u8 = undefined;
-        const n = try readAtLeast(pair.engine_side.?, buf[0..], 1);
-        const got = buf[0..n];
-        try expect.toBeTrue(std.mem.indexOf(u8, got, "\"kind\":\"subscribe_flow\"") != null);
-        try expect.toBeTrue(std.mem.indexOf(u8, got, "\"flow\":\"player_state_machine\"") != null);
-    }
-
-    test "component_changed routes to the inspector callback" {
-        const allocator = std.testing.allocator;
-        var pair = try Pair.make();
-        defer pair.close();
-
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        try driveToRunning(&s, &pair);
-
-        var insp = InspectorStub.init(allocator);
-        defer insp.deinit();
-        insp.watched_entity = 42;
-        s.on_component_changed = .{ .ctx = &insp, .func = InspectorStub.onComponentChanged };
-
-        var frame_buf: [256]u8 = undefined;
-        const payload = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
-        const total = makeComponentChangedFrame(frame_buf[0..], 42, "Position", payload[0..]);
-        try pair.write(frame_buf[0..total]);
-
-        const reached = pollUntilHasComponent(&s, &insp, "Position");
-        try expect.toBeTrue(reached);
-        const stored = insp.components.get("Position").?;
-        try expect.equal(stored.len, payload.len);
-        try expect.toBeTrue(std.mem.eql(u8, stored, payload[0..]));
-    }
-
-    test "component_changed for unwatched entity does not alter inspector state" {
-        const allocator = std.testing.allocator;
-        var pair = try Pair.make();
-        defer pair.close();
-
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        try driveToRunning(&s, &pair);
-
-        var insp = InspectorStub.init(allocator);
-        defer insp.deinit();
-        insp.watched_entity = 42;
-        s.on_component_changed = .{ .ctx = &insp, .func = InspectorStub.onComponentChanged };
-
-        // First: a legitimate frame for the watched entity so we know
-        // the pipeline works end-to-end.
-        var frame_buf: [256]u8 = undefined;
-        const good_payload = [_]u8{ 1, 2, 3, 4 };
-        const good_n = makeComponentChangedFrame(frame_buf[0..], 42, "Position", good_payload[0..]);
-        try pair.write(frame_buf[0..good_n]);
-        try expect.toBeTrue(pollUntilHasComponent(&s, &insp, "Position"));
-
-        // Now send a frame for entity 99 (NOT watched). It should be
-        // dropped by the inspector's filter — components count stays
-        // at 1, "Position" still holds the original bytes, and no
-        // entry called "Velocity" exists.
-        const bad_payload = [_]u8{ 9, 9, 9 };
-        const bad_n = makeComponentChangedFrame(frame_buf[0..], 99, "Velocity", bad_payload[0..]);
-        try pair.write(frame_buf[0..bad_n]);
-
-        // Drain a few polls so the bad frame is observed.
-        var i: usize = 0;
-        while (i < 20) : (i += 1) {
-            s.poll();
-            std.Thread.sleep(1 * std.time.ns_per_ms);
-        }
-
-        try expect.equal(insp.components.count(), 1);
-        try expect.toBeTrue(insp.components.get("Velocity") == null);
-        try expect.equal(insp.watched_entity.?, 42);
-        const stored = insp.components.get("Position").?;
-        try expect.toBeTrue(std.mem.eql(u8, stored, good_payload[0..]));
-    }
-
-    test "node_entered routes (flow_name, node_id) to the pulse callback" {
-        const allocator = std.testing.allocator;
-        var pair = try Pair.make();
-        defer pair.close();
-
-        var s = preview.PreviewSession.init(allocator);
-        defer s.deinit();
-        try driveToRunning(&s, &pair);
-
-        var pulse = PulseStub.init(allocator);
-        defer pulse.deinit();
-        s.on_node_entered = .{ .ctx = &pulse, .func = PulseStub.onNodeEntered };
-
-        var frame_buf: [128]u8 = undefined;
-        const n = makeNodeEnteredFrame(frame_buf[0..], "player_state_machine", 7);
-        try pair.write(frame_buf[0..n]);
-
-        const reached = pollUntilCallCount(&s, &pulse, 1);
-        try expect.toBeTrue(reached);
-        try expect.equal(pulse.calls.items[0].node_id, 7);
-        try expect.toBeTrue(std.mem.eql(u8, pulse.calls.items[0].flow_name, "player_state_machine"));
-    }
-
-    fn pollUntilHasComponent(s: *preview.PreviewSession, insp: *InspectorStub, name: []const u8) bool {
-        const deadline = std.time.milliTimestamp() + 200;
-        while (std.time.milliTimestamp() < deadline) {
-            s.poll();
-            if (insp.components.contains(name)) return true;
-            std.Thread.sleep(1 * std.time.ns_per_ms);
-        }
-        return insp.components.contains(name);
-    }
-
-    fn pollUntilCallCount(s: *preview.PreviewSession, pulse: *PulseStub, target: usize) bool {
-        const deadline = std.time.milliTimestamp() + 200;
-        while (std.time.milliTimestamp() < deadline) {
-            s.poll();
-            if (pulse.calls.items.len >= target) return true;
-            std.Thread.sleep(1 * std.time.ns_per_ms);
-        }
-        return pulse.calls.items.len >= target;
     }
 };
 
@@ -3428,7 +2801,7 @@ pub const FlowsRendererTests = struct {
 
 pub const PreferencesTests = struct {
     fn tmpPath(allocator: std.mem.Allocator, tmp: std.testing.TmpDir) ![]u8 {
-        const dir = try tmp.dir.realpathAlloc(allocator, ".");
+        const dir = try tmp.dir.realPathFileAlloc(io_global.io(), ".", allocator);
         defer allocator.free(dir);
         return std.fs.path.join(allocator, &.{ dir, prefs.PREFS_FILENAME });
     }
@@ -3477,9 +2850,10 @@ pub const PreferencesTests = struct {
         defer std.testing.allocator.free(path);
 
         const hand_edited = ".{ .font_scale = 0.1 }\n";
-        const file = try std.fs.cwd().createFile(path, .{});
-        defer file.close();
-        try file.writeAll(hand_edited);
+        try std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = path,
+            .data = hand_edited,
+        });
 
         const loaded = prefs.loadFromPath(std.testing.allocator, path);
         try expect.equal(loaded.font_scale, prefs.min_font_scale);
@@ -3491,9 +2865,10 @@ pub const PreferencesTests = struct {
         const path = try tmpPath(std.testing.allocator, tmp);
         defer std.testing.allocator.free(path);
 
-        const file = try std.fs.cwd().createFile(path, .{});
-        defer file.close();
-        try file.writeAll("this is not zon");
+        try std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = path,
+            .data = "this is not zon",
+        });
 
         const loaded = prefs.loadFromPath(std.testing.allocator, path);
         try expect.equal(loaded.font_scale, prefs.default_font_scale);

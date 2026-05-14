@@ -246,7 +246,7 @@ pub const FlowIoTests = struct {
 
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
-        const dir = try tmp.dir.realpathAlloc(allocator, ".");
+        const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
         defer allocator.free(dir);
         const path = try std.fs.path.join(allocator, &.{ dir, "demo.flow.zon" });
         defer allocator.free(path);
@@ -254,9 +254,9 @@ pub const FlowIoTests = struct {
         var l1 = try flow_io.parseFlow(allocator, sample_issue_46);
         defer l1.deinit();
 
-        try flow_io.saveFlow(allocator, path, l1);
+        try flow_io.saveFlow(std.testing.io, allocator, path, l1);
 
-        var l2 = try flow_io.loadFromFile(allocator, path);
+        var l2 = try flow_io.loadFromFile(std.testing.io, allocator, path);
         defer l2.deinit();
 
         try expect.equal(l2.flow.nodes.len, l1.flow.nodes.len);

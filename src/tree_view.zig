@@ -2,6 +2,7 @@ const std = @import("std");
 const zgui = @import("zgui");
 const project = @import("project.zig");
 const icons = @import("icons.zig");
+const io_global = @import("io_global.zig");
 
 /// Icons for each folder type (FontAwesome icons)
 /// Centralized icon set for the tree view. Every folder — top-level or
@@ -316,7 +317,8 @@ pub const TreeView = struct {
         var temp_entries: std.ArrayListUnmanaged(FileEntry) = .empty;
         defer temp_entries.deinit(self.allocator);
 
-        var dir = std.fs.cwd().openDir(folder_path, .{ .iterate = true }) catch |err| {
+        const io = io_global.io();
+        var dir = std.Io.Dir.cwd().openDir(io, folder_path, .{ .iterate = true }) catch |err| {
             if (err == error.FileNotFound) {
                 // Folder doesn't exist yet - that's okay
                 const empty_entries = try self.allocator.alloc(FileEntry, 0);
@@ -326,10 +328,10 @@ pub const TreeView = struct {
             }
             return err;
         };
-        defer dir.close();
+        defer dir.close(io);
 
         var iter = dir.iterate();
-        while (try iter.next()) |entry| {
+        while (try iter.next(io)) |entry| {
             // Skip hidden files
             if (entry.name[0] == '.') continue;
 

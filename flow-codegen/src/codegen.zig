@@ -112,7 +112,7 @@ pub fn renderFlowZig(
     allocator: std.mem.Allocator,
     flow: flow_io.Flow,
     options: Options,
-) (CodegenError || std.mem.Allocator.Error)![]u8 {
+) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)![]u8 {
     // Index, validate, and topo-sort up front so we can stream the
     // output linearly without back-patching. `index` lives on the
     // caller's allocator (small, freed before return).
@@ -132,9 +132,9 @@ pub fn renderFlowZig(
         if (!isInputPin(consumer.kind, l.to.pin)) return error.UnknownPin;
     }
 
-    var out: std.ArrayList(u8) = .{};
-    errdefer out.deinit(allocator);
-    const w = out.writer(allocator);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    const w = &aw.writer;
 
     // File header. The `Game` / `EntityId` types are conventionally
     // imported from the consuming project; we re-export the
@@ -210,7 +210,7 @@ pub fn renderFlowZig(
     }
 
     try w.writeAll("}\n");
-    return out.toOwnedSlice(allocator);
+    return aw.toOwnedSlice();
 }
 
 // =====================================================================
@@ -301,7 +301,7 @@ fn topoSort(
 
     // Seed the ready set with every zero-indegree node, sorted by id
     // for deterministic output.
-    var ready = std.ArrayList(u32){};
+    var ready: std.ArrayList(u32) = .empty;
     defer ready.deinit(allocator);
     for (flow.nodes) |n| {
         if (indeg.get(n.id).? == 0) try ready.append(allocator, n.id);
@@ -320,7 +320,7 @@ fn topoSort(
 
         // Decrement the indegree of every node `next` feeds. Any
         // that hit zero join the ready set in id order.
-        var added: std.ArrayList(u32) = .{};
+        var added: std.ArrayList(u32) = .empty;
         defer added.deinit(allocator);
         for (flow.links) |l| {
             if (l.from.node != next) continue;
@@ -388,7 +388,7 @@ fn writeNodeBody(
     flow: flow_io.Flow,
     index: *const Index,
     scratch: std.mem.Allocator,
-) (CodegenError || std.mem.Allocator.Error)!void {
+) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
     switch (node.kind) {
         .GetComponent => |b| try w.print(
             "    const n{d}_value = game.getComponent(entity, {s}) orelse return;\n",

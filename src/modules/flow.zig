@@ -34,6 +34,7 @@ const App = @import("../app.zig").App;
 const scene_io = @import("../scene_io.zig");
 const projector = @import("../flows/projector.zig");
 const flow_types = @import("../flows/types.zig");
+const io_global = @import("../io_global.zig");
 
 const Graph = flow_types.Graph;
 const GraphNodeSpec = flow_types.GraphNodeSpec;
@@ -59,7 +60,7 @@ pub const FlowState = struct {
     /// Last-observed mtime of `path` (in nanoseconds since the unix
     /// epoch — `std.fs.File.Stat.mtime`). Render reparses when this
     /// changes. Null until the first read succeeds.
-    last_mtime: ?i128 = null,
+    last_mtime: ?i96 = null,
     /// 0-terminated source text. Re-allocated off `arena` on every
     /// (re)read. `std.zig.Ast.parse` requires the `[:0]const u8`
     /// shape so we keep a sentinel here rather than re-terminating
@@ -143,12 +144,15 @@ pub fn loadAndProject(s: *FlowState, allocator: std.mem.Allocator) !void {
         s.graph = null;
     }
 
-    const file = try std.fs.cwd().openFile(s.path, .{});
-    defer file.close();
-    const stat = try file.stat();
+    const io = io_global.io();
     const max_bytes: usize = 1 << 20; // 1 MiB — scripts are tiny.
-    const raw = try file.readToEndAlloc(allocator, max_bytes);
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, s.path, allocator, .limited(max_bytes));
     defer allocator.free(raw);
+    // Re-stat to record mtime — cheap and avoids opening the file twice
+    // in the common case.
+    const stat_file = try std.Io.Dir.cwd().openFile(io, s.path, .{ .mode = .read_only });
+    defer stat_file.close(io);
+    const stat = try stat_file.stat(io);
 
     // Duplicate into the arena with an explicit 0 sentinel for
     // `std.zig.Ast.parse`. Source must outlive the parse but not
@@ -165,18 +169,19 @@ pub fn loadAndProject(s: *FlowState, allocator: std.mem.Allocator) !void {
     // freeze in the failed-parse state until a manual Reparse click
     // (cursor bugbot #63 low).
     s.graph = try projector.project(allocator, src);
-    s.last_mtime = stat.mtime;
+    s.last_mtime = stat.mtime.nanoseconds;
 }
 
 /// Per-frame mtime check. Cheap — `stat` is one syscall and we
 /// only reparse on change. Errors are swallowed (logged once) to
 /// keep the UI responsive when the file disappears mid-session.
 fn maybeReparse(s: *FlowState, allocator: std.mem.Allocator) void {
-    const file = std.fs.cwd().openFile(s.path, .{}) catch return;
-    defer file.close();
-    const stat = file.stat() catch return;
+    const io = io_global.io();
+    const file = std.Io.Dir.cwd().openFile(io, s.path, .{}) catch return;
+    defer file.close(io);
+    const stat = file.stat(io) catch return;
     if (s.last_mtime) |prev| {
-        if (prev == stat.mtime) return;
+        if (prev == stat.mtime.nanoseconds) return;
     }
     loadAndProject(s, allocator) catch |err| {
         std.log.warn("flow {s}: reparse failed: {s}", .{ s.path, @errorName(err) });
@@ -462,9 +467,17 @@ pub fn saveFlow(s: *FlowState, app: *App) void {
 /// render time from `pulse_started_ms`. Calling again with the same
 /// or a different id restarts the fade — back-to-back step traces
 /// re-pulse without trailing.
+// std.time.milliTimestamp was removed in Zig 0.16. Use clock_gettime
+// directly — matches the pattern in src/tests.zig timestampSeconds.
+fn nowMillis() i64 {
+    var ts: std.posix.timespec = undefined;
+    _ = std.posix.system.clock_gettime(.REALTIME, &ts);
+    return @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, 1_000_000);
+}
+
 pub fn pulseNode(s: *FlowState, node_id: u32) void {
     s.pulse_node_id = node_id;
-    s.pulse_started_ms = std.time.milliTimestamp();
+    s.pulse_started_ms = nowMillis();
 }
 
 /// Render the active pulse, if any, as a faded border over the node's
@@ -474,7 +487,7 @@ pub fn pulseNode(s: *FlowState, node_id: u32) void {
 fn renderPulse(s: *FlowState) void {
     const id = s.pulse_node_id orelse return;
     const started = s.pulse_started_ms orelse return;
-    const now = std.time.milliTimestamp();
+    const now = nowMillis();
     const elapsed = now - started;
     if (elapsed < 0 or elapsed > pulse_duration_ms) {
         // Decayed — clear so we don't keep computing a zero-alpha

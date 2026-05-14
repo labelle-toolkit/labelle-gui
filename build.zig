@@ -60,12 +60,12 @@ pub fn build(b: *std.Build) void {
     });
 
     exe.root_module.addImport("zglfw", zglfw.module("root"));
-    exe.linkLibrary(zglfw.artifact("glfw"));
+    exe.root_module.linkLibrary(zglfw.artifact("glfw"));
 
     exe.root_module.addImport("zopengl", zopengl.module("root"));
 
     exe.root_module.addImport("zgui", zgui.module("root"));
-    exe.linkLibrary(zgui.artifact("imgui"));
+    exe.root_module.linkLibrary(zgui.artifact("imgui"));
 
     exe.root_module.addImport("nfd", nfd.module("nfd"));
 
@@ -141,10 +141,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
     gui_tests_exe.root_module.addImport("zglfw", zglfw.module("root"));
-    gui_tests_exe.linkLibrary(zglfw.artifact("glfw"));
+    gui_tests_exe.root_module.linkLibrary(zglfw.artifact("glfw"));
     gui_tests_exe.root_module.addImport("zopengl", zopengl.module("root"));
     gui_tests_exe.root_module.addImport("zgui", zgui_te.module("root"));
-    gui_tests_exe.linkLibrary(zgui_te.artifact("imgui"));
+    gui_tests_exe.root_module.linkLibrary(zgui_te.artifact("imgui"));
     gui_tests_exe.root_module.addImport("zstbi", zstbi.module("root"));
     gui_tests_exe.root_module.addImport("flow_codegen", flow_codegen_module);
 

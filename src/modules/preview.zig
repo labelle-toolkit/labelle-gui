@@ -59,7 +59,10 @@ fn renderStatus(p: *const preview.PreviewSession) void {
         .connecting => zgui.textColored(.{ 1.0, 1.0, 0.0, 1.0 }, "Connecting — engine connected, waiting for hello...", .{}),
         .running => {
             const pid = p.engine_pid orelse 0;
-            const ago: i64 = if (p.last_heartbeat_ms) |hb| std.time.milliTimestamp() - hb else 0;
+            // std.time.milliTimestamp was removed in 0.16; preview is
+            // a stub during the migration so the actual ms-ago value
+            // isn't surfaced. Shows 0 until preview is restored.
+            const ago: i64 = if (p.last_heartbeat_ms) |hb| -hb else 0;
             zgui.textColored(.{ 0.0, 1.0, 0.0, 1.0 }, "Preview running (engine PID {d}, last heartbeat {d}ms ago)", .{ pid, ago });
             if (p.engine_version) |v| zgui.text("Engine version: {s}", .{v});
         },

@@ -38,7 +38,7 @@ pub const FlowRuntime = struct {
     /// Names the editor has subscribed to in the current session.
     /// Sized for a handful of flows — preview's typical workload is
     /// one or two flows under observation at once.
-    subscribed: std.ArrayListUnmanaged([]u8) = .{},
+    subscribed: std.ArrayListUnmanaged([]u8) = .empty,
     /// Rolling log of recent `node_entered` arrivals — newest at index
     /// `log_head - 1 (mod max)`. Drawn as a small read-only window so
     /// the user can see frames arriving even without a flow tab open.

@@ -157,7 +157,7 @@ pub const App = struct {
     /// `OpenTab` variants. Populated when the user clicks an
     /// editable file in the project tree; closed via the × on a
     /// tab. `closeAllTabs` runs on project transitions.
-    open_tabs: std.ArrayList(OpenTab) = .{},
+    open_tabs: std.ArrayList(OpenTab) = .empty,
     /// Which tab is foregrounded. null when no tabs are open.
     /// Updated each frame from whichever tab ImGui reports active.
     active_tab_idx: ?usize = null,
@@ -336,7 +336,7 @@ pub const App = struct {
         // Map ProjectConfig.resources → atlas.Resource (decoupling
         // the atlas module from project.zig). Allocated on the
         // stack via ArrayList because the count is small.
-        var resources: std.ArrayList(atlas.Resource) = .{};
+        var resources: std.ArrayList(atlas.Resource) = .empty;
         defer resources.deinit(self.allocator);
         for (proj.config.resources) |r| {
             resources.append(self.allocator, .{

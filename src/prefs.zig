@@ -1,11 +1,10 @@
 //! User-scoped preferences for labelle-gui.
 //!
-//! Persisted as a small ZON file in the platform-specific app-data dir
-//! resolved by `std.fs.getAppDataDir`:
+//! Persisted as a small ZON file in the platform-specific app-data dir:
 //!
 //!   - macOS:   `~/Library/Application Support/labelle-gui/preferences.zon`
-//!   - Linux:   `~/.config/labelle-gui/preferences.zon`
-//!   - Windows: `%APPDATA%\labelle-gui\preferences.zon`
+//!   - Linux:   `~/.local/share/labelle-gui/preferences.zon`
+//!   - Windows: `%LOCALAPPDATA%\labelle-gui\preferences.zon`
 //!
 //! Read once at startup (via `loadOrDefault`) and re-written whenever the
 //! Preferences dialog changes a value. The application reads the file's
@@ -19,6 +18,8 @@
 //! editing mistakes are self-healing.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const io_global = @import("io_global.zig");
 
 pub const APP_DATA_NAME = "labelle-gui";
 pub const PREFS_FILENAME = "preferences.zon";
@@ -41,12 +42,42 @@ pub const Preferences = struct {
     font_scale: f32 = default_font_scale,
 };
 
+/// Replacement for `std.fs.getAppDataDir` which was removed in 0.16.
+/// Reads the same platform-specific environment variables and returns
+/// an absolute path joined with the application name.
+fn getAppDataDir(allocator: std.mem.Allocator, appname: []const u8) ![]u8 {
+    const env = io_global.environ();
+    switch (builtin.os.tag) {
+        .windows => {
+            const local_app_data = env.getAlloc(allocator, "LOCALAPPDATA") catch return error.AppDataDirUnavailable;
+            defer allocator.free(local_app_data);
+            return std.fs.path.join(allocator, &.{ local_app_data, appname });
+        },
+        .macos, .ios, .tvos, .watchos, .visionos => {
+            const home = env.getAlloc(allocator, "HOME") catch return error.AppDataDirUnavailable;
+            defer allocator.free(home);
+            return std.fs.path.join(allocator, &.{ home, "Library", "Application Support", appname });
+        },
+        else => {
+            if (env.getAlloc(allocator, "XDG_DATA_HOME") catch null) |xdg| {
+                defer allocator.free(xdg);
+                if (xdg.len > 0) {
+                    return std.fs.path.join(allocator, &.{ xdg, appname });
+                }
+            }
+            const home = env.getAlloc(allocator, "HOME") catch return error.AppDataDirUnavailable;
+            defer allocator.free(home);
+            return std.fs.path.join(allocator, &.{ home, ".local", "share", appname });
+        },
+    }
+}
+
 /// Return the absolute path to the preferences file. Caller owns the
 /// returned slice. The parent directory is NOT created — `save` does
 /// that lazily so the read path stays fast on the common case where the
 /// directory already exists.
 pub fn pathOwned(allocator: std.mem.Allocator) ![]u8 {
-    const dir = try std.fs.getAppDataDir(allocator, APP_DATA_NAME);
+    const dir = try getAppDataDir(allocator, APP_DATA_NAME);
     defer allocator.free(dir);
     return std.fs.path.join(allocator, &.{ dir, PREFS_FILENAME });
 }
@@ -68,23 +99,15 @@ pub fn loadOrDefault(allocator: std.mem.Allocator) Preferences {
 /// Path-injectable variant of `loadOrDefault`. Used by tests to point
 /// at a temp file; production callers go through `loadOrDefault`. The
 /// path must be absolute — `getAppDataDir` returns one, and tests
-/// build one from `realpathAlloc`. `openFileAbsolute` over
-/// `cwd().openFile` so a Windows path on a different drive than CWD
-/// resolves correctly (gemini #72 medium).
+/// build one from `realpathAlloc`.
 pub fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) Preferences {
-    const file = std.fs.openFileAbsolute(path, .{}) catch |err| {
+    const io = io_global.io();
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1 << 14)) catch |err| {
         if (err == error.FileNotFound) {
             std.log.info("prefs: no preferences file at {s}; using defaults", .{path});
         } else {
-            std.log.warn("prefs: could not open {s}: {s}", .{ path, @errorName(err) });
+            std.log.warn("prefs: could not read {s}: {s}", .{ path, @errorName(err) });
         }
-        return .{};
-    };
-    defer file.close();
-
-    const max_bytes: usize = 1 << 14; // 16 KiB — preferences are tiny.
-    const raw = file.readToEndAlloc(allocator, max_bytes) catch |err| {
-        std.log.warn("prefs: read {s} failed: {s}", .{ path, @errorName(err) });
         return .{};
     };
     defer allocator.free(raw);
@@ -113,9 +136,13 @@ pub fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) Preferences 
 /// Clamps `font_scale` to the documented bounds before writing so the
 /// next read is self-healing.
 pub fn save(allocator: std.mem.Allocator, prefs: Preferences) !void {
-    const dir = try std.fs.getAppDataDir(allocator, APP_DATA_NAME);
+    const io = io_global.io();
+    const dir = try getAppDataDir(allocator, APP_DATA_NAME);
     defer allocator.free(dir);
-    try std.fs.cwd().makePath(dir);
+    std.Io.Dir.cwd().createDirPath(io, dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
 
     const path = try std.fs.path.join(allocator, &.{ dir, PREFS_FILENAME });
     defer allocator.free(path);
@@ -124,13 +151,12 @@ pub fn save(allocator: std.mem.Allocator, prefs: Preferences) !void {
 }
 
 /// Path-injectable variant of `save`. The parent directory must already
-/// exist; production callers go through `save` which makePath's first.
+/// exist; production callers go through `save` which createDirPath's first.
 ///
 /// Writes atomically: emits to `<path>.tmp` first, then renames over the
 /// real path. A crash mid-write leaves the previous-good preferences
 /// intact (or no file at all on first run) rather than corrupting the
-/// real file (gemini #72 medium). Uses absolute-path APIs so a Windows
-/// path on a different drive than CWD resolves correctly.
+/// real file (gemini #72 medium).
 pub fn saveToPath(allocator: std.mem.Allocator, path: []const u8, prefs: Preferences) !void {
     const clamped: Preferences = .{
         .font_scale = std.math.clamp(prefs.font_scale, min_font_scale, max_font_scale),
@@ -150,11 +176,11 @@ pub fn saveToPath(allocator: std.mem.Allocator, path: []const u8, prefs: Prefere
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
     defer allocator.free(tmp_path);
 
-    {
-        var file = try std.fs.createFileAbsolute(tmp_path, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(body);
-    }
-    try std.fs.renameAbsolute(tmp_path, path);
+    const io = io_global.io();
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = tmp_path,
+        .data = body,
+    });
+    const cwd = std.Io.Dir.cwd();
+    try cwd.rename(tmp_path, cwd, path, io);
 }
-

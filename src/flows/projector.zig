@@ -33,9 +33,9 @@ pub const Projector = struct {
     arena: std.mem.Allocator,
     ast: *const Ast,
 
-    nodes: std.ArrayList(GraphNodeSpec) = .{},
-    edges: std.ArrayList(EdgeSpec) = .{},
-    entry_points: std.ArrayList(u32) = .{},
+    nodes: std.ArrayList(GraphNodeSpec) = .empty,
+    edges: std.ArrayList(EdgeSpec) = .empty,
+    entry_points: std.ArrayList(u32) = .empty,
 
     /// Maps a variable name (the identifier token slice of a
     /// `var_decl`) to `(node_id, output_pin_id)`. The
@@ -43,7 +43,7 @@ pub const Projector = struct {
     /// their declaration. Lexical scoping is approximated as a flat
     /// map — the projector handles nested blocks by passing distinct
     /// scopes via `pushScope` / `popScope`.
-    scopes: std.ArrayList(Scope) = .{},
+    scopes: std.ArrayList(Scope) = .empty,
 
     next_node_id: u32 = 1,
     next_pin_id: u32 = 1,
@@ -56,7 +56,7 @@ pub const Projector = struct {
     /// because the graph treats each branch as a single visited
     /// subtree — adequate for v1.
     pub const Scope = struct {
-        bindings: std.StringHashMapUnmanaged(VarBinding) = .{},
+        bindings: std.StringHashMapUnmanaged(VarBinding) = .empty,
     };
 
     pub fn init(arena: std.mem.Allocator, ast: *const Ast) Projector {

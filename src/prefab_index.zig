@@ -17,6 +17,7 @@
 const std = @import("std");
 
 const scene_io = @import("scene_io.zig");
+const io_global = @import("io_global.zig");
 
 /// One cached prefab entry. `path` is owned by the index (heap dup);
 /// `loaded` carries its own arena. Both freed by `Index.deinit`.
@@ -30,7 +31,7 @@ pub const Index = struct {
     /// Owns every `Entry.loaded.arena` + `Entry.path` + key string in
     /// `by_name`. `Entry.loaded.deinit` is called for each on
     /// `Index.deinit`.
-    entries: std.StringHashMapUnmanaged(Entry) = .{},
+    entries: std.StringHashMapUnmanaged(Entry) = .empty,
     /// `ProjectManager.generation` this index was built against. App
     /// invalidates when the live generation changes.
     generation: u64,
@@ -84,11 +85,12 @@ pub const Index = struct {
 /// latter allocates a queue and we want to keep the call site simple +
 /// errors locally absorbed.
 fn walk(allocator: std.mem.Allocator, idx: *Index, path: []const u8) void {
-    var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch return;
-    defer dir.close();
+    const io = io_global.io();
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
 
     var it = dir.iterate();
-    while (it.next() catch null) |dirent| {
+    while (it.next(io) catch null) |dirent| {
         const full = std.fs.path.join(allocator, &.{ path, dirent.name }) catch continue;
         defer allocator.free(full);
 

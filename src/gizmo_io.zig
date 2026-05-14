@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const zon_scan = @import("zon_scan.zig");
+const io_global = @import("io_global.zig");
 
 /// One parsed gizmo. `match` and `exclude` are typed string lists
 /// owned by the surrounding `LoadedGizmo.arena`. `entity_verbatim` and
@@ -53,7 +54,7 @@ pub const LoadedGizmo = struct {
 };
 
 pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !LoadedGizmo {
-    const raw = try std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024);
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io_global.io(), path, allocator, .limited(16 * 1024 * 1024));
     defer allocator.free(raw);
     return parseGizmo(allocator, raw);
 }
@@ -83,7 +84,7 @@ pub fn parseGizmo(allocator: std.mem.Allocator, raw: []const u8) !LoadedGizmo {
 
     var diag: std.zon.parse.Diagnostics = .{};
     defer diag.deinit(arena_alloc);
-    const parsed = try std.zon.parse.fromSlice(Intermediate, arena_alloc, source, &diag, .{
+    const parsed = try std.zon.parse.fromSliceAlloc(Intermediate, arena_alloc, source, &diag, .{
         .ignore_unknown_fields = true,
     });
 
@@ -106,41 +107,40 @@ pub fn parseGizmo(allocator: std.mem.Allocator, raw: []const u8) !LoadedGizmo {
 /// `.entity` (only when present), then `.children` (only when
 /// present). Mirrors `project.zig`'s `renderProjectLabelle` layout.
 pub fn renderGizmoZon(allocator: std.mem.Allocator, loaded: LoadedGizmo) ![]u8 {
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    const w = out.writer(allocator);
 
-    try w.writeAll(".{\n");
+    try out.appendSlice(allocator, ".{\n");
 
     // .match — always emitted (the engine requires it).
     // Strings are escaped via `std.zig.fmtString` so a hostile value
     // (containing `"`, `\\`, or non-printables) round-trips as valid
     // ZON instead of breaking the file.
-    try w.writeAll("    .match = .{");
+    try out.appendSlice(allocator, "    .match = .{");
     for (loaded.gizmo.match, 0..) |s, i| {
-        if (i > 0) try w.writeAll(", ");
-        try w.print("\"{f}\"", .{std.zig.fmtString(s)});
+        if (i > 0) try out.appendSlice(allocator, ", ");
+        try out.print(allocator, "\"{f}\"", .{std.zig.fmtString(s)});
     }
-    try w.writeAll("},\n");
+    try out.appendSlice(allocator, "},\n");
 
     if (loaded.gizmo.exclude.len > 0) {
-        try w.writeAll("    .exclude = .{");
+        try out.appendSlice(allocator, "    .exclude = .{");
         for (loaded.gizmo.exclude, 0..) |s, i| {
-            if (i > 0) try w.writeAll(", ");
-            try w.print("\"{f}\"", .{std.zig.fmtString(s)});
+            if (i > 0) try out.appendSlice(allocator, ", ");
+            try out.print(allocator, "\"{f}\"", .{std.zig.fmtString(s)});
         }
-        try w.writeAll("},\n");
+        try out.appendSlice(allocator, "},\n");
     }
 
     if (loaded.gizmo.entity_verbatim) |text| {
-        try w.print("    .entity = {s},\n", .{text});
+        try out.print(allocator, "    .entity = {s},\n", .{text});
     }
 
     if (loaded.gizmo.children_verbatim) |text| {
-        try w.print("    .children = {s},\n", .{text});
+        try out.print(allocator, "    .children = {s},\n", .{text});
     }
 
-    try w.writeAll("}\n");
+    try out.appendSlice(allocator, "}\n");
     return out.toOwnedSlice(allocator);
 }
 
@@ -148,9 +148,10 @@ pub fn renderGizmoZon(allocator: std.mem.Allocator, loaded: LoadedGizmo) ![]u8 {
 pub fn saveGizmo(allocator: std.mem.Allocator, path: []const u8, loaded: LoadedGizmo) !void {
     const text = try renderGizmoZon(allocator, loaded);
     defer allocator.free(text);
-    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(text);
+    try std.Io.Dir.cwd().writeFile(io_global.io(), .{
+        .sub_path = path,
+        .data = text,
+    });
 }
 
 /// Strip a trailing `.zon` extension from a path's basename and
