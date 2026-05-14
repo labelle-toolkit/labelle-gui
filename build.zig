@@ -51,12 +51,12 @@ pub fn build(b: *std.Build) void {
     });
 
     exe.root_module.addImport("zglfw", zglfw.module("root"));
-    exe.linkLibrary(zglfw.artifact("glfw"));
+    exe.root_module.linkLibrary(zglfw.artifact("glfw"));
 
     exe.root_module.addImport("zopengl", zopengl.module("root"));
 
     exe.root_module.addImport("zgui", zgui.module("root"));
-    exe.linkLibrary(zgui.artifact("imgui"));
+    exe.root_module.linkLibrary(zgui.artifact("imgui"));
 
     exe.root_module.addImport("nfd", nfd.module("nfd"));
 

@@ -2,30 +2,31 @@
     .name = .labelle_gui,
     .version = "0.1.0",
     .fingerprint = 0x3fd05a33857eec15,
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zgui = .{
-            .url = "https://github.com/zig-gamedev/zgui/archive/b6a4dff52.tar.gz",
-            .hash = "zgui-0.6.0-dev--L6sZJUVbgCEsNU_5TOMPX5xl8aSzsbHTIPajxAl5hiR",
+            .url = "git+https://github.com/zig-gamedev/zgui?ref=main#bfbebed372723d1f585f86fc0a550232b3427f4d",
+            .hash = "zgui-0.6.0-dev--L6sZJhIbgAjWdK5h6xuVUrsOcD-RdqEOEPf03Zgi4mF",
         },
         .zglfw = .{
-            .url = "https://github.com/zig-gamedev/zglfw/archive/0dd29d807.tar.gz",
-            .hash = "zglfw-0.10.0-dev-zgVDNIG4IQBWN_sfMD-xfC9bJS2hbBN2W7jNlDLovcdC",
+            .url = "git+https://github.com/zig-gamedev/zglfw?ref=main#51003c105d23db378bb59ce415a387b22f1b0892",
+            .hash = "zglfw-0.10.0-dev-zgVDNIy4IQDJNRy4jrP1As-SZxfJpuWhU1iJ-wBab_VD",
         },
         .zopengl = .{
-            .url = "https://github.com/zig-gamedev/zopengl/archive/db9d615c7.tar.gz",
-            .hash = "zopengl-0.6.0-dev-5-tnz36mDgBuU9pDfag6_B-qCWOJQc5GXiXuZ6z41zQM",
+            .url = "git+https://github.com/zig-gamedev/zopengl?ref=main#29908b1ba2d91baf91e348f6cd192630488d77b6",
+            .hash = "zopengl-0.6.0-dev-5-tnz32mDgB82moljuLD0fmbj1mU3NSCXjzttpmoV2iP",
         },
         .nfd = .{
-            .url = "https://github.com/fabioarnold/nfd-zig/archive/refs/heads/master.tar.gz",
-            .hash = "nfd-0.1.0-y82kbsSLBgBgSEauGFsHxH7RmcL4AEOqZEqOvA8-NEFq",
+            .url = "git+https://github.com/apotema/nfd-zig.git?ref=feat/zig-0.16-migration#f1710340688d72201da59b1571285ffddf700352",
+            .hash = "nfd-0.1.0-y82kbsSLBgCxj9gDvxK7fxPFYnI3oe2wWx6M9ykp9Gio",
         },
         .zspec = .{
-            .url = "https://github.com/apotema/zspec/archive/refs/heads/main.tar.gz",
-            .hash = "zspec-0.8.0-jaKLbSK-AwD6myJjkg3OfGAKJyj5iaFzFfVu-pcUsUn1",
+            .url = "git+https://github.com/apotema/zspec.git?ref=feat/zig-0.16-migration#42e1e69e31a6971c93e6807d29eabe30d9f46bd6",
+            .hash = "zspec-0.8.0-jaKLbe3SAwDRIFxFJbSQvz_lr9Xn-trRT9KR16I8C5_P",
         },
         .zstbi = .{
-            .url = "https://github.com/zig-gamedev/zstbi/archive/664305dd5.tar.gz",
-            .hash = "zstbi-0.11.0-dev-L0Ea_2yVBwA4uh-tHfgdhZcQaWRoZVYlNGs4Dl_WTeuR",
+            .url = "git+https://github.com/zig-gamedev/zstbi?ref=main#3813f5f113b26f644cfa01a30155cc76b3526e91",
+            .hash = "zstbi-0.11.0-dev-L0Ea_3GWBwAh7m54XX055vwLKPTPij5hyqyeq92MXPE2",
         },
     },
     .paths = .{

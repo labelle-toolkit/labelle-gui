@@ -8,6 +8,7 @@ const icons = @import("icons.zig");
 const config = @import("config.zig");
 const prefs_mod = @import("prefs.zig");
 const App = @import("app.zig").App;
+const io_global = @import("io_global.zig");
 
 const gl = zopengl.bindings;
 
@@ -28,10 +29,15 @@ fn contentScaleCallback(_: *zglfw.Window, xscale: f32, _: f32) callconv(.c) void
     g_dpi_changed.store(true, .release);
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(proc_init: std.process.Init.Minimal) !void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+
+    // Initialize the process-wide Io for filesystem helpers that
+    // previously used std.fs.cwd() (removed in Zig 0.16).
+    io_global.init(proc_init);
+
 
     zglfw.init() catch {
         std.log.err("Failed to initialize GLFW", .{});

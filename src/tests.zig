@@ -17,6 +17,28 @@ const preview = @import("preview.zig");
 const flow_projector = @import("flows/projector.zig");
 const flow_types = @import("flows/types.zig");
 const prefs = @import("prefs.zig");
+const io_global = @import("io_global.zig");
+
+/// Wall-clock seconds since the Unix epoch; replacement for the
+/// `std.time.timestamp` helper removed in Zig 0.16. Used only to
+/// generate unique scratch directory names in tests.
+fn timestampSeconds() i64 {
+    const native_os = @import("builtin").os.tag;
+    switch (native_os) {
+        .windows => {
+            var ft: std.os.windows.FILETIME = undefined;
+            std.os.windows.kernel32.GetSystemTimeAsFileTime(&ft);
+            const ticks: i64 = (@as(i64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+            const unix_epoch_offset: i64 = 11644473600;
+            return @divTrunc(ticks, 10_000_000) - unix_epoch_offset;
+        },
+        else => {
+            var ts: std.posix.timespec = undefined;
+            _ = std.posix.system.clock_gettime(.REALTIME, &ts);
+            return ts.sec;
+        },
+    }
+}
 
 test {
     zspec.runAll(@This());
@@ -1745,14 +1767,14 @@ pub const SceneTemplateTests = struct {
 pub const ProjectFileTests = struct {
     fn createTempDir(allocator: std.mem.Allocator) ![]const u8 {
         const tmp_base = "/tmp";
-        const ts = std.time.nanoTimestamp();
+        const ts = timestampSeconds();
         const dir_name = try std.fmt.allocPrint(allocator, "{s}/labelle_test_{d}", .{ tmp_base, ts });
-        try std.fs.cwd().makeDir(dir_name);
+        try std.Io.Dir.cwd().createDir(io_global.io(), dir_name, .default_dir);
         return dir_name;
     }
 
     fn deleteTempDir(allocator: std.mem.Allocator, dir_path: []const u8) void {
-        std.fs.cwd().deleteTree(dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(io_global.io(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
@@ -1769,9 +1791,7 @@ pub const ProjectFileTests = struct {
         const labelle_path = try std.fs.path.join(allocator, &.{ temp_dir, "project.labelle" });
         defer allocator.free(labelle_path);
 
-        const file = try std.fs.cwd().openFile(labelle_path, .{});
-        defer file.close();
-        const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+        const content = try std.Io.Dir.cwd().readFileAlloc(io_global.io(), labelle_path, allocator, .limited(1024 * 1024));
         defer allocator.free(content);
 
         try expect.toBeTrue(std.mem.indexOf(u8, content, ".name = \"test_project\"") != null);
@@ -1794,11 +1814,12 @@ pub const ProjectFileTests = struct {
             const folder_path = try std.fs.path.join(allocator, &.{ temp_dir, folder });
             defer allocator.free(folder_path);
 
-            var dir = std.fs.cwd().openDir(folder_path, .{}) catch {
+            const io = io_global.io();
+            var dir = std.Io.Dir.cwd().openDir(io, folder_path, .{}) catch {
                 std.debug.print("Missing folder: {s}\n", .{folder});
                 return error.MissingFolder;
             };
-            dir.close();
+            dir.close(io);
         }
     }
 

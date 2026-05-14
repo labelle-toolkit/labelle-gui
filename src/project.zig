@@ -1,5 +1,6 @@
 const std = @import("std");
 const zon_scan = @import("zon_scan.zig");
+const io_global = @import("io_global.zig");
 
 pub const PROJECT_FILENAME = "project.labelle";
 
@@ -14,10 +15,9 @@ pub const ProjectFolders = struct {
     /// Nested subfolder under `scripts/` for visual-scripting
     /// `.flow.zon` files (issue #45 — Flows editor). Scaffolded as
     /// part of `ProjectFolders.all` so `createProjectFolders`
-    /// creates it on new project, but `std.fs.Dir.makeDir`
-    /// with this path needs the parent to exist first — it does,
-    /// because `scripts` appears earlier in `all`. The Flow tab
-    /// router (`project_tree.isFlowPath`) requires this exact
+    /// creates it on new project, but `std.Io.Dir.createDirPath`
+    /// will create the `scripts` parent if it's missing. The Flow
+    /// tab router (`project_tree.isFlowPath`) requires this exact
     /// relative path.
     pub const scripts_flows = "scripts/flows";
     pub const resources = "resources";
@@ -145,7 +145,7 @@ pub const ProjectManager = struct {
     /// Monotonic counter bumped every time `current_project` is
     /// replaced (new / load / close). Modules that cache per-project
     /// state should track this rather than the raw `*Project` pointer —
-    /// `GeneralPurposeAllocator` can reuse an address after `deinit`,
+    /// `DebugAllocator` can reuse an address after `deinit`,
     /// so two different projects can have the same pointer in
     /// sequence. Comparing the generation avoids that ABA trap.
     generation: u64,
@@ -171,15 +171,16 @@ pub const ProjectManager = struct {
     }
 
     pub fn createProjectFolders(_: *Self, base_path: []const u8) !void {
-        var dir = try std.fs.cwd().openDir(base_path, .{});
-        defer dir.close();
+        const io = io_global.io();
+        var dir = try std.Io.Dir.cwd().openDir(io, base_path, .{});
+        defer dir.close(io);
 
-        // `makePath` instead of `makeDir` so `scripts/flows`
+        // `createDirPath` instead of `createDir` so `scripts/flows`
         // creates the `scripts` parent if it's missing — and so
         // path separators in entries work on Windows (where
-        // `makeDir` only accepts a single component).
+        // `createDir` only accepts a single component).
         for (ProjectFolders.all) |folder| {
-            dir.makePath(folder) catch |err| {
+            dir.createDirPath(io, folder) catch |err| {
                 if (err != error.PathAlreadyExists) return err;
             };
         }
@@ -190,7 +191,8 @@ pub const ProjectManager = struct {
     pub fn saveProject(self: *Self, dir_path: []const u8) !void {
         const proj = self.current_project orelse return error.NoProjectOpen;
 
-        std.fs.cwd().makePath(dir_path) catch |err| switch (err) {
+        const io = io_global.io();
+        std.Io.Dir.cwd().createDirPath(io, dir_path) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
@@ -202,9 +204,10 @@ pub const ProjectManager = struct {
         const content = try renderProjectLabelle(self.allocator, proj.config, proj.extras);
         defer self.allocator.free(content);
 
-        const file = try std.fs.cwd().createFile(file_path, .{});
-        defer file.close();
-        try file.writeAll(content);
+        try std.Io.Dir.cwd().writeFile(io, .{
+            .sub_path = file_path,
+            .data = content,
+        });
 
         proj.dir = try proj.arena.allocator().dupe(u8, dir_path);
         proj.is_dirty = false;
@@ -222,10 +225,11 @@ pub const ProjectManager = struct {
         const file_path = try std.fs.path.join(self.allocator, &.{ dir_path, PROJECT_FILENAME });
         defer self.allocator.free(file_path);
 
+        const io = io_global.io();
         // 16 MB cap is overkill for project.labelle (real ones are <10 KB)
         // but the bot reviewer flagged 1 MB as too tight for "robustness";
         // bumping it costs nothing and removes the question.
-        const raw = try std.fs.cwd().readFileAlloc(self.allocator, file_path, 16 * 1024 * 1024);
+        const raw = try std.Io.Dir.cwd().readFileAlloc(io, file_path, self.allocator, .limited(16 * 1024 * 1024));
         defer self.allocator.free(raw);
 
         // Build the project up front so its arena owns every string we parse
@@ -339,7 +343,7 @@ fn extractUnmodeledFields(arena: std.mem.Allocator, raw: []const u8) ![]const []
     if (i + 1 >= raw.len or raw[i] != '.' or raw[i + 1] != '{') return &.{};
     i += 2;
 
-    var out: std.ArrayList([]const u8) = .{};
+    var out: std.ArrayList([]const u8) = .empty;
     errdefer out.deinit(arena);
 
     while (i < raw.len) {
@@ -420,34 +424,33 @@ fn renderProjectLabelle(
     extras: []const []const u8,
 ) ![]u8 {
     const title = if (cfg.title.len > 0) cfg.title else cfg.name;
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
 
-    try w.writeAll(".{\n");
-    try w.print("    .name = \"{s}\",\n", .{cfg.name});
-    try w.print("    .description = \"{s}\",\n", .{cfg.description});
-    try w.print("    .title = \"{s}\",\n", .{title});
-    try w.print("    .width = {d},\n", .{cfg.width});
-    try w.print("    .height = {d},\n", .{cfg.height});
-    try w.print("    .target_fps = {d},\n", .{cfg.target_fps});
-    try w.print("    .backend = .{s},\n", .{@tagName(cfg.backend)});
-    try w.print("    .ecs = .{s},\n", .{@tagName(cfg.ecs)});
-    try w.print("    .initial_scene = \"{s}\",\n", .{cfg.initial_scene});
-    try w.print("    .core_version = \"{s}\",\n", .{cfg.core_version});
-    try w.print("    .engine_version = \"{s}\",\n", .{cfg.engine_version});
-    try w.print("    .gfx_version = \"{s}\",\n", .{cfg.gfx_version});
-    try w.print("    .assembler_version = \"{s}\",\n", .{cfg.assembler_version});
+    try buf.appendSlice(allocator, ".{\n");
+    try buf.print(allocator, "    .name = \"{s}\",\n", .{cfg.name});
+    try buf.print(allocator, "    .description = \"{s}\",\n", .{cfg.description});
+    try buf.print(allocator, "    .title = \"{s}\",\n", .{title});
+    try buf.print(allocator, "    .width = {d},\n", .{cfg.width});
+    try buf.print(allocator, "    .height = {d},\n", .{cfg.height});
+    try buf.print(allocator, "    .target_fps = {d},\n", .{cfg.target_fps});
+    try buf.print(allocator, "    .backend = .{s},\n", .{@tagName(cfg.backend)});
+    try buf.print(allocator, "    .ecs = .{s},\n", .{@tagName(cfg.ecs)});
+    try buf.print(allocator, "    .initial_scene = \"{s}\",\n", .{cfg.initial_scene});
+    try buf.print(allocator, "    .core_version = \"{s}\",\n", .{cfg.core_version});
+    try buf.print(allocator, "    .engine_version = \"{s}\",\n", .{cfg.engine_version});
+    try buf.print(allocator, "    .gfx_version = \"{s}\",\n", .{cfg.gfx_version});
+    try buf.print(allocator, "    .assembler_version = \"{s}\",\n", .{cfg.assembler_version});
 
     if (cfg.resources.len > 0) {
-        try w.writeAll("    .resources = .{\n");
+        try buf.appendSlice(allocator, "    .resources = .{\n");
         for (cfg.resources) |r| {
-            try w.print(
+            try buf.print(allocator,
                 "        .{{ .name = \"{s}\", .json = \"{s}\", .texture = \"{s}\" }},\n",
                 .{ r.name, r.json, r.texture },
             );
         }
-        try w.writeAll("    },\n");
+        try buf.appendSlice(allocator, "    },\n");
     }
 
     // Re-emit fields the gui doesn't model, verbatim from the source we
@@ -457,11 +460,11 @@ fn renderProjectLabelle(
     // not their original indentation level — good enough; the file is
     // still ZON-parseable and human-editable.
     for (extras) |field_text| {
-        try w.writeAll("    ");
-        try w.writeAll(field_text);
-        try w.writeAll(",\n");
+        try buf.appendSlice(allocator, "    ");
+        try buf.appendSlice(allocator, field_text);
+        try buf.appendSlice(allocator, ",\n");
     }
 
-    try w.writeAll("}\n");
+    try buf.appendSlice(allocator, "}\n");
     return buf.toOwnedSlice(allocator);
 }
