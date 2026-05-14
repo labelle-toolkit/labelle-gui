@@ -138,8 +138,8 @@ pub const ParseError = error{
 
 /// Read `path` as ZON and parse it into a `LoadedFlow`. 16 MiB cap
 /// matches `gizmo_io` — these files are tiny.
-pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !LoadedFlow {
-    const raw = try std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024);
+pub fn loadFromFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !LoadedFlow {
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024));
     defer allocator.free(raw);
     return parseFlow(allocator, raw);
 }
@@ -165,7 +165,7 @@ pub fn parseFlow(allocator: std.mem.Allocator, raw: []const u8) !LoadedFlow {
 
     var diag: std.zon.parse.Diagnostics = .{};
     defer diag.deinit(arena_alloc);
-    const parsed = try std.zon.parse.fromSlice(Flow, arena_alloc, source, &diag, .{
+    const parsed = try std.zon.parse.fromSliceAlloc(Flow, arena_alloc, source, &diag, .{
         .ignore_unknown_fields = true,
     });
 
@@ -211,9 +211,9 @@ fn hasNode(nodes: []const Node, id: u32) bool {
 /// values run through `std.zig.fmtString` so a `"` or `\` inside an
 /// identifier round-trips as valid ZON.
 pub fn renderFlowZon(allocator: std.mem.Allocator, loaded: LoadedFlow) ![]u8 {
-    var out: std.ArrayList(u8) = .{};
-    errdefer out.deinit(allocator);
-    const w = out.writer(allocator);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    const w = &aw.writer;
 
     try w.writeAll(".{\n");
 
@@ -255,7 +255,7 @@ pub fn renderFlowZon(allocator: std.mem.Allocator, loaded: LoadedFlow) ![]u8 {
     try w.writeAll("    },\n");
 
     try w.writeAll("}\n");
-    return out.toOwnedSlice(allocator);
+    return aw.toOwnedSlice();
 }
 
 fn lessThanNode(_: void, a: Node, b: Node) bool {
@@ -317,12 +317,10 @@ fn writeNodeKind(w: anytype, k: NodeKind) !void {
 }
 
 /// Persist `loaded` to disk at `path`. Truncates any existing file.
-pub fn saveFlow(allocator: std.mem.Allocator, path: []const u8, loaded: LoadedFlow) !void {
+pub fn saveFlow(io: std.Io, allocator: std.mem.Allocator, path: []const u8, loaded: LoadedFlow) !void {
     const text = try renderFlowZon(allocator, loaded);
     defer allocator.free(text);
-    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(text);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text });
 }
 
 /// Strip the trailing `.flow.zon` double extension from a path's
