@@ -77,6 +77,39 @@ pub const Bye = struct {
     reason: ?[]u8 = null,
 };
 
+/// Binary-frame kinds emitted by the engine on the multiplexed socket.
+/// Mirror of `labelle-engine`'s `preview_mode.BinaryFrameKind`. Numbers
+/// are explicit because they go on the wire.
+pub const BinaryFrameKind = enum(u8) {
+    entity_created = 1,
+    entity_destroyed = 2,
+    component_changed = 3,
+    node_entered = 4,
+    _,
+};
+
+/// Magic byte that prefixes every binary frame. JSON documents start
+/// with `{` so the first-byte peek disambiguates without lookahead.
+pub const binary_magic: u8 = 0x1B;
+
+/// Header bytes per binary frame: [magic][kind][u32 len LE].
+const binary_header_bytes: usize = 6;
+
+/// Callback fired when the engine emits a `component_changed` binary
+/// frame. `comp_bytes` is borrowed — only valid for the duration of
+/// the call. Listeners that need to retain it must copy.
+pub const ComponentChangedCallback = struct {
+    ctx: *anyopaque,
+    func: *const fn (ctx: *anyopaque, entity_id: u64, comp_name: []const u8, comp_bytes: []const u8) void,
+};
+
+/// Callback fired when the engine emits a `node_entered` binary frame.
+/// `flow_name` is borrowed — copy if you need to keep it.
+pub const NodeEnteredCallback = struct {
+    ctx: *anyopaque,
+    func: *const fn (ctx: *anyopaque, flow_name: []const u8, node_id: u32) void,
+};
+
 /// How long we wait between spawning the child and getting an accept()
 /// before declaring failure. Engine cold-start is dominated by package
 /// cache resolution and build, so 2s is generous for the simple case
@@ -135,6 +168,18 @@ pub const PreviewSession = struct {
     /// inside `drainStream`; partial frames stay here until completed
     /// next frame.
     rx_buf: std.ArrayList(u8),
+
+    /// Phase 3 (#84). Optional listener for `component_changed` binary
+    /// frames. The Entity Inspector module installs this once at App
+    /// construction to receive watched-entity updates. Only the last
+    /// installed listener fires — Phase 3 is single-consumer; Phase 4+
+    /// can grow this into a list if multiple panels want the same data.
+    on_component_changed: ?ComponentChangedCallback = null,
+    /// Phase 3 (#84). Optional listener for `node_entered` binary
+    /// frames. The Flow editor module installs this so the active node
+    /// pulses while the runtime is stepping. Same single-consumer rule
+    /// as `on_component_changed`.
+    on_node_entered: ?NodeEnteredCallback = null,
 
     /// Captured child-stderr tail, drained non-blockingly each frame.
     /// Surfaced verbatim by the preview panel when the session lands
@@ -428,10 +473,27 @@ pub const PreviewSession = struct {
         var consumed: usize = 0;
         while (true) {
             const rest = self.rx_buf.items[consumed..];
-            const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse break;
-            const line = rest[0..nl];
-            self.handleFrame(line);
-            consumed += nl + 1;
+            if (rest.len == 0) break;
+
+            if (rest[0] == binary_magic) {
+                // Binary frame: [magic][kind][u32 len LE][payload...].
+                // Wait for the full header + payload before dispatching;
+                // a torn read leaves the partial bytes in rx_buf for the
+                // next drain.
+                if (rest.len < binary_header_bytes) break;
+                const payload_len: usize = @intCast(std.mem.readInt(u32, rest[2..6], .little));
+                const total = binary_header_bytes + payload_len;
+                if (rest.len < total) break;
+                const kind: BinaryFrameKind = @enumFromInt(rest[1]);
+                self.handleBinaryFrame(kind, rest[binary_header_bytes..total]);
+                consumed += total;
+            } else {
+                // JSON line: newline-terminated.
+                const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse break;
+                const line = rest[0..nl];
+                self.handleFrame(line);
+                consumed += nl + 1;
+            }
             if (self.state == .stopped or self.state == .crashed) break;
         }
         if (consumed > 0) {
@@ -439,6 +501,117 @@ pub const PreviewSession = struct {
             std.mem.copyForwards(u8, self.rx_buf.items[0..remaining], self.rx_buf.items[consumed..]);
             self.rx_buf.shrinkRetainingCapacity(remaining);
         }
+    }
+
+    /// Decode a binary telemetry frame's payload (header already
+    /// stripped) and dispatch into the appropriate Phase 3 listener.
+    /// Unknown / malformed payloads are dropped — the protocol is
+    /// forwards-compatible, so a too-new engine kind just gets ignored.
+    fn handleBinaryFrame(self: *Self, kind: BinaryFrameKind, payload: []const u8) void {
+        switch (kind) {
+            .component_changed => self.dispatchComponentChanged(payload),
+            .node_entered => self.dispatchNodeEntered(payload),
+            // entity_created / entity_destroyed are Phase 2 lifecycle
+            // events; Phase 3 doesn't consume them on the editor side
+            // yet (Phase 4 will), so drop them rather than fail.
+            else => {},
+        }
+    }
+
+    fn dispatchComponentChanged(self: *Self, payload: []const u8) void {
+        const cb = self.on_component_changed orelse return;
+        // [u64 entity_id] [u16 name_len] [name bytes] [u32 data_len] [data bytes]
+        if (payload.len < 8 + 2) return;
+        const entity_id = std.mem.readInt(u64, payload[0..8], .little);
+        const name_len: usize = @intCast(std.mem.readInt(u16, payload[8..10], .little));
+        const name_end = 10 + name_len;
+        if (payload.len < name_end + 4) return;
+        const name = payload[10..name_end];
+        const data_len: usize = @intCast(std.mem.readInt(u32, payload[name_end..][0..4], .little));
+        const data_start = name_end + 4;
+        if (payload.len < data_start + data_len) return;
+        const data = payload[data_start .. data_start + data_len];
+        cb.func(cb.ctx, entity_id, name, data);
+    }
+
+    fn dispatchNodeEntered(self: *Self, payload: []const u8) void {
+        const cb = self.on_node_entered orelse return;
+        // [u16 flow_name_len] [flow_name bytes] [u32 node_id]
+        if (payload.len < 2) return;
+        const name_len: usize = @intCast(std.mem.readInt(u16, payload[0..2], .little));
+        const name_end = 2 + name_len;
+        if (payload.len < name_end + 4) return;
+        const flow_name = payload[2..name_end];
+        const node_id = std.mem.readInt(u32, payload[name_end..][0..4], .little);
+        cb.func(cb.ctx, flow_name, node_id);
+    }
+
+    /// Send `watch_entity(id)` to the engine. Caller is responsible
+    /// for matching `unwatchEntity` (or relying on session teardown).
+    /// No-op when the session isn't running — the editor's selection
+    /// UI can fire freely and we just drop subscribe traffic the
+    /// engine can't observe.
+    pub fn watchEntity(self: *Self, id: u64) !void {
+        try self.sendIdFrame("watch_entity", id);
+    }
+
+    pub fn unwatchEntity(self: *Self, id: u64) !void {
+        try self.sendIdFrame("unwatch_entity", id);
+    }
+
+    /// Send `subscribe_flow(flow_name)` to the engine. Engine emits
+    /// `node_entered` frames for this flow until `unsubscribeFlow`.
+    pub fn subscribeFlow(self: *Self, flow_name: []const u8) !void {
+        try self.sendFlowFrame("subscribe_flow", flow_name);
+    }
+
+    pub fn unsubscribeFlow(self: *Self, flow_name: []const u8) !void {
+        try self.sendFlowFrame("unsubscribe_flow", flow_name);
+    }
+
+    /// Send `subscribe(components)` to the engine. Phase 3 ships this
+    /// here (rather than baking it into `watchEntity`) so the inspector
+    /// can opt into the components it wants to render without forcing
+    /// the engine to emit every typed mutation.
+    pub fn subscribeComponents(self: *Self, components: []const []const u8) !void {
+        try self.sendComponentsFrame("subscribe", components);
+    }
+
+    pub fn unsubscribeComponents(self: *Self, components: []const []const u8) !void {
+        try self.sendComponentsFrame("unsubscribe", components);
+    }
+
+    fn sendIdFrame(self: *Self, kind: []const u8, id: u64) !void {
+        const stream = self.stream orelse return;
+        var buf: [128]u8 = undefined;
+        const line = try std.fmt.bufPrint(&buf, "{{\"kind\":\"{s}\",\"id\":{d}}}\n", .{ kind, id });
+        try stream.writeAll(line);
+    }
+
+    fn sendFlowFrame(self: *Self, kind: []const u8, flow_name: []const u8) !void {
+        const stream = self.stream orelse return;
+        // Build the JSON via stringify so flow names with quotes / escapes
+        // don't corrupt the wire.
+        const Msg = struct {
+            kind: []const u8,
+            flow: []const u8,
+        };
+        const body = try std.json.Stringify.valueAlloc(self.allocator, Msg{ .kind = kind, .flow = flow_name }, .{});
+        defer self.allocator.free(body);
+        try stream.writeAll(body);
+        try stream.writeAll("\n");
+    }
+
+    fn sendComponentsFrame(self: *Self, kind: []const u8, components: []const []const u8) !void {
+        const stream = self.stream orelse return;
+        const Msg = struct {
+            kind: []const u8,
+            components: []const []const u8,
+        };
+        const body = try std.json.Stringify.valueAlloc(self.allocator, Msg{ .kind = kind, .components = components }, .{});
+        defer self.allocator.free(body);
+        try stream.writeAll(body);
+        try stream.writeAll("\n");
     }
 
     fn handleFrame(self: *Self, raw: []const u8) void {

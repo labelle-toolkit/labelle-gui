@@ -41,6 +41,11 @@ const GraphNodeSpec = flow_types.GraphNodeSpec;
 const inspector_w: f32 = 320;
 const split_gap: f32 = 8;
 
+/// Duration of the active-node pulse highlight (issue #84). 300ms is
+/// long enough to register at 60Hz frame rates without trailing
+/// previous fires when nodes step every couple of frames.
+pub const pulse_duration_ms: i64 = 300;
+
 pub const FlowState = struct {
     arena: *std.heap.ArenaAllocator,
     /// Absolute path on disk. Read-only; used for tab dedup and for
@@ -66,6 +71,17 @@ pub const FlowState = struct {
     /// `false` always — flows are derived from Zig, never authored
     /// here. Kept to satisfy `OpenTab.isDirty`.
     is_dirty: bool = false,
+
+    /// Phase 3 (#84): id of the node currently being pulse-highlighted
+    /// because the engine just sent a `node_entered` frame for it.
+    /// `null` while no pulse is in progress. The actual node is looked
+    /// up by id at render time so a graph reparse doesn't dangle the
+    /// reference.
+    pulse_node_id: ?u32 = null,
+    /// Wall-clock ms (std.time.milliTimestamp()) when the current
+    /// pulse started. Used to compute the alpha falloff. Together with
+    /// `pulse_node_id` defines an active pulse.
+    pulse_started_ms: ?i64 = null,
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !FlowState {
         const arena = try allocator.create(std.heap.ArenaAllocator);
@@ -265,6 +281,10 @@ fn renderCanvas(s: *FlowState, allocator: std.mem.Allocator) void {
         };
         _ = ne.link(link_id, @intCast(e.from_pin), @intCast(e.to_pin), colour, 1.5);
     }
+
+    // Active-node pulse (Phase 3, #84). Drawn after nodes/edges so
+    // the highlight overlays the node's own border.
+    renderPulse(s);
 }
 
 fn renderSidebar(s: *FlowState) void {
@@ -435,4 +455,47 @@ fn layoutNodes(allocator: std.mem.Allocator, graph: Graph) ![][2]f32 {
 pub fn saveFlow(s: *FlowState, app: *App) void {
     _ = s;
     _ = app;
+}
+
+/// Phase 3 (#84): trigger a brief pulse highlight on `node_id`. The
+/// pulse fades over `pulse_duration_ms`; the falloff is computed at
+/// render time from `pulse_started_ms`. Calling again with the same
+/// or a different id restarts the fade — back-to-back step traces
+/// re-pulse without trailing.
+pub fn pulseNode(s: *FlowState, node_id: u32) void {
+    s.pulse_node_id = node_id;
+    s.pulse_started_ms = std.time.milliTimestamp();
+}
+
+/// Render the active pulse, if any, as a faded border over the node's
+/// editor rect. Cheap — one `getNodePosition`+`getNodeSize` lookup
+/// plus an `addRect` on the foreground draw list. Returns silently
+/// when no pulse is active or it has decayed past the duration.
+fn renderPulse(s: *FlowState) void {
+    const id = s.pulse_node_id orelse return;
+    const started = s.pulse_started_ms orelse return;
+    const now = std.time.milliTimestamp();
+    const elapsed = now - started;
+    if (elapsed < 0 or elapsed > pulse_duration_ms) {
+        // Decayed — clear so we don't keep computing a zero-alpha
+        // border each frame.
+        s.pulse_node_id = null;
+        s.pulse_started_ms = null;
+        return;
+    }
+    const t: f32 = @as(f32, @floatFromInt(elapsed)) / @as(f32, @floatFromInt(pulse_duration_ms));
+    const alpha: f32 = 1.0 - t;
+
+    // Position + size come from the node editor's per-node state.
+    const pos = ne.getNodePosition(@intCast(id));
+    const size = ne.getNodeSize(@intCast(id));
+    if (size[0] <= 0 or size[1] <= 0) return;
+    const dl = zgui.getWindowDrawList();
+    const col = zgui.colorConvertFloat4ToU32(.{ 1.0, 0.8, 0.2, alpha });
+    dl.addRect(.{
+        .pmin = .{ pos[0], pos[1] },
+        .pmax = .{ pos[0] + size[0], pos[1] + size[1] },
+        .col = col,
+        .thickness = 3.0,
+    });
 }
