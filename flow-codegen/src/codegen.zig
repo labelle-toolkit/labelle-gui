@@ -556,7 +556,7 @@ fn collectComponentTypes(
 ) (CodegenError || std.mem.Allocator.Error)![][]const u8 {
     var seen = std.StringHashMap(void).init(allocator);
     defer seen.deinit();
-    var list: std.ArrayList([]const u8) = .{};
+    var list: std.ArrayList([]const u8) = .empty;
     errdefer list.deinit(allocator);
 
     for (flow.nodes) |n| {
