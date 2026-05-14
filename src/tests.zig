@@ -14,6 +14,7 @@ const atlas = @import("atlas.zig");
 const gizmo_io = @import("gizmo_io.zig");
 const gizmos = @import("gizmos.zig");
 const preview = @import("preview.zig");
+const flow_io = @import("flows/flow_io.zig");
 const flow_projector = @import("flows/projector.zig");
 const flow_types = @import("flows/types.zig");
 const prefs = @import("prefs.zig");
@@ -2320,6 +2321,252 @@ pub const GizmoIoTests = struct {
         try expect.toBeTrue(std.mem.eql(u8, reparsed.gizmo.match[0], hostile));
         try expect.equal(reparsed.gizmo.exclude.len, 1);
         try expect.toBeTrue(std.mem.eql(u8, reparsed.gizmo.exclude[0], "Tab\there"));
+    }
+};
+
+pub const FlowIoTests = struct {
+    // The sketch from issue #46 — the canonical example a flow file
+    // looks like in v1. Used by the round-trip test below.
+    const sample_issue_46 =
+        \\.{
+        \\    .event = .{ .OnUpdate = .{ .arg_dt = "dt" } },
+        \\    .nodes = .{
+        \\        .{ .id = 1, .pos = .{120, 80}, .kind = .{ .GetComponent = .{ .type = "Position" } } },
+        \\        .{ .id = 2, .pos = .{280, 80}, .kind = .{ .BinOp = .{ .op = .add } } },
+        \\        .{ .id = 3, .pos = .{440, 80}, .kind = .{ .SetField = .{ .target = "Position.x" } } },
+        \\    },
+        \\    .links = .{
+        \\        .{ .from = .{ .node = 1, .pin = "x" }, .to = .{ .node = 2, .pin = "a" } },
+        \\    },
+        \\}
+        \\
+    ;
+
+    const minimal_on_update =
+        \\.{
+        \\    .event = .{ .OnUpdate = .{ .arg_dt = "dt" } },
+        \\    .nodes = .{},
+        \\    .links = .{},
+        \\}
+        \\
+    ;
+
+    test "parses minimal flow with OnUpdate event" {
+        const allocator = std.testing.allocator;
+        var loaded = try flow_io.parseFlow(allocator, minimal_on_update);
+        defer loaded.deinit();
+
+        try expect.equal(@as(std.meta.Tag(flow_io.Event), loaded.flow.event), .OnUpdate);
+        try expect.toBeTrue(std.mem.eql(u8, loaded.flow.event.OnUpdate.arg_dt, "dt"));
+        try expect.equal(loaded.flow.nodes.len, 0);
+        try expect.equal(loaded.flow.links.len, 0);
+    }
+
+    test "parses each NodeKind variant" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\.{
+            \\    .event = .{ .OnUpdate = .{ .arg_dt = "dt" } },
+            \\    .nodes = .{
+            \\        .{ .id = 1, .pos = .{0, 0}, .kind = .{ .GetComponent = .{ .type = "Position" } } },
+            \\        .{ .id = 2, .pos = .{0, 0}, .kind = .{ .SetField = .{ .target = "Position.x" } } },
+            \\        .{ .id = 3, .pos = .{0, 0}, .kind = .{ .BinOp = .{ .op = .mul } } },
+            \\        .{ .id = 4, .pos = .{0, 0}, .kind = .{ .Literal = .{ .value = "1.5" } } },
+            \\        .{ .id = 5, .pos = .{0, 0}, .kind = .{ .Identifier = .{ .name = "speed" } } },
+            \\        .{ .id = 6, .pos = .{0, 0}, .kind = .{ .Call = .{ .callee = "std.math.sin" } } },
+            \\    },
+            \\    .links = .{},
+            \\}
+            \\
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        try expect.equal(loaded.flow.nodes.len, 6);
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), loaded.flow.nodes[0].kind), .GetComponent);
+        try expect.toBeTrue(std.mem.eql(u8, loaded.flow.nodes[0].kind.GetComponent.type, "Position"));
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), loaded.flow.nodes[1].kind), .SetField);
+        try expect.toBeTrue(std.mem.eql(u8, loaded.flow.nodes[1].kind.SetField.target, "Position.x"));
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), loaded.flow.nodes[2].kind), .BinOp);
+        try expect.equal(loaded.flow.nodes[2].kind.BinOp.op, .mul);
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), loaded.flow.nodes[3].kind), .Literal);
+        try expect.toBeTrue(std.mem.eql(u8, loaded.flow.nodes[3].kind.Literal.value, "1.5"));
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), loaded.flow.nodes[4].kind), .Identifier);
+        try expect.toBeTrue(std.mem.eql(u8, loaded.flow.nodes[4].kind.Identifier.name, "speed"));
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), loaded.flow.nodes[5].kind), .Call);
+        try expect.toBeTrue(std.mem.eql(u8, loaded.flow.nodes[5].kind.Call.callee, "std.math.sin"));
+    }
+
+    test "parses each Event variant" {
+        const allocator = std.testing.allocator;
+
+        const on_create =
+            \\.{
+            \\    .event = .{ .OnCreate = .{ .arg_entity = "self" } },
+            \\    .nodes = .{},
+            \\    .links = .{},
+            \\}
+            \\
+        ;
+        var l1 = try flow_io.parseFlow(allocator, on_create);
+        defer l1.deinit();
+        try expect.equal(@as(std.meta.Tag(flow_io.Event), l1.flow.event), .OnCreate);
+        try expect.toBeTrue(std.mem.eql(u8, l1.flow.event.OnCreate.arg_entity, "self"));
+
+        const on_destroy =
+            \\.{
+            \\    .event = .{ .OnDestroy = .{ .arg_entity = "victim" } },
+            \\    .nodes = .{},
+            \\    .links = .{},
+            \\}
+            \\
+        ;
+        var l2 = try flow_io.parseFlow(allocator, on_destroy);
+        defer l2.deinit();
+        try expect.equal(@as(std.meta.Tag(flow_io.Event), l2.flow.event), .OnDestroy);
+        try expect.toBeTrue(std.mem.eql(u8, l2.flow.event.OnDestroy.arg_entity, "victim"));
+    }
+
+    test "round-trips example from #46 structurally" {
+        // The renderer's output is canonical (sorted, indented) so a
+        // byte-equal compare to the hand-authored source would fight
+        // the spec. Instead, parse → render → parse and confirm the
+        // structural shape matches.
+        const allocator = std.testing.allocator;
+
+        var l1 = try flow_io.parseFlow(allocator, sample_issue_46);
+        defer l1.deinit();
+
+        const rendered = try flow_io.renderFlowZon(allocator, l1);
+        defer allocator.free(rendered);
+
+        var l2 = try flow_io.parseFlow(allocator, rendered);
+        defer l2.deinit();
+
+        try expect.equal(@as(std.meta.Tag(flow_io.Event), l2.flow.event), .OnUpdate);
+        try expect.toBeTrue(std.mem.eql(u8, l2.flow.event.OnUpdate.arg_dt, "dt"));
+
+        try expect.equal(l2.flow.nodes.len, 3);
+        try expect.equal(l2.flow.nodes[0].id, 1);
+        try expect.equal(l2.flow.nodes[0].pos[0], @as(f32, 120));
+        try expect.equal(l2.flow.nodes[0].pos[1], @as(f32, 80));
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), l2.flow.nodes[0].kind), .GetComponent);
+        try expect.toBeTrue(std.mem.eql(u8, l2.flow.nodes[0].kind.GetComponent.type, "Position"));
+
+        try expect.equal(l2.flow.nodes[1].id, 2);
+        try expect.equal(l2.flow.nodes[1].kind.BinOp.op, .add);
+
+        try expect.equal(l2.flow.nodes[2].id, 3);
+        try expect.toBeTrue(std.mem.eql(u8, l2.flow.nodes[2].kind.SetField.target, "Position.x"));
+
+        try expect.equal(l2.flow.links.len, 1);
+        try expect.equal(l2.flow.links[0].from.node, 1);
+        try expect.toBeTrue(std.mem.eql(u8, l2.flow.links[0].from.pin, "x"));
+        try expect.equal(l2.flow.links[0].to.node, 2);
+        try expect.toBeTrue(std.mem.eql(u8, l2.flow.links[0].to.pin, "a"));
+
+        // And the rendered output should re-render byte-identically
+        // (idempotent canonicalization).
+        const rendered2 = try flow_io.renderFlowZon(allocator, l2);
+        defer allocator.free(rendered2);
+        try expect.toBeTrue(std.mem.eql(u8, rendered, rendered2));
+    }
+
+    test "rejects duplicate node IDs" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\.{
+            \\    .event = .{ .OnUpdate = .{ .arg_dt = "dt" } },
+            \\    .nodes = .{
+            \\        .{ .id = 1, .pos = .{0, 0}, .kind = .{ .Identifier = .{ .name = "a" } } },
+            \\        .{ .id = 1, .pos = .{0, 0}, .kind = .{ .Identifier = .{ .name = "b" } } },
+            \\    },
+            \\    .links = .{},
+            \\}
+            \\
+        ;
+        try std.testing.expectError(error.DuplicateNodeId, flow_io.parseFlow(allocator, src));
+    }
+
+    test "rejects link to nonexistent node" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\.{
+            \\    .event = .{ .OnUpdate = .{ .arg_dt = "dt" } },
+            \\    .nodes = .{
+            \\        .{ .id = 1, .pos = .{0, 0}, .kind = .{ .Identifier = .{ .name = "a" } } },
+            \\    },
+            \\    .links = .{
+            \\        .{ .from = .{ .node = 1, .pin = "x" }, .to = .{ .node = 99, .pin = "y" } },
+            \\    },
+            \\}
+            \\
+        ;
+        try std.testing.expectError(error.DanglingLink, flow_io.parseFlow(allocator, src));
+    }
+
+    test "rejects node id == 0" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\.{
+            \\    .event = .{ .OnUpdate = .{ .arg_dt = "dt" } },
+            \\    .nodes = .{
+            \\        .{ .id = 0, .pos = .{0, 0}, .kind = .{ .Identifier = .{ .name = "a" } } },
+            \\    },
+            \\    .links = .{},
+            \\}
+            \\
+        ;
+        try std.testing.expectError(error.InvalidNodeId, flow_io.parseFlow(allocator, src));
+    }
+
+    test "displayNameFromPath strips .flow.zon" {
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            flow_io.displayNameFromPath("scripts/flows/move.flow.zon"),
+            "move",
+        ));
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            flow_io.displayNameFromPath("/abs/path/to/jump.flow.zon"),
+            "jump",
+        ));
+        // Bare `.zon` (without the `.flow` infix) is NOT stripped —
+        // that's a different file kind and the editor wouldn't open
+        // it via this loader anyway.
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            flow_io.displayNameFromPath("scene.zon"),
+            "scene.zon",
+        ));
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            flow_io.displayNameFromPath("noext"),
+            "noext",
+        ));
+    }
+
+    test "saveFlow + loadFromFile round trip via tmpDir" {
+        const allocator = std.testing.allocator;
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const dir = try tmp.dir.realpathAlloc(allocator, ".");
+        defer allocator.free(dir);
+        const path = try std.fs.path.join(allocator, &.{ dir, "demo.flow.zon" });
+        defer allocator.free(path);
+
+        var l1 = try flow_io.parseFlow(allocator, sample_issue_46);
+        defer l1.deinit();
+
+        try flow_io.saveFlow(allocator, path, l1);
+
+        var l2 = try flow_io.loadFromFile(allocator, path);
+        defer l2.deinit();
+
+        try expect.equal(l2.flow.nodes.len, l1.flow.nodes.len);
+        try expect.equal(l2.flow.links.len, l1.flow.links.len);
+        try expect.equal(@as(std.meta.Tag(flow_io.Event), l2.flow.event), .OnUpdate);
     }
 };
 
