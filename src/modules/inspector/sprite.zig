@@ -56,8 +56,17 @@ fn render(
         const name = std.mem.sliceTo(&sprite.sprite_name, 0);
         break :blk name.len > 0 and idx.find(name) == null;
     };
-    const label_reserve: f32 = if (is_missing) 180 else 100;
-    zgui.setNextItemWidth(@max(60, zgui.getContentRegionAvail()[0] - label_reserve));
+    // Reserve actual rendered width — a hardcoded constant breaks on
+    // HiDPI where the font is bigger. inputText puts its label after
+    // the widget with `item_inner_spacing`; an optional sameLine adds
+    // one `item_spacing` before `(missing)`.
+    const style = zgui.getStyle();
+    const label_w = zgui.calcTextSize("sprite_name", .{})[0];
+    const trailing: f32 = if (is_missing)
+        style.item_inner_spacing[0] + label_w + style.item_spacing[0] + zgui.calcTextSize("(missing)", .{})[0]
+    else
+        style.item_inner_spacing[0] + label_w;
+    zgui.setNextItemWidth(@max(60, zgui.getContentRegionAvail()[0] - trailing - 4));
     if (zgui.inputText("sprite_name", .{ .buf = &sprite.sprite_name })) is_dirty.* = true;
     if (is_missing) {
         zgui.sameLine(.{});
