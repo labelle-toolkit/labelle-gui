@@ -205,6 +205,23 @@ pub const PreviewSession = struct {
         if (self.state != .idle and self.state != .stopped and self.state != .crashed) {
             return error.AlreadyRunning;
         }
+        // Clean up leftover resources from a prior `.crashed` /
+        // `.stopped` cycle. `markCrashed` doesn't kill the child
+        // (it only manages the listener+conn fds), and the bye
+        // path closed neither — both cases can leak through to a
+        // fresh `start()` and leak a subprocess + fd (#113 review).
+        if (self.child) |*c| {
+            c.kill(io_global.io());
+            self.child = null;
+        }
+        if (self.conn_fd >= 0) {
+            _ = close(self.conn_fd);
+            self.conn_fd = -1;
+        }
+        if (self.listener) |*l| {
+            l.deinit(io_global.io());
+            self.listener = null;
+        }
         self.releaseOwnedStrings();
         self.stderr_buf.clearRetainingCapacity();
         self.inbox.clearRetainingCapacity();
@@ -248,8 +265,13 @@ pub const PreviewSession = struct {
         try self.bindListener();
         errdefer self.stop();
 
-        var port_buf: [8]u8 = undefined;
-        const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{self.port.?}) catch
+        // The engine's `--preview-mode` flag expects `host:port`, not
+        // a bare port — `preview_mode.parseArgs` calls
+        // `lastIndexOfScalar(':')` to split the value. Missing the
+        // host prefix made the engine fail to parse and silently
+        // fall through to non-preview mode (#113 review).
+        var addr_buf: [32]u8 = undefined;
+        const addr_str = std.fmt.bufPrint(&addr_buf, "127.0.0.1:{d}", .{self.port.?}) catch
             return error.OutOfMemory;
 
         var argv_buf: [16][]const u8 = undefined;
@@ -258,7 +280,7 @@ pub const PreviewSession = struct {
             argv_buf[1] = "run";
             argv_buf[2] = dir_path;
             argv_buf[3] = "--preview-mode";
-            argv_buf[4] = port_str;
+            argv_buf[4] = addr_str;
             break :blk argv_buf[0..5];
         };
 
@@ -315,14 +337,26 @@ pub const PreviewSession = struct {
             .connecting, .running => self.tryRead(),
         }
 
-        // Connecting-timeout: if no client showed up within the
-        // window, the subprocess likely failed to dial. Land in
-        // `.crashed` so the UI surfaces it.
+        // Connecting-timeout: if no client showed up — or accepted
+        // but didn't `hello` — within the window, the subprocess
+        // likely failed and we land in `.crashed`. Two cases share
+        // the same deadline (#113 review uncovered the inner guard
+        // restricted the timeout to `.listening` only, making it
+        // dead code for `.connecting`):
+        //
+        //  - `.listening` — engine never opened the TCP connection.
+        //  - `.connecting` — TCP handshake succeeded but `hello`
+        //    never arrived (engine spawned, crashed before the
+        //    handshake, or got stuck).
         if (self.state == .listening or self.state == .connecting) {
             if (self.connect_start_ms) |t0| {
                 const elapsed = nowMs() - t0;
-                if (elapsed > connecting_timeout_ms and self.state == .listening) {
-                    self.markCrashed("engine never connected");
+                if (elapsed > connecting_timeout_ms) {
+                    const reason: []const u8 = if (self.state == .listening)
+                        "engine never connected"
+                    else
+                        "engine connected but no hello";
+                    self.markCrashed(reason);
                 }
             }
         }
@@ -407,6 +441,7 @@ pub const PreviewSession = struct {
     fn tryRead(self: *Self) void {
         if (self.conn_fd < 0) return;
         var scratch: [1024]u8 = undefined;
+        var saw_eof = false;
         // Loop: drain everything currently available. The connection
         // is non-blocking; EAGAIN ends the loop.
         while (true) {
@@ -418,9 +453,17 @@ pub const PreviewSession = struct {
                 return;
             }
             if (n == 0) {
-                // EOF without a `bye` — engine died.
-                if (self.bye_reason == null) self.markCrashed("connection closed");
-                return;
+                // EOF — don't bail without parsing what's already in
+                // the inbox. In the standard `bye + close` shutdown
+                // the engine writes the bye frame then closes the
+                // socket; on a fast cycle a single `poll` can see
+                // both halves and would otherwise miss the bye
+                // because `markCrashed` returned before the parsing
+                // loop (#113 review). Break out of the read loop
+                // here, parse below, and decide crashed-vs-stopped
+                // based on whether the bye actually landed.
+                saw_eof = true;
+                break;
             }
             if (self.inbox.items.len + @as(usize, @intCast(n)) > inbox_cap) {
                 self.markCrashed("inbox overflow");
@@ -433,13 +476,21 @@ pub const PreviewSession = struct {
         }
 
         // Parse all complete newline-framed JSON lines.
-        while (true) {
-            const nl = std.mem.indexOfScalar(u8, self.inbox.items, '\n') orelse return;
+        while (std.mem.indexOfScalar(u8, self.inbox.items, '\n')) |nl| {
             const line = self.inbox.items[0..nl];
             self.handleFrame(line);
             const remaining = self.inbox.items.len - (nl + 1);
             std.mem.copyForwards(u8, self.inbox.items[0..remaining], self.inbox.items[nl + 1 ..]);
             self.inbox.shrinkRetainingCapacity(remaining);
+        }
+
+        // Post-parse: if we hit EOF in the read loop, decide
+        // crashed-vs-stopped based on whether the bye actually
+        // landed (handleFrame sets state=.stopped + bye_reason).
+        // The `.stopped` check matches both the bye-then-close
+        // clean shutdown and a manual `stop()` racing the EOF.
+        if (saw_eof and self.state != .stopped and self.bye_reason == null) {
+            self.markCrashed("connection closed");
         }
     }
 
@@ -486,6 +537,13 @@ pub const PreviewSession = struct {
             if (self.bye_reason) |r| self.allocator.free(r);
             self.bye_reason = self.allocator.dupe(u8, m.reason) catch null;
             self.state = .stopped;
+            // Symmetric with `markCrashed`: close the connection fd
+            // on clean shutdown too, so a "Run" re-press doesn't
+            // inherit a leftover open fd (#113 review).
+            if (self.conn_fd >= 0) {
+                _ = close(self.conn_fd);
+                self.conn_fd = -1;
+            }
         } else if (std.mem.eql(u8, kind_only.kind, "frame_offer")) {
             const Msg = struct {
                 kind: []const u8,
