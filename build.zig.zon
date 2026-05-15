@@ -31,6 +31,16 @@
         .flow_codegen = .{
             .path = "flow-codegen",
         },
+        // labelle-engine via sibling-path dep — same pattern
+        // labelle-assembler uses for `../labelle-gui/flow-codegen`.
+        // Dev-time and CI both check out the engine as a sibling
+        // (see `.github/workflows/ci.yml`). Release builds swap in
+        // a `git+https://...?ref=vX.Y.Z#<hash>` pin at build time;
+        // the path here is the dev-time default, not the source of
+        // truth for shipped binaries.
+        .engine = .{
+            .path = "../labelle-engine",
+        },
     },
     .paths = .{
         "build.zig",

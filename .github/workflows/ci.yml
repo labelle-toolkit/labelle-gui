@@ -11,9 +11,33 @@ jobs:
     runs-on: ubuntu-latest
     name: Build & Unit Tests (Linux)
 
+    # build.zig.zon depends on `../labelle-engine` (#107 — PIE
+    # viewport). Both checkouts go into named subdirs so the sibling
+    # path resolves; all `run:` steps live inside labelle-gui via
+    # `defaults.run.working-directory`.
+    defaults:
+      run:
+        working-directory: labelle-gui
+
     steps:
-      - name: Checkout
+      - name: Checkout labelle-gui
         uses: actions/checkout@v4
+        with:
+          path: labelle-gui
+
+      - name: Checkout labelle-engine sibling
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-engine
+          ref: main
+          path: labelle-engine
+
+      - name: Checkout labelle-core sibling
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-core
+          ref: main
+          path: labelle-core
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
@@ -29,8 +53,8 @@ jobs:
         with:
           path: |
             ~/.cache/zig
-            .zig-cache
-          key: zig-${{ runner.os }}-${{ hashFiles('build.zig.zon', 'build.zig') }}
+            labelle-gui/.zig-cache
+          key: zig-${{ runner.os }}-${{ hashFiles('labelle-gui/build.zig.zon', 'labelle-gui/build.zig') }}
           restore-keys: |
             zig-${{ runner.os }}-
 
@@ -56,7 +80,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: labelle-gui-Linux
-          path: zig-out/bin/
+          # `working-directory` doesn't apply to `uses:` action steps,
+          # so the path needs the explicit prefix.
+          path: labelle-gui/zig-out/bin/
           if-no-files-found: error
 
   # ImGui Test Engine harness — downloads the gui-tests binary built by
