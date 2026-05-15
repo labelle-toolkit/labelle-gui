@@ -2805,9 +2805,14 @@ pub const FlowsRendererTests = struct {
 
 pub const PreferencesTests = struct {
     fn tmpPath(allocator: std.mem.Allocator, tmp: std.testing.TmpDir) ![]u8 {
-        const dir = try tmp.dir.realPathFileAlloc(io_global.io(), ".", allocator);
-        defer allocator.free(dir);
-        return std.fs.path.join(allocator, &.{ dir, prefs.PREFS_FILENAME });
+        // `std.testing.tmpDir` plants the temp dir at `.zig-cache/tmp/<sub_path>`
+        // (see std.testing.tmpDir in 0.16). Build the relative path string
+        // directly rather than calling `realPathFileAlloc(io, ".")`, which
+        // deadlocks on ubuntu CI under `std.testing.io` (a `Threaded` Io).
+        // The downstream `prefs.loadFromPath` / `saveToPath` are happy with
+        // a relative path — they use `std.Io.Dir.cwd().readFileAlloc(io, ...)`
+        // which resolves it normally.
+        return std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, prefs.PREFS_FILENAME });
     }
 
     test "defaults when file is missing" {
