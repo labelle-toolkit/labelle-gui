@@ -49,6 +49,17 @@ pub fn build(b: *std.Build) void {
     });
     const flow_codegen_module = flow_codegen.module("flow_codegen");
 
+    // labelle-engine — for the PIE viewport (#107). We pull the
+    // engine in solely for `preview_mode.preview_shm.Consumer`
+    // (cross-process pixel ring reader) and the protocol types.
+    // The engine's own deps (labelle-core etc.) come along for the
+    // ride but the editor only links the preview surface.
+    const engine = b.dependency("engine", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const engine_module = engine.module("engine");
+
     // Main executable
     const exe = b.addExecutable(.{
         .name = "labelle-gui",
@@ -72,6 +83,8 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("zstbi", zstbi.module("root"));
 
     exe.root_module.addImport("flow_codegen", flow_codegen_module);
+
+    exe.root_module.addImport("engine", engine_module);
 
     // Windows-specific: embed DPI awareness manifest
     if (target.result.os.tag == .windows) {
@@ -105,6 +118,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "zopengl", .module = zopengl.module("root") },
                 .{ .name = "zstbi", .module = zstbi.module("root") },
                 .{ .name = "flow_codegen", .module = flow_codegen_module },
+                .{ .name = "engine", .module = engine_module },
             },
         }),
         .test_runner = .{ .path = zspec.path("src/runner.zig"), .mode = .simple },
@@ -153,6 +167,7 @@ pub fn build(b: *std.Build) void {
     // as soon as the previously-dead `Callbacks.gui` / `Callbacks.run`
     // bodies start being analyzed.
     gui_tests_exe.root_module.addImport("nfd", nfd.module("nfd"));
+    gui_tests_exe.root_module.addImport("engine", engine_module);
 
     const run_gui_tests = b.addRunArtifact(gui_tests_exe);
     const gui_test_step = b.step("gui-test", "Run the UI test runner");

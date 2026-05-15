@@ -31,6 +31,16 @@
         .flow_codegen = .{
             .path = "flow-codegen",
         },
+        // labelle-engine pinned at the open feat/544 branch for the
+        // PIE viewport work (#107). The engine ships `preview_mode`
+        // (protocol API) and `preview_mode.preview_shm` (cross-
+        // process SHM ring consumer) — the editor's Game View module
+        // wraps `preview_shm.Consumer` to display engine-rendered
+        // frames inside an ImGui::Image panel. Flip this to a tag
+        // (e.g. v1.37.2) once labelle-engine#545 and #546 merge.
+        .engine = .{
+            .path = "../labelle-engine",
+        },
     },
     .paths = .{
         "build.zig",
