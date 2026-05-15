@@ -72,7 +72,7 @@ pub fn main() !void {
     defer g_app = null;
 
     _ = engine.registerTest("phase1", "hello_world", @src(), struct {
-        fn run(_: *zgui.te.TestContext) !void {
+        pub fn run(_: *zgui.te.TestContext) !void {
             _ = zgui.te.check(@src(), .{}, true, "trivially true");
         }
     });
@@ -102,11 +102,11 @@ pub fn main() !void {
     defer g_settings_project_dir = null;
 
     _ = engine.registerTest("phase3", "view_compiler_output_toggle", @src(), struct {
-        fn gui(_: *zgui.te.TestContext) !void {
+        pub fn gui(_: *zgui.te.TestContext) !void {
             // Synthetic dt; tests don't observe status_timer decay.
             if (g_app) |a| a.renderFrame(1.0 / 60.0);
         }
-        fn run(ctx: *zgui.te.TestContext) !void {
+        pub fn run(ctx: *zgui.te.TestContext) !void {
             const a = g_app orelse {
                 _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
                 return;
@@ -193,10 +193,10 @@ pub fn main() !void {
     }
 
     _ = engine.registerTest("phase3", "prefab_open_save_preserves_extras", @src(), struct {
-        fn gui(_: *zgui.te.TestContext) !void {
+        pub fn gui(_: *zgui.te.TestContext) !void {
             if (g_app) |a| a.renderFrame(1.0 / 60.0);
         }
-        fn run(ctx: *zgui.te.TestContext) !void {
+        pub fn run(ctx: *zgui.te.TestContext) !void {
             const a = g_app orelse {
                 _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
                 return;
@@ -240,10 +240,10 @@ pub fn main() !void {
     });
 
     _ = engine.registerTest("phase3", "scene_open_save_preserves_extras", @src(), struct {
-        fn gui(_: *zgui.te.TestContext) !void {
+        pub fn gui(_: *zgui.te.TestContext) !void {
             if (g_app) |a| a.renderFrame(1.0 / 60.0);
         }
-        fn run(ctx: *zgui.te.TestContext) !void {
+        pub fn run(ctx: *zgui.te.TestContext) !void {
             const a = g_app orelse {
                 _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
                 return;
@@ -289,11 +289,11 @@ pub fn main() !void {
     });
 
     _ = engine.registerTest("phase3", "resources_add_and_save", @src(), struct {
-        fn gui(_: *zgui.te.TestContext) !void {
+        pub fn gui(_: *zgui.te.TestContext) !void {
             // Synthetic dt; tests don't observe status_timer decay.
             if (g_app) |a| a.renderFrame(1.0 / 60.0);
         }
-        fn run(ctx: *zgui.te.TestContext) !void {
+        pub fn run(ctx: *zgui.te.TestContext) !void {
             const a = g_app orelse {
                 _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
                 return;
@@ -336,10 +336,10 @@ pub fn main() !void {
     // the public API keeps this test hermetic — same pattern the
     // scene/prefab tests use to avoid touching nfd.
     _ = engine.registerTest("phase3", "preview_panel_toggle_and_stop", @src(), struct {
-        fn gui(_: *zgui.te.TestContext) !void {
+        pub fn gui(_: *zgui.te.TestContext) !void {
             if (g_app) |a| a.renderFrame(1.0 / 60.0);
         }
-        fn run(ctx: *zgui.te.TestContext) !void {
+        pub fn run(ctx: *zgui.te.TestContext) !void {
             const a = g_app orelse {
                 _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
                 return;
@@ -368,10 +368,10 @@ pub fn main() !void {
     });
 
     _ = engine.registerTest("phase3", "flow_opens_and_renders_graph", @src(), struct {
-        fn gui(_: *zgui.te.TestContext) !void {
+        pub fn gui(_: *zgui.te.TestContext) !void {
             if (g_app) |a| a.renderFrame(1.0 / 60.0);
         }
-        fn run(ctx: *zgui.te.TestContext) !void {
+        pub fn run(ctx: *zgui.te.TestContext) !void {
             const a = g_app orelse {
                 _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
                 return;
@@ -409,11 +409,11 @@ pub fn main() !void {
     });
 
     _ = engine.registerTest("phase3", "project_settings_edit_save", @src(), struct {
-        fn gui(_: *zgui.te.TestContext) !void {
+        pub fn gui(_: *zgui.te.TestContext) !void {
             // Synthetic dt; tests don't observe status_timer decay.
             if (g_app) |a| a.renderFrame(1.0 / 60.0);
         }
-        fn run(ctx: *zgui.te.TestContext) !void {
+        pub fn run(ctx: *zgui.te.TestContext) !void {
             const a = g_app orelse {
                 _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
                 return;
