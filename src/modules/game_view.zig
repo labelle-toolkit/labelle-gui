@@ -70,16 +70,26 @@ fn renderViewport(app: *App) void {
     const avail = zgui.getContentRegionAvail();
     const src_w: f32 = @floatFromInt(app.game_view.tex_w);
     const src_h: f32 = @floatFromInt(app.game_view.tex_h);
+    // Guard the aspect-fit divisions: a tiny / collapsed window can
+    // give a zero `avail[]`, and a malformed SHM header could (in
+    // theory) hand us zero dims. Either lands NaN/inf in
+    // `draw_w` / `draw_h` and inside `zgui.image` (#111 review).
+    // Floor each dimension at 1 px so the math is well-defined; the
+    // resulting image is invisible but the panel keeps rendering.
+    const safe_src_w = @max(src_w, 1.0);
+    const safe_src_h = @max(src_h, 1.0);
+    const safe_avail_w = @max(avail[0], 1.0);
+    const safe_avail_h = @max(avail[1], 1.0);
     // Aspect-fit inside the available content region; centre the
     // image rather than stretching to the panel dimensions.
-    const aspect_src = src_w / src_h;
-    const aspect_avail = avail[0] / avail[1];
-    var draw_w: f32 = avail[0];
-    var draw_h: f32 = avail[1];
+    const aspect_src = safe_src_w / safe_src_h;
+    const aspect_avail = safe_avail_w / safe_avail_h;
+    var draw_w: f32 = safe_avail_w;
+    var draw_h: f32 = safe_avail_h;
     if (aspect_src > aspect_avail) {
-        draw_h = avail[0] / aspect_src;
+        draw_h = safe_avail_w / aspect_src;
     } else {
-        draw_w = avail[1] * aspect_src;
+        draw_w = safe_avail_h * aspect_src;
     }
     // Centre with an InvisibleButton offset before the image.
     const dx = (avail[0] - draw_w) * 0.5;
@@ -113,7 +123,10 @@ fn renderStats(app: *App) void {
     const last_ms: f64 = @as(f64, @floatFromInt(app.game_view.last_latency_ns)) / ns_per_ms;
     const mean_ms: f64 = @as(f64, @floatFromInt(app.game_view.meanLatencyNs())) / ns_per_ms;
 
-    zgui.text("frame_idx = {d}", .{app.game_view.last_frame_idx});
+    if (app.game_view.last_frame_idx) |idx|
+        zgui.text("frame_idx = {d}", .{idx})
+    else
+        zgui.text("frame_idx = (waiting for first frame)", .{});
     zgui.text("presented = {d}", .{app.game_view.presented});
     zgui.text("dropped   = {d}", .{app.game_view.dropped});
     zgui.text("dims      = {d}x{d}", .{ app.game_view.tex_w, app.game_view.tex_h });

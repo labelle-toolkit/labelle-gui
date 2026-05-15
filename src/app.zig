@@ -318,19 +318,14 @@ pub const App = struct {
         // Empty / unset → no attach. Lookup errors (missing region,
         // bad magic) are logged but don't fail App.init — the user
         // can still drive the editor without preview. GameView.attach
-        // dupes the name into its own buffer so the env-var string
-        // can be freed immediately.
+        // dupes the name into its own buffer.
         if (io_global.environ().getAlloc(allocator, "LABELLE_GAME_VIEW_SHM") catch null) |raw| {
             defer allocator.free(raw);
             if (raw.len > 0) {
-                const shm_name_z = allocator.dupeZ(u8, raw) catch null;
-                if (shm_name_z) |z| {
-                    defer allocator.free(z);
-                    app.game_view.attach(z) catch |err| {
-                        std.log.warn("game_view: attach('{s}') failed: {s}", .{ z, @errorName(err) });
-                    };
-                    if (app.game_view.isAttached()) app.show_game_view = true;
-                }
+                app.game_view.attach(raw) catch |err| {
+                    std.log.warn("game_view: attach('{s}') failed: {s}", .{ raw, @errorName(err) });
+                };
+                if (app.game_view.isAttached()) app.show_game_view = true;
             }
         }
 
@@ -362,7 +357,7 @@ pub const App = struct {
     /// LABELLE_GAME_VIEW_SHM startup hook and by external test
     /// code; will also be the seam the eventual preview-transport
     /// restore plugs into.
-    pub fn attachGameView(self: *Self, shm_name: [:0]const u8) !void {
+    pub fn attachGameView(self: *Self, shm_name: []const u8) !void {
         try self.game_view.attach(shm_name);
         self.show_game_view = true;
     }

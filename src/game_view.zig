@@ -31,8 +31,9 @@ const latency_ring_capacity: usize = 120;
 
 /// Errors specific to `GameView.attach`. SHM-open / mmap failures
 /// from `preview_shm.Consumer.init` (`error.ShmOpenFailed`, etc.)
-/// propagate verbatim.
-pub const AttachError = shm.Error || error{AlreadyAttached};
+/// propagate verbatim; the shm_name-dupe step folds into
+/// `error.OutOfMemory`.
+pub const AttachError = shm.Error || error{OutOfMemory};
 
 pub const GameView = struct {
     allocator: std.mem.Allocator,
@@ -51,11 +52,15 @@ pub const GameView = struct {
     tex_id: gl.Uint = 0,
     tex_w: u32 = 0,
     tex_h: u32 = 0,
-    /// Monotonic — the frame_idx the texture currently contains.
-    /// Test code reads this to assert "the editor is presenting new
-    /// frames" without ever inspecting pixels (the zgui binding
-    /// doesn't expose `ImGuiTestEngine_CaptureScreenshot`).
-    last_frame_idx: u64 = 0,
+    /// `null` before the first frame is uploaded; the frame_idx of
+    /// the texture's current contents once a frame has been seen.
+    /// Optional so a producer frame_idx of 0 doesn't collide with
+    /// the "no frame received yet" sentinel — drops would otherwise
+    /// undercount on the very first frame of a session (#111
+    /// review). Test code reads this to assert "the editor is
+    /// presenting new frames" without ever inspecting pixels (the
+    /// zgui binding doesn't expose `ImGuiTestEngine_CaptureScreenshot`).
+    last_frame_idx: ?u64 = null,
     last_latency_ns: u64 = 0,
     /// Frames the producer outran us on — `frame.frame_idx -
     /// prior_idx - 1` summed over the session.
@@ -84,10 +89,14 @@ pub const GameView = struct {
     /// session and stand up a matching `GL_TEXTURE_2D`. The GL
     /// context must be current on the calling thread (which it
     /// always is on the main thread for labelle-gui's frame loop).
-    pub fn attach(self: *Self, shm_name: [:0]const u8) AttachError!void {
-        if (self.consumer != null) return error.AlreadyAttached;
+    pub fn attach(self: *Self, shm_name: []const u8) AttachError!void {
+        // Auto-detach any prior session — the engine emits a fresh
+        // `frame_offer` on resize / restart, and forcing the caller
+        // to manually detach first would block routine resolution
+        // changes (#111 review).
+        if (self.consumer != null) self.detach();
 
-        const owned = self.allocator.dupeZ(u8, shm_name) catch return error.MmapFailed;
+        const owned = self.allocator.dupeZ(u8, shm_name) catch return error.OutOfMemory;
         errdefer self.allocator.free(owned);
 
         var consumer = try shm.Consumer.init(owned);
@@ -125,7 +134,7 @@ pub const GameView = struct {
         self.tex_id = tex;
         self.tex_w = w;
         self.tex_h = h;
-        self.last_frame_idx = 0;
+        self.last_frame_idx = null;
         self.last_latency_ns = 0;
         self.dropped = 0;
         self.presented = 0;
@@ -184,12 +193,14 @@ pub const GameView = struct {
             frame.pixels,
         );
 
-        // Drop accounting: how many producer frames did we skip
-        // between `last_frame_idx` and this one? First frame after
-        // attach has `last_frame_idx == 0` so the gap-from-zero math
-        // is correct.
-        if (self.last_frame_idx > 0 and frame.frame_idx > self.last_frame_idx + 1) {
-            self.dropped += frame.frame_idx - self.last_frame_idx - 1;
+        // Drop accounting: count producer frames we skipped between
+        // the previous frame and this one. First frame after attach
+        // (`last_frame_idx == null`) sets the counter but doesn't
+        // count gaps — we have no prior baseline.
+        if (self.last_frame_idx) |prior| {
+            if (frame.frame_idx > prior + 1) {
+                self.dropped += frame.frame_idx - prior - 1;
+            }
         }
         self.last_frame_idx = frame.frame_idx;
 
