@@ -29,10 +29,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-engine
-          # Pinned to the feat/544 branch until labelle-engine#545
-          # and #546 merge to main. Flip this to `main` (or a tag)
-          # once both PRs land.
-          ref: feat/544-pbo-shm-publish
+          ref: main
           path: labelle-engine
 
       - name: Checkout labelle-core sibling

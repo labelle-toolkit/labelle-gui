@@ -31,13 +31,13 @@
         .flow_codegen = .{
             .path = "flow-codegen",
         },
-        // labelle-engine pinned at the open feat/544 branch for the
-        // PIE viewport work (#107). The engine ships `preview_mode`
-        // (protocol API) and `preview_mode.preview_shm` (cross-
-        // process SHM ring consumer) — the editor's Game View module
-        // wraps `preview_shm.Consumer` to display engine-rendered
-        // frames inside an ImGui::Image panel. Flip this to a tag
-        // (e.g. v1.37.2) once labelle-engine#545 and #546 merge.
+        // labelle-engine via sibling-path dep — same pattern
+        // labelle-assembler uses for `../labelle-gui/flow-codegen`.
+        // Dev-time and CI both check out the engine as a sibling
+        // (see `.github/workflows/ci.yml`). Release builds swap in
+        // a `git+https://...?ref=vX.Y.Z#<hash>` pin at build time;
+        // the path here is the dev-time default, not the source of
+        // truth for shipped binaries.
         .engine = .{
             .path = "../labelle-engine",
         },
