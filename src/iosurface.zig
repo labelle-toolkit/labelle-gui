@@ -147,6 +147,13 @@ pub const Consumer = struct {
     width: u32 = 0,
     height: u32 = 0,
     bytes_per_row: u32 = 0,
+    /// Snapshot of `shm_consumer.header.slot_size` taken at init.
+    /// Reading it once and stashing it locally protects `latest()`
+    /// from a producer that mutates the shared header — the same
+    /// TOCTOU class as `ring_size`. Computing `slot_base` from a
+    /// racing slot_size could land the trailer pointer outside the
+    /// mapped region (#115 review).
+    slot_size: usize = 0,
     last_seen_frame: u64 = 0,
 
     /// Open the shm region the engine advertised, read its
@@ -198,6 +205,12 @@ pub const Consumer = struct {
         // null into `IOSurfaceGetBytesPerRow` (#115 review).
         const bpr: u32 = @intCast(IOSurfaceGetBytesPerRow(surfaces[0].?));
 
+        // Snapshot the shm slot_size too — `latest()` uses it to
+        // walk to the trailer; a racing producer mutating
+        // `header.slot_size` between frames could otherwise put the
+        // trailer pointer outside the mmap region (#115 review).
+        const slot_size: usize = @intCast(sc.header.slot_size);
+
         return .{
             .shm_consumer = sc,
             .surfaces = surfaces,
@@ -205,6 +218,7 @@ pub const Consumer = struct {
             .width = width,
             .height = height,
             .bytes_per_row = bpr,
+            .slot_size = slot_size,
             .last_seen_frame = 0,
         };
     }
@@ -245,9 +259,10 @@ pub const Consumer = struct {
         // The shm slot's pixel area is unused in iosurface mode, but
         // the trailer still carries (frame_idx, produce_ns) so the
         // latency stat path is identical to shm mode.
-        const slot_size: usize = @intCast(self.shm_consumer.header.slot_size);
-        const slot_base = self.shm_consumer.base + @sizeOf(shm.Header) + @as(usize, slot) * slot_size;
-        const trailer: *const shm.SlotTrailer = @ptrCast(@alignCast(slot_base + slot_size - @sizeOf(shm.SlotTrailer)));
+        // Use the init-time snapshot of slot_size (see field doc)
+        // rather than re-reading `header.slot_size` each frame.
+        const slot_base = self.shm_consumer.base + @sizeOf(shm.Header) + @as(usize, slot) * self.slot_size;
+        const trailer: *const shm.SlotTrailer = @ptrCast(@alignCast(slot_base + self.slot_size - @sizeOf(shm.SlotTrailer)));
         const frame_idx = trailer.frame_idx;
         if (frame_idx <= self.last_seen_frame) return null;
         self.last_seen_frame = frame_idx;
