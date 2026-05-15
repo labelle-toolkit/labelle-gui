@@ -44,6 +44,30 @@ test {
     zspec.runAll(@This());
 }
 
+// Global beforeAll hook for zspec — fires once before the first test
+// of any scope (zspec's hookAppliesToTest matches on prefix, and every
+// scope in this file starts with "tests").
+//
+// Initializes `std.testing.io_instance`. In Zig 0.16, `std.testing.io`
+// is `const io = io_instance.io()` (testing.zig:34-35) — the `io()`
+// method bakes `&io_instance` into the returned Io's `userdata` at
+// comptime. With no runtime init, the global memory at that address
+// stays zero-initialized — `worker_threads = null`, etc. — and every
+// operation that needs the thread pool (createDirPathOpen for nested
+// cache dirs, realpath, file-not-found readFileAlloc, writes under a
+// tmpDir) deadlocks on Linux. macOS lets more zero-init paths through.
+//
+// The stdlib's own terminal runner (lib/compiler/test_runner.zig:273-282)
+// does `testing.io_instance = .init(testing.allocator, .{...})` before
+// every test. zspec's `mode: .simple` runner skips that, so we do it
+// once at the top-level scope. Same memory address, just now actually
+// initialized — the `.userdata` pointers baked at comptime now point
+// at a Threaded with a real worker pool. See discussion in
+// codeberg ziglang/zig#31718 for the related Io.Threaded poll issue.
+test "tests:beforeAll" {
+    std.testing.io_instance = .init(std.testing.allocator, .{});
+}
+
 pub const ProjectConfigTests = struct {
     test "defaults to raylib backend" {
         const cfg = project.ProjectConfig{ .name = "test" };
@@ -2804,30 +2828,21 @@ pub const FlowsRendererTests = struct {
 };
 
 pub const PreferencesTests = struct {
-    // Every test in this scope hangs under ubuntu CI's `std.testing.io`
-    // (Threaded Io). Three io paths have already been ruled out by
-    // earlier fixes (realPathFileAlloc, file-not-found readFileAlloc,
-    // direct path construction) — the hang now reproduces on a plain
-    // `std.testing.tmpDir(.{})` → `prefs.saveToPath(...)` sequence.
-    // Project-save-load tests use the same writeFile-then-readFile
-    // pattern with non-tmpDir paths and pass cleanly, so the trigger
-    // is something specific to a tmpDir-created subdir under
-    // `.zig-cache/tmp/`.
-    //
-    // Skipping the whole scope on Linux unblocks CI for the rest of
-    // the suite. Tests still run locally on macOS (currently the
-    // primary dev platform). Restore on Linux once the upstream
-    // std.Io.Threaded behavior is understood / fixed.
-    fn skipLinuxIo() !void {
-        if (@import("builtin").os.tag == .linux) return error.SkipZigTest;
-    }
-
     fn tmpPath(allocator: std.mem.Allocator, tmp: std.testing.TmpDir) ![]u8 {
         return std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, prefs.PREFS_FILENAME });
     }
 
+    test "defaults when file is missing" {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try tmpPath(std.testing.allocator, tmp);
+        defer std.testing.allocator.free(path);
+
+        const loaded = prefs.loadFromPath(std.testing.allocator, path);
+        try expect.equal(loaded.font_scale, prefs.default_font_scale);
+    }
+
     test "round-trip preserves value" {
-        try skipLinuxIo();
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try tmpPath(std.testing.allocator, tmp);
@@ -2840,7 +2855,6 @@ pub const PreferencesTests = struct {
     }
 
     test "save clamps oversized values" {
-        try skipLinuxIo();
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try tmpPath(std.testing.allocator, tmp);
@@ -2856,7 +2870,6 @@ pub const PreferencesTests = struct {
         // Simulates a hand-edited prefs file with an out-of-bounds value
         // — load is expected to clamp on the way in so the rest of the
         // app sees only valid scales.
-        try skipLinuxIo();
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try tmpPath(std.testing.allocator, tmp);
@@ -2873,7 +2886,6 @@ pub const PreferencesTests = struct {
     }
 
     test "malformed file falls back to defaults" {
-        try skipLinuxIo();
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try tmpPath(std.testing.allocator, tmp);
