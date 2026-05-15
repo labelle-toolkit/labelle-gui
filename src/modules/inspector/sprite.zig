@@ -47,6 +47,9 @@ fn render(
     atlas_index: ?*const atlas.Index,
 ) void {
     const sprite = entity.sprite.?;
+    // Reserve room for the trailing "sprite_name" label so it doesn't
+    // get clipped by the inspector panel's right edge on narrow layouts.
+    zgui.setNextItemWidth(@max(60, zgui.getContentRegionAvail()[0] - 100));
     if (zgui.inputText("sprite_name", .{ .buf = &sprite.sprite_name })) is_dirty.* = true;
     // Resolve the typed sprite name against the project's atlas
     // index; surface a soft `(missing)` hint when it doesn't match
@@ -84,6 +87,9 @@ fn render(
     if (zgui.checkbox("z_index?", .{ .v = &sprite.has_z_index })) is_dirty.* = true;
     if (sprite.has_z_index) {
         zgui.sameLine(.{});
+        // Clamp the inputInt to the line's remaining width so its step
+        // buttons stay inside the panel.
+        zgui.setNextItemWidth(zgui.getContentRegionAvail()[0]);
         if (zgui.inputInt("##z_index", .{ .v = &sprite.z_index })) is_dirty.* = true;
     }
 }
