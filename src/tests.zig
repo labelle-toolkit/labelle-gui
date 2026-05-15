@@ -2379,11 +2379,15 @@ pub const GizmosIndexTests = struct {
         // Regression: the loader has to tolerate projects without a
         // gizmos/ subtree (the common case). `Index.deinit` must be
         // safe on the resulting empty struct.
-        var tmp = std.testing.tmpDir(.{});
-        defer tmp.cleanup();
-        const dir_path = try tmp.dir.realPathFileAlloc(io_global.io(), ".", std.testing.allocator);
-        defer std.testing.allocator.free(dir_path);
-
+        //
+        // The original test used `std.testing.tmpDir(...)` and then
+        // `realPathFileAlloc(io_global.io(), ".", ...)` to materialize a
+        // dir path for the empty-case input. Under Zig 0.16 that routes
+        // through `std.testing.io` (a `Threaded` Io) which deadlocks on
+        // Linux CI but works on macOS. The test only needs a path that
+        // *doesn't* contain a gizmos/ subtree — a known-nonexistent
+        // string is equivalent for the assertion and skips the Io path.
+        const dir_path = "/labelle-gui-test-no-such-dir";
         var idx = gizmos.Index.build(std.testing.allocator, dir_path, 1);
         defer idx.deinit();
         try expect.toBeEmpty(idx.entries.items);
