@@ -693,7 +693,7 @@ pub const FlowCodegenTests = struct {
         const out = try renderFromZon(allocator, src, "imp_gc");
         defer allocator.free(out);
 
-        const needle = "const Position = @import(\"components/Position.zig\").Position;";
+        const needle = "const Position = @import(\"../../components/Position.zig\").Position;";
         try expect.toBeTrue(std.mem.indexOf(u8, out, needle) != null);
         // Exactly once -- no duplicate emission.
         var count: usize = 0;
@@ -733,7 +733,7 @@ pub const FlowCodegenTests = struct {
         const out = try renderFromZon(allocator, src, "imp_sf");
         defer allocator.free(out);
 
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "const Position = @import(\"components/Position.zig\").Position;") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const Position = @import(\"../../components/Position.zig\").Position;") != null);
         // And the SetField template still calls into the same name.
         try expect.toBeTrue(std.mem.indexOf(u8, out, "game.setField(Position, .x, entity, n1_value);") != null);
     }
@@ -761,7 +761,7 @@ pub const FlowCodegenTests = struct {
         const out = try renderFromZon(allocator, src, "imp_dup");
         defer allocator.free(out);
 
-        const needle = "const Position = @import(\"components/Position.zig\").Position;";
+        const needle = "const Position = @import(\"../../components/Position.zig\").Position;";
         var count: usize = 0;
         var start: usize = 0;
         while (std.mem.indexOfPos(u8, out, start, needle)) |at| {
@@ -790,8 +790,8 @@ pub const FlowCodegenTests = struct {
         const out = try renderFromZon(allocator, src, "imp_sort");
         defer allocator.free(out);
 
-        const pos_needle = "const Position = @import(\"components/Position.zig\").Position;";
-        const vel_needle = "const Velocity = @import(\"components/Velocity.zig\").Velocity;";
+        const pos_needle = "const Position = @import(\"../../components/Position.zig\").Position;";
+        const vel_needle = "const Velocity = @import(\"../../components/Velocity.zig\").Velocity;";
         const pos_at = std.mem.indexOf(u8, out, pos_needle) orelse return error.TestExpectedSubstring;
         const vel_at = std.mem.indexOf(u8, out, vel_needle) orelse return error.TestExpectedSubstring;
         try expect.toBeTrue(pos_at < vel_at);
@@ -863,7 +863,7 @@ pub const FlowCodegenTests = struct {
         const out = try renderFromZon(allocator, src, "imp_none");
         defer allocator.free(out);
 
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "@import(\"components/") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "@import(\"../../components/") == null);
     }
 
     test "output passes std.zig.Ast.parse without errors" {
