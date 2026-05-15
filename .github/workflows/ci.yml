@@ -35,6 +35,13 @@ jobs:
           ref: feat/544-pbo-shm-publish
           path: labelle-engine
 
+      - name: Checkout labelle-core sibling
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-core
+          ref: main
+          path: labelle-core
+
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
