@@ -22,6 +22,13 @@
         },
         .zspec = .{
             .url = "https://github.com/apotema/zspec/archive/v0.9.2.tar.gz",
+            // Hash prefix says `0.9.1` because upstream's own
+            // `build.zig.zon` still declares `.version = "0.9.1"` at
+            // the v0.9.2 tag — Zig's package manager bakes that
+            // string into the hash and rejects manual edits with a
+            // "hash mismatch" error. The base64 portion is the only
+            // integrity-relevant part; the prefix is cosmetic
+            // metadata sourced from upstream.
             .hash = "zspec-0.9.1-jaKLbXgMBACFwbNjflhbMyP113leoYjboxn-1UOP-FGw",
         },
         .zstbi = .{

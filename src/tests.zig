@@ -1938,7 +1938,7 @@ pub const ProjectFileTests = struct {
             .height = 1080,
             .backend = .sokol,
             .initial_scene = "splash",
-            .engine_version = "1.35.0",
+            .engine_version = "1.36.0",
         });
 
         try pm.saveProject(temp_dir);
@@ -1954,10 +1954,17 @@ pub const ProjectFileTests = struct {
         try expect.equal(cfg.height, 1080);
         try expect.equal(cfg.backend, .sokol);
         try expect.toBeTrue(std.mem.eql(u8, cfg.initial_scene, "splash"));
-        try expect.toBeTrue(std.mem.eql(u8, cfg.engine_version, "1.35.0"));
-        // Unmodified-by-override fields keep their fixture defaults.
+        try expect.toBeTrue(std.mem.eql(u8, cfg.engine_version, "1.36.0"));
+        // Non-overridden fields keep their ProjectConfigFactory
+        // defaults — proves the factory's defaults pass through
+        // saveProject + loadProject untouched.
         try expect.equal(cfg.ecs, .zig_ecs);
         try expect.equal(cfg.target_fps, 60);
+        try expect.toBeTrue(std.mem.eql(u8, cfg.description, ""));
+        try expect.toBeTrue(std.mem.eql(u8, cfg.core_version, "1.12.0"));
+        try expect.toBeTrue(std.mem.eql(u8, cfg.gfx_version, "1.10.0"));
+        try expect.toBeTrue(std.mem.eql(u8, cfg.assembler_version, "0.17.0"));
+        try expect.equal(cfg.resources.len, 0);
     }
 
     // Regression: ../flying-platform-labelle/project.labelle (and any
