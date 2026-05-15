@@ -26,6 +26,9 @@ const prefab_mod = @import("modules/prefab.zig");
 const flow_mod = @import("modules/flow.zig");
 const gizmo_mod = @import("modules/gizmo.zig");
 const entity_inspector_mod = @import("modules/entity_inspector.zig");
+const game_view_mod = @import("modules/game_view.zig");
+const game_view = @import("game_view.zig");
+const io_global = @import("io_global.zig");
 const flow_runtime_mod = @import("modules/flow_runtime.zig");
 const close_scene_dialog = @import("dialogs/close_scene.zig");
 const atlas = @import("atlas.zig");
@@ -140,6 +143,14 @@ pub const App = struct {
     /// pointer; clicking Run preview also force-opens it.
     show_preview: bool = false,
 
+    /// Game View panel state (#107). Owns the SHM consumer + GL
+    /// texture for the live game frames. Toggleable from the View
+    /// menu; until the editor-side preview transport is restored
+    /// (separate follow-up), the consumer is attached either via
+    /// `App.attachGameView` or the `LABELLE_GAME_VIEW_SHM` env var.
+    show_game_view: bool = false,
+    game_view: game_view.GameView = undefined,
+
     /// Phase 3 (#84): Entity Inspector panel toggle.
     show_entity_inspector: bool = false,
     /// Entity Inspector state — fed by `PreviewSession`'s
@@ -229,7 +240,7 @@ pub const App = struct {
 
     /// Fixed-size storage for registered modules. Grow the array literal
     /// when adding modules; Zig will tell you if it overflows.
-    modules: [7]module.Module = undefined,
+    modules: [8]module.Module = undefined,
     registry: module.Registry = .{ .modules = &.{} },
 
     const Self = @This();
@@ -245,6 +256,7 @@ pub const App = struct {
             .tree_view = tree_view.TreeView.init(allocator),
             .compiler = compiler.Compiler.init(allocator),
             .preview = preview.PreviewSession.init(allocator),
+            .game_view = game_view.GameView.init(allocator),
             .prefs = user_prefs,
             .startup_prefs = user_prefs,
         };
@@ -298,7 +310,29 @@ pub const App = struct {
         app.modules[4] = preview_mod.makeModule(app);
         app.modules[5] = entity_inspector_mod.makeModule(app);
         app.modules[6] = flow_runtime_mod.makeModule(app);
+        app.modules[7] = game_view_mod.makeModule(app);
         app.registry = .{ .modules = &app.modules };
+
+        // Honor LABELLE_GAME_VIEW_SHM as a manual attach path until
+        // the preview-transport restore wires this up automatically.
+        // Empty / unset → no attach. Lookup errors (missing region,
+        // bad magic) are logged but don't fail App.init — the user
+        // can still drive the editor without preview. GameView.attach
+        // dupes the name into its own buffer so the env-var string
+        // can be freed immediately.
+        if (io_global.environ().getAlloc(allocator, "LABELLE_GAME_VIEW_SHM") catch null) |raw| {
+            defer allocator.free(raw);
+            if (raw.len > 0) {
+                const shm_name_z = allocator.dupeZ(u8, raw) catch null;
+                if (shm_name_z) |z| {
+                    defer allocator.free(z);
+                    app.game_view.attach(z) catch |err| {
+                        std.log.warn("game_view: attach('{s}') failed: {s}", .{ z, @errorName(err) });
+                    };
+                    if (app.game_view.isAttached()) app.show_game_view = true;
+                }
+            }
+        }
 
         return app;
     }
@@ -318,7 +352,19 @@ pub const App = struct {
         self.tree_view.deinit();
         self.compiler.deinit();
         self.preview.deinit();
+        self.game_view.deinit();
         self.allocator.destroy(self);
+    }
+
+    /// Open the SHM region the engine advertised in `frame_offer`
+    /// (#107). Convenience wrapper that surfaces the panel
+    /// automatically on a successful attach. Used both by the
+    /// LABELLE_GAME_VIEW_SHM startup hook and by external test
+    /// code; will also be the seam the eventual preview-transport
+    /// restore plugs into.
+    pub fn attachGameView(self: *Self, shm_name: [:0]const u8) !void {
+        try self.game_view.attach(shm_name);
+        self.show_game_view = true;
     }
 
     /// Rebuild the atlas index from the active project's

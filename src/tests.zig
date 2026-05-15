@@ -18,6 +18,7 @@ const flow_projector = @import("flows/projector.zig");
 const flow_types = @import("flows/types.zig");
 const prefs = @import("prefs.zig");
 const io_global = @import("io_global.zig");
+const game_view = @import("game_view.zig");
 
 /// Wall-clock seconds since the Unix epoch; replacement for the
 /// `std.time.timestamp` helper removed in Zig 0.16. Used only to
@@ -2898,5 +2899,40 @@ pub const PreferencesTests = struct {
 
         const loaded = prefs.loadFromPath(std.testing.allocator, path);
         try expect.equal(loaded.font_scale, prefs.default_font_scale);
+    }
+};
+
+pub const GameViewLatencyTests = struct {
+    // GameView.meanLatencyNs is pure math over its latency_ring; no
+    // GL context needed. Compose the struct manually to test the
+    // bookkeeping in isolation. attach()/poll() are exercised
+    // end-to-end in the gui-tests TE binary (display + headless GL).
+
+    test "meanLatencyNs returns 0 before any samples" {
+        var gv = game_view.GameView.init(std.testing.allocator);
+        defer gv.deinit();
+        try expect.equal(gv.meanLatencyNs(), @as(u64, 0));
+    }
+
+    test "meanLatencyNs averages every populated slot" {
+        var gv = game_view.GameView.init(std.testing.allocator);
+        defer gv.deinit();
+        gv.latency_ring[0] = 1_000_000;
+        gv.latency_ring[1] = 2_000_000;
+        gv.latency_ring[2] = 3_000_000;
+        gv.latency_count = 3;
+        // (1 + 2 + 3) / 3 == 2 ms.
+        try expect.equal(gv.meanLatencyNs(), @as(u64, 2_000_000));
+    }
+
+    test "meanLatencyNs uses latency_count, not the full capacity" {
+        // Guards against averaging across uninitialized slots after a
+        // fresh attach but before the ring fills.
+        var gv = game_view.GameView.init(std.testing.allocator);
+        defer gv.deinit();
+        gv.latency_ring[0] = 5_000_000;
+        // Slots [1..120) are zero-initialized; only slot 0 counts.
+        gv.latency_count = 1;
+        try expect.equal(gv.meanLatencyNs(), @as(u64, 5_000_000));
     }
 };
