@@ -267,6 +267,31 @@ pub const App = struct {
         // pointer is stable for the lifetime of the App.
         app.entity_inspector = entity_inspector_mod.EntityInspector.init(allocator, &app.preview);
 
+        // Wire the preview session's `frame_offer` listener — the
+        // editor-side end of #112's transport restore + #107's Game
+        // View panel meet here. When the engine emits `frame_offer`
+        // the transport calls back into App, which attaches the
+        // Game View consumer to the advertised SHM region. Tests
+        // can drive this end-to-end via `bindListener` +
+        // `LABELLE_GAME_VIEW_SHM`, the production path uses
+        // `start(project)` + `labelle run` spawn.
+        app.preview.on_frame_offer = .{
+            .ctx = app,
+            .func = struct {
+                fn cb(ctx: *anyopaque, shm_name: [:0]const u8, width: u32, height: u32) void {
+                    _ = width;
+                    _ = height;
+                    const a: *App = @ptrCast(@alignCast(ctx));
+                    a.attachGameView(shm_name) catch |err| {
+                        std.log.warn(
+                            "preview: attachGameView('{s}') failed: {s}",
+                            .{ shm_name, @errorName(err) },
+                        );
+                    };
+                }
+            }.cb,
+        };
+
         // Wire the preview session's binary-frame listeners. Both are
         // single-consumer in Phase 3; future panels that need the same
         // stream will gain a multi-listener path.
