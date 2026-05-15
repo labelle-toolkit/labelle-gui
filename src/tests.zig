@@ -2902,6 +2902,170 @@ pub const PreferencesTests = struct {
     }
 };
 
+pub const PreviewTransportTests = struct {
+    // Drives `PreviewSession` end-to-end against an in-test fake
+    // engine that dials the editor's listener and writes JSON
+    // frames. Subprocess spawn is **not** exercised here — tests
+    // use `bindListener` instead of `start(proj)` to skip the
+    // `labelle run` invocation.
+
+    const Timespec = extern struct { sec: isize, nsec: isize };
+    extern "c" fn nanosleep(req: *const Timespec, rem: ?*Timespec) c_int;
+    fn sleepMs(ms: u64) void {
+        const ts: Timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * 1_000_000) };
+        _ = nanosleep(&ts, null);
+    }
+
+    extern "c" fn connect(fd: c_int, addr: *const std.posix.sockaddr.in, len: std.posix.socklen_t) c_int;
+    extern "c" fn write(fd: c_int, buf: [*]const u8, len: usize) isize;
+    extern "c" fn close(fd: c_int) c_int;
+
+    /// Dial the editor's listener as if we were a freshly-spawned
+    /// engine. Returns the connected fd; caller writes JSON frames
+    /// via `write(2)`.
+    fn dialEditor(port: u16) !c_int {
+        const sock_fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+        if (sock_fd < 0) return error.SocketFailed;
+        const addr: std.posix.sockaddr.in = .{
+            .family = std.posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, port),
+            .addr = std.mem.nativeToBig(u32, 0x7F000001),
+            .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        };
+        const rc = connect(@intCast(sock_fd), &addr, @sizeOf(@TypeOf(addr)));
+        if (rc < 0) return error.ConnectFailed;
+        return @intCast(sock_fd);
+    }
+
+    fn sendJsonLine(fd: c_int, body: []const u8) !void {
+        var off: usize = 0;
+        while (off < body.len) {
+            const n = write(fd, body.ptr + off, body.len - off);
+            if (n <= 0) return error.WriteFailed;
+            off += @intCast(n);
+        }
+    }
+
+    /// Poll the session until `predicate` returns true or the
+    /// deadline expires. Mirrors the engine-side `waitFor` pattern.
+    fn waitUntilState(p: *preview.PreviewSession, target: preview.State, deadline_ms: u64) !void {
+        var slept: u64 = 0;
+        while (slept < deadline_ms) {
+            p.poll();
+            if (p.state == target) return;
+            sleepMs(2);
+            slept += 2;
+        }
+        return error.DeadlineExceeded;
+    }
+
+    test "bindListener picks a port and lands in .listening" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+
+        try sess.bindListener();
+        try expect.equal(sess.state, preview.State.listening);
+        try expect.toBeTrue(sess.port != null);
+        try expect.toBeTrue(sess.port.? != 0);
+    }
+
+    test "hello frame transitions .connecting → .running and records engine_pid" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        try sess.bindListener();
+
+        const port = sess.port.?;
+        const fd = try dialEditor(port);
+        // give the kernel a beat to land the SYN
+        try waitUntilState(&sess, .connecting, 500);
+
+        try sendJsonLine(fd, "{\"kind\":\"hello\",\"engine_version\":\"1.37.1\",\"pid\":12345,\"protocol_version\":1}\n");
+        try waitUntilState(&sess, .running, 500);
+        try expect.equal(sess.engine_pid.?, @as(i64, 12345));
+
+        _ = close(fd);
+    }
+
+    test "frame_offer fires on_frame_offer callback with shm_name + dims" {
+        const Capture = struct {
+            var got_name: [64]u8 = [_]u8{0} ** 64;
+            var got_name_len: usize = 0;
+            var got_width: u32 = 0;
+            var got_height: u32 = 0;
+            var fired: bool = false;
+
+            fn cb(_: *anyopaque, name: [:0]const u8, w: u32, h: u32) void {
+                fired = true;
+                got_name_len = @min(name.len, got_name.len);
+                @memcpy(got_name[0..got_name_len], name[0..got_name_len]);
+                got_width = w;
+                got_height = h;
+            }
+        };
+        Capture.fired = false;
+        Capture.got_name_len = 0;
+        Capture.got_width = 0;
+        Capture.got_height = 0;
+
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        try sess.bindListener();
+        sess.on_frame_offer = .{ .ctx = &Capture.fired, .func = Capture.cb };
+
+        const fd = try dialEditor(sess.port.?);
+        try waitUntilState(&sess, .connecting, 500);
+        try sendJsonLine(fd, "{\"kind\":\"hello\",\"engine_version\":\"x\",\"pid\":1,\"protocol_version\":1}\n");
+        try waitUntilState(&sess, .running, 500);
+
+        try sendJsonLine(fd,
+            "{\"kind\":\"frame_offer\",\"shm_name\":\"/lbl-test\",\"width\":640,\"height\":360,\"format\":\"rgba8\",\"ring_size\":3,\"slot_size_bytes\":921600}\n");
+
+        // poll for ~500 ms waiting for the callback
+        var i: u32 = 0;
+        while (i < 250 and !Capture.fired) : (i += 1) {
+            sess.poll();
+            sleepMs(2);
+        }
+        try expect.toBeTrue(Capture.fired);
+        try std.testing.expectEqualStrings(Capture.got_name[0..Capture.got_name_len], "/lbl-test");
+        try expect.equal(Capture.got_width, @as(u32, 640));
+        try expect.equal(Capture.got_height, @as(u32, 360));
+
+        _ = close(fd);
+    }
+
+    test "bye frame transitions .running → .stopped and records reason" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        try sess.bindListener();
+
+        const fd = try dialEditor(sess.port.?);
+        try waitUntilState(&sess, .connecting, 500);
+        try sendJsonLine(fd, "{\"kind\":\"hello\",\"engine_version\":\"\",\"pid\":7,\"protocol_version\":1}\n");
+        try waitUntilState(&sess, .running, 500);
+        try sendJsonLine(fd, "{\"kind\":\"bye\",\"reason\":\"normal\"}\n");
+        try waitUntilState(&sess, .stopped, 500);
+        try std.testing.expectEqualStrings(sess.bye_reason.?, "normal");
+
+        _ = close(fd);
+    }
+
+    test "EOF without bye lands in .crashed" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        try sess.bindListener();
+
+        const fd = try dialEditor(sess.port.?);
+        try waitUntilState(&sess, .connecting, 500);
+        try sendJsonLine(fd, "{\"kind\":\"hello\",\"engine_version\":\"\",\"pid\":7,\"protocol_version\":1}\n");
+        try waitUntilState(&sess, .running, 500);
+
+        // Hard-close the engine fd without bye.
+        _ = close(fd);
+        try waitUntilState(&sess, .crashed, 500);
+    }
+};
+
 pub const GameViewLatencyTests = struct {
     // GameView.meanLatencyNs is pure math over its latency_ring; no
     // GL context needed. Compose the struct manually to test the
