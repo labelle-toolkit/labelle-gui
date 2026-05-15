@@ -172,6 +172,13 @@ pub fn build(b: *std.Build) void {
     gui_tests_exe.root_module.linkLibrary(zgui_te.artifact("imgui"));
     gui_tests_exe.root_module.addImport("zstbi", zstbi.module("root"));
     gui_tests_exe.root_module.addImport("flow_codegen", flow_codegen_module);
+    // App.renderFrame transitively imports nfd via the file-dialog
+    // code path; without this addImport the test binary fails to
+    // compile as soon as the previously-dead `Callbacks.gui`/`run`
+    // bodies are analyzed (this addition originally landed in #106
+    // and was inadvertently dropped during #115's review-fix
+    // cherry-pick rebase).
+    gui_tests_exe.root_module.addImport("nfd", nfd.module("nfd"));
     gui_tests_exe.root_module.addImport("engine", engine_module);
 
     const run_gui_tests = b.addRunArtifact(gui_tests_exe);

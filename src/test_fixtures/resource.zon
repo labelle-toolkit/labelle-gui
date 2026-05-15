@@ -1,0 +1,5 @@
+.{
+    .name = "sprites",
+    .json = "assets/sprites.json",
+    .texture = "assets/sprites.png",
+}
