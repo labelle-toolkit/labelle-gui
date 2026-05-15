@@ -19,6 +19,7 @@ const flow_types = @import("flows/types.zig");
 const prefs = @import("prefs.zig");
 const io_global = @import("io_global.zig");
 const game_view = @import("game_view.zig");
+const test_fixtures = @import("test_fixtures.zig");
 
 /// Wall-clock seconds since the Unix epoch; replacement for the
 /// `std.time.timestamp` helper removed in Zig 0.16. Used only to
@@ -1886,9 +1887,11 @@ pub const ProjectFileTests = struct {
         const temp_dir = try createTempDir(allocator);
         defer deleteTempDir(allocator, temp_dir);
 
-        // Build a project with one resource directly via the arena so
-        // the slice is owned correctly. Save then reload via a fresh
-        // ProjectManager and assert the resource came back intact.
+        // Save a project carrying one Factory-built ResourceDef, reload
+        // via a fresh ProjectManager, assert the resource came back
+        // intact. Factory.defineFrom validates each field name against
+        // ResourceDef at comptime — a typo in `test_fixtures/resource.zon`
+        // fails the build, not the test.
         var pm = project.ProjectManager.init(allocator);
         defer pm.deinit();
         try pm.newProject("with_resources");
@@ -1896,11 +1899,7 @@ pub const ProjectFileTests = struct {
         const proj = pm.current_project.?;
         const a = proj.arena.allocator();
         const resources = try a.alloc(project.ResourceDef, 1);
-        resources[0] = .{
-            .name = try a.dupe(u8, "sprites"),
-            .json = try a.dupe(u8, "assets/sprites.json"),
-            .texture = try a.dupe(u8, "assets/sprites.png"),
-        };
+        resources[0] = test_fixtures.ResourceFactory.build(.{});
         proj.config.resources = resources;
 
         try pm.saveProject(temp_dir);
@@ -1914,6 +1913,51 @@ pub const ProjectFileTests = struct {
         try expect.toBeTrue(std.mem.eql(u8, loaded[0].name, "sprites"));
         try expect.toBeTrue(std.mem.eql(u8, loaded[0].json, "assets/sprites.json"));
         try expect.toBeTrue(std.mem.eql(u8, loaded[0].texture, "assets/sprites.png"));
+    }
+
+    test "ProjectConfigFactory overrides round-trip through save + load" {
+        // Proof-of-value for the Factory pattern (precursor to #120's
+        // `project_settings_edit_save` triage): build a non-default
+        // ProjectConfig with several overrides via Factory.build,
+        // round-trip through saveProject/loadProject, assert every
+        // override survived. Replaces what would otherwise be a
+        // multi-line struct literal plus arena.dupe per string field.
+        const allocator = std.testing.allocator;
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+        try pm.newProject("factory_overrides");
+
+        const proj = pm.current_project.?;
+        proj.config = test_fixtures.ProjectConfigFactory.build(.{
+            .name = "factory_overrides",
+            .title = "Factory Overrides",
+            .width = 1920,
+            .height = 1080,
+            .backend = .sokol,
+            .initial_scene = "splash",
+            .engine_version = "1.35.0",
+        });
+
+        try pm.saveProject(temp_dir);
+
+        var pm2 = project.ProjectManager.init(allocator);
+        defer pm2.deinit();
+        try pm2.loadProject(temp_dir);
+
+        const cfg = pm2.current_project.?.config;
+        try expect.toBeTrue(std.mem.eql(u8, cfg.name, "factory_overrides"));
+        try expect.toBeTrue(std.mem.eql(u8, cfg.title, "Factory Overrides"));
+        try expect.equal(cfg.width, 1920);
+        try expect.equal(cfg.height, 1080);
+        try expect.equal(cfg.backend, .sokol);
+        try expect.toBeTrue(std.mem.eql(u8, cfg.initial_scene, "splash"));
+        try expect.toBeTrue(std.mem.eql(u8, cfg.engine_version, "1.35.0"));
+        // Unmodified-by-override fields keep their fixture defaults.
+        try expect.equal(cfg.ecs, .zig_ecs);
+        try expect.equal(cfg.target_fps, 60);
     }
 
     // Regression: ../flying-platform-labelle/project.labelle (and any
