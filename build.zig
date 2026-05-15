@@ -86,6 +86,17 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.addImport("engine", engine_module);
 
+    // macOS-only: link the frameworks `src/iosurface.zig` calls into
+    // (`IOSurfaceLookup`, `CFRelease`, `CGLTexImageIOSurface2D`).
+    // The bindings are no-ops on other platforms (every public API
+    // returns `error.PlatformUnsupported`), so the links stay
+    // mac-gated. See labelle-gui#108.
+    if (target.result.os.tag == .macos) {
+        exe.root_module.linkFramework("IOSurface", .{});
+        exe.root_module.linkFramework("CoreFoundation", .{});
+        exe.root_module.linkFramework("OpenGL", .{});
+    }
+
     // Windows-specific: embed DPI awareness manifest
     if (target.result.os.tag == .windows) {
         exe.win32_manifest = b.path("assets/labelle-gui.manifest");
@@ -161,12 +172,6 @@ pub fn build(b: *std.Build) void {
     gui_tests_exe.root_module.linkLibrary(zgui_te.artifact("imgui"));
     gui_tests_exe.root_module.addImport("zstbi", zstbi.module("root"));
     gui_tests_exe.root_module.addImport("flow_codegen", flow_codegen_module);
-    // App.renderFrame (which the tests now actually compile-check —
-    // see issue #105) transitively imports nfd via the file-dialog
-    // code path. Without this addImport the test binary stops linking
-    // as soon as the previously-dead `Callbacks.gui` / `Callbacks.run`
-    // bodies start being analyzed.
-    gui_tests_exe.root_module.addImport("nfd", nfd.module("nfd"));
     gui_tests_exe.root_module.addImport("engine", engine_module);
 
     const run_gui_tests = b.addRunArtifact(gui_tests_exe);

@@ -3066,6 +3066,42 @@ pub const PreviewTransportTests = struct {
     }
 };
 
+pub const IOSurfaceLayoutTests = struct {
+    // The iosurface.ControlBlock layout has to match what the engine's
+    // (future) iosurface producer writes into shm slot 0. Layout
+    // changes break the protocol — keep these comptime-correlated to
+    // catch a drift between either side.
+
+    const iosurface = @import("iosurface.zig");
+
+    test "ControlBlock magic is the four-CC the producer expects" {
+        // 'IOSRFCL1' big-endian → 0x494F535246434C31. The PoC's
+        // producer expects this exact value; the engine producer
+        // follow-up will match.
+        try expect.equal(iosurface.ControlBlock.MAGIC, @as(u64, 0x494F535246434C31));
+    }
+
+    test "ControlBlock size matches the documented layout" {
+        // 24 fixed bytes (magic + ring_size + pixel_format + width +
+        // height) + MAX_RING * 4 (ids) + 16 pad. The comptime assert
+        // inside iosurface.zig guards this; the test reads the asserted
+        // value so a drift surfaces as a test failure too.
+        const expected = 24 + iosurface.MAX_RING * 4 + 16;
+        try expect.equal(@sizeOf(iosurface.ControlBlock), expected);
+    }
+
+    test "BGRA8 pixel format constant matches CGLTexImageIOSurface2D's expectation" {
+        // 'BGRA' four-CC = 0x42475241.
+        try expect.equal(iosurface.kPixelFormat_BGRA8, @as(u32, 0x42475241));
+    }
+
+    test "MAX_RING bounds the ControlBlock id array" {
+        // Catches a silent reduction of MAX_RING that'd shrink the
+        // struct under what the engine producer might still send.
+        try expect.equal(iosurface.MAX_RING, @as(u32, 8));
+    }
+};
+
 pub const GameViewLatencyTests = struct {
     // GameView.meanLatencyNs is pure math over its latency_ring; no
     // GL context needed. Compose the struct manually to test the
