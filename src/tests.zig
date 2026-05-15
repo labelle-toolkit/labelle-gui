@@ -3102,6 +3102,307 @@ pub const IOSurfaceLayoutTests = struct {
     }
 };
 
+pub const PreviewBinaryPlaneTests = struct {
+    // Drives `PreviewSession` end-to-end against an in-test fake
+    // engine that dials the editor's listener and writes hand-built
+    // binary plane frames (the format `labelle-engine`'s
+    // `preview_mode.zig` emits via `writeBinaryFrame`). Mirrors
+    // `PreviewTransportTests` for the JSON control plane (#112).
+
+    const Timespec = extern struct { sec: isize, nsec: isize };
+    extern "c" fn nanosleep(req: *const Timespec, rem: ?*Timespec) c_int;
+    fn sleepMs(ms: u64) void {
+        const ts: Timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * 1_000_000) };
+        _ = nanosleep(&ts, null);
+    }
+
+    extern "c" fn connect(fd: c_int, addr: *const std.posix.sockaddr.in, len: std.posix.socklen_t) c_int;
+    extern "c" fn write(fd: c_int, buf: [*]const u8, len: usize) isize;
+    extern "c" fn close(fd: c_int) c_int;
+
+    fn dialEditor(port: u16) !c_int {
+        const sock_fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+        if (sock_fd < 0) return error.SocketFailed;
+        const addr: std.posix.sockaddr.in = .{
+            .family = std.posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, port),
+            .addr = std.mem.nativeToBig(u32, 0x7F000001),
+            .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        };
+        const rc = connect(@intCast(sock_fd), &addr, @sizeOf(@TypeOf(addr)));
+        if (rc < 0) return error.ConnectFailed;
+        return @intCast(sock_fd);
+    }
+
+    fn writeAll(fd: c_int, bytes: []const u8) !void {
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const n = write(fd, bytes.ptr + off, bytes.len - off);
+            if (n <= 0) return error.WriteFailed;
+            off += @intCast(n);
+        }
+    }
+
+    fn waitUntilState(p: *preview.PreviewSession, target: preview.State, deadline_ms: u64) !void {
+        var slept: u64 = 0;
+        while (slept < deadline_ms) {
+            p.poll();
+            if (p.state == target) return;
+            sleepMs(2);
+            slept += 2;
+        }
+        return error.DeadlineExceeded;
+    }
+
+    // Boilerplate: bind editor listener, dial from the fake engine,
+    // send `hello`, wait until `.running`. Returns the engine-side
+    // fd. Caller closes it.
+    fn connectPair(sess: *preview.PreviewSession) !c_int {
+        try sess.bindListener();
+        const fd = try dialEditor(sess.port.?);
+        try waitUntilState(sess, .connecting, 500);
+        try writeAll(fd, "{\"kind\":\"hello\",\"engine_version\":\"\",\"pid\":1,\"protocol_version\":1}\n");
+        try waitUntilState(sess, .running, 500);
+        return fd;
+    }
+
+    // Write a binary frame header [u8 magic] [u8 kind] [u32 len-LE]
+    // followed by `payload`, mirroring engine-side `writeBinaryFrame`.
+    fn writeBinaryFrame(fd: c_int, kind: preview.BinaryFrameKind, payload: []const u8) !void {
+        var header: [6]u8 = undefined;
+        header[0] = preview.binary_magic;
+        header[1] = @intFromEnum(kind);
+        std.mem.writeInt(u32, header[2..6], @intCast(payload.len), .little);
+        try writeAll(fd, &header);
+        if (payload.len > 0) try writeAll(fd, payload);
+    }
+
+    // Poll the session until `predicate` returns true or the deadline
+    // expires. Used for callback-firing tests where state doesn't
+    // transition.
+    fn waitUntil(sess: *preview.PreviewSession, ctx: anytype, predicate: *const fn (@TypeOf(ctx)) bool, deadline_ms: u64) !void {
+        var slept: u64 = 0;
+        while (slept < deadline_ms) {
+            sess.poll();
+            if (predicate(ctx)) return;
+            sleepMs(2);
+            slept += 2;
+        }
+        return error.DeadlineExceeded;
+    }
+
+    test "component_changed binary frame fires on_component_changed callback" {
+        const Capture = struct {
+            var fired: bool = false;
+            var got_entity: u64 = 0;
+            var got_name: [64]u8 = [_]u8{0} ** 64;
+            var got_name_len: usize = 0;
+            var got_bytes: [128]u8 = [_]u8{0} ** 128;
+            var got_bytes_len: usize = 0;
+
+            fn cb(_: *anyopaque, entity_id: u64, name: []const u8, bytes: []const u8) void {
+                fired = true;
+                got_entity = entity_id;
+                got_name_len = @min(name.len, got_name.len);
+                @memcpy(got_name[0..got_name_len], name[0..got_name_len]);
+                got_bytes_len = @min(bytes.len, got_bytes.len);
+                @memcpy(got_bytes[0..got_bytes_len], bytes[0..got_bytes_len]);
+            }
+        };
+        Capture.fired = false;
+        Capture.got_entity = 0;
+        Capture.got_name_len = 0;
+        Capture.got_bytes_len = 0;
+
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        sess.on_component_changed = .{ .ctx = &Capture.fired, .func = Capture.cb };
+        const fd = try connectPair(&sess);
+        defer _ = close(fd);
+
+        // Payload: [u64 entity_id=42] [u16 name_len=8] ["Position"]
+        //          [u32 data_len=4] [0xDE 0xAD 0xBE 0xEF]
+        const name = "Position";
+        const data = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
+        var payload_buf: [256]u8 = undefined;
+        var off: usize = 0;
+        std.mem.writeInt(u64, payload_buf[off..][0..8], 42, .little);
+        off += 8;
+        std.mem.writeInt(u16, payload_buf[off..][0..2], @intCast(name.len), .little);
+        off += 2;
+        @memcpy(payload_buf[off .. off + name.len], name);
+        off += name.len;
+        std.mem.writeInt(u32, payload_buf[off..][0..4], @intCast(data.len), .little);
+        off += 4;
+        @memcpy(payload_buf[off .. off + data.len], &data);
+        off += data.len;
+
+        try writeBinaryFrame(fd, .component_changed, payload_buf[0..off]);
+
+        const wait = struct {
+            fn fired(_: *bool) bool {
+                return Capture.fired;
+            }
+        };
+        try waitUntil(&sess, &Capture.fired, wait.fired, 500);
+
+        try expect.toBeTrue(Capture.fired);
+        try expect.equal(Capture.got_entity, @as(u64, 42));
+        try std.testing.expectEqualStrings(Capture.got_name[0..Capture.got_name_len], "Position");
+        try std.testing.expectEqualSlices(u8, Capture.got_bytes[0..Capture.got_bytes_len], &data);
+    }
+
+    test "node_entered binary frame fires on_node_entered callback" {
+        const Capture = struct {
+            var fired: bool = false;
+            var got_flow: [64]u8 = [_]u8{0} ** 64;
+            var got_flow_len: usize = 0;
+            var got_node: u32 = 0;
+
+            fn cb(_: *anyopaque, flow_name: []const u8, node_id: u32) void {
+                fired = true;
+                got_flow_len = @min(flow_name.len, got_flow.len);
+                @memcpy(got_flow[0..got_flow_len], flow_name[0..got_flow_len]);
+                got_node = node_id;
+            }
+        };
+        Capture.fired = false;
+        Capture.got_flow_len = 0;
+        Capture.got_node = 0;
+
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        sess.on_node_entered = .{ .ctx = &Capture.fired, .func = Capture.cb };
+        const fd = try connectPair(&sess);
+        defer _ = close(fd);
+
+        // Payload: [u16 flow_name_len=20] ["player_state_machine"] [u32 node_id=7]
+        const flow_name = "player_state_machine";
+        var payload_buf: [128]u8 = undefined;
+        var off: usize = 0;
+        std.mem.writeInt(u16, payload_buf[off..][0..2], @intCast(flow_name.len), .little);
+        off += 2;
+        @memcpy(payload_buf[off .. off + flow_name.len], flow_name);
+        off += flow_name.len;
+        std.mem.writeInt(u32, payload_buf[off..][0..4], 7, .little);
+        off += 4;
+
+        try writeBinaryFrame(fd, .node_entered, payload_buf[0..off]);
+
+        const wait = struct {
+            fn fired(_: *bool) bool {
+                return Capture.fired;
+            }
+        };
+        try waitUntil(&sess, &Capture.fired, wait.fired, 500);
+
+        try expect.toBeTrue(Capture.fired);
+        try std.testing.expectEqualStrings(Capture.got_flow[0..Capture.got_flow_len], "player_state_machine");
+        try expect.equal(Capture.got_node, @as(u32, 7));
+    }
+
+    // `entity_created` doesn't have a callback slot today (the
+    // Entity Inspector doesn't model "new entity announced" yet) —
+    // just verify the decoder consumes the bytes so following
+    // frames stay aligned.
+    test "entity_created binary frame is consumed (no callback)" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        const fd = try connectPair(&sess);
+        defer _ = close(fd);
+
+        // [u64 entity_id=99] [u16 name_len=6] ["player"]
+        const name = "player";
+        var payload_buf: [64]u8 = undefined;
+        var off: usize = 0;
+        std.mem.writeInt(u64, payload_buf[off..][0..8], 99, .little);
+        off += 8;
+        std.mem.writeInt(u16, payload_buf[off..][0..2], @intCast(name.len), .little);
+        off += 2;
+        @memcpy(payload_buf[off .. off + name.len], name);
+        off += name.len;
+
+        try writeBinaryFrame(fd, .entity_created, payload_buf[0..off]);
+
+        // Follow up with a heartbeat — the only way to confirm the
+        // decoder didn't get stuck on the binary frame's length
+        // prefix is to see a later JSON frame still parses.
+        try writeAll(fd, "{\"kind\":\"heartbeat\",\"t\":555}\n");
+        const wait = struct {
+            fn hb(p: *preview.PreviewSession) bool {
+                return (p.last_heartbeat_ms orelse 0) == 555;
+            }
+        };
+        try waitUntil(&sess, &sess, wait.hb, 500);
+        try expect.equal(sess.last_heartbeat_ms.?, @as(i64, 555));
+        try expect.equal(sess.state, preview.State.running);
+    }
+
+    // `entity_destroyed` has no callback slot today either — confirm
+    // the 8-byte payload is consumed and the stream stays aligned.
+    test "entity_destroyed binary frame is consumed (no callback)" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        const fd = try connectPair(&sess);
+        defer _ = close(fd);
+
+        var payload: [8]u8 = undefined;
+        std.mem.writeInt(u64, &payload, 123, .little);
+        try writeBinaryFrame(fd, .entity_destroyed, &payload);
+
+        try writeAll(fd, "{\"kind\":\"heartbeat\",\"t\":777}\n");
+        const wait = struct {
+            fn hb(p: *preview.PreviewSession) bool {
+                return (p.last_heartbeat_ms orelse 0) == 777;
+            }
+        };
+        try waitUntil(&sess, &sess, wait.hb, 500);
+        try expect.equal(sess.last_heartbeat_ms.?, @as(i64, 777));
+    }
+
+    // `pin_value` has no callback slot today (consumer tracked in
+    // #100) — confirm the variable-length payload is fully consumed
+    // so the stream stays aligned for the next frame.
+    test "pin_value binary frame is consumed (no callback)" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        const fd = try connectPair(&sess);
+        defer _ = close(fd);
+
+        // Payload: [u16 flow_len] [flow bytes] [u32 node_id]
+        //          [u16 pin_len] [pin bytes] [f64 value bits]
+        const flow_name = "main_flow";
+        const pin_name = "out";
+        var payload_buf: [128]u8 = undefined;
+        var off: usize = 0;
+        std.mem.writeInt(u16, payload_buf[off..][0..2], @intCast(flow_name.len), .little);
+        off += 2;
+        @memcpy(payload_buf[off .. off + flow_name.len], flow_name);
+        off += flow_name.len;
+        std.mem.writeInt(u32, payload_buf[off..][0..4], 13, .little);
+        off += 4;
+        std.mem.writeInt(u16, payload_buf[off..][0..2], @intCast(pin_name.len), .little);
+        off += 2;
+        @memcpy(payload_buf[off .. off + pin_name.len], pin_name);
+        off += pin_name.len;
+        const value: f64 = 3.14;
+        const bits: u64 = @bitCast(value);
+        std.mem.writeInt(u64, payload_buf[off..][0..8], bits, .little);
+        off += 8;
+
+        try writeBinaryFrame(fd, .pin_value, payload_buf[0..off]);
+
+        try writeAll(fd, "{\"kind\":\"heartbeat\",\"t\":1234}\n");
+        const wait = struct {
+            fn hb(p: *preview.PreviewSession) bool {
+                return (p.last_heartbeat_ms orelse 0) == 1234;
+            }
+        };
+        try waitUntil(&sess, &sess, wait.hb, 500);
+        try expect.equal(sess.last_heartbeat_ms.?, @as(i64, 1234));
+    }
+};
+
 pub const GameViewLatencyTests = struct {
     // GameView.meanLatencyNs is pure math over its latency_ring; no
     // GL context needed. Compose the struct manually to test the

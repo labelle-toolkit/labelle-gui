@@ -12,7 +12,7 @@
 //! ABI lesson re-learned in labelle-engine#545), so `poll()` returns
 //! promptly even when nothing has connected yet.
 //!
-//! Scope ceiling — this PR (#112) restores:
+//! Scope ceiling — this PR (#112) restored:
 //!   - hello / heartbeat / bye   (engine→editor JSON control frames)
 //!   - frame_offer               (engine→editor; #543 / drives
 //!                                `on_frame_offer` callback the App
@@ -20,11 +20,13 @@
 //!   - frame_published           (engine→editor; informational, no
 //!                                state change in editor for v1)
 //!
+//! #117 extends the scope with the **binary telemetry plane** —
+//! length-prefixed records led by an `ESC` (0x1B) magic byte. The
+//! reader peeks byte 0 of the inbox: `0x1B` → decode header + payload
+//! per `BinaryFrameKind`; `{` → newline-framed JSON as before. See the
+//! engine-side `preview_mode.zig` top-doc for the wire format.
+//!
 //! Out of scope (kept stubbed so consumer code compiles):
-//!   - binary plane frames (entity_created / entity_destroyed /
-//!     component_changed / node_entered / pin_value) — `on_component
-//!     _changed` / `on_node_entered` callback slots stay defined
-//!     but never fire.
 //!   - editor→engine uplink (subscribe / unsubscribe / watch_entity
 //!     / subscribe_flow / subscribe_pin_values) — methods stay
 //!     present but write nothing on the wire.
@@ -110,23 +112,54 @@ pub const FrameOfferCallback = struct {
     func: *const fn (ctx: *anyopaque, shm_name: [:0]const u8, width: u32, height: u32) void,
 };
 
-/// Callback invoked on `component_changed` binary frames. Stubbed —
-/// the transport doesn't decode the binary plane yet. The field is
-/// preserved so consumer code (entity_inspector, flow_runtime) compiles
-/// against the post-Phase-3 API shape.
+/// Callback invoked on `component_changed` binary frames (kind=3 of the
+/// preview-mode binary plane). `name` and `bytes` are borrowed slices
+/// into the inbox — valid only for the call duration. Copy before
+/// storing. App wires this to `EntityInspector` (#84 / #91).
 pub const ComponentChangedCallback = struct {
     ctx: *anyopaque,
     func: *const fn (ctx: *anyopaque, entity_id: u64, name: []const u8, bytes: []const u8) void,
 };
 
+/// Callback invoked on `node_entered` binary frames (kind=4). `flow_name`
+/// is a borrowed slice into the inbox — valid only for the call duration.
+/// App wires this to `FlowRuntime` for the flow-node pulse (#91).
 pub const NodeEnteredCallback = struct {
     ctx: *anyopaque,
     func: *const fn (ctx: *anyopaque, flow_name: []const u8, node_id: u32) void,
 };
 
-/// Inbox buffer cap. JSON frames are tiny (~100 B for hello,
-/// ~80 B for frame_offer); a few KB is plenty of slack.
-const inbox_cap: usize = 4 * 1024;
+/// Magic byte that flags a binary telemetry frame on the multiplexed
+/// socket — must match `preview_mode.binary_magic` on the engine side.
+/// `ESC` (0x1B) is chosen because no valid JSON document or whitespace
+/// prefix can begin with it; the reader peeks the first inbox byte to
+/// discriminate JSON vs binary.
+pub const binary_magic: u8 = 0x1B;
+
+/// Mirrors `preview_mode.BinaryFrameKind` on the engine side. Numbered
+/// explicitly because these go on the wire — appending is safe,
+/// reordering is a protocol break.
+pub const BinaryFrameKind = enum(u8) {
+    entity_created = 1,
+    entity_destroyed = 2,
+    component_changed = 3,
+    node_entered = 4,
+    pin_value = 5,
+    _,
+};
+
+/// Fixed 6-byte header preceding each binary payload:
+/// `[u8 magic] [u8 kind] [u32 length_LE]`. `length` covers the payload
+/// only — not the header.
+const binary_header_bytes: usize = 6;
+
+/// Inbox buffer cap. JSON control frames are tiny (~100 B for hello,
+/// ~80 B for frame_offer). Binary plane frames (component_changed
+/// in particular) carry per-component serialized payloads — for the
+/// scenes we ship today, a handful of components × a few hundred
+/// bytes each. 16 KB gives plenty of headroom; bump if a single
+/// component's serialized payload approaches that ceiling.
+const inbox_cap: usize = 16 * 1024;
 
 pub const PreviewSession = struct {
     allocator: std.mem.Allocator,
@@ -475,13 +508,22 @@ pub const PreviewSession = struct {
             };
         }
 
-        // Parse all complete newline-framed JSON lines.
-        while (std.mem.indexOfScalar(u8, self.inbox.items, '\n')) |nl| {
-            const line = self.inbox.items[0..nl];
-            self.handleFrame(line);
-            const remaining = self.inbox.items.len - (nl + 1);
-            std.mem.copyForwards(u8, self.inbox.items[0..remaining], self.inbox.items[nl + 1 ..]);
-            self.inbox.shrinkRetainingCapacity(remaining);
+        // Drain the inbox. Peek byte 0 of each pending record to
+        // route — `binary_magic` (0x1B) → length-prefixed binary
+        // frame; anything else → newline-framed JSON. Stops when no
+        // complete frame is available (binary frame's length bytes
+        // haven't all arrived yet, or no `\n` in the buffer).
+        while (self.inbox.items.len > 0) {
+            if (self.inbox.items[0] == binary_magic) {
+                if (!self.tryReadBinary()) break;
+            } else {
+                const nl = std.mem.indexOfScalar(u8, self.inbox.items, '\n') orelse break;
+                const line = self.inbox.items[0..nl];
+                self.handleFrame(line);
+                const remaining = self.inbox.items.len - (nl + 1);
+                std.mem.copyForwards(u8, self.inbox.items[0..remaining], self.inbox.items[nl + 1 ..]);
+                self.inbox.shrinkRetainingCapacity(remaining);
+            }
         }
 
         // Post-parse: if we hit EOF in the read loop, decide
@@ -492,6 +534,140 @@ pub const PreviewSession = struct {
         if (saw_eof and self.state != .stopped and self.bye_reason == null) {
             self.markCrashed("connection closed");
         }
+    }
+
+    /// Try to consume one binary frame from the head of the inbox.
+    /// Returns `true` if a full frame was decoded (and the caller can
+    /// loop for the next one), `false` if not enough bytes have
+    /// arrived yet (caller should bail until the next `poll`). Bumps
+    /// the session to `.crashed` on a malformed `kind`/`length`.
+    fn tryReadBinary(self: *Self) bool {
+        // Need the full 6-byte header before we can read `length`.
+        if (self.inbox.items.len < binary_header_bytes) return false;
+
+        // Header layout: [u8 magic=0x1B] [u8 kind] [u32 length-LE].
+        const kind_byte = self.inbox.items[1];
+        const length: u32 = std.mem.readInt(u32, self.inbox.items[2..6], .little);
+
+        // Reject oversize lengths up front so a corrupted byte stream
+        // doesn't park the decoder waiting forever for bytes the
+        // engine will never send.
+        if (binary_header_bytes + @as(usize, length) > inbox_cap) {
+            self.markCrashed("binary frame too large");
+            return false;
+        }
+
+        const total = binary_header_bytes + @as(usize, length);
+        if (self.inbox.items.len < total) return false; // Wait for more.
+
+        const payload = self.inbox.items[binary_header_bytes..total];
+        const kind: BinaryFrameKind = @enumFromInt(kind_byte);
+        self.handleBinaryFrame(kind, payload);
+
+        // Consume the frame.
+        const remaining = self.inbox.items.len - total;
+        std.mem.copyForwards(u8, self.inbox.items[0..remaining], self.inbox.items[total..]);
+        self.inbox.shrinkRetainingCapacity(remaining);
+        return true;
+    }
+
+    fn handleBinaryFrame(self: *Self, kind: BinaryFrameKind, payload: []const u8) void {
+        // Decoders consume `payload` in place — string slices are
+        // borrowed views into the inbox, valid for the call duration.
+        // No allocator needed today. Add a per-frame FBA scratch
+        // here if a future decoder needs heap (#119 review).
+        switch (kind) {
+            .entity_created => self.decodeEntityCreated(payload),
+            .entity_destroyed => self.decodeEntityDestroyed(payload),
+            .component_changed => self.decodeComponentChanged(payload),
+            .node_entered => self.decodeNodeEntered(payload),
+            .pin_value => self.decodePinValue(payload),
+            _ => {}, // Unknown kind — drop silently (forward-compat).
+        }
+    }
+
+    /// Payload: `[u64 entity_id] [u16 name_len] [name_len bytes]`.
+    /// No callback slot today (EntityInspector doesn't have a "new
+    /// entity announced" hook yet) — consume the bytes so the decoder
+    /// stays in sync.
+    fn decodeEntityCreated(self: *Self, payload: []const u8) void {
+        _ = self;
+        if (payload.len < 10) return; // u64 + u16 minimum.
+        // const entity_id = std.mem.readInt(u64, payload[0..8], .little);
+        const name_len: u16 = std.mem.readInt(u16, payload[8..10], .little);
+        if (10 + @as(usize, name_len) > payload.len) return;
+        // Borrowed slice (unused for now): payload[10 .. 10 + name_len].
+    }
+
+    /// Payload: `[u64 entity_id]`. No callback today.
+    fn decodeEntityDestroyed(self: *Self, payload: []const u8) void {
+        _ = self;
+        if (payload.len < 8) return;
+        // const entity_id = std.mem.readInt(u64, payload[0..8], .little);
+    }
+
+    /// Payload: `[u64 entity_id] [u16 name_len] [name bytes] [u32 data_len] [data bytes]`.
+    /// Fires `on_component_changed` with borrowed `name` + `bytes` slices.
+    fn decodeComponentChanged(self: *Self, payload: []const u8) void {
+        if (payload.len < 14) return; // u64 + u16 + u32 minimum.
+        const entity_id = std.mem.readInt(u64, payload[0..8], .little);
+        const name_len: u16 = std.mem.readInt(u16, payload[8..10], .little);
+        var off: usize = 10;
+        if (off + name_len > payload.len) return;
+        const name = payload[off .. off + name_len];
+        off += name_len;
+        if (off + 4 > payload.len) return;
+        const data_len: u32 = std.mem.readInt(u32, payload[off..][0..4], .little);
+        off += 4;
+        if (off + data_len > payload.len) return;
+        const bytes = payload[off .. off + data_len];
+
+        if (self.on_component_changed) |cb| {
+            cb.func(cb.ctx, entity_id, name, bytes);
+        }
+    }
+
+    /// Payload: `[u16 flow_name_len] [flow bytes] [u32 node_id]`.
+    /// Fires `on_node_entered` with the borrowed `flow_name` slice.
+    fn decodeNodeEntered(self: *Self, payload: []const u8) void {
+        if (payload.len < 6) return; // u16 + u32 minimum.
+        const flow_len: u16 = std.mem.readInt(u16, payload[0..2], .little);
+        var off: usize = 2;
+        if (off + flow_len > payload.len) return;
+        const flow_name = payload[off .. off + flow_len];
+        off += flow_len;
+        if (off + 4 > payload.len) return;
+        const node_id: u32 = std.mem.readInt(u32, payload[off..][0..4], .little);
+
+        if (self.on_node_entered) |cb| {
+            cb.func(cb.ctx, flow_name, node_id);
+        }
+    }
+
+    /// Payload: `[u16 flow_name_len] [flow bytes] [u32 node_id]
+    /// [u16 pin_name_len] [pin bytes] [f64 value]`. No callback slot
+    /// today (consumer tracked in #100); consume the bytes correctly
+    /// and drop the payload so the decoder stays in sync.
+    fn decodePinValue(self: *Self, payload: []const u8) void {
+        _ = self;
+        if (payload.len < 2) return;
+        const flow_len: u16 = std.mem.readInt(u16, payload[0..2], .little);
+        var off: usize = 2;
+        if (off + flow_len > payload.len) return;
+        off += flow_len;
+        if (off + 4 > payload.len) return;
+        // const node_id = std.mem.readInt(u32, payload[off..][0..4], .little);
+        off += 4;
+        if (off + 2 > payload.len) return;
+        const pin_len: u16 = std.mem.readInt(u16, payload[off..][0..2], .little);
+        off += 2;
+        if (off + pin_len > payload.len) return;
+        off += pin_len;
+        if (off + 8 > payload.len) return;
+        // f64 bit-pattern as u64 little-endian — reverse the producer's
+        // `@bitCast(u64, value)`:
+        // const bits = std.mem.readInt(u64, payload[off..][0..8], .little);
+        // const value: f64 = @bitCast(bits);
     }
 
     fn handleFrame(self: *Self, line: []const u8) void {
@@ -571,7 +747,8 @@ pub const PreviewSession = struct {
             // Informational — editor consumer polls the SHM ring
             // directly. Drop silently.
         }
-        // Unknown kinds (Phase 2 binary frames, etc.) drop silently.
+        // Unknown JSON kinds drop silently. Binary plane frames are
+        // routed by `tryReadBinary` before they ever reach this path.
     }
 
     fn drainChildStderr(self: *Self) void {
