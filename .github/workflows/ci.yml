@@ -50,7 +50,25 @@ jobs:
         run: zig build gui-test-build -Dcpu=baseline
 
       - name: Unit Tests (zspec)
-        run: zig build test -Dcpu=baseline
+        # Debug: zspec hangs on Linux CI past the Zig 0.16 migration but
+        # passes locally on macOS in ~500ms. Wrap in `timeout` so the
+        # step always produces logs we can read (otherwise GitHub
+        # discards the live blob and we never see what hung).
+        run: |
+          set +e
+          timeout --signal=ABRT --kill-after=10s 90s zig build test -Dcpu=baseline 2>&1 | tee zspec_output.txt
+          rc=${PIPESTATUS[0]}
+          echo "----- exit code: $rc -----"
+          # Don't fail the step yet — we want the diagnostic logs.
+          # 124 = clean timeout, 134 = SIGABRT (timeout --signal=ABRT)
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$rc" -ne 134 ]; then
+            exit $rc
+          fi
+          # Cap as failure when timed out so the step is visibly red.
+          if [ "$rc" -eq 124 ] || [ "$rc" -eq 134 ]; then
+            echo "FAIL: zspec exceeded 90s timeout"
+            exit 1
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
