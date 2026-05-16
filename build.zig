@@ -181,6 +181,19 @@ pub fn build(b: *std.Build) void {
     gui_tests_exe.root_module.addImport("nfd", nfd.module("nfd"));
     gui_tests_exe.root_module.addImport("engine", engine_module);
 
+    // macOS-only frameworks — same set as the production `exe` above.
+    // The iosurface dispatch test (PIE viewport) drives the real
+    // `iosurface.Consumer` + `bindSurface`, which call into
+    // `CGLTexImageIOSurface2D` / `CGLGetCurrentContext`. Without the
+    // OpenGL framework, the gui-tests binary fails to link on macOS
+    // even though only one TE test exercises the path. See
+    // labelle-gui#108 for the upstream rationale.
+    if (target.result.os.tag == .macos) {
+        gui_tests_exe.root_module.linkFramework("IOSurface", .{});
+        gui_tests_exe.root_module.linkFramework("CoreFoundation", .{});
+        gui_tests_exe.root_module.linkFramework("OpenGL", .{});
+    }
+
     const run_gui_tests = b.addRunArtifact(gui_tests_exe);
     const gui_test_step = b.step("gui-test", "Run the UI test runner");
     gui_test_step.dependOn(&run_gui_tests.step);

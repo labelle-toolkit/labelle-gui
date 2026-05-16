@@ -224,6 +224,13 @@ pub const Consumer = struct {
     }
 
     pub fn deinit(self: *Consumer) void {
+        // Same comptime-elimination pattern as `init` and `bindSurface`:
+        // without this gate the Linux/Windows analyzer walks the
+        // `CFRelease` call and the linker fails with an undefined
+        // symbol once any caller exists (PR #124's `GameView.detach`
+        // switch arm). The body only ever runs on macOS where
+        // `init` would succeed.
+        if (builtin.os.tag != .macos) return;
         var i: u32 = 0;
         while (i < self.ring_size) : (i += 1) {
             if (self.surfaces[i]) |s| CFRelease(@ptrCast(s));
