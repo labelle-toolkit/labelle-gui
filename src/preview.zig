@@ -48,6 +48,16 @@ extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 extern "c" var environ: [*]?[*:0]const u8;
 
+/// `waitpid` declared directly rather than going through Zig 0.16's
+/// `std.process.Child.wait` — `wait` is blocking-only on 0.16 (no
+/// `tryWait` exists), and we need WNOHANG semantics in the per-frame
+/// `poll()`. Status word is interpreted via `std.posix.W.*` macros
+/// (same as the stdlib's own `childWaitPosix`).
+extern "c" fn waitpid(pid: std.c.pid_t, status: *c_int, options: c_int) std.c.pid_t;
+/// `WNOHANG` — return 0 immediately if no child has exited. Constant
+/// value is `1` on every libc we target (Darwin, glibc, musl, *BSD).
+const WNOHANG: c_int = 1;
+
 fn libcErrno() c_int {
     return if (builtin.os.tag == .macos) __error().* else __errno_location().*;
 }
@@ -180,6 +190,43 @@ const binary_header_bytes: usize = 6;
 /// bytes each. 16 KB gives plenty of headroom; bump if a single
 /// component's serialized payload approaches that ceiling.
 const inbox_cap: usize = 16 * 1024;
+
+/// Result of a non-blocking `waitpid(WNOHANG)` poll against the
+/// spawned `labelle run` subprocess. `null` from `pollChildExit` means
+/// the child is still alive; non-null means it exited (cleanly or via
+/// signal) before connecting back to the editor.
+pub const ChildExitInfo = struct {
+    /// Normal exit code (0..255) if `exited`. Meaningless for signal/
+    /// unknown terminations — read `kind` first.
+    code: u8,
+    /// Signal number if `signaled`. Zero otherwise.
+    signal: u8,
+    kind: Kind,
+
+    pub const Kind = enum { exited, signaled, unknown };
+};
+
+/// Format a crash reason for the `.connecting` / `.listening` →
+/// `.crashed` transition driven by a non-null `pollChildExit` result.
+/// Extracted as a pure helper so the regression-lock test in `#136`
+/// can cover the formatter without spawning a real subprocess —
+/// mirrors the `buildSpawnArgv` (#134) split. Returns a slice borrowed
+/// from `buf`; caller copies if it needs to outlive the next call.
+pub fn formatChildExitReason(buf: []u8, info: ChildExitInfo) []const u8 {
+    return switch (info.kind) {
+        .exited => std.fmt.bufPrint(
+            buf,
+            "subprocess exited before connecting (code: {d})",
+            .{info.code},
+        ) catch "subprocess exited before connecting",
+        .signaled => std.fmt.bufPrint(
+            buf,
+            "subprocess killed by signal {d} before connecting",
+            .{info.signal},
+        ) catch "subprocess killed before connecting",
+        .unknown => "subprocess terminated before connecting",
+    };
+}
 
 /// Compose the argv used to spawn `labelle run` for a preview session.
 /// Extracted so the shape is regression-locked under unit test without
@@ -456,6 +503,23 @@ pub const PreviewSession = struct {
             .connecting, .running => self.tryRead(),
         }
 
+        // Early-crash check (#136): if the spawned `labelle run`
+        // subprocess exited before the editor connection landed, jump
+        // straight to `.crashed` with the captured exit code instead
+        // of waiting out the full `connecting_timeout_ms` window. The
+        // flat timeout below stays as a backstop for the
+        // `child == null` test path (the loopback fixture skips
+        // `start()` and dials the listener directly) and for child
+        // alive + never-connects pathologies.
+        if (self.state == .listening or self.state == .connecting) {
+            if (self.pollChildExit()) |info| {
+                var buf: [128]u8 = undefined;
+                const reason = formatChildExitReason(&buf, info);
+                self.markCrashed(reason);
+                return;
+            }
+        }
+
         // Connecting-timeout: if no client showed up — or accepted
         // but didn't `hello` — within the window, the subprocess
         // likely failed and we land in `.crashed`. Two cases share
@@ -479,6 +543,53 @@ pub const PreviewSession = struct {
                 }
             }
         }
+    }
+
+    /// Non-blocking `waitpid(pid, &status, WNOHANG)` on the spawned
+    /// child. Returns `null` if no child is tracked or the child is
+    /// still alive; returns a populated `ChildExitInfo` if the child
+    /// exited or was signaled. Wraps libc directly because Zig 0.16's
+    /// `std.process.Child.wait` is blocking-only — no `tryWait` exists.
+    /// Public so unit tests can swap in a fake `child` and exercise
+    /// the same machinery (#136 regression-lock).
+    pub fn pollChildExit(self: *Self) ?ChildExitInfo {
+        const child = if (self.child) |*c| c else return null;
+        const pid = child.id orelse return null;
+        var status: c_int = 0;
+        const rc = waitpid(pid, &status, WNOHANG);
+        if (rc <= 0) return null; // 0 = still alive; <0 = error (likely ECHILD; treat as alive).
+        // Drain any final stderr the child emitted before closing the
+        // pipe. The previous `drainChildStderr` at the top of `poll`
+        // may have missed bytes written between that drain and the
+        // child's exit; a second pass right before close is a one-shot
+        // safety net so the crash panel sees the goodbye output.
+        self.drainChildStderr();
+        // Child reaped — mirror `childCleanupPosix` from the stdlib so
+        // a subsequent `stop()` / `kill()` sees a fully-cleaned-up
+        // handle (the std assert in `Child.kill` fires if `id` is
+        // null but a stdio pipe is still attached).
+        if (child.stdin) |f| {
+            _ = close(@intCast(f.handle));
+            child.stdin = null;
+        }
+        if (child.stdout) |f| {
+            _ = close(@intCast(f.handle));
+            child.stdout = null;
+        }
+        if (child.stderr) |f| {
+            _ = close(@intCast(f.handle));
+            child.stderr = null;
+        }
+        child.id = null;
+        const status_u32: u32 = @bitCast(status);
+        if (std.posix.W.IFEXITED(status_u32)) {
+            return .{ .code = std.posix.W.EXITSTATUS(status_u32), .signal = 0, .kind = .exited };
+        }
+        if (std.posix.W.IFSIGNALED(status_u32)) {
+            const sig: u32 = @intFromEnum(std.posix.W.TERMSIG(status_u32));
+            return .{ .code = 0, .signal = @truncate(sig), .kind = .signaled };
+        }
+        return .{ .code = 0, .signal = 0, .kind = .unknown };
     }
 
     pub fn isActive(self: *const Self) bool {

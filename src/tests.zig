@@ -3324,6 +3324,101 @@ pub const PreviewSpawnArgvTests = struct {
     }
 };
 
+pub const PreviewEarlyCrashTests = struct {
+    // Regression-lock for #136: when the spawned `labelle run`
+    // subprocess exits *before* dialing back into the editor's
+    // listener, `Preview.poll()` must transition to `.crashed`
+    // immediately via the WNOHANG `waitpid` check, instead of
+    // waiting out the full 60s `connecting_timeout_ms` window.
+    //
+    // The exit-reason formatter is unit-tested directly (pure
+    // function, no syscall). The integration test spawns a real
+    // process that exits immediately (`/bin/sh -c exit <code>`) and
+    // asserts the state machine reacts within a few polls — well
+    // under the flat timeout. Mirrors the `buildSpawnArgv` (#134)
+    // split: pure helper covered without I/O, integration shape
+    // exercised with a tiny real subprocess.
+
+    test "formatChildExitReason emits exit code for normal exit" {
+        var buf: [128]u8 = undefined;
+        const info: preview.ChildExitInfo = .{ .code = 42, .signal = 0, .kind = .exited };
+        const reason = preview.formatChildExitReason(&buf, info);
+        try std.testing.expectEqualStrings("subprocess exited before connecting (code: 42)", reason);
+    }
+
+    test "formatChildExitReason emits signal number for signaled termination" {
+        var buf: [128]u8 = undefined;
+        const info: preview.ChildExitInfo = .{ .code = 0, .signal = 9, .kind = .signaled };
+        const reason = preview.formatChildExitReason(&buf, info);
+        try std.testing.expectEqualStrings("subprocess killed by signal 9 before connecting", reason);
+    }
+
+    test "formatChildExitReason falls back for unknown termination" {
+        var buf: [128]u8 = undefined;
+        const info: preview.ChildExitInfo = .{ .code = 0, .signal = 0, .kind = .unknown };
+        const reason = preview.formatChildExitReason(&buf, info);
+        try std.testing.expectEqualStrings("subprocess terminated before connecting", reason);
+    }
+
+    test "poll() transitions .connecting → .crashed when child exited (no 60s wait)" {
+        // Spawn a trivially-exiting subprocess and stash it on a
+        // `PreviewSession` whose listener is already bound. The
+        // session won't actually receive a TCP connection (the child
+        // is `/bin/sh -c exit 7`, not `labelle run`), so the only
+        // path out of `.listening` is the WNOHANG exit check.
+        //
+        // Without #136 this test would hang for ~60s on the flat
+        // `connecting_timeout_ms` backstop. We bound the wait to
+        // 2s — generous enough for the kernel to reap the trivial
+        // child, tight enough to fail loudly if the flat-timeout
+        // backstop is the only path firing.
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        try sess.bindListener();
+        try expect.equal(sess.state, preview.State.listening);
+
+        // Spawn `/bin/sh -c "exit 7"` — exits immediately with code 7.
+        // The session takes ownership of the Child struct so
+        // `stop()` / `deinit()` clean up the pid (`kill()` is a no-op
+        // post-reap; our `pollChildExit` nulls `child.id` on success).
+        const argv: []const []const u8 = &.{ "/bin/sh", "-c", "exit 7" };
+        const child = try std.process.spawn(io_global.io(), .{
+            .argv = argv,
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .pipe,
+        });
+        sess.child = child;
+
+        // Pump `poll()` until we land in `.crashed` or hit the 2s
+        // budget. 2s is two orders of magnitude under the flat 60s
+        // backstop — if this loop times out, the WNOHANG path
+        // regressed.
+        const Timespec = extern struct { sec: isize, nsec: isize };
+        const sleepFns = struct {
+            extern "c" fn nanosleep(req: *const Timespec, rem: ?*Timespec) c_int;
+            fn sleepMs(ms: u64) void {
+                const ts: Timespec = .{
+                    .sec = @intCast(ms / 1000),
+                    .nsec = @intCast((ms % 1000) * 1_000_000),
+                };
+                _ = nanosleep(&ts, null);
+            }
+        };
+        var waited_ms: u64 = 0;
+        while (waited_ms < 2000 and sess.state != .crashed) : (waited_ms += 5) {
+            sess.poll();
+            sleepFns.sleepMs(5);
+        }
+        try expect.equal(sess.state, preview.State.crashed);
+        // The bye_reason should carry the formatted exit-code message,
+        // not the flat-timeout fallback ("engine never connected").
+        try expect.toBeTrue(sess.bye_reason != null);
+        const reason = sess.bye_reason.?;
+        try expect.toBeTrue(std.mem.indexOf(u8, reason, "exited before connecting") != null);
+    }
+};
+
 pub const PreviewTransportTests = struct {
     // Drives `PreviewSession` end-to-end against an in-test fake
     // engine that dials the editor's listener and writes JSON
