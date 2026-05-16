@@ -3715,3 +3715,57 @@ pub const GameViewLatencyTests = struct {
         try expect.equal(gv.meanLatencyNs(), @as(u64, 5_000_000));
     }
 };
+
+pub const PreviewSpawnTests = struct {
+    // Regression-lock for #130 — the gui used to pass
+    // `--preview-mode 127.0.0.1:<port>` argv to `labelle run`, but
+    // the CLI doesn't define that flag. The fix moved the address
+    // to the `LABELLE_PREVIEW` env var. `PreviewTransportTests` /
+    // `PreviewBinaryPlaneTests` skip `start()` and dial the
+    // listener directly, so none of them would have caught the
+    // regression. These tests exercise the spawn-argv + env shape
+    // via the pure helpers extracted from `start()`.
+
+    // `std.posix.getenv` was dropped in Zig 0.16; go through libc
+    // directly. `LABELLE_PREVIEW` is ASCII so a borrowed slice into
+    // libc's env is safe for the duration of the read.
+    extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+    fn readPreviewEnv() ?[]const u8 {
+        const raw = getenv("LABELLE_PREVIEW") orelse return null;
+        return std.mem.span(raw);
+    }
+
+    test "buildSpawnArgv returns labelle/run/<dir>, no --preview-mode" {
+        var buf: [16][]const u8 = undefined;
+        const argv = preview.buildSpawnArgv("/tmp/proj", &buf);
+        try expect.equal(argv.len, @as(usize, 3));
+        try expect.toBeTrue(std.mem.eql(u8, argv[0], "labelle"));
+        try expect.toBeTrue(std.mem.eql(u8, argv[1], "run"));
+        try expect.toBeTrue(std.mem.eql(u8, argv[2], "/tmp/proj"));
+        // Regression-lock the bug from PR #130: argv MUST NOT
+        // include a `--preview-mode` flag — the labelle CLI doesn't
+        // define it.
+        for (argv) |a| try expect.toBeFalse(std.mem.eql(u8, a, "--preview-mode"));
+    }
+
+    test "setPreviewEnv formats 127.0.0.1:<port> and sets LABELLE_PREVIEW" {
+        var buf: [32]u8 = undefined;
+        const addr = try preview.setPreviewEnv(54321, &buf);
+        defer preview.clearPreviewEnv();
+        try expect.toBeTrue(std.mem.eql(u8, addr, "127.0.0.1:54321"));
+        const seen = readPreviewEnv() orelse "";
+        try expect.toBeTrue(std.mem.eql(u8, seen, "127.0.0.1:54321"));
+    }
+
+    test "clearPreviewEnv unsets LABELLE_PREVIEW (idempotent)" {
+        preview.clearPreviewEnv(); // no-op if unset
+        var buf: [32]u8 = undefined;
+        _ = try preview.setPreviewEnv(11111, &buf);
+        preview.clearPreviewEnv();
+        try expect.toBeTrue(readPreviewEnv() == null);
+        // Second call should also be safe.
+        preview.clearPreviewEnv();
+        try expect.toBeTrue(readPreviewEnv() == null);
+    }
+};

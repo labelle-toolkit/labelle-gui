@@ -46,6 +46,52 @@ extern "c" fn __errno_location() *c_int;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
+/// Env var name the assembler-generated game's `main` reads via
+/// `_preview_getenv` to discover the editor's listener address.
+/// Exported so unit tests can read it back via `std.posix.getenv`
+/// after `setPreviewEnv` without re-stringifying the literal.
+pub const preview_env_var: [:0]const u8 = "LABELLE_PREVIEW";
+
+/// Build the argv slice for spawning `labelle run` for a given
+/// project directory. Returns a borrowed slice into the caller-
+/// provided buf. Separate from `start()` so unit tests can lock the
+/// shape (regression for #130 — the gui used to pass an undefined
+/// `--preview-mode` flag) without actually spawning a subprocess.
+///
+/// The CLI doesn't define `--preview-mode`; the preview address
+/// reaches the game via the `LABELLE_PREVIEW` env var instead (see
+/// `setPreviewEnv`).
+pub fn buildSpawnArgv(
+    dir_path: []const u8,
+    argv_buf: *[16][]const u8,
+) []const []const u8 {
+    argv_buf[0] = "labelle";
+    argv_buf[1] = "run";
+    argv_buf[2] = dir_path;
+    return argv_buf[0..3];
+}
+
+/// Set `LABELLE_PREVIEW=127.0.0.1:<port>` so the about-to-spawn
+/// child (and its eventual game subprocess, by POSIX fork+exec env
+/// inheritance) discovers the editor's listener. Returns the
+/// host:port string written into `addr_buf` as a borrowed
+/// NUL-terminated slice — valid while `addr_buf` is in scope.
+/// Extracted from `start()` so unit tests can lock the env shape
+/// without spawning a subprocess.
+pub fn setPreviewEnv(port: u16, addr_buf: *[32]u8) error{OutOfMemory}![:0]const u8 {
+    const addr_str = std.fmt.bufPrintZ(addr_buf, "127.0.0.1:{d}", .{port}) catch
+        return error.OutOfMemory;
+    _ = setenv(preview_env_var.ptr, addr_str.ptr, 1);
+    return addr_str;
+}
+
+/// Unset `LABELLE_PREVIEW`. Idempotent — safe to call when the var
+/// was never set (libc's `unsetenv` is a no-op in that case). Pair
+/// with `setPreviewEnv` inside `start()` / `stop()`.
+pub fn clearPreviewEnv() void {
+    _ = unsetenv(preview_env_var.ptr);
+}
+
 fn libcErrno() c_int {
     return if (builtin.os.tag == .macos) __error().* else __errno_location().*;
 }
@@ -317,23 +363,15 @@ pub const PreviewSession = struct {
         try self.bindListener();
         errdefer self.stop();
 
-        var addr_buf: [32]u8 = undefined;
-        const addr_str = std.fmt.bufPrintZ(&addr_buf, "127.0.0.1:{d}", .{self.port.?}) catch
-            return error.OutOfMemory;
-
         // Push LABELLE_PREVIEW into the parent's env so the eventual
         // game subprocess (spawned by the labelle CLI we're about
         // to invoke) inherits it. `stop()` unsets it. Single
         // preview session at a time so no race.
-        _ = setenv("LABELLE_PREVIEW", addr_str.ptr, 1);
+        var addr_buf: [32]u8 = undefined;
+        _ = try setPreviewEnv(self.port.?, &addr_buf);
 
         var argv_buf: [16][]const u8 = undefined;
-        const argv = blk: {
-            argv_buf[0] = "labelle";
-            argv_buf[1] = "run";
-            argv_buf[2] = dir_path;
-            break :blk argv_buf[0..3];
-        };
+        const argv = buildSpawnArgv(dir_path, &argv_buf);
 
         const child = std.process.spawn(io_global.io(), .{
             .argv = argv,
@@ -354,7 +392,7 @@ pub const PreviewSession = struct {
     pub fn stop(self: *Self) void {
         // Symmetric with `start()`'s setenv. Multiple stops are safe
         // (unsetenv on an unset var is a no-op).
-        _ = unsetenv("LABELLE_PREVIEW");
+        clearPreviewEnv();
         if (self.child) |*c| {
             c.kill(io_global.io());
             self.child = null;
