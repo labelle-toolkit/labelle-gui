@@ -424,6 +424,12 @@ pub const App = struct {
         self.openGameViewTab() catch |err| {
             std.log.warn("attachGameView: openGameViewTab failed: {s}", .{@errorName(err)});
         };
+        // Reply with `frame_accept` so the engine flips its
+        // `frame_state` to `.accepted` and starts publishing —
+        // without this, `signalSlotReady`/`publishFrame*` bounce
+        // with `StreamNotActive` and the Game View stays at
+        // "waiting for first frame" forever.
+        self.preview.sendFrameAccept();
     }
 
     /// Push a `.game_view` tab onto `open_tabs` (or focus an existing
