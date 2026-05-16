@@ -37,8 +37,8 @@ pub const ProjectConfigFactory = Factory.define(project.ProjectConfig, .{
     .ecs = .zig_ecs,
     .initial_scene = "main",
     .core_version = "1.12.0",
-    .engine_version = "1.35.0",
+    .engine_version = "1.37.3",
     .gfx_version = "1.10.0",
-    .assembler_version = "0.17.0",
+    .assembler_version = "0.20.0",
     .resources = @as([]const project.ResourceDef, &.{}),
 });
