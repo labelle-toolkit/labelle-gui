@@ -3130,6 +3130,200 @@ pub const PreferencesTests = struct {
     }
 };
 
+pub const ScenesAvailableTests = struct {
+    // `Project.scenesAvailable` is the data source for the Run-button
+    // scene picker (#132). The picker assumes basenames, alphabetical
+    // order, top-level `.jsonc` only. These tests lock those shape
+    // contracts so a future tweak (e.g. recursing into subdirs) flags
+    // up before it surprises the UI code.
+
+    fn createTempDir(allocator: std.mem.Allocator) ![]const u8 {
+        const tmp_base = "/tmp";
+        const ts = timestampSeconds();
+        // Disambiguate by both ts and an incrementing index so two tests
+        // running back-to-back inside the same second don't collide on
+        // the same temp dir.
+        const Counter = struct {
+            var i: u64 = 0;
+        };
+        Counter.i += 1;
+        const dir_name = try std.fmt.allocPrint(allocator, "{s}/labelle_scenes_{d}_{d}", .{ tmp_base, ts, Counter.i });
+        try std.Io.Dir.cwd().createDir(io_global.io(), dir_name, .default_dir);
+        return dir_name;
+    }
+
+    fn deleteTempDir(allocator: std.mem.Allocator, dir_path: []const u8) void {
+        std.Io.Dir.cwd().deleteTree(io_global.io(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+
+    fn touchFile(allocator: std.mem.Allocator, dir_path: []const u8, name: []const u8) !void {
+        const path = try std.fs.path.join(allocator, &.{ dir_path, name });
+        defer allocator.free(path);
+        try std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = path,
+            .data = "{ \"entities\": {} }\n",
+        });
+    }
+
+    test "returns empty slice when project has no dir" {
+        const allocator = std.testing.allocator;
+        const proj = try project.Project.create(allocator, "no_dir");
+        defer proj.deinit();
+        const scenes = try proj.scenesAvailable(allocator);
+        try expect.equal(scenes.len, 0);
+    }
+
+    test "returns empty slice when scenes/ is missing" {
+        const allocator = std.testing.allocator;
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+        try pm.newProject("missing_scenes");
+        // Don't call saveProject — it scaffolds `scenes/`. Force-set the
+        // dir so the lookup runs.
+        pm.current_project.?.dir = try pm.current_project.?.arena.allocator().dupe(u8, temp_dir);
+
+        const scenes = try pm.current_project.?.scenesAvailable(allocator);
+        try expect.equal(scenes.len, 0);
+    }
+
+    test "lists *.jsonc files alphabetically by stem" {
+        const allocator = std.testing.allocator;
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+        try pm.newProject("scenes_test");
+        try pm.saveProject(temp_dir);
+
+        const scenes_dir = try std.fs.path.join(allocator, &.{ temp_dir, "scenes" });
+        defer allocator.free(scenes_dir);
+
+        // Drop files in a non-alphabetical order to prove the sort step
+        // runs.
+        try touchFile(allocator, scenes_dir, "main.jsonc");
+        try touchFile(allocator, scenes_dir, "debug.jsonc");
+        try touchFile(allocator, scenes_dir, "menu.jsonc");
+
+        const scenes = try pm.current_project.?.scenesAvailable(allocator);
+        try expect.equal(scenes.len, 3);
+        try std.testing.expectEqualStrings(scenes[0], "debug");
+        try std.testing.expectEqualStrings(scenes[1], "main");
+        try std.testing.expectEqualStrings(scenes[2], "menu");
+    }
+
+    test "ignores non-jsonc files and subdirectories" {
+        const allocator = std.testing.allocator;
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+        try pm.newProject("scenes_test");
+        try pm.saveProject(temp_dir);
+
+        const scenes_dir = try std.fs.path.join(allocator, &.{ temp_dir, "scenes" });
+        defer allocator.free(scenes_dir);
+
+        try touchFile(allocator, scenes_dir, "main.jsonc");
+        try touchFile(allocator, scenes_dir, "README.md");
+        try touchFile(allocator, scenes_dir, "main.json"); // wrong extension
+
+        // Subdir scenes are out of scope for the v1 picker — the
+        // launcher's `--scene=<name>` flag only accepts a single name,
+        // not a path. Drop a nested file to assert it's skipped.
+        const nested = try std.fs.path.join(allocator, &.{ scenes_dir, "debug" });
+        defer allocator.free(nested);
+        try std.Io.Dir.cwd().createDir(io_global.io(), nested, .default_dir);
+        try touchFile(allocator, nested, "main.jsonc");
+
+        const scenes = try pm.current_project.?.scenesAvailable(allocator);
+        try expect.equal(scenes.len, 1);
+        try std.testing.expectEqualStrings(scenes[0], "main");
+    }
+
+    test "caches the result across repeated calls" {
+        // The picker hits this on every render; make sure repeat calls
+        // return the same slice (identity check) rather than re-walking
+        // the filesystem and reallocating.
+        const allocator = std.testing.allocator;
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+        try pm.newProject("scenes_cache");
+        try pm.saveProject(temp_dir);
+
+        const scenes_dir = try std.fs.path.join(allocator, &.{ temp_dir, "scenes" });
+        defer allocator.free(scenes_dir);
+        try touchFile(allocator, scenes_dir, "main.jsonc");
+
+        const first = try pm.current_project.?.scenesAvailable(allocator);
+        const second = try pm.current_project.?.scenesAvailable(allocator);
+        try expect.equal(first.ptr, second.ptr);
+        try expect.equal(first.len, second.len);
+    }
+};
+
+pub const PreviewSpawnArgvTests = struct {
+    // Regression-lock the argv shape `preview.start` passes to
+    // `std.process.spawn` (#131 / #132). The launcher integration is
+    // covered by `zig build smoke`; this is the pure-formatter side.
+
+    test "no scene override matches the post-#130 argv shape (env-var, no --preview-mode)" {
+        var argv_buf: [16][]const u8 = undefined;
+        var scene_buf: [128]u8 = undefined;
+        const argv = try preview.buildSpawnArgv(
+            &argv_buf,
+            &scene_buf,
+            "/projects/game",
+            null,
+        );
+        try expect.equal(argv.len, 3);
+        try std.testing.expectEqualStrings(argv[0], "labelle");
+        try std.testing.expectEqualStrings(argv[1], "run");
+        try std.testing.expectEqualStrings(argv[2], "/projects/game");
+        // Regression-lock the bug from PR #130: argv MUST NOT include
+        // `--preview-mode` — the labelle CLI doesn't define it. The
+        // host:port goes through `LABELLE_PREVIEW` env var instead.
+        for (argv) |a| try expect.toBeFalse(std.mem.eql(u8, a, "--preview-mode"));
+    }
+
+    test "scene override appends --scene=<name>" {
+        var argv_buf: [16][]const u8 = undefined;
+        var scene_buf: [128]u8 = undefined;
+        const argv = try preview.buildSpawnArgv(
+            &argv_buf,
+            &scene_buf,
+            "/projects/game",
+            "level2",
+        );
+        try expect.equal(argv.len, 4);
+        try std.testing.expectEqualStrings(argv[3], "--scene=level2");
+    }
+
+    test "OOM when scene name overflows the scene buffer" {
+        // Names this long can't reach the launcher (the picker only
+        // surfaces filenames the OS already accepted), but the bounded
+        // buffer should reject them cleanly rather than truncating.
+        var argv_buf: [16][]const u8 = undefined;
+        var scene_buf: [128]u8 = undefined;
+        const oversize = "x" ** 200;
+        const got = preview.buildSpawnArgv(
+            &argv_buf,
+            &scene_buf,
+            "/d",
+            oversize[0..],
+        );
+        try std.testing.expectError(error.OutOfMemory, got);
+    }
+};
+
 pub const PreviewTransportTests = struct {
     // Drives `PreviewSession` end-to-end against an in-test fake
     // engine that dials the editor's listener and writes JSON
