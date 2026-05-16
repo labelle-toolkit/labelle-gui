@@ -41,10 +41,12 @@ const io_global = @import("io_global.zig");
 
 extern "c" fn close(fd: c_int) c_int;
 extern "c" fn read(fd: c_int, buf: [*]u8, len: usize) isize;
+extern "c" fn write(fd: c_int, buf: [*]const u8, len: usize) isize;
 extern "c" fn __error() *c_int;
 extern "c" fn __errno_location() *c_int;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+extern "c" var environ: [*]?[*:0]const u8;
 
 fn libcErrno() c_int {
     return if (builtin.os.tag == .macos) __error().* else __errno_location().*;
@@ -101,7 +103,15 @@ pub const Bye = struct {
     reason: ?[]u8 = null,
 };
 
-pub const connecting_timeout_ms: i64 = 2_000;
+/// How long to wait for the spawned `labelle run` subprocess to
+/// dial back into the listener before declaring the preview
+/// `.crashed`. The CLI runs `zig build` first (cold builds can take
+/// 30-60+ seconds for a sokol+imgui game), so the timeout must cover
+/// the build phase + the game's own startup, not just the network
+/// connect. A proper fix would distinguish "build pending" (child
+/// alive, no connection yet) from "really crashed" (child exited)
+/// — see #134-follow-up. For now, generous flat budget.
+pub const connecting_timeout_ms: i64 = 60_000;
 
 /// Callback slot — fires on the first `frame_offer` JSON frame the
 /// engine sends after the `hello` handshake. The App wires this to
@@ -356,11 +366,26 @@ pub const PreviewSession = struct {
         const addr_str = std.fmt.bufPrintZ(&addr_buf, "127.0.0.1:{d}", .{self.port.?}) catch
             return error.OutOfMemory;
 
-        // Push LABELLE_PREVIEW into the parent's env so the eventual
-        // game subprocess (spawned by the labelle CLI we're about to
-        // invoke) inherits it. `stop()` unsets it. Single preview
-        // session at a time so no race.
-        _ = setenv("LABELLE_PREVIEW", addr_str.ptr, 1);
+        // Build an env Map by cloning the current process environ
+        // and adding LABELLE_PREVIEW. Pass via SpawnOptions —
+        // mutating the parent's environ via libc setenv() was
+        // unreliable in practice (the spawned game's env didn't
+        // see LABELLE_PREVIEW even though PATH propagated correctly,
+        // suggesting std.process.spawn snapshots env in a way that
+        // doesn't pick up runtime setenv calls on Darwin).
+        _ = setenv("LABELLE_PREVIEW", addr_str.ptr, 1); // still set for the simpler propagation path
+        var env_map = std.process.Environ.Map.init(self.allocator);
+        defer env_map.deinit();
+        // Copy the current environ into the Map. extern environ is
+        // a null-terminated array of "KEY=VAL" strings.
+        var i: usize = 0;
+        while (environ[i]) |entry| : (i += 1) {
+            const s = std.mem.span(entry);
+            if (std.mem.indexOfScalar(u8, s, '=')) |eq| {
+                env_map.put(s[0..eq], s[eq + 1 ..]) catch return error.OutOfMemory;
+            }
+        }
+        env_map.put("LABELLE_PREVIEW", addr_str) catch return error.OutOfMemory;
 
         // `scene_buf` lives on this function's stack and is referenced
         // by `argv` until `std.process.spawn` returns. Spawn reads
@@ -376,6 +401,7 @@ pub const PreviewSession = struct {
 
         const child = std.process.spawn(io_global.io(), .{
             .argv = argv,
+            .environ_map = &env_map,
             .stdin = .ignore,
             .stdout = .inherit,
             .stderr = .pipe,
@@ -467,6 +493,23 @@ pub const PreviewSession = struct {
     }
 
     // ── Phase-3 uplink stubs (out of scope for #112) ──────────────
+    /// Send `{"kind":"frame_accept"}\n` to the engine, flipping its
+    /// `frame_state` to `.accepted` so subsequent `publishFrame*` /
+    /// `signalSlotReady` calls succeed instead of bouncing with
+    /// `StreamNotActive`. Caller invokes this after `on_frame_offer`
+    /// has run and the consumer side (SHM or IOSurface) has
+    /// successfully attached.
+    pub fn sendFrameAccept(self: *Self) void {
+        if (self.conn_fd < 0) return;
+        const msg: []const u8 = "{\"kind\":\"frame_accept\"}\n";
+        var off: usize = 0;
+        while (off < msg.len) {
+            const n = write(self.conn_fd, msg.ptr + off, msg.len - off);
+            if (n <= 0) return; // best-effort; drop on error
+            off += @intCast(n);
+        }
+    }
+
     pub fn watchEntity(self: *Self, entity_id: u64) !void {
         _ = self;
         _ = entity_id;
@@ -844,6 +887,11 @@ pub const PreviewSession = struct {
     }
 
     fn markCrashed(self: *Self, reason: []const u8) void {
+        std.log.warn("preview: markCrashed reason={s} state_before={s} stderr_capture={s}", .{
+            reason,
+            @tagName(self.state),
+            self.stderr_buf.items[0..@min(self.stderr_buf.items.len, 512)],
+        });
         if (self.bye_reason == null) {
             self.bye_reason = self.allocator.dupe(u8, reason) catch null;
         }
