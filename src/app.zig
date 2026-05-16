@@ -278,14 +278,14 @@ pub const App = struct {
         app.preview.on_frame_offer = .{
             .ctx = app,
             .func = struct {
-                fn cb(ctx: *anyopaque, shm_name: [:0]const u8, width: u32, height: u32) void {
+                fn cb(ctx: *anyopaque, shm_name: [:0]const u8, width: u32, height: u32, format: []const u8) void {
                     _ = width;
                     _ = height;
                     const a: *App = @ptrCast(@alignCast(ctx));
-                    a.attachGameView(shm_name) catch |err| {
+                    a.attachGameView(shm_name, format) catch |err| {
                         std.log.warn(
-                            "preview: attachGameView('{s}') failed: {s}",
-                            .{ shm_name, @errorName(err) },
+                            "preview: attachGameView('{s}', '{s}') failed: {s}",
+                            .{ shm_name, format, @errorName(err) },
                         );
                     };
                 }
@@ -347,7 +347,9 @@ pub const App = struct {
         if (io_global.environ().getAlloc(allocator, "LABELLE_GAME_VIEW_SHM") catch null) |raw| {
             defer allocator.free(raw);
             if (raw.len > 0) {
-                app.game_view.attach(raw) catch |err| {
+                // Env-var hook is shm-only; the iosurface dispatch
+                // arrives through the engine's `frame_offer` JSON.
+                app.game_view.attach(raw, "bgra8") catch |err| {
                     std.log.warn("game_view: attach('{s}') failed: {s}", .{ raw, @errorName(err) });
                 };
                 if (app.game_view.isAttached()) app.show_game_view = true;
@@ -378,12 +380,14 @@ pub const App = struct {
 
     /// Open the SHM region the engine advertised in `frame_offer`
     /// (#107). Convenience wrapper that surfaces the panel
-    /// automatically on a successful attach. Used both by the
-    /// LABELLE_GAME_VIEW_SHM startup hook and by external test
-    /// code; will also be the seam the eventual preview-transport
-    /// restore plugs into.
-    pub fn attachGameView(self: *Self, shm_name: []const u8) !void {
-        try self.game_view.attach(shm_name);
+    /// automatically on a successful attach.
+    ///
+    /// `format` mirrors the engine's `frame_offer.format` field —
+    /// `"bgra8"` (the default for legacy callers) routes to the SHM
+    /// CPU upload path, `"iosurface_bgra8"` routes to the macOS
+    /// zero-copy path. Anything else falls back to SHM.
+    pub fn attachGameView(self: *Self, shm_name: []const u8, format: []const u8) !void {
+        try self.game_view.attach(shm_name, format);
         self.show_game_view = true;
     }
 

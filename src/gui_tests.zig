@@ -5,6 +5,7 @@
 //! until the test queue drains. Exit code reflects pass/fail.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const zglfw = @import("zglfw");
 const zopengl = @import("zopengl");
 const zgui = @import("zgui");
@@ -15,6 +16,7 @@ const prefab_mod = @import("modules/prefab.zig");
 const io_global = @import("io_global.zig");
 const engine_mod = @import("engine");
 const shm_mod = engine_mod.preview_mode_mod.preview_shm;
+const iosurface_producer_mod = engine_mod.preview_mode_mod.preview_iosurface;
 
 const gl_major = 4;
 const gl_minor = 1;
@@ -98,8 +100,15 @@ fn pieServicePending() void {
         g_pie_pending_detach = false;
     }
     if (g_pie_pending_attach) {
-        app.attachGameView(pie_shm_name) catch {};
+        // Shm transport: the synthetic producer publishes BGRA8/RGBA8
+        // bytes into the ring directly. The iosurface dispatch lives
+        // in its own dedicated test below.
+        app.attachGameView(pie_shm_name, "bgra8") catch {};
         g_pie_pending_attach = false;
+    }
+    if (g_pie_pending_ios_attach) {
+        app.attachGameView(pie_ios_shm_name, "iosurface_bgra8") catch {};
+        g_pie_pending_ios_attach = false;
     }
 }
 
@@ -115,6 +124,74 @@ fn piePreviewPublish(byte: u8) u64 {
     p.publish(true);
     return p.header.frame_count;
 }
+
+// ── iosurface synthetic producer (macOS-only) ──────────────────────
+//
+// Parallels the shm helpers above. Runs the engine's iosurface
+// producer in-process so the TE iosurface dispatch test can drive
+// `App.attachGameView(name, "iosurface_bgra8")` and observe the
+// consumer flip into the rectangle-texture + FBO blit path. Lookups
+// rely on `kIOSurfaceIsGlobal = true` (the engine producer sets it),
+// which works in-process and is what `iosurface.Consumer.init`
+// expects. On non-macOS hosts these globals stay null and the test
+// skips itself.
+
+var g_pie_ios_producer: ?iosurface_producer_mod.Producer = null;
+
+const pie_ios_shm_name: [:0]const u8 = "/lbl-gui-te-ios";
+
+fn pieIosStart(width: u32, height: u32) !void {
+    if (builtin.os.tag != .macos) return;
+    if (g_pie_ios_producer != null) {
+        g_pie_pending_detach = true;
+        if (g_pie_ios_producer) |*p| {
+            shm_mod.signalShutdown(p.shm_producer.header);
+            p.deinit();
+            g_pie_ios_producer = null;
+        }
+    }
+    g_pie_ios_producer = try iosurface_producer_mod.Producer.init(pie_ios_shm_name, .{
+        .width = width,
+        .height = height,
+        .ring_size = 3,
+    });
+    g_pie_pending_ios_attach = true;
+}
+
+fn pieIosStop() void {
+    if (builtin.os.tag != .macos) return;
+    g_pie_pending_detach = true;
+    if (g_pie_ios_producer) |*p| {
+        shm_mod.signalShutdown(p.shm_producer.header);
+        p.deinit();
+        g_pie_ios_producer = null;
+    }
+}
+
+/// Lock the next IOSurface, fill with a flat byte (B = G = R = A =
+/// byte → easy to recognise in a pixel inspector if a later test
+/// adds capture), publish. Returns the producer's frame_count.
+fn pieIosPublish(byte: u8) u64 {
+    if (builtin.os.tag != .macos) return 0;
+    const p = &(g_pie_ios_producer.?);
+    const locked = p.pixelsPtr() catch return p.shm_producer.header.frame_count;
+    // BGRA8 — bytes_per_row may pad past width*4.
+    const rows: usize = @intCast(p.height);
+    const row_bytes: usize = @intCast(p.width * 4);
+    var y: usize = 0;
+    while (y < rows) : (y += 1) {
+        const row_base: [*]u8 = locked.base + y * locked.bytes_per_row;
+        @memset(row_base[0..row_bytes], byte);
+    }
+    p.publish(true) catch {};
+    return p.shm_producer.header.frame_count;
+}
+
+/// Pending attach flag for the iosurface path — services on the GL
+/// thread via `pieServicePending`. Separate from the shm flag so the
+/// two paths can coexist in the same test binary without clobbering
+/// each other.
+var g_pie_pending_ios_attach: bool = false;
 
 pub fn main() !void {
     try zglfw.init();
@@ -193,6 +270,7 @@ pub fn main() !void {
     // defer, ensure the producer mapping is torn down before the
     // process exits so the next run gets a clean shm slot.
     defer piePreviewStop();
+    defer pieIosStop();
 
     _ = engine.registerTest("phase3", "view_compiler_output_toggle", @src(), struct {
         pub fn gui(_: *zgui.te.TestContext) !void {
@@ -763,6 +841,80 @@ pub fn main() !void {
             ctx.yield(2);
             _ = zgui.te.check(@src(), .{}, !a.game_view.isAttached(), "consumer reports detached after teardown");
             _ = zgui.te.check(@src(), .{}, a.game_view.tex_id == 0, "GL texture released on detach");
+        }
+    });
+
+    // ── iosurface dispatch (macOS-only) ────────────────────────────
+    //
+    // Asserts the format-dispatch wiring: when the engine emits
+    // `format = "iosurface_bgra8"`, App.attachGameView opens an
+    // `iosurface.Consumer` (not a `shm.Consumer`), allocates the
+    // rectangle textures + FBOs, and the per-frame FBO blit fills the
+    // GL_TEXTURE_2D that imgui samples. On non-macOS hosts the engine
+    // producer returns `error.PlatformUnsupported` at init, so this
+    // test skips cleanly.
+    _ = engine.registerTest("pie", "viewport/iosurface_dispatch", @src(), struct {
+        pub fn gui(_: *zgui.te.TestContext) !void {
+            pieServicePending();
+            if (g_app) |a| a.renderFrame(1.0 / 60.0);
+        }
+        pub fn run(ctx: *zgui.te.TestContext) !void {
+            if (builtin.os.tag != .macos) {
+                _ = zgui.te.check(@src(), .{}, true, "iosurface path is macOS-only — skipped");
+                return;
+            }
+            const a = g_app orelse {
+                _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
+                return;
+            };
+
+            pieIosStart(64, 64) catch |err| {
+                // CFAllocationFailed / IOSurfaceCreateFailed can happen
+                // under sandboxes that disable IOSurface — treat as a
+                // skip rather than a failure so CI on locked-down
+                // runners doesn't break.
+                std.log.warn("iosurface producer init failed: {s} — skipping", .{@errorName(err)});
+                _ = zgui.te.check(@src(), .{}, true, "iosurface producer unavailable on this host");
+                return;
+            };
+            defer pieIosStop();
+            ctx.yield(2); // service the deferred attach (GL work).
+
+            _ = zgui.te.check(@src(), .{}, a.game_view.isAttached(), "iosurface consumer attached");
+            _ = zgui.te.check(@src(), .{}, a.show_game_view, "Game View panel opened on iosurface attach");
+            // Rectangle textures + draw FBO only exist in iosurface
+            // mode — they're the smoking gun that we took the right
+            // dispatch branch.
+            _ = zgui.te.check(@src(), .{}, a.game_view.rect_count > 0, "rectangle textures allocated for iosurface ring");
+            _ = zgui.te.check(@src(), .{}, a.game_view.draw_fbo != 0, "draw FBO allocated for iosurface blit");
+            _ = zgui.te.check(@src(), .{}, a.game_view.tex_id != 0, "destination GL_TEXTURE_2D allocated");
+
+            // Drive a handful of publishes; assert frame_idx advances
+            // through the FBO blit (i.e. `poll()` walked the iosurface
+            // branch and reached `recordFrameStats`).
+            var prev_idx: ?u64 = null;
+            var saw_increase: bool = false;
+            var i: usize = 0;
+            while (i < 20) : (i += 1) {
+                _ = pieIosPublish(@intCast(i & 0xFF));
+                ctx.yield(1);
+                const cur = a.game_view.last_frame_idx orelse continue;
+                if (prev_idx) |p| {
+                    if (cur > p) saw_increase = true;
+                }
+                prev_idx = cur;
+            }
+            _ = zgui.te.check(@src(), .{}, prev_idx != null, "iosurface consumer saw at least one frame");
+            _ = zgui.te.check(@src(), .{}, saw_increase, "iosurface frame_idx advanced across the window");
+            _ = zgui.te.check(@src(), .{}, a.game_view.last_latency_ns > 0, "iosurface latency stat populated");
+
+            // Detach explicitly so the next test starts from clean
+            // GL state. detach() runs on the gui (GL) thread.
+            g_pie_pending_detach = true;
+            ctx.yield(2);
+            _ = zgui.te.check(@src(), .{}, !a.game_view.isAttached(), "iosurface consumer detached cleanly");
+            _ = zgui.te.check(@src(), .{}, a.game_view.rect_count == 0, "rectangle textures freed on detach");
+            _ = zgui.te.check(@src(), .{}, a.game_view.draw_fbo == 0, "draw FBO freed on detach");
         }
     });
 

@@ -3037,26 +3037,31 @@ pub const PreviewTransportTests = struct {
         _ = close(fd);
     }
 
-    test "frame_offer fires on_frame_offer callback with shm_name + dims" {
+    test "frame_offer fires on_frame_offer callback with shm_name + dims + format" {
         const Capture = struct {
             var got_name: [64]u8 = [_]u8{0} ** 64;
             var got_name_len: usize = 0;
             var got_width: u32 = 0;
             var got_height: u32 = 0;
+            var got_format: [64]u8 = [_]u8{0} ** 64;
+            var got_format_len: usize = 0;
             var fired: bool = false;
 
-            fn cb(_: *anyopaque, name: [:0]const u8, w: u32, h: u32) void {
+            fn cb(_: *anyopaque, name: [:0]const u8, w: u32, h: u32, format: []const u8) void {
                 fired = true;
                 got_name_len = @min(name.len, got_name.len);
                 @memcpy(got_name[0..got_name_len], name[0..got_name_len]);
                 got_width = w;
                 got_height = h;
+                got_format_len = @min(format.len, got_format.len);
+                @memcpy(got_format[0..got_format_len], format[0..got_format_len]);
             }
         };
         Capture.fired = false;
         Capture.got_name_len = 0;
         Capture.got_width = 0;
         Capture.got_height = 0;
+        Capture.got_format_len = 0;
 
         var sess = preview.PreviewSession.init(std.testing.allocator);
         defer sess.deinit();
@@ -3069,7 +3074,7 @@ pub const PreviewTransportTests = struct {
         try waitUntilState(&sess, .running, 500);
 
         try sendJsonLine(fd,
-            "{\"kind\":\"frame_offer\",\"shm_name\":\"/lbl-test\",\"width\":640,\"height\":360,\"format\":\"rgba8\",\"ring_size\":3,\"slot_size_bytes\":921600}\n");
+            "{\"kind\":\"frame_offer\",\"shm_name\":\"/lbl-test\",\"width\":640,\"height\":360,\"format\":\"bgra8\",\"ring_size\":3,\"slot_size_bytes\":921600}\n");
 
         // poll for ~500 ms waiting for the callback
         var i: u32 = 0;
@@ -3081,6 +3086,51 @@ pub const PreviewTransportTests = struct {
         try std.testing.expectEqualStrings(Capture.got_name[0..Capture.got_name_len], "/lbl-test");
         try expect.equal(Capture.got_width, @as(u32, 640));
         try expect.equal(Capture.got_height, @as(u32, 360));
+        try std.testing.expectEqualStrings(Capture.got_format[0..Capture.got_format_len], "bgra8");
+
+        _ = close(fd);
+    }
+
+    test "frame_offer forwards format=iosurface_bgra8 to the callback" {
+        // The format-dispatch wiring lives in App.attachGameView / the
+        // GameView consumer; this test stops one level shy of that, at
+        // the JSON parser. We assert the parser hands the borrowed
+        // slice through verbatim — App reads it to pick shm vs iosurface
+        // transport (`src/game_view.zig`).
+        const Capture = struct {
+            var got_format: [64]u8 = [_]u8{0} ** 64;
+            var got_format_len: usize = 0;
+            var fired: bool = false;
+
+            fn cb(_: *anyopaque, _: [:0]const u8, _: u32, _: u32, format: []const u8) void {
+                fired = true;
+                got_format_len = @min(format.len, got_format.len);
+                @memcpy(got_format[0..got_format_len], format[0..got_format_len]);
+            }
+        };
+        Capture.fired = false;
+        Capture.got_format_len = 0;
+
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        try sess.bindListener();
+        sess.on_frame_offer = .{ .ctx = &Capture.fired, .func = Capture.cb };
+
+        const fd = try dialEditor(sess.port.?);
+        try waitUntilState(&sess, .connecting, 500);
+        try sendJsonLine(fd, "{\"kind\":\"hello\",\"engine_version\":\"x\",\"pid\":1,\"protocol_version\":1}\n");
+        try waitUntilState(&sess, .running, 500);
+
+        try sendJsonLine(fd,
+            "{\"kind\":\"frame_offer\",\"shm_name\":\"/lbl-ios\",\"width\":1280,\"height\":720,\"format\":\"iosurface_bgra8\",\"ring_size\":3}\n");
+
+        var i: u32 = 0;
+        while (i < 250 and !Capture.fired) : (i += 1) {
+            sess.poll();
+            sleepMs(2);
+        }
+        try expect.toBeTrue(Capture.fired);
+        try std.testing.expectEqualStrings(Capture.got_format[0..Capture.got_format_len], "iosurface_bgra8");
 
         _ = close(fd);
     }

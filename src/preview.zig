@@ -103,13 +103,21 @@ pub const connecting_timeout_ms: i64 = 2_000;
 
 /// Callback slot — fires on the first `frame_offer` JSON frame the
 /// engine sends after the `hello` handshake. The App wires this to
-/// `attachGameView(shm_name)` (#107 → #112 end-to-end seam).
+/// `attachGameView(shm_name, format)` (#107 → #112 end-to-end seam).
 ///
-/// `shm_name` is borrowed — only valid for the call duration. Copy
-/// before storing.
+/// `shm_name` and `format` are borrowed — only valid for the call
+/// duration. Copy before storing.
+///
+/// `format` mirrors the engine's `frame_offer.format` field. Today's
+/// values:
+///   - `"bgra8"` (default) → shm CPU upload path (`preview_shm.Consumer`).
+///   - `"iosurface_bgra8"` → macOS zero-copy path (`iosurface.Consumer`).
+/// Unknown formats should fall back to the SHM path on the consumer
+/// side; `frame_offer` JSON without an explicit `format` key parses as
+/// `"bgra8"` for backward compat with engines that predate the field.
 pub const FrameOfferCallback = struct {
     ctx: *anyopaque,
-    func: *const fn (ctx: *anyopaque, shm_name: [:0]const u8, width: u32, height: u32) void,
+    func: *const fn (ctx: *anyopaque, shm_name: [:0]const u8, width: u32, height: u32, format: []const u8) void,
 };
 
 /// Callback invoked on `component_changed` binary frames (kind=3 of the
@@ -726,6 +734,13 @@ pub const PreviewSession = struct {
                 shm_name: []const u8 = "",
                 width: u32 = 0,
                 height: u32 = 0,
+                /// `bgra8` (default — SHM CPU upload path) vs
+                /// `iosurface_bgra8` (macOS zero-copy). Defaulted so
+                /// engines that predate the field keep working. The
+                /// borrowed slice into the parse arena is valid for
+                /// the call into `on_frame_offer.func`; copy on the
+                /// consumer side before storing.
+                format: []const u8 = "bgra8",
             };
             const m = std.json.parseFromSliceLeaky(Msg, alloc, line, .{
                 .ignore_unknown_fields = true,
@@ -741,7 +756,7 @@ pub const PreviewSession = struct {
                 @memcpy(name_buf[0..m.shm_name.len], m.shm_name);
                 name_buf[m.shm_name.len] = 0;
                 const name_z: [:0]const u8 = name_buf[0..m.shm_name.len :0];
-                cb.func(cb.ctx, name_z, m.width, m.height);
+                cb.func(cb.ctx, name_z, m.width, m.height, m.format);
             }
         } else if (std.mem.eql(u8, kind_only.kind, "frame_published")) {
             // Informational — editor consumer polls the SHM ring
