@@ -40,6 +40,16 @@ fn render(app: *App) void {
     renderStats(app);
 }
 
+/// Tab-mode entry — called from `OpenTab.render` when the active tab
+/// is `.game_view`. The parent tab strip already wraps the body in a
+/// window, so no `zgui.begin`/`end` here. Stats live in their own
+/// floating window (still gated on `show_game_view`) so the user can
+/// dock them wherever; the tab body is just the live frame.
+pub fn renderTab(app: *App) void {
+    _ = app.game_view.poll();
+    renderViewportContent(app);
+}
+
 fn renderViewport(app: *App) void {
     zgui.setNextWindowSize(.{ .w = 720, .h = 460, .cond = .first_use_ever });
     if (!zgui.begin("Game View", .{ .popen = &app.show_game_view, .flags = .{} })) {
@@ -47,7 +57,12 @@ fn renderViewport(app: *App) void {
         return;
     }
     defer zgui.end();
+    renderViewportContent(app);
+}
 
+/// Inner content — drawn either inside the tab's container OR inside
+/// the standalone panel's begin/end. No window chrome here.
+fn renderViewportContent(app: *App) void {
     if (!app.game_view.isAttached()) {
         zgui.textWrapped(
             \\No engine attached.

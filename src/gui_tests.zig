@@ -193,6 +193,24 @@ fn pieIosPublish(byte: u8) u64 {
 /// each other.
 var g_pie_pending_ios_attach: bool = false;
 
+/// Pending close request for the Game View tab (#128). Set from the
+/// run-callback thread, serviced in the gui callback because
+/// `closeTab`'s `.game_view` arm calls `game_view.detach()` which is
+/// GL-thread work.
+var g_pending_game_view_close: bool = false;
+
+/// Count `.game_view` entries in `App.open_tabs`. Used by the #128
+/// tests to assert tab dedup without taking a dep on absolute index
+/// (other tests may leave document tabs lying around).
+fn countGameViewTabs(a: *App) usize {
+    var n: usize = 0;
+    for (a.open_tabs.items) |t| switch (t) {
+        .game_view => n += 1,
+        else => {},
+    };
+    return n;
+}
+
 pub fn main() !void {
     try zglfw.init();
     defer zglfw.terminate();
@@ -915,6 +933,137 @@ pub fn main() !void {
             _ = zgui.te.check(@src(), .{}, !a.game_view.isAttached(), "iosurface consumer detached cleanly");
             _ = zgui.te.check(@src(), .{}, a.game_view.rect_count == 0, "rectangle textures freed on detach");
             _ = zgui.te.check(@src(), .{}, a.game_view.draw_fbo == 0, "draw FBO freed on detach");
+        }
+    });
+
+    // ── Game View tab (#128) ───────────────────────────────────────
+    //
+    // `attachGameView` now pushes an `OpenTab.game_view` entry onto
+    // `open_tabs` (in addition to the legacy `show_game_view` panel
+    // toggle) so the live frame surfaces inside the main content
+    // area's TabBar. Closing the tab eagerly stops the preview
+    // subprocess + detaches the consumer.
+    //
+    // The actual `closeTab` invocation has to land on the gui (GL)
+    // thread because the `.game_view` arm calls `game_view.detach()`
+    // which deletes GL textures. The pattern matches the existing
+    // PIE viewport tests: set a flag on the run thread, service it
+    // on the gui-callback frame.
+    _ = engine.registerTest("pie", "tab/opens_on_attach", @src(), struct {
+        pub fn gui(_: *zgui.te.TestContext) !void {
+            pieServicePending();
+            if (g_app) |a| a.renderFrame(1.0 / 60.0);
+        }
+        pub fn run(ctx: *zgui.te.TestContext) !void {
+            const a = g_app orelse {
+                _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
+                return;
+            };
+
+            // Earlier PIE viewport tests may have attached + detached
+            // the consumer, which under #128 also pushes a `.game_view`
+            // tab onto `open_tabs`. The tab persists after detach
+            // (close-on-detach would be wrong: detach is normal during
+            // resize). Count `.game_view` tabs as the invariant, not
+            // total tab length, so this test stays robust to leftover
+            // tabs.
+            const game_view_tabs_before = countGameViewTabs(a);
+
+            piePreviewStart(64, 64) catch {
+                _ = zgui.te.check(@src(), .{}, false, "piePreviewStart must succeed");
+                return;
+            };
+            defer piePreviewStop();
+            ctx.yield(2);
+
+            _ = zgui.te.check(@src(), .{}, a.game_view.isAttached(), "consumer attached");
+            const expected_tabs: usize = if (game_view_tabs_before == 0) 1 else game_view_tabs_before;
+            _ = zgui.te.check(@src(), .{}, countGameViewTabs(a) == expected_tabs, "exactly one .game_view tab present (new or refocused)");
+
+            // Re-attach with the same name should refocus, not
+            // duplicate. attach() inside game_view.attach auto-detaches
+            // first — that's GL work, so route via the pending flag.
+            g_pie_pending_attach = true;
+            ctx.yield(2);
+            _ = zgui.te.check(@src(), .{}, countGameViewTabs(a) == expected_tabs, "re-attach refocuses instead of duplicating");
+
+            // Cleanup: tear down via the detach flag (GL work) so the
+            // next test starts clean. The .game_view tab will still be
+            // present in open_tabs after detach; the close-stops-preview
+            // test below exercises the close path.
+            g_pie_pending_detach = true;
+            ctx.yield(2);
+        }
+    });
+
+    _ = engine.registerTest("pie", "tab/close_stops_preview", @src(), struct {
+        pub fn gui(_: *zgui.te.TestContext) !void {
+            pieServicePending();
+            // closeTab's .game_view arm runs game_view.detach (GL
+            // work) — service it here, on the GL thread, when the
+            // run callback flags an outstanding close request.
+            if (g_pending_game_view_close) {
+                g_pending_game_view_close = false;
+                if (g_app) |a| {
+                    var i: usize = 0;
+                    while (i < a.open_tabs.items.len) {
+                        switch (a.open_tabs.items[i]) {
+                            .game_view => {
+                                a.closeTab(i);
+                                break;
+                            },
+                            else => i += 1,
+                        }
+                    }
+                }
+            }
+            if (g_app) |a| a.renderFrame(1.0 / 60.0);
+        }
+        pub fn run(ctx: *zgui.te.TestContext) !void {
+            const a = g_app orelse {
+                _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
+                return;
+            };
+
+            piePreviewStart(64, 64) catch {
+                _ = zgui.te.check(@src(), .{}, false, "piePreviewStart must succeed");
+                return;
+            };
+            defer piePreviewStop();
+            ctx.yield(2);
+
+            // Pre-close sanity.
+            _ = zgui.te.check(@src(), .{}, a.game_view.isAttached(), "consumer attached pre-close");
+            var found_pre: bool = false;
+            for (a.open_tabs.items) |t| switch (t) {
+                .game_view => {
+                    found_pre = true;
+                    break;
+                },
+                else => {},
+            };
+            _ = zgui.te.check(@src(), .{}, found_pre, "game_view tab present pre-close");
+
+            // Drive the production close path through the gui frame
+            // so detach() lands on the GL thread.
+            g_pending_game_view_close = true;
+            ctx.yield(2);
+
+            _ = zgui.te.check(@src(), .{}, !a.game_view.isAttached(), "consumer detached on tab close");
+            _ = zgui.te.check(@src(), .{}, !a.show_game_view, "panel toggle reset on tab close");
+            _ = zgui.te.check(@src(), .{}, !a.preview.isActive(), "preview reports inactive after stop()");
+
+            // No .game_view tab remains. Other test-leftover tabs
+            // (scene, prefab) are out of scope here.
+            var still_there: bool = false;
+            for (a.open_tabs.items) |t| switch (t) {
+                .game_view => {
+                    still_there = true;
+                    break;
+                },
+                else => {},
+            };
+            _ = zgui.te.check(@src(), .{}, !still_there, "no .game_view tab remains after closeTab");
         }
     });
 
