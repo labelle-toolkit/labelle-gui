@@ -56,6 +56,12 @@ pub const OpenTab = union(enum) {
     /// `.flow.zon` schema.
     flow: flow_mod.FlowState,
     gizmo: gizmo_mod.GizmoState,
+    /// Live game view (#128). Routing marker only — the consumer +
+    /// GL texture state live on `App.game_view`. No per-tab struct
+    /// because there's only one preview session at a time, and the
+    /// tab body just dispatches into `modules/game_view.zig`'s
+    /// existing renderer.
+    game_view: void,
 
     pub fn deinit(self: *OpenTab, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -63,6 +69,7 @@ pub const OpenTab = union(enum) {
             .prefab => |*p| p.deinit(allocator),
             .flow => |*f| f.deinit(allocator),
             .gizmo => |*g| g.deinit(allocator),
+            .game_view => {},
         }
     }
 
@@ -72,6 +79,7 @@ pub const OpenTab = union(enum) {
             .prefab => |*p| prefab_mod.render(p, app),
             .flow => |*f| flow_mod.render(f, app),
             .gizmo => |*g| gizmo_mod.render(g, app),
+            .game_view => game_view_mod.renderTab(app),
         }
     }
 
@@ -81,6 +89,7 @@ pub const OpenTab = union(enum) {
             .prefab => |*p| prefab_mod.savePrefab(p, app),
             .flow => |*f| flow_mod.saveFlow(f, app),
             .gizmo => |*g| gizmo_mod.saveGizmo(g, app),
+            .game_view => {},
         }
     }
 
@@ -90,6 +99,7 @@ pub const OpenTab = union(enum) {
             .prefab => |p| p.display_name,
             .flow => |f| f.display_name,
             .gizmo => |g| g.display_name,
+            .game_view => "▶ Game View",
         };
     }
 
@@ -99,6 +109,7 @@ pub const OpenTab = union(enum) {
             .prefab => |p| p.path,
             .flow => |f| f.path,
             .gizmo => |g| g.path,
+            .game_view => "<runtime>",
         };
     }
 
@@ -108,6 +119,7 @@ pub const OpenTab = union(enum) {
             .prefab => |p| p.is_dirty,
             .flow => |f| f.is_dirty,
             .gizmo => |g| g.is_dirty,
+            .game_view => false,
         };
     }
 };
@@ -388,7 +400,39 @@ pub const App = struct {
     /// zero-copy path. Anything else falls back to SHM.
     pub fn attachGameView(self: *Self, shm_name: []const u8, format: []const u8) !void {
         try self.game_view.attach(shm_name, format);
+        // Backwards-compat: the floating "Game View" panel registered
+        // via the Module Registry is still available for users who
+        // want a docked-elsewhere layout. The tab below is the
+        // default surface; both share `renderViewportContent` so
+        // they stay in lockstep.
         self.show_game_view = true;
+        // #128: also open the Game View as a tab in the main content
+        // area so users see the live frame inline with the editor
+        // tabs they were working in. Logged + swallowed because an
+        // OOM here shouldn't fail the attach — the panel still works.
+        self.openGameViewTab() catch |err| {
+            std.log.warn("attachGameView: openGameViewTab failed: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// Push a `.game_view` tab onto `open_tabs` (or focus an existing
+    /// one) and queue a one-shot focus request so the next frame
+    /// brings it forward. Idempotent — multiple `frame_offer`s in a
+    /// session refocus instead of duplicating tabs. #128.
+    fn openGameViewTab(self: *Self) !void {
+        for (self.open_tabs.items, 0..) |t, i| {
+            switch (t) {
+                .game_view => {
+                    self.focus_tab_idx = i;
+                    return;
+                },
+                else => {},
+            }
+        }
+        try self.open_tabs.append(self.allocator, .{ .game_view = {} });
+        const new_idx = self.open_tabs.items.len - 1;
+        self.active_tab_idx = new_idx;
+        self.focus_tab_idx = new_idx;
     }
 
     /// Rebuild the atlas index from the active project's
@@ -572,6 +616,19 @@ pub const App = struct {
     /// about unsaved changes via `requestCloseTab` first.
     pub fn closeTab(self: *Self, idx: usize) void {
         if (idx >= self.open_tabs.items.len) return;
+        // #128: closing the Game View tab is the runtime-view "stop"
+        // affordance — there's no dirty-doc dialog; tear down the
+        // preview subprocess + consumer eagerly. Done before the
+        // tab is removed so `.game_view`-specific cleanup still has
+        // an attached consumer to work with.
+        switch (self.open_tabs.items[idx]) {
+            .game_view => {
+                self.preview.stop();
+                self.game_view.detach();
+                self.show_game_view = false;
+            },
+            else => {},
+        }
         var removed = self.open_tabs.orderedRemove(idx);
         removed.deinit(self.allocator);
 
