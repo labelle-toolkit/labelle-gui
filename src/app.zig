@@ -143,6 +143,22 @@ pub const App = struct {
     /// module. The module reads this via its `Module.is_open` pointer.
     show_compiler_output: bool = false,
     compiler_output_scroll_to_bottom: bool = false,
+    /// Tail buffer for the Compiler Output panel's live preview view
+    /// (#127). The panel pulls newly-arrived stderr bytes from
+    /// `preview.PreviewSession.consumeStderr` each frame and appends
+    /// them here, so the build phase's progress is visible live
+    /// instead of only on `.crashed`. Capped to keep the buffer from
+    /// growing without bound on a chatty subprocess; older bytes are
+    /// discarded from the front when the cap is hit. Reset on every
+    /// fresh `startPreview`.
+    preview_tail: std.ArrayList(u8) = .empty,
+    /// Tracks whether the *user* manually closed the Compiler Output
+    /// panel during the current preview session. We force-open the
+    /// panel on each `startPreview` (so the user sees the build
+    /// output without a menu click), but if they close it via the
+    /// title-bar ×, we don't keep fighting them by re-opening it on
+    /// every frame. Reset on each fresh Run.
+    preview_force_opened: bool = false,
 
     show_project_settings: bool = false,
     project_settings: project_settings_mod.ProjectSettings = .{},
@@ -385,6 +401,7 @@ pub const App = struct {
     pub fn deinit(self: *Self) void {
         self.closeAllTabs();
         self.open_tabs.deinit(self.allocator);
+        self.preview_tail.deinit(self.allocator);
         if (self.atlas_index) |*idx| idx.deinit();
         if (self.gizmo_index) |*idx| idx.deinit();
         if (self.prefab_index) |*idx| idx.deinit();
@@ -927,6 +944,10 @@ pub const App = struct {
             self.setStatus("Error syncing project files!");
             return;
         };
+        // Reset the panel's live-tail buffer before the session
+        // starts — old bytes from a previous Run shouldn't leak into
+        // the new session's output.
+        self.preview_tail.clearRetainingCapacity();
         self.preview.start(proj, self.preview_scene_override) catch |err| {
             std.log.err("Error starting preview: {}", .{err});
             self.setStatus("Error starting preview!");
@@ -934,6 +955,49 @@ pub const App = struct {
         };
         self.setStatus("Preview starting...");
         self.show_preview = true;
+        // Force-open the Compiler Output panel so the user sees the
+        // subprocess's stderr live during the (potentially 30-60s)
+        // cold `zig build` phase. Manual close via the panel × flips
+        // `show_compiler_output` back to false and stays that way for
+        // the rest of the session — `preview_force_opened` is the
+        // one-shot latch (#127).
+        self.show_compiler_output = true;
+        self.preview_force_opened = true;
+        self.compiler_output_scroll_to_bottom = true;
+    }
+
+    /// Append `bytes` to the Compiler Output panel's live preview
+    /// tail buffer (#127). Bounded by `preview_tail_cap` — when the
+    /// buffer would exceed the cap, the oldest bytes are dropped from
+    /// the front so the *recent* tail (where the build error or panic
+    /// trace lives) is what the user sees. Called from the panel's
+    /// per-frame `consumeStderr` drain; safe to call with an empty
+    /// slice.
+    pub fn appendPreviewTail(self: *Self, bytes: []const u8) void {
+        if (bytes.len == 0) return;
+        // Cap matches `preview.stderr_buf`'s cap (16 KiB) so the panel
+        // never holds more than two windows' worth of stderr in flight.
+        const preview_tail_cap: usize = 16 * 1024;
+        if (bytes.len >= preview_tail_cap) {
+            // Single record already exceeds the cap — keep only the
+            // tail end.
+            self.preview_tail.clearRetainingCapacity();
+            const start = bytes.len - preview_tail_cap;
+            self.preview_tail.appendSlice(self.allocator, bytes[start..]) catch return;
+            return;
+        }
+        // Drop from the front if appending `bytes` would overflow.
+        if (self.preview_tail.items.len + bytes.len > preview_tail_cap) {
+            const need_to_drop = self.preview_tail.items.len + bytes.len - preview_tail_cap;
+            const remaining = self.preview_tail.items.len - need_to_drop;
+            std.mem.copyForwards(
+                u8,
+                self.preview_tail.items[0..remaining],
+                self.preview_tail.items[need_to_drop..],
+            );
+            self.preview_tail.shrinkRetainingCapacity(remaining);
+        }
+        self.preview_tail.appendSlice(self.allocator, bytes) catch return;
     }
 
     pub fn stopPreview(self: *Self) void {

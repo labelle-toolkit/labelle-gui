@@ -47,6 +47,15 @@ extern "c" fn __errno_location() *c_int;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 extern "c" var environ: [*]?[*:0]const u8;
+/// libc `waitpid(2)` — used in non-blocking mode (`WNOHANG`) by
+/// `tryWaitChild` to detect a subprocess that exited before the
+/// editor's connecting-timeout fires. Returns the pid of a reaped
+/// child, 0 when no child has exited yet, or -1 on error.
+extern "c" fn waitpid(pid: c_int, status: ?*c_int, options: c_int) c_int;
+/// `WNOHANG` is `1` on both Darwin and Linux — safe to hardcode here
+/// rather than threading it through `std.posix.W` (which doesn't
+/// re-export the value as a Zig constant).
+const WNOHANG: c_int = 1;
 
 fn libcErrno() c_int {
     return if (builtin.os.tag == .macos) __error().* else __errno_location().*;
@@ -220,6 +229,12 @@ pub const PreviewSession = struct {
     bye_reason: ?[]u8,
     started_ms: ?i64,
     stderr_buf: std.ArrayList(u8),
+    /// Read cursor for `consumeStderr` — the next call returns bytes
+    /// `stderr_buf.items[stderr_cursor..]` and advances the cursor.
+    /// Reset alongside `stderr_buf` on every fresh `bindListener`
+    /// (i.e. each Run cycle) so a stale tail from the previous session
+    /// doesn't leak into the new one's live-tail consumer.
+    stderr_cursor: usize = 0,
     /// PIE viewport frame-offer hook (#112). App wires to
     /// `attachGameView` so the Game View panel auto-opens when the
     /// engine emits its `frame_offer`. `null` = ignore offers.
@@ -306,6 +321,7 @@ pub const PreviewSession = struct {
         }
         self.releaseOwnedStrings();
         self.stderr_buf.clearRetainingCapacity();
+        self.stderr_cursor = 0;
         self.inbox.clearRetainingCapacity();
 
         const addr = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable;
@@ -456,6 +472,21 @@ pub const PreviewSession = struct {
             .connecting, .running => self.tryRead(),
         }
 
+        // Subprocess-exit early-crash detection (#127, subsuming the
+        // first half of #136). If the spawned `labelle run` exits —
+        // build failure, panic, immediate `error.FileNotFound` on the
+        // game binary — before the engine dials back and completes
+        // the `hello` handshake, the listener would otherwise wait
+        // the full 60-second `connecting_timeout_ms` window before
+        // declaring `.crashed`. Poll `waitpid(WNOHANG)` here so we
+        // land in `.crashed` immediately, surfacing the exit code in
+        // the `bye_reason` for the panel. The timeout below stays as
+        // a backstop for the case where the child is alive but
+        // wedged.
+        if (self.state == .listening or self.state == .connecting) {
+            self.tryWaitChild();
+        }
+
         // Connecting-timeout: if no client showed up — or accepted
         // but didn't `hello` — within the window, the subprocess
         // likely failed and we land in `.crashed`. Two cases share
@@ -490,6 +521,25 @@ pub const PreviewSession = struct {
 
     pub fn capturedStderr(self: *const Self) []const u8 {
         return self.stderr_buf.items;
+    }
+
+    /// Yield stderr bytes that have arrived since the last call and
+    /// advance the internal cursor past them. Designed to be called
+    /// once per editor frame from the Compiler Output panel so the
+    /// build phase's progress (the `zig build` step running inside
+    /// `labelle run`, which is cold-cache 30-60+ seconds for a
+    /// sokol+imgui game) is visible live instead of only on `.crashed`.
+    ///
+    /// Returned slice borrows from `stderr_buf`; the caller must copy
+    /// before the next `poll()` invocation if it needs to retain the
+    /// bytes. Empty slice when no new bytes have arrived. Cursor is
+    /// monotonic within a session and resets to 0 on `bindListener`
+    /// (every fresh Run).
+    pub fn consumeStderr(self: *Self) []const u8 {
+        if (self.stderr_cursor >= self.stderr_buf.items.len) return &.{};
+        const fresh = self.stderr_buf.items[self.stderr_cursor..];
+        self.stderr_cursor = self.stderr_buf.items.len;
+        return fresh;
     }
 
     // ── Phase-3 uplink stubs (out of scope for #112) ──────────────
@@ -859,6 +909,69 @@ pub const PreviewSession = struct {
         }
         // Unknown JSON kinds drop silently. Binary plane frames are
         // routed by `tryReadBinary` before they ever reach this path.
+    }
+
+    /// Non-blocking `waitpid` on the spawned subprocess. If the child
+    /// has already exited, transition to `.crashed` with the exit
+    /// code (or signal number) embedded in the `bye_reason`. No-op
+    /// when there's no child (test fixtures call `bindListener`
+    /// directly) or when the child is still alive.
+    ///
+    /// Why bypass `std.process.Child.wait` here: that API blocks until
+    /// termination and tears the Child down (sets `id = null`, closes
+    /// stderr pipe). We need a *peek* — child may still be running
+    /// the cold `zig build` step, and even when it has exited we want
+    /// to drain the stderr pipe one more time on the next `poll` before
+    /// `stop()` closes everything down. Calling `waitpid(WNOHANG)`
+    /// directly leaves the Child's pipes intact and only reaps the
+    /// zombie when the kernel has one.
+    fn tryWaitChild(self: *Self) void {
+        const child = if (self.child) |*c| c else return;
+        const pid = child.id orelse return; // already waited/killed
+        var status: c_int = 0;
+        const rc = waitpid(@intCast(pid), &status, WNOHANG);
+        if (rc <= 0) return; // 0 = still running; -1 = error (race with kill); leave for the next tick
+        // Decode wait(2) status — same shape as `<sys/wait.h>` macros
+        // (`WIFEXITED` / `WEXITSTATUS` / `WIFSIGNALED` / `WTERMSIG`).
+        // The high byte is the exit code on a normal exit; the low 7
+        // bits are the terminating signal otherwise. Keep the reason
+        // string short — the panel surfaces it inline.
+        var reason_buf: [64]u8 = undefined;
+        const reason: []const u8 = blk: {
+            if ((status & 0x7F) == 0) {
+                const code = (status >> 8) & 0xFF;
+                break :blk std.fmt.bufPrint(&reason_buf, "labelle exited (code {d})", .{code}) catch "labelle exited";
+            } else {
+                const sig = status & 0x7F;
+                break :blk std.fmt.bufPrint(&reason_buf, "labelle killed by signal {d}", .{sig}) catch "labelle killed";
+            }
+        };
+        // One final stderr drain so the panel surfaces the *last*
+        // bytes the child wrote before exiting. Without this, the
+        // tail (often the compile error in the `zig build` step) can
+        // sit in the pipe buffer past `markCrashed`'s teardown.
+        self.drainChildStderr();
+        // `waitpid` already reaped the zombie. We have to mirror
+        // `std.process.Child.wait`'s post-condition exactly so a
+        // subsequent `stop()` → `kill()` is a no-op (instead of
+        // tripping the `child.stderr == null` assertion). That means
+        // clearing `id` *and* closing all pipe fds the spawn opened.
+        // Today only `stderr` is piped (start() uses `.pipe`); the
+        // others are `.ignore`/`.inherit` so they're already `null`.
+        if (child.stderr) |f| {
+            f.close(io_global.io());
+            child.stderr = null;
+        }
+        if (child.stdout) |f| {
+            f.close(io_global.io());
+            child.stdout = null;
+        }
+        if (child.stdin) |f| {
+            f.close(io_global.io());
+            child.stdin = null;
+        }
+        child.id = null;
+        self.markCrashed(reason);
     }
 
     fn drainChildStderr(self: *Self) void {
