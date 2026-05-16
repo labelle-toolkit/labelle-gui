@@ -73,9 +73,9 @@ pub const ProjectConfig = struct {
     ecs: EcsChoice = .zig_ecs,
     initial_scene: []const u8 = "main",
     core_version: []const u8 = "1.12.0",
-    engine_version: []const u8 = "1.35.0",
+    engine_version: []const u8 = "1.37.3",
     gfx_version: []const u8 = "1.10.0",
-    assembler_version: []const u8 = "0.17.0",
+    assembler_version: []const u8 = "0.20.0",
     /// Sprite atlas resources — name + JSON manifest + texture file. The
     /// engine consumes these via the generated `main.zig` (see assembler
     /// codegen). Defaults to empty; the editor adds entries.

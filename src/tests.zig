@@ -1963,7 +1963,7 @@ pub const ProjectFileTests = struct {
         try expect.toBeTrue(std.mem.eql(u8, cfg.description, ""));
         try expect.toBeTrue(std.mem.eql(u8, cfg.core_version, "1.12.0"));
         try expect.toBeTrue(std.mem.eql(u8, cfg.gfx_version, "1.10.0"));
-        try expect.toBeTrue(std.mem.eql(u8, cfg.assembler_version, "0.17.0"));
+        try expect.toBeTrue(std.mem.eql(u8, cfg.assembler_version, "0.20.0"));
         try expect.equal(cfg.resources.len, 0);
     }
 
@@ -2247,6 +2247,183 @@ pub const ProjectFileTests = struct {
         try expect.toBeTrue(std.mem.eql(u8, pm2.current_project.?.config.name, "round_trip"));
         try expect.equal(pm2.current_project.?.config.backend, .raylib);
         try expect.equal(pm2.current_project.?.config.ecs, .zig_ecs);
+    }
+
+    // Regression for #125: opening flying-platform-labelle in the gui
+    // and triggering a save silently overwrote `engine_version` /
+    // `assembler_version` / etc. with the gui's compiled-in defaults.
+    // Load + save must preserve non-default version pins on the
+    // managed modeled fields.
+    test "loadProject preserves non-default version pins through save round-trip" {
+        const allocator = std.testing.allocator;
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        const labelle_path = try std.fs.path.join(allocator, &.{ temp_dir, "project.labelle" });
+        defer allocator.free(labelle_path);
+
+        // Pin every version field to an obviously-non-default value so
+        // a load that silently fell back to defaults would be caught
+        // immediately on any field. Field order mirrors the real
+        // flying-platform-labelle file (versions trail the body and
+        // `.labelle_version` is interspersed with the managed pins).
+        const original =
+            \\.{
+            \\    .name = "pinned_project",
+            \\    .title = "Pinned",
+            \\    .width = 1024,
+            \\    .height = 768,
+            \\    .target_fps = 60,
+            \\    .backend = .sokol,
+            \\    .ecs = .zig_ecs,
+            \\    .initial_scene = "loading",
+            \\    .states = .{ "loading", "playing" },
+            \\    .core_version = "9.9.9",
+            \\    .engine_version = "1.99.0",
+            \\    .gfx_version = "9.9.9",
+            \\    .labelle_version = "1.36.0",
+            \\    .assembler_version = "9.9.9",
+            \\}
+            \\
+        ;
+        std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = labelle_path,
+            .data = original,
+        }) catch unreachable;
+
+        // Step 1 of the triage: assert the load picked the pins up,
+        // not the ProjectConfig defaults. Catches a regression in
+        // either the parser call or the field name list.
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+        try pm.loadProject(temp_dir);
+
+        const loaded_cfg = pm.current_project.?.config;
+        try expect.toBeTrue(std.mem.eql(u8, loaded_cfg.engine_version, "1.99.0"));
+        try expect.toBeTrue(std.mem.eql(u8, loaded_cfg.assembler_version, "9.9.9"));
+        try expect.toBeTrue(std.mem.eql(u8, loaded_cfg.core_version, "9.9.9"));
+        try expect.toBeTrue(std.mem.eql(u8, loaded_cfg.gfx_version, "9.9.9"));
+
+        // Step 2: round-trip through save + load and re-assert. Save
+        // emits from the in-memory ProjectConfig; if a downstream
+        // code path is overwriting it with defaults, this catches it.
+        try pm.saveProject(temp_dir);
+
+        var pm2 = project.ProjectManager.init(allocator);
+        defer pm2.deinit();
+        try pm2.loadProject(temp_dir);
+
+        const reloaded = pm2.current_project.?.config;
+        try expect.toBeTrue(std.mem.eql(u8, reloaded.engine_version, "1.99.0"));
+        try expect.toBeTrue(std.mem.eql(u8, reloaded.assembler_version, "9.9.9"));
+        try expect.toBeTrue(std.mem.eql(u8, reloaded.core_version, "9.9.9"));
+        try expect.toBeTrue(std.mem.eql(u8, reloaded.gfx_version, "9.9.9"));
+    }
+
+    // Same as the previous test but mirroring the exact layout of
+    // ../flying-platform-labelle/project.labelle (resources block,
+    // plugins block, layers block between top fields and version
+    // pins). Catches any save-order or extras-interaction bug that
+    // a minimal synthetic file wouldn't hit.
+    test "flying-platform-shaped project preserves version pins" {
+        const allocator = std.testing.allocator;
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        const labelle_path = try std.fs.path.join(allocator, &.{ temp_dir, "project.labelle" });
+        defer allocator.free(labelle_path);
+
+        const original =
+            \\.{
+            \\    .name = "flying_platform",
+            \\    .title = "Flying Platform",
+            \\    .width = 1024,
+            \\    .height = 768,
+            \\    .target_fps = 60,
+            \\    .backend = .sokol,
+            \\    .ecs = .zig_ecs,
+            \\    .initial_scene = "loading",
+            \\    .states = .{ "loading", "playing", "debug", "menu" },
+            \\    .gui = .{ .plugin = "imgui" },
+            \\    .resources = .{
+            \\        .{ .name = "background", .json = "assets/background.json", .texture = "assets/background.png" },
+            \\    },
+            \\    .plugins = .{
+            \\        .{ .name = "imgui", .repo = "github.com/labelle-toolkit/labelle-imgui", .version = "0.3.1" },
+            \\    },
+            \\    .layers = .{
+            \\        .{ .name = "world", .order = 1, .space = .world },
+            \\    },
+            \\    .core_version = "1.12.0",
+            \\    .engine_version = "1.37.3",
+            \\    .gfx_version = "1.10.0",
+            \\    .labelle_version = "1.36.0",
+            \\    .assembler_version = "0.20.0",
+            \\}
+            \\
+        ;
+        std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = labelle_path,
+            .data = original,
+        }) catch unreachable;
+
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+        try pm.loadProject(temp_dir);
+        try pm.saveProject(temp_dir);
+
+        const saved = try std.Io.Dir.cwd().readFileAlloc(io_global.io(), labelle_path, allocator, .limited(1024 * 1024));
+        defer allocator.free(saved);
+
+        // Managed pins must survive intact.
+        try expect.toBeTrue(std.mem.indexOf(u8, saved, ".engine_version = \"1.37.3\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, saved, ".assembler_version = \"0.20.0\"") != null);
+        // Plugin .version must survive intact (unmodeled extras).
+        try expect.toBeTrue(std.mem.indexOf(u8, saved, ".version = \"0.3.1\"") != null);
+    }
+
+    // Regression for #125 (plugin half): plugins are unmodeled in the
+    // gui's ProjectConfig, so each plugin entry — including its
+    // `.version` sub-field — must survive a load/save round-trip
+    // verbatim via the extras pass-through.
+    test "plugin entry .version survives load/save round-trip" {
+        const allocator = std.testing.allocator;
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        const labelle_path = try std.fs.path.join(allocator, &.{ temp_dir, "project.labelle" });
+        defer allocator.free(labelle_path);
+
+        const original =
+            \\.{
+            \\    .name = "plugged",
+            \\    .plugins = .{
+            \\        .{ .name = "imgui", .repo = "github.com/labelle-toolkit/labelle-imgui", .version = "0.3.1" },
+            \\        .{ .name = "fsm", .repo = "github.com/labelle-toolkit/labelle-fsm", .version = "0.1.0" },
+            \\    },
+            \\}
+            \\
+        ;
+        std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = labelle_path,
+            .data = original,
+        }) catch unreachable;
+
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+        try pm.loadProject(temp_dir);
+        try pm.saveProject(temp_dir);
+
+        const saved = try std.Io.Dir.cwd().readFileAlloc(io_global.io(), labelle_path, allocator, .limited(1024 * 1024));
+        defer allocator.free(saved);
+
+        // Plugin entry `.version` must be byte-identical to the input
+        // for both plugins.
+        try expect.toBeTrue(std.mem.indexOf(u8, saved, ".version = \"0.3.1\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, saved, ".version = \"0.1.0\"") != null);
+        // And the rest of each plugin entry must also survive.
+        try expect.toBeTrue(std.mem.indexOf(u8, saved, "github.com/labelle-toolkit/labelle-imgui") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, saved, "github.com/labelle-toolkit/labelle-fsm") != null);
     }
 };
 
