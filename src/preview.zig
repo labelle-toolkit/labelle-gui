@@ -101,7 +101,15 @@ pub const Bye = struct {
     reason: ?[]u8 = null,
 };
 
-pub const connecting_timeout_ms: i64 = 2_000;
+/// How long to wait for the spawned `labelle run` subprocess to
+/// dial back into the listener before declaring the preview
+/// `.crashed`. The CLI runs `zig build` first (cold builds can take
+/// 30-60+ seconds for a sokol+imgui game), so the timeout must cover
+/// the build phase + the game's own startup, not just the network
+/// connect. A proper fix would distinguish "build pending" (child
+/// alive, no connection yet) from "really crashed" (child exited)
+/// — see #134-follow-up. For now, generous flat budget.
+pub const connecting_timeout_ms: i64 = 60_000;
 
 /// Callback slot — fires on the first `frame_offer` JSON frame the
 /// engine sends after the `hello` handshake. The App wires this to
