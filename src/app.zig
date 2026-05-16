@@ -154,6 +154,17 @@ pub const App = struct {
     /// action. The Preview panel reads this via its `Module.is_open`
     /// pointer; clicking Run preview also force-opens it.
     show_preview: bool = false,
+    /// Scene name (no extension) the user picked from the Run-button
+    /// dropdown (#132). When non-null, passed as `--scene=<name>` to
+    /// `labelle run`. `null` falls back to `project.labelle`'s
+    /// `initial_scene` field — the pre-#132 behavior.
+    ///
+    /// Borrowed from the active project's arena (scene name strings
+    /// returned by `Project.scenesAvailable`). Reset to null on project
+    /// transition (`closeAllTabs` codepath in `renderFrame`) so a stale
+    /// pointer from the old project's arena can't leak into a fresh
+    /// `preview.start` call.
+    preview_scene_override: ?[]const u8 = null,
 
     /// Game View panel state (#107). Owns the SHM consumer + GL
     /// texture for the live game frames. Toggleable from the View
@@ -703,6 +714,11 @@ pub const App = struct {
                 self.rebuildAtlasIndex();
                 self.rebuildGizmoIndex();
                 self.rebuildPrefabIndex();
+                // The override borrowed a string from the previous
+                // project's arena, which is freed on the transition.
+                // Drop it so the next Run uses `initial_scene` until
+                // the user picks again (#132).
+                self.preview_scene_override = null;
             }
         } else {
             self.rebuildAtlasIndex();
@@ -905,7 +921,7 @@ pub const App = struct {
             self.setStatus("Error syncing project files!");
             return;
         };
-        self.preview.start(proj) catch |err| {
+        self.preview.start(proj, self.preview_scene_override) catch |err| {
             std.log.err("Error starting preview: {}", .{err});
             self.setStatus("Error starting preview!");
             return;

@@ -171,6 +171,35 @@ const binary_header_bytes: usize = 6;
 /// component's serialized payload approaches that ceiling.
 const inbox_cap: usize = 16 * 1024;
 
+/// Compose the argv used to spawn `labelle run` for a preview session.
+/// Extracted so the shape is regression-locked under unit test without
+/// going through `std.process.spawn` (#131 / #132). The returned slice
+/// references `argv_buf`, `scene_buf`, and the caller's `dir_path` +
+/// `addr_str` — all must outlive the returned slice. Returns
+/// `error.OutOfMemory` only if `scene` doesn't fit in `scene_buf`.
+pub fn buildSpawnArgv(
+    argv_buf: *[16][]const u8,
+    scene_buf: *[128]u8,
+    dir_path: []const u8,
+    scene: ?[]const u8,
+) error{OutOfMemory}![]const []const u8 {
+    // Per #130: the labelle CLI doesn't define `--preview-mode`;
+    // the host:port is propagated via `LABELLE_PREVIEW` env var
+    // instead. So argv stays `["labelle", "run", <dir>]` plus the
+    // optional `--scene=<name>` from #132.
+    argv_buf[0] = "labelle";
+    argv_buf[1] = "run";
+    argv_buf[2] = dir_path;
+    var n: usize = 3;
+    if (scene) |s| {
+        const flag = std.fmt.bufPrint(scene_buf, "--scene={s}", .{s}) catch
+            return error.OutOfMemory;
+        argv_buf[n] = flag;
+        n += 1;
+    }
+    return argv_buf[0..n];
+}
+
 pub const PreviewSession = struct {
     allocator: std.mem.Allocator,
     state: State,
@@ -298,10 +327,11 @@ pub const PreviewSession = struct {
     }
 
     /// Production entry: bind + spawn `labelle run <project_dir>`
-    /// with `LABELLE_PREVIEW=127.0.0.1:<port>` in the env.
-    /// Captures the subprocess' stderr to surface on `.crashed`
-    /// (currently the engine doesn't expose useful stderr — that's
-    /// #79 territory — but the scaffolding is back in place).
+    /// (plus an optional `--scene=<name>` flag) with
+    /// `LABELLE_PREVIEW=127.0.0.1:<port>` in the env. Captures the
+    /// subprocess' stderr to surface on `.crashed` (currently the
+    /// engine doesn't expose useful stderr — that's #79 territory —
+    /// but the scaffolding is back in place).
     ///
     /// The labelle CLI's `run` subcommand doesn't define a
     /// `--preview-mode` flag (verified `labelle --help` — only
@@ -311,7 +341,12 @@ pub const PreviewSession = struct {
     /// the env in the parent process before spawning makes the
     /// child + CLI subprocess + game subprocess all inherit it
     /// (POSIX fork+exec env propagation).
-    pub fn start(self: *Self, proj: *const project.Project) PreviewError!void {
+    ///
+    /// `scene` is the optional scene picker override (#132). When
+    /// non-null, `--scene=<name>` is appended to the argv. `null`
+    /// (the default) leaves scene selection to `project.labelle`'s
+    /// `initial_scene` field.
+    pub fn start(self: *Self, proj: *const project.Project, scene: ?[]const u8) PreviewError!void {
         const dir_path = proj.dir orelse return error.NoProjectPath;
 
         try self.bindListener();
@@ -322,18 +357,22 @@ pub const PreviewSession = struct {
             return error.OutOfMemory;
 
         // Push LABELLE_PREVIEW into the parent's env so the eventual
-        // game subprocess (spawned by the labelle CLI we're about
-        // to invoke) inherits it. `stop()` unsets it. Single
-        // preview session at a time so no race.
+        // game subprocess (spawned by the labelle CLI we're about to
+        // invoke) inherits it. `stop()` unsets it. Single preview
+        // session at a time so no race.
         _ = setenv("LABELLE_PREVIEW", addr_str.ptr, 1);
 
+        // `scene_buf` lives on this function's stack and is referenced
+        // by `argv` until `std.process.spawn` returns. Spawn reads
+        // argv during the syscall, so the stack lifetime is fine —
+        // same pattern `addr_buf` already uses for the listener
+        // address. 128 bytes is generous for a scene name (the
+        // project tree's `isScenePath` only ever surfaces names that
+        // fit in a file path).
+        var scene_buf: [128]u8 = undefined;
         var argv_buf: [16][]const u8 = undefined;
-        const argv = blk: {
-            argv_buf[0] = "labelle";
-            argv_buf[1] = "run";
-            argv_buf[2] = dir_path;
-            break :blk argv_buf[0..3];
-        };
+        const argv = buildSpawnArgv(&argv_buf, &scene_buf, dir_path, scene) catch
+            return error.OutOfMemory;
 
         const child = std.process.spawn(io_global.io(), .{
             .argv = argv,
