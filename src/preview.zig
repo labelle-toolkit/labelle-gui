@@ -43,6 +43,8 @@ extern "c" fn close(fd: c_int) c_int;
 extern "c" fn read(fd: c_int, buf: [*]u8, len: usize) isize;
 extern "c" fn __error() *c_int;
 extern "c" fn __errno_location() *c_int;
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 fn libcErrno() c_int {
     return if (builtin.os.tag == .macos) __error().* else __errno_location().*;
@@ -295,34 +297,42 @@ pub const PreviewSession = struct {
         self.started_ms = self.connect_start_ms;
     }
 
-    /// Production entry: bind + spawn `labelle run <project_dir>
-    /// --preview-mode 127.0.0.1:<port>`. Captures the subprocess'
-    /// stderr to surface on `.crashed` (currently the engine doesn't
-    /// expose useful stderr — that's #79 territory — but the
-    /// scaffolding is back in place).
+    /// Production entry: bind + spawn `labelle run <project_dir>`
+    /// with `LABELLE_PREVIEW=127.0.0.1:<port>` in the env.
+    /// Captures the subprocess' stderr to surface on `.crashed`
+    /// (currently the engine doesn't expose useful stderr — that's
+    /// #79 territory — but the scaffolding is back in place).
+    ///
+    /// The labelle CLI's `run` subcommand doesn't define a
+    /// `--preview-mode` flag (verified `labelle --help` — only
+    /// `--timeout`, `--scene`, `--platform`, `--optimize`,
+    /// `--docker`, `--target`, `-- <args>`). The assembler-generated
+    /// game's main reads `LABELLE_PREVIEW` env var instead. Setting
+    /// the env in the parent process before spawning makes the
+    /// child + CLI subprocess + game subprocess all inherit it
+    /// (POSIX fork+exec env propagation).
     pub fn start(self: *Self, proj: *const project.Project) PreviewError!void {
         const dir_path = proj.dir orelse return error.NoProjectPath;
 
         try self.bindListener();
         errdefer self.stop();
 
-        // The engine's `--preview-mode` flag expects `host:port`, not
-        // a bare port — `preview_mode.parseArgs` calls
-        // `lastIndexOfScalar(':')` to split the value. Missing the
-        // host prefix made the engine fail to parse and silently
-        // fall through to non-preview mode (#113 review).
         var addr_buf: [32]u8 = undefined;
-        const addr_str = std.fmt.bufPrint(&addr_buf, "127.0.0.1:{d}", .{self.port.?}) catch
+        const addr_str = std.fmt.bufPrintZ(&addr_buf, "127.0.0.1:{d}", .{self.port.?}) catch
             return error.OutOfMemory;
+
+        // Push LABELLE_PREVIEW into the parent's env so the eventual
+        // game subprocess (spawned by the labelle CLI we're about
+        // to invoke) inherits it. `stop()` unsets it. Single
+        // preview session at a time so no race.
+        _ = setenv("LABELLE_PREVIEW", addr_str.ptr, 1);
 
         var argv_buf: [16][]const u8 = undefined;
         const argv = blk: {
             argv_buf[0] = "labelle";
             argv_buf[1] = "run";
             argv_buf[2] = dir_path;
-            argv_buf[3] = "--preview-mode";
-            argv_buf[4] = addr_str;
-            break :blk argv_buf[0..5];
+            break :blk argv_buf[0..3];
         };
 
         const child = std.process.spawn(io_global.io(), .{
@@ -342,6 +352,9 @@ pub const PreviewSession = struct {
     /// Idempotent — safe to call from `.idle` or after a previous
     /// `.crashed`/`.stopped` landing.
     pub fn stop(self: *Self) void {
+        // Symmetric with `start()`'s setenv. Multiple stops are safe
+        // (unsetenv on an unset var is a no-op).
+        _ = unsetenv("LABELLE_PREVIEW");
         if (self.child) |*c| {
             c.kill(io_global.io());
             self.child = null;
