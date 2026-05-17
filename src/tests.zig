@@ -3538,6 +3538,195 @@ pub const PreviewTransportTests = struct {
     }
 };
 
+pub const PreviewLiveStderrTests = struct {
+    // Covers the #127 live-tail mechanism:
+    //  - `consumeStderr` returns newly-arrived bytes once and advances
+    //    the internal cursor so a second call returns an empty slice.
+    //  - The cursor resets on `bindListener` so a fresh Run doesn't
+    //    inherit a stale cursor.
+    //
+    // Driven directly against `stderr_buf` (an exported field on the
+    // session struct) so the test stays hermetic — no real subprocess
+    // is spawned. The end-to-end `drainChildStderr` path is exercised
+    // by the subprocess-exit test below and by `zig build smoke`.
+
+    test "consumeStderr yields fresh bytes once and advances the cursor" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        try sess.bindListener();
+
+        // Simulate two batches of stderr arriving from a hypothetical
+        // subprocess. `drainChildStderr` would do this for us in the
+        // production path; we inject directly to stay subprocess-free.
+        try sess.stderr_buf.appendSlice(std.testing.allocator, "compiling foo.zig\n");
+        const first = sess.consumeStderr();
+        try std.testing.expectEqualStrings(first, "compiling foo.zig\n");
+
+        // No new bytes arrived since the last consume — the next call
+        // returns an empty slice (panel renders nothing new this frame).
+        const empty = sess.consumeStderr();
+        try expect.equal(empty.len, @as(usize, 0));
+
+        // A second batch arrives. `consumeStderr` returns only the new
+        // bytes, not the original batch (cursor was advanced past it).
+        try sess.stderr_buf.appendSlice(std.testing.allocator, "compiling bar.zig\n");
+        const second = sess.consumeStderr();
+        try std.testing.expectEqualStrings(second, "compiling bar.zig\n");
+
+        // The full buffer is still accessible via `capturedStderr`
+        // (the crash-tail surface) so the on-crash panel still shows
+        // everything the subprocess wrote across the whole session.
+        try std.testing.expectEqualStrings(sess.capturedStderr(), "compiling foo.zig\ncompiling bar.zig\n");
+    }
+
+    test "bindListener resets the consumeStderr cursor and buffer" {
+        // Run #1 leaves a non-empty stderr_buf and a partially-consumed
+        // cursor. Run #2 (`bindListener`) must reset both — otherwise
+        // the panel would see stale bytes from the previous build.
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        try sess.bindListener();
+        try sess.stderr_buf.appendSlice(std.testing.allocator, "stale output\n");
+        _ = sess.consumeStderr();
+        try expect.equal(sess.stderr_cursor, @as(usize, "stale output\n".len));
+
+        // Land in `.stopped` (the legal restart-from state) before the
+        // fresh `bindListener` — same path the user takes when they
+        // press Stop and then Run again.
+        sess.stop();
+        try sess.bindListener();
+        try expect.equal(sess.stderr_buf.items.len, @as(usize, 0));
+        try expect.equal(sess.stderr_cursor, @as(usize, 0));
+        const fresh = sess.consumeStderr();
+        try expect.equal(fresh.len, @as(usize, 0));
+    }
+
+    // tryWaitChild integration: a real subprocess (`/usr/bin/false`)
+    // is spawned, it exits with code 1 immediately, and `poll` is
+    // expected to land the session in `.crashed` *before* the
+    // 60-second `connecting_timeout_ms` window — the whole point of
+    // the subprocess-exit early-crash detection (#127, #136).
+    //
+    // `/usr/bin/false` is part of the POSIX base on every machine
+    // this codebase is expected to run on (macOS, Linux, CI). No
+    // network or labelle-cli needed.
+    const Timespec = extern struct { sec: isize, nsec: isize };
+    extern "c" fn nanosleep(req: *const Timespec, rem: ?*Timespec) c_int;
+    fn sleepMs(ms: u64) void {
+        const ts: Timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * 1_000_000) };
+        _ = nanosleep(&ts, null);
+    }
+
+    test "stderr_buf rotates when over cap so live tail keeps surfacing recent bytes" {
+        // The non-rotating version of `drainChildStderr` froze at 16
+        // KiB — once full it stopped appending, hiding the build
+        // error that lands at the END of zig's output. The rotating
+        // version drops oldest bytes from the front and adjusts the
+        // consumeStderr cursor so the live-tail consumer keeps
+        // observing fresh data.
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+
+        // Fill exactly to the cap with 'A's, drain via consumeStderr
+        // so the cursor advances to the end, then push 1024 'B's
+        // past the cap.
+        const cap: usize = 16 * 1024;
+        var filler: [1024]u8 = undefined;
+        @memset(&filler, 'A');
+        var pushed: usize = 0;
+        while (pushed < cap) {
+            sess.appendStderrChunk(&filler);
+            pushed += filler.len;
+        }
+        try expect.equal(sess.stderr_buf.items.len, cap);
+        const drained_first = sess.consumeStderr();
+        try expect.equal(drained_first.len, cap);
+        try expect.equal(sess.stderr_cursor, cap);
+
+        // Push a B-block past the cap — front should drop and the
+        // cursor should slide back so subsequent reads see ONLY the
+        // freshly-arrived bytes (not stale A's).
+        var b_block: [1024]u8 = undefined;
+        @memset(&b_block, 'B');
+        sess.appendStderrChunk(&b_block);
+        try expect.equal(sess.stderr_buf.items.len, cap);
+        // Last 1024 bytes are B's, rest are still A's.
+        try expect.toBeTrue(sess.stderr_buf.items[cap - 1] == 'B');
+        try expect.toBeTrue(sess.stderr_buf.items[0] == 'A');
+        const drained_second = sess.consumeStderr();
+        // We dropped 1024 from the front and appended 1024 — cursor
+        // had been at `cap` (i.e. fully drained), shifted to
+        // `cap - 1024`, then `appendSlice` grew the buffer to `cap`
+        // again. So fresh = exactly the 1024 newest bytes.
+        try expect.equal(drained_second.len, @as(usize, 1024));
+        try expect.toBeTrue(drained_second[0] == 'B');
+        try expect.toBeTrue(drained_second[drained_second.len - 1] == 'B');
+    }
+
+    test "a single oversized chunk keeps only the tail of the chunk" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        const cap: usize = 16 * 1024;
+        const chunk = std.testing.allocator.alloc(u8, cap + 4096) catch unreachable;
+        defer std.testing.allocator.free(chunk);
+        @memset(chunk[0..4096], 'A');
+        @memset(chunk[4096..], 'B');
+        sess.appendStderrChunk(chunk);
+        // The leading 'A's should be entirely dropped — only the
+        // tail 16 KiB of 'B's survives.
+        try expect.equal(sess.stderr_buf.items.len, cap);
+        try expect.toBeTrue(sess.stderr_buf.items[0] == 'B');
+        try expect.toBeTrue(sess.stderr_buf.items[cap - 1] == 'B');
+        try expect.equal(sess.stderr_cursor, @as(usize, 0));
+    }
+
+    test "subprocess-exit early detection transitions .listening → .crashed before the 60s timeout" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        try sess.bindListener();
+        try expect.equal(sess.state, preview.State.listening);
+
+        // Spawn a child that exits immediately with a non-zero code.
+        // The `/usr/bin/false` binary is present on macOS, Linux,
+        // and the CI image. Stderr piped so `drainChildStderr` has a
+        // valid fd to poll (the production path always pipes stderr).
+        const argv = &[_][]const u8{"/usr/bin/false"};
+        const child = std.process.spawn(io_global.io(), .{
+            .argv = argv,
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .pipe,
+        }) catch |err| {
+            // If we're on an exotic platform without /usr/bin/false,
+            // skip rather than fail — the production preview path
+            // depends on `labelle` being on PATH anyway, which is
+            // a stricter environmental assumption.
+            std.debug.print("skip: /usr/bin/false unavailable ({s})\n", .{@errorName(err)});
+            return error.SkipZigTest;
+        };
+        sess.child = child;
+
+        // Wait for the child to exit and `poll` to observe it via
+        // `waitpid(WNOHANG)`. 2 s is generous — `/usr/bin/false`
+        // exits in microseconds, and the cap is intentionally far
+        // below the 60 s `connecting_timeout_ms` backstop so the
+        // assertion proves the early-detection path (not the fallback).
+        var slept: u64 = 0;
+        while (slept < 2000) {
+            sess.poll();
+            if (sess.state == .crashed) break;
+            sleepMs(5);
+            slept += 5;
+        }
+        try expect.equal(sess.state, preview.State.crashed);
+        // The reason should reflect the exit code, not the timeout
+        // message ("engine never connected") — that's how we know
+        // the early-detection branch fired.
+        const reason = sess.bye_reason orelse "";
+        try expect.toBeTrue(std.mem.indexOf(u8, reason, "labelle exited") != null);
+    }
+};
+
 pub const IOSurfaceLayoutTests = struct {
     // The iosurface.ControlBlock layout has to match what the engine's
     // (future) iosurface producer writes into shm slot 0. Layout
