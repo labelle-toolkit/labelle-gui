@@ -989,14 +989,42 @@ pub const PreviewSession = struct {
         while (true) {
             const n = read(fd, @ptrCast(&buf[0]), buf.len);
             if (n <= 0) return;
-            // Cap to keep the buffer from runaway-growing if the
-            // subprocess spams stderr.
-            const stderr_cap: usize = 16 * 1024;
-            if (self.stderr_buf.items.len >= stderr_cap) return;
-            const room = stderr_cap - self.stderr_buf.items.len;
-            const take = @min(@as(usize, @intCast(n)), room);
-            self.stderr_buf.appendSlice(self.allocator, buf[0..take]) catch return;
+            self.appendStderrChunk(buf[0..@intCast(n)]);
         }
+    }
+
+    /// Append `chunk` to `stderr_buf`, rotating from the front when the
+    /// resulting size would exceed `stderr_cap`. Compile errors land
+    /// at the END of stderr — a non-rotating buffer would freeze the
+    /// live tail on the first 16 KiB of zig output and hide the actual
+    /// failure. `stderr_cursor` is shifted by the dropped amount so
+    /// `consumeStderr` keeps emitting only NEW bytes after a rotation
+    /// (or returns nothing extra if the consumer was entirely inside
+    /// the dropped prefix). `pub` so the tests can drive it without
+    /// a real subprocess.
+    pub fn appendStderrChunk(self: *Self, chunk: []const u8) void {
+        const stderr_cap: usize = 16 * 1024;
+        if (chunk.len == 0) return;
+        if (chunk.len >= stderr_cap) {
+            self.stderr_buf.clearRetainingCapacity();
+            const tail_off = chunk.len - stderr_cap;
+            self.stderr_buf.appendSlice(self.allocator, chunk[tail_off..]) catch return;
+            self.stderr_cursor = 0;
+            return;
+        }
+        if (self.stderr_buf.items.len + chunk.len > stderr_cap) {
+            const overflow = self.stderr_buf.items.len + chunk.len - stderr_cap;
+            const drop = @min(overflow, self.stderr_buf.items.len);
+            const remaining = self.stderr_buf.items.len - drop;
+            std.mem.copyForwards(
+                u8,
+                self.stderr_buf.items[0..remaining],
+                self.stderr_buf.items[drop..],
+            );
+            self.stderr_buf.shrinkRetainingCapacity(remaining);
+            self.stderr_cursor = if (self.stderr_cursor > drop) self.stderr_cursor - drop else 0;
+        }
+        self.stderr_buf.appendSlice(self.allocator, chunk) catch return;
     }
 
     fn markCrashed(self: *Self, reason: []const u8) void {

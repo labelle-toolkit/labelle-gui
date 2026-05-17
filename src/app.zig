@@ -152,13 +152,6 @@ pub const App = struct {
     /// discarded from the front when the cap is hit. Reset on every
     /// fresh `startPreview`.
     preview_tail: std.ArrayList(u8) = .empty,
-    /// Tracks whether the *user* manually closed the Compiler Output
-    /// panel during the current preview session. We force-open the
-    /// panel on each `startPreview` (so the user sees the build
-    /// output without a menu click), but if they close it via the
-    /// title-bar ×, we don't keep fighting them by re-opening it on
-    /// every frame. Reset on each fresh Run.
-    preview_force_opened: bool = false,
 
     show_project_settings: bool = false,
     project_settings: project_settings_mod.ProjectSettings = .{},
@@ -957,12 +950,10 @@ pub const App = struct {
         self.show_preview = true;
         // Force-open the Compiler Output panel so the user sees the
         // subprocess's stderr live during the (potentially 30-60s)
-        // cold `zig build` phase. Manual close via the panel × flips
-        // `show_compiler_output` back to false and stays that way for
-        // the rest of the session — `preview_force_opened` is the
-        // one-shot latch (#127).
+        // cold `zig build` phase. Manual close via the panel × keeps
+        // it closed for the rest of this Run; the next `startPreview`
+        // call re-opens it on the next Run (#127).
         self.show_compiler_output = true;
-        self.preview_force_opened = true;
         self.compiler_output_scroll_to_bottom = true;
     }
 

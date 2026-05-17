@@ -3617,6 +3617,69 @@ pub const PreviewLiveStderrTests = struct {
         _ = nanosleep(&ts, null);
     }
 
+    test "stderr_buf rotates when over cap so live tail keeps surfacing recent bytes" {
+        // The non-rotating version of `drainChildStderr` froze at 16
+        // KiB — once full it stopped appending, hiding the build
+        // error that lands at the END of zig's output. The rotating
+        // version drops oldest bytes from the front and adjusts the
+        // consumeStderr cursor so the live-tail consumer keeps
+        // observing fresh data.
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+
+        // Fill exactly to the cap with 'A's, drain via consumeStderr
+        // so the cursor advances to the end, then push 1024 'B's
+        // past the cap.
+        const cap: usize = 16 * 1024;
+        var filler: [1024]u8 = undefined;
+        @memset(&filler, 'A');
+        var pushed: usize = 0;
+        while (pushed < cap) {
+            sess.appendStderrChunk(&filler);
+            pushed += filler.len;
+        }
+        try expect.equal(sess.stderr_buf.items.len, cap);
+        const drained_first = sess.consumeStderr();
+        try expect.equal(drained_first.len, cap);
+        try expect.equal(sess.stderr_cursor, cap);
+
+        // Push a B-block past the cap — front should drop and the
+        // cursor should slide back so subsequent reads see ONLY the
+        // freshly-arrived bytes (not stale A's).
+        var b_block: [1024]u8 = undefined;
+        @memset(&b_block, 'B');
+        sess.appendStderrChunk(&b_block);
+        try expect.equal(sess.stderr_buf.items.len, cap);
+        // Last 1024 bytes are B's, rest are still A's.
+        try expect.toBeTrue(sess.stderr_buf.items[cap - 1] == 'B');
+        try expect.toBeTrue(sess.stderr_buf.items[0] == 'A');
+        const drained_second = sess.consumeStderr();
+        // We dropped 1024 from the front and appended 1024 — cursor
+        // had been at `cap` (i.e. fully drained), shifted to
+        // `cap - 1024`, then `appendSlice` grew the buffer to `cap`
+        // again. So fresh = exactly the 1024 newest bytes.
+        try expect.equal(drained_second.len, @as(usize, 1024));
+        try expect.toBeTrue(drained_second[0] == 'B');
+        try expect.toBeTrue(drained_second[drained_second.len - 1] == 'B');
+    }
+
+    test "a single oversized chunk keeps only the tail of the chunk" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        const cap: usize = 16 * 1024;
+        const chunk = std.testing.allocator.alloc(u8, cap + 4096) catch unreachable;
+        defer std.testing.allocator.free(chunk);
+        @memset(chunk[0..4096], 'A');
+        @memset(chunk[4096..], 'B');
+        sess.appendStderrChunk(chunk);
+        // The leading 'A's should be entirely dropped — only the
+        // tail 16 KiB of 'B's survives.
+        try expect.equal(sess.stderr_buf.items.len, cap);
+        try expect.toBeTrue(sess.stderr_buf.items[0] == 'B');
+        try expect.toBeTrue(sess.stderr_buf.items[cap - 1] == 'B');
+        try expect.equal(sess.stderr_cursor, @as(usize, 0));
+    }
+
     test "subprocess-exit early detection transitions .listening → .crashed before the 60s timeout" {
         var sess = preview.PreviewSession.init(std.testing.allocator);
         defer sess.deinit();
