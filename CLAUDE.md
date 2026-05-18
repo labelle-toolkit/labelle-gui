@@ -137,13 +137,12 @@ When zgui is built with `with_te = true`:
 - `zgui.init(allocator)` **already calls `zgui.te.init()`** (gui.zig:60). A second explicit `te.init()` double-registers the `TestEnginePerfTool` settings handler and trips an imgui assertion. Just use `zgui.te.getTestEngine()` to retrieve the engine zgui created.
 - `engine.queueTests(.tests, "", .{})` matches nothing — the empty string filter falls through to "include nothing". Use the literal `"all"` to match every registered test (`imgui_test_engine/imgui_te_engine.cpp:1382`).
 
-## Dep pinning notes
+## Toolchain & dep pinning notes
 
-`build.zig.zon` pins the three zig-gamedev deps (`zgui`, `zglfw`, `zopengl`) to specific pre-Zig-0.16 commits. Upstream main moved to Zig 0.16 in early 2026; this project targets 0.15.2 (toolkit-wide). If you bump these, verify against:
+This project targets **Zig 0.16.0** (`build.zig.zon` `minimum_zig_version`, mirrored by `.github/workflows/ci.yml`). Almost every other repo in the toolkit is on 0.16.0 too; `flying-platform-labelle` is the lone holdout still on 0.15.2 — when building the example project locally, switch toolchains.
 
-- `zopengl` must not use `@Enum` (added when upstream switched to 0.16).
+`build.zig.zon` pins the three zig-gamedev deps (`zgui`, `zglfw`, `zopengl`) to specific commits compatible with 0.16. If you bump these:
+
 - `zglfw` 5-arg `createWindow` signature is what `main.zig:67` expects.
-- `zgui` must predate the `0.16.x` branch merge. The current pin
-  (`b6a4dff52`, 2026-03-05) includes upstream PR #88, which fixes the
-  128-byte `g_ContextMap` leak warning that older pins logged at
-  shutdown. If bumping zgui further, verify on 0.15.2 first.
+- `zgui` must keep `with_te = true` available — `gui_tests.zig` depends on the ImGui Test Engine binding.
+- Verify against the current Zig version (`zig version`) before merging — upstream main moves fast and may break against 0.16 once 0.17 lands.
