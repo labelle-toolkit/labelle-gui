@@ -47,17 +47,33 @@ fn render(
     atlas_index: ?*const atlas.Index,
 ) void {
     const sprite = entity.sprite.?;
-    if (zgui.inputText("sprite_name", .{ .buf = &sprite.sprite_name })) is_dirty.* = true;
-    // Resolve the typed sprite name against the project's atlas
-    // index; surface a soft `(missing)` hint when it doesn't match
-    // anything. Doesn't block edits — the engine ultimately decides
-    // what's valid; we just guide.
-    if (atlas_index) |idx| {
-        const name_str = std.mem.sliceTo(&sprite.sprite_name, 0);
-        if (name_str.len > 0 and idx.find(name_str) == null) {
-            zgui.sameLine(.{});
-            zgui.textColored(.{ 1.0, 0.5, 0.4, 1.0 }, "(missing)", .{});
-        }
+    // Hoist the atlas lookup: we need it both for sizing (the
+    // `(missing)` hint takes extra room on the same line) and the
+    // conditional render below. Doesn't block edits — the engine
+    // ultimately decides what's valid; we just guide.
+    const is_missing = blk: {
+        const idx = atlas_index orelse break :blk false;
+        const name = std.mem.sliceTo(&sprite.sprite_name, 0);
+        break :blk name.len > 0 and idx.find(name) == null;
+    };
+    // Reserve actual rendered width — a hardcoded constant breaks on
+    // HiDPI where the font is bigger. inputText puts its label after
+    // the widget with `item_inner_spacing`; an optional sameLine adds
+    // one `item_spacing` before `(missing)`.
+    const sprite_name_label = "sprite_name";
+    const style = zgui.getStyle();
+    const label_w = zgui.calcTextSize(sprite_name_label, .{})[0];
+    const trailing: f32 = if (is_missing)
+        style.item_inner_spacing[0] + label_w + style.item_spacing[0] + zgui.calcTextSize("(missing)", .{})[0]
+    else
+        style.item_inner_spacing[0] + label_w;
+    // 4px breathing room from the panel's right edge so the label
+    // doesn't kiss the border.
+    zgui.setNextItemWidth(@max(60, zgui.getContentRegionAvail()[0] - trailing - 4));
+    if (zgui.inputText(sprite_name_label, .{ .buf = &sprite.sprite_name })) is_dirty.* = true;
+    if (is_missing) {
+        zgui.sameLine(.{});
+        zgui.textColored(.{ 1.0, 0.5, 0.4, 1.0 }, "(missing)", .{});
     }
     // Pivot is a closed enum on the engine side — let the user pick
     // from the 9 valid names rather than free-type. Order matches
@@ -84,6 +100,9 @@ fn render(
     if (zgui.checkbox("z_index?", .{ .v = &sprite.has_z_index })) is_dirty.* = true;
     if (sprite.has_z_index) {
         zgui.sameLine(.{});
+        // Clamp the inputInt to the line's remaining width so its step
+        // buttons stay inside the panel.
+        zgui.setNextItemWidth(zgui.getContentRegionAvail()[0]);
         if (zgui.inputInt("##z_index", .{ .v = &sprite.z_index })) is_dirty.* = true;
     }
 }
