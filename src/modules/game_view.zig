@@ -118,7 +118,40 @@ fn renderViewportContent(app: *App) void {
         .tex_data = null,
         .tex_id = @enumFromInt(@as(u64, app.game_view.tex_id)),
     };
+    // Capture the image's screen-rect *before* drawing so we can map
+    // mouse coords back into IOSurface space for the input-uplink
+    // (labelle-assembler#143). `getCursorScreenPos` returns the
+    // top-left of the next widget — that's the image origin.
+    const img_screen_pos = zgui.getCursorScreenPos();
     zgui.image(tex_ref, .{ .w = draw_w, .h = draw_h });
+
+    // ── Mouse → game input uplink (#143) ──
+    // Only fire while the image is hovered. Convert screen → image
+    // → IOSurface coords (scale by tex / draw ratio). Without a clip
+    // check, clicks anywhere on the panel would bleed into the game.
+    if (zgui.isItemHovered(.{})) {
+        const mp = zgui.getMousePos();
+        const dx_img = mp[0] - img_screen_pos[0];
+        const dy_img = mp[1] - img_screen_pos[1];
+        const scale_x = src_w / draw_w;
+        const scale_y = src_h / draw_h;
+        const sx: f32 = dx_img * scale_x;
+        const sy: f32 = dy_img * scale_y;
+        app.preview.sendMousePos(sx, sy);
+
+        // ImGui mouse buttons: 0 = left, 1 = right, 2 = middle.
+        // `isMouseClicked`/`isMouseReleased` fire on the exact frame
+        // of the transition, so each user press maps to one
+        // `mouse_button down=true` followed by `down=false`.
+        inline for (.{
+            .{ .btn = zgui.MouseButton.left, .idx = @as(i32, 0) },
+            .{ .btn = zgui.MouseButton.right, .idx = @as(i32, 1) },
+            .{ .btn = zgui.MouseButton.middle, .idx = @as(i32, 2) },
+        }) |entry| {
+            if (zgui.isMouseClicked(entry.btn)) app.preview.sendMouseButton(entry.idx, true);
+            if (zgui.isMouseReleased(entry.btn)) app.preview.sendMouseButton(entry.idx, false);
+        }
+    }
 }
 
 fn renderStats(app: *App) void {
