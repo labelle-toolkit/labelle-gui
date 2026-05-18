@@ -60,14 +60,17 @@ fn render(
     // HiDPI where the font is bigger. inputText puts its label after
     // the widget with `item_inner_spacing`; an optional sameLine adds
     // one `item_spacing` before `(missing)`.
+    const sprite_name_label = "sprite_name";
     const style = zgui.getStyle();
-    const label_w = zgui.calcTextSize("sprite_name", .{})[0];
+    const label_w = zgui.calcTextSize(sprite_name_label, .{})[0];
     const trailing: f32 = if (is_missing)
         style.item_inner_spacing[0] + label_w + style.item_spacing[0] + zgui.calcTextSize("(missing)", .{})[0]
     else
         style.item_inner_spacing[0] + label_w;
+    // 4px breathing room from the panel's right edge so the label
+    // doesn't kiss the border.
     zgui.setNextItemWidth(@max(60, zgui.getContentRegionAvail()[0] - trailing - 4));
-    if (zgui.inputText("sprite_name", .{ .buf = &sprite.sprite_name })) is_dirty.* = true;
+    if (zgui.inputText(sprite_name_label, .{ .buf = &sprite.sprite_name })) is_dirty.* = true;
     if (is_missing) {
         zgui.sameLine(.{});
         zgui.textColored(.{ 1.0, 0.5, 0.4, 1.0 }, "(missing)", .{});
