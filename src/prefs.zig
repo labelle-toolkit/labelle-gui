@@ -35,11 +35,29 @@ pub const max_font_scale: f32 = 3.0;
 /// monitors.
 pub const default_font_scale: f32 = 1.5;
 
+/// Bounds for the editor inspector-column width. The lower bound keeps
+/// the inspector usable (input fields stay readable); the upper bound
+/// stops a malformed file from hiding the viewport entirely. Per-tab
+/// clamping in the splitter handler also enforces a viewport-side
+/// minimum so the two never fight.
+pub const min_inspector_width: f32 = 200;
+pub const max_inspector_width: f32 = 800;
+/// Default applied on first launch and to fresh tabs when no
+/// user-chosen width has been saved yet. Matches the previous
+/// hardcoded value so the visual remains unchanged on first open.
+pub const default_inspector_width: f32 = 300;
+
 pub const Preferences = struct {
     /// Multiplier applied on top of the DPI-derived font size at
     /// startup. Larger values produce bigger text. The ImGui atlas is
     /// sized at startup so a change requires a restart to take effect.
     font_scale: f32 = default_font_scale,
+    /// Width in pixels of the inspector column in the scene / prefab
+    /// editor tabs. Updated when the user drags the splitter; new
+    /// tabs read this on open so the chosen width persists across
+    /// editor restarts (#140). Each open tab keeps its own copy so
+    /// in-session drags don't reflow other tabs.
+    inspector_width: f32 = default_inspector_width,
 };
 
 /// Replacement for `std.fs.getAppDataDir` which was removed in 0.16.
@@ -129,6 +147,7 @@ pub fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) Preferences 
 
     return .{
         .font_scale = std.math.clamp(parsed.font_scale, min_font_scale, max_font_scale),
+        .inspector_width = std.math.clamp(parsed.inspector_width, min_inspector_width, max_inspector_width),
     };
 }
 
@@ -160,18 +179,20 @@ pub fn save(allocator: std.mem.Allocator, prefs: Preferences) !void {
 pub fn saveToPath(allocator: std.mem.Allocator, path: []const u8, prefs: Preferences) !void {
     const clamped: Preferences = .{
         .font_scale = std.math.clamp(prefs.font_scale, min_font_scale, max_font_scale),
+        .inspector_width = std.math.clamp(prefs.inspector_width, min_inspector_width, max_inspector_width),
     };
 
     // Hand-rolled emission keeps the file readable and avoids pulling in
-    // `std.zon.stringify`'s broader formatting choices. We only have one
-    // field and the format is dirt-simple.
+    // `std.zon.stringify`'s broader formatting choices. Tiny fixed
+    // schema; grows by hand if a new field lands.
     var buf: [256]u8 = undefined;
     const body = try std.fmt.bufPrint(&buf,
         \\.{{
         \\    .font_scale = {d},
+        \\    .inspector_width = {d},
         \\}}
         \\
-    , .{clamped.font_scale});
+    , .{ clamped.font_scale, clamped.inspector_width });
 
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
     defer allocator.free(tmp_path);

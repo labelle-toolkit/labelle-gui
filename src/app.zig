@@ -546,6 +546,10 @@ pub const App = struct {
 
         var state = try scene_mod.SceneState.open(self.allocator, path);
         errdefer state.deinit(self.allocator);
+        // Seed inspector width from prefs so the user's preferred
+        // split carries across sessions (#140). In-tab drags update
+        // both this field and prefs.
+        state.inspector_width = self.prefs.inspector_width;
         try self.open_tabs.append(self.allocator, .{ .scene = state });
         const new_idx = self.open_tabs.items.len - 1;
         self.active_tab_idx = new_idx;
@@ -562,6 +566,7 @@ pub const App = struct {
 
         var state = try prefab_mod.PrefabState.open(self.allocator, path);
         errdefer state.deinit(self.allocator);
+        state.inspector_width = self.prefs.inspector_width;
         try self.open_tabs.append(self.allocator, .{ .prefab = state });
         const new_idx = self.open_tabs.items.len - 1;
         self.active_tab_idx = new_idx;
