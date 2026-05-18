@@ -77,6 +77,10 @@ fn render(app: *App) void {
             .failed => zgui.textColored(.{ 1.0, 0.0, 0.0, 1.0 }, "Failed", .{}),
         }
     }
+    zgui.sameLine(.{});
+    if (zgui.smallButton("Copy")) {
+        copyOutputToClipboard(app);
+    }
     zgui.separator();
 
     // Tail any stderr bytes that arrived since the last frame into the
@@ -125,4 +129,18 @@ fn render(app: *App) void {
         }
     }
     zgui.endChild();
+}
+
+fn copyOutputToClipboard(app: *App) void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(app.allocator);
+
+    buf.appendSlice(app.allocator, app.preview_tail.items) catch return;
+    if (app.compiler.last_result) |result| {
+        if (result.errors.len > 0) buf.appendSlice(app.allocator, result.errors) catch return;
+        if (result.output.len > 0) buf.appendSlice(app.allocator, result.output) catch return;
+    }
+    buf.append(app.allocator, 0) catch return;
+    const zterm = buf.items[0 .. buf.items.len - 1 :0];
+    zgui.setClipboardText(zterm);
 }
