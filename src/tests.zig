@@ -21,6 +21,7 @@ const prefab_contents = @import("modules/inspector/prefab_contents.zig");
 const io_global = @import("io_global.zig");
 const game_view = @import("game_view.zig");
 const test_fixtures = @import("test_fixtures.zig");
+const splitter = @import("modules/splitter.zig");
 
 /// Wall-clock seconds since the Unix epoch; replacement for the
 /// `std.time.timestamp` helper removed in Zig 0.16. Used only to
@@ -4126,5 +4127,54 @@ pub const GameViewLatencyTests = struct {
         // Slots [1..120) are zero-initialized; only slot 0 counts.
         gv.latency_count = 1;
         try expect.equal(gv.meanLatencyNs(), @as(u64, 5_000_000));
+    }
+};
+
+pub const SplitterClampTests = struct {
+    // The splitter's clamp math is pure (no imgui draw context),
+    // so we exercise it directly. Three bounds cooperate — static
+    // ceiling (`prefs.max_inspector_width`), dynamic ceiling derived
+    // from window width, static floor (`prefs.min_inspector_width`).
+    // Each test pins one bound in the driver's seat. Spacing of 8
+    // matches ImGui's default `item_spacing.x` so the dynamic_upper
+    // computation in `clampInspectorWidth` matches real frames.
+    const default_gap: f32 = 8;
+
+    test "typical case passes through unchanged" {
+        // Plenty of room on a 1600px row → requested 400 is well within
+        // both static and dynamic ceilings. Returned verbatim.
+        const result = splitter.clampInspectorWidth(400, 1600, default_gap);
+        try expect.equal(result, @as(f32, 400));
+    }
+
+    test "shrunk window: dynamic ceiling clamps before the static max" {
+        // 600px row, requested 700. The dynamic ceiling is
+        // 600 - min_viewport_width(120) - handle_w(6) - 2*8 = 458.
+        // 700 → clamped to 458, well below the static 800 ceiling.
+        const result = splitter.clampInspectorWidth(700, 600, default_gap);
+        try expect.equal(result, @as(f32, 458));
+    }
+
+    test "huge window: static max_inspector_width wins" {
+        // 4000px row, requested 1500. Dynamic ceiling allows ~3858,
+        // but the static max (800) wins as the tighter cap.
+        const result = splitter.clampInspectorWidth(1500, 4000, default_gap);
+        try expect.equal(result, @as(f32, prefs.max_inspector_width));
+    }
+
+    test "below minimum clamps to the floor" {
+        // Requested 50 (way under the floor). Returned 200, the static
+        // minimum, regardless of how much room the row has.
+        const result = splitter.clampInspectorWidth(50, 1600, default_gap);
+        try expect.equal(result, @as(f32, prefs.min_inspector_width));
+    }
+
+    test "extremely narrow window keeps floor stable" {
+        // 100px row — narrower than `min_viewport_width + handle_w`.
+        // Dynamic ceiling would go negative; the @max-with-floor in
+        // `clampInspectorWidth` keeps the bound at min_inspector_width
+        // so the clamp range stays consistent. Result: the floor.
+        const result = splitter.clampInspectorWidth(500, 100, default_gap);
+        try expect.equal(result, @as(f32, prefs.min_inspector_width));
     }
 };

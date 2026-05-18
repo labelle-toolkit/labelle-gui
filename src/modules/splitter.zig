@@ -12,7 +12,7 @@
 //!     beginChild "##viewport_col"  width = viewport_w
 //!     endChild
 //!     sameLine()
-//!     splitter.render(&state.inspector_width, &app.prefs.inspector_width, app)   ← here
+//!     splitter.render(&state.inspector_width, total_w, app)   ← here
 //!     sameLine()
 //!     beginChild "##inspector_col" width = state.inspector_width
 //!     endChild
@@ -25,6 +25,9 @@
 //!    caller's existing `@max(min_viewport_width, total_w - inspector_w - gap)`
 //!    formula — if the window shrinks below the sum, the inspector
 //!    visually loses pixels rather than the viewport disappearing.
+//!
+//! The clamp math itself lives in `clampInspectorWidth` so it's
+//! testable without an imgui draw context (see `tests.zig`).
 
 const std = @import("std");
 const zgui = @import("zgui");
@@ -43,6 +46,41 @@ pub const handle_w: f32 = 6;
 /// it here to decide how much the user can shrink the inspector
 /// without squashing the viewport beyond reason.
 pub const min_viewport_width: f32 = 120;
+
+/// Clamp a requested inspector width to the bounds the splitter
+/// enforces every frame. Pulled out of `render` so the clamp math
+/// can be unit-tested without an imgui draw context (see
+/// `SplitterClampTests` in `tests.zig`).
+///
+/// The clamp is bounded by three numbers:
+///
+///   - `prefs_mod.min_inspector_width` — hard floor; the inspector
+///     never gets thinner than this so its widgets stay usable.
+///   - `prefs_mod.max_inspector_width` — hard static ceiling so a
+///     hand-edited prefs file with a wild value can't fill the
+///     screen with inspector chrome.
+///   - `available_w - min_viewport_width - handle_w - 2*sameline_gap`
+///     — dynamic ceiling that adapts to the current window width.
+///     When the editor shrinks, this reins the inspector back in on
+///     the same frame.
+///
+/// The dynamic ceiling AND the static ceiling are combined via
+/// `@min`, so whichever is tighter wins. The floor is enforced by
+/// `@max` against the dynamic upper so we never produce a value
+/// below the minimum even when the window is very small.
+pub fn clampInspectorWidth(value: f32, available_w: f32, sameline_gap: f32) f32 {
+    const dynamic_upper = available_w - min_viewport_width - handle_w - 2 * sameline_gap;
+    // `@max` against the floor keeps the upper bound from collapsing
+    // below the minimum when the window has no room for an inspector
+    // at all — better to render a tiny inspector and let the viewport
+    // get squashed than to flip the clamp range upside-down.
+    const upper = @max(prefs_mod.min_inspector_width, dynamic_upper);
+    return std.math.clamp(
+        value,
+        prefs_mod.min_inspector_width,
+        @min(prefs_mod.max_inspector_width, upper),
+    );
+}
 
 /// Render the splitter handle and apply drag deltas to
 /// `inspector_width.*`. On mouse-release after a drag, syncs the
@@ -98,41 +136,27 @@ pub fn render(inspector_width: *f32, available_w: f32, app: *App) void {
         });
     }
 
+    // Single source of truth for the clamp bounds this frame. Drag
+    // handler and reactive resize handler both read from this — if
+    // the math changes, both paths see the change at once (gemini /
+    // PR review #142 catch).
+    const sameline_gap = zgui.getStyle().item_spacing[0];
+
     // Drag handling: accumulate the per-frame X delta into the
     // stored width. `getMouseDragDelta` returns *cumulative* delta
     // since the press, so we reset after each consumption to avoid
-    // double-applying.
-    //
-    // Upper clamp is dynamic: never let the inspector grow past what
-    // the current row can fit while still leaving `min_viewport_width`
-    // for the other column. This keeps the splitter from dragging the
-    // inspector "out of the window" when the user shrinks the editor.
+    // double-applying. Inspector lives on the right of the splitter —
+    // a leftward drag (negative dx) widens it; rightward narrows it.
     if (active and zgui.isMouseDragging(.left, 0)) {
         const d = zgui.getMouseDragDelta(.left, .{});
-        // Inspector lives on the right of the splitter — a leftward
-        // drag (negative dx) widens it; rightward narrows it.
-        const sameline_gap = zgui.getStyle().item_spacing[0];
-        const upper = @max(prefs_mod.min_inspector_width, available_w - min_viewport_width - handle_w - 2 * sameline_gap);
-        inspector_width.* = std.math.clamp(
-            inspector_width.* - d[0],
-            prefs_mod.min_inspector_width,
-            @min(prefs_mod.max_inspector_width, upper),
-        );
+        inspector_width.* = clampInspectorWidth(inspector_width.* - d[0], available_w, sameline_gap);
         zgui.resetMouseDragDelta(.left);
     }
 
-    // Also re-clamp every frame so a window-shrink event correctly
-    // reins in an inspector that's now too wide for the row. Without
-    // this, the inspector would only update on the next drag.
-    {
-        const sameline_gap = zgui.getStyle().item_spacing[0];
-        const upper = @max(prefs_mod.min_inspector_width, available_w - min_viewport_width - handle_w - 2 * sameline_gap);
-        inspector_width.* = std.math.clamp(
-            inspector_width.*,
-            prefs_mod.min_inspector_width,
-            @min(prefs_mod.max_inspector_width, upper),
-        );
-    }
+    // Re-clamp every frame so a window-shrink event correctly reins
+    // in an inspector that's now too wide for the row. Without this,
+    // the inspector would only update on the next drag.
+    inspector_width.* = clampInspectorWidth(inspector_width.*, available_w, sameline_gap);
 
     // Persist on release. We compare against the prefs value so a
     // hover-without-drag doesn't churn the file. The drag-released
