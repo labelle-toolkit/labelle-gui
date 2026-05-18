@@ -118,6 +118,12 @@ pub fn render(s: *PrefabState, app: *App) void {
     const gizmo_index_ptr: ?*const @import("../gizmos.zig").Index = if (app.gizmo_index) |*ix| ix else null;
     const prefab_index_ptr: ?*const @import("../prefab_index.zig").Index = if (app.prefab_index) |*ix| ix else null;
 
+    // One-shot sink for a component drag-drop landing on the canvas
+    // (#143). Read after viewport.render returns; materialises a new
+    // child at the prefab body's origin carrying the matching
+    // prefab's body Sprite (visual) and the component name as an
+    // unmodeled extra (engine data).
+    var component_drop: ?viewport.ComponentDrop = null;
     if (zgui.beginChild("##prefab_viewport_col", .{ .w = viewport_w, .h = 0 })) {
         viewport.render(
             .{
@@ -127,6 +133,7 @@ pub fn render(s: *PrefabState, app: *App) void {
                 .is_dirty = &s.is_dirty,
                 .drag_armed = &s.drag_armed,
                 .drag_start_world = &s.drag_start_world,
+                .component_drop = &component_drop,
                 .grid_step = s.grid_step,
                 .snap_enabled = s.snap_enabled,
             },
@@ -139,6 +146,29 @@ pub fn render(s: *PrefabState, app: *App) void {
         );
     }
     zgui.endChild();
+    if (component_drop) |drop| {
+        // Component drops land at the prefab origin (0, 0) regardless
+        // of where the cursor was on screen — gives the user a
+        // predictable spawn point and a discoverable result. They
+        // re-position the new child via the inspector.
+        const a = s.loaded.arena.allocator();
+        const sprite_ptr: ?*scene_io.Sprite =
+            scene_io.copySpriteFromMatchingPrefab(a, drop.name(), prefab_index_ptr);
+        scene_io.insertChild(&s.loaded, .{
+            .position = .{ .x = 0, .y = 0 },
+            .sprite = sprite_ptr,
+        }) catch |err| {
+            std.log.err("insertChild failed during component drop: {s}", .{@errorName(err)});
+            app.setStatus("Component drop failed");
+            return;
+        };
+        const new_idx = s.loaded.children.len - 1;
+        appendChildExtra(s, new_idx, drop.name()) catch |err| {
+            std.log.err("appendChildExtra failed during component drop: {s}", .{@errorName(err)});
+        };
+        s.selected_child_idx = new_idx;
+        s.is_dirty = true;
+    }
     zgui.sameLine(.{});
     if (zgui.beginChild("##prefab_inspector_col", .{
         .w = 0,
@@ -209,4 +239,32 @@ fn renderInspector(s: *PrefabState, atlas_index: ?*const @import("../atlas.zig")
             if (zgui.selectable(label, .{})) s.selected_child_idx = i;
         }
     }
+}
+
+/// Append a `{ name, value_text: "{}" }` extras entry to the
+/// prefab child at `idx`. Grows `children_extras` so it always
+/// matches the children length — older prefab files may have an
+/// extras slice shorter than the children slice. Used by the
+/// component-drop handler to attach the dropped component name
+/// to the new child (#143).
+fn appendChildExtra(s: *PrefabState, idx: usize, name: []const u8) !void {
+    if (idx >= s.loaded.children.len) return error.IndexOutOfBounds;
+    const a = s.loaded.arena.allocator();
+
+    while (s.loaded.children_extras.len <= idx) {
+        const new_extras = try a.alloc([]const scene_io.ComponentExtra, s.loaded.children_extras.len + 1);
+        @memcpy(new_extras[0..s.loaded.children_extras.len], s.loaded.children_extras);
+        new_extras[s.loaded.children_extras.len] = &.{};
+        s.loaded.children_extras = new_extras;
+    }
+
+    const old = s.loaded.children_extras[idx];
+    const new_extras = try a.alloc(scene_io.ComponentExtra, old.len + 1);
+    @memcpy(new_extras[0..old.len], old);
+    new_extras[old.len] = .{
+        .name = try a.dupe(u8, name),
+        .value_text = try a.dupe(u8, "{}"),
+    };
+    const ce = @constCast(s.loaded.children_extras);
+    ce[idx] = new_extras;
 }

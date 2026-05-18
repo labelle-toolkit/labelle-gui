@@ -15,8 +15,24 @@ const scene_io = @import("../scene_io.zig");
 const atlas = @import("../atlas.zig");
 const gizmos = @import("../gizmos.zig");
 const prefab_index_mod = @import("../prefab_index.zig");
+const dnd = @import("dnd.zig");
 
 pub const min_h: f32 = 240;
+
+/// One-shot sink for a component drag-drop that landed on the canvas
+/// (#143). The caller passes `&slot` through `State.component_drop`;
+/// after `render` returns, the caller checks `slot.*` and (if set)
+/// appends a new child entity carrying the component. The name is
+/// copied into a fixed buffer so the receiver doesn't depend on
+/// ImGui's payload buffer staying alive past the accept callback.
+pub const ComponentDrop = struct {
+    name_buf: [128]u8 = [_]u8{0} ** 128,
+    name_len: u8 = 0,
+
+    pub fn name(self: *const ComponentDrop) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+};
 
 /// Mutable per-tab state the viewport reads and writes.
 pub const State = struct {
@@ -59,6 +75,13 @@ pub const State = struct {
     /// click — entity-hit goes to `right_click_entity`, miss goes to
     /// `right_click_world`.
     right_click_entity: ?*?usize = null,
+    /// Optional sink for "a component dragged from the project tree's
+    /// components/ folder was dropped on the canvas" (#143). The
+    /// viewport fills the `ComponentDrop` with the component name;
+    /// the caller appends a new child entity with the matching
+    /// prefab's body Sprite and the component as an unmodeled extra.
+    /// Null in editor tabs that don't accept component drops.
+    component_drop: ?*?ComponentDrop = null,
     /// World-space spacing for the visual grid AND, when snapping is on,
     /// the snap step. One number drives both so the grid the user sees
     /// is the grid their drags land on. Default 16 matches what most 2D
@@ -178,6 +201,29 @@ pub fn render(
         .h = canvas_size[1],
         .flags = .{ .mouse_button_left = true, .mouse_button_middle = true },
     });
+
+    // Drag-drop target for components from the project tree (#143).
+    // Must attach to the LAST submitted item (the invisibleButton
+    // above) so `beginDragDropTarget` picks up the canvas region.
+    // Gated on `component_drop` being non-null — only editors that
+    // know how to consume the drop (the prefab editor today) wire
+    // this sink.
+    if (state.component_drop) |sink| {
+        if (zgui.beginDragDropTarget()) {
+            defer zgui.endDragDropTarget();
+            if (zgui.acceptDragDropPayload(dnd.COMPONENT_TYPE, .{})) |raw| {
+                if (raw.data) |ptr| {
+                    const p: *const dnd.ComponentPayload = @ptrCast(@alignCast(ptr));
+                    const stem = dnd.unpackComponent(p);
+                    var out: ComponentDrop = .{};
+                    const n = @min(stem.len, out.name_buf.len);
+                    @memcpy(out.name_buf[0..n], stem[0..n]);
+                    out.name_len = @intCast(n);
+                    sink.* = out;
+                }
+            }
+        }
+    }
 
     // Holding Space turns left-click+drag into a pan grab — Figma /
     // Photoshop convention, works on any input device (Mac trackpads
