@@ -69,10 +69,13 @@ const std = @import("std");
 const flow_io = @import("flow_io.zig");
 
 /// Format string for `@import` paths to component type files in the
-/// assembler's project layout. Centralized so a future layout change
-/// (e.g. `src/components/<Name>.zig`) is a one-line edit. The `{s}`
+/// assembler's project layout. Zig resolves `@import` paths relative
+/// to the importing file's directory, and generated flows live at
+/// `<project>/scripts/flows/<name>.zig` (the v1 convention enforced
+/// by `flow_scanner` in labelle-assembler). Components live at
+/// `<project>/components/<Name>.zig` — two directories up. The `{s}`
 /// substitutes the component type name (`Position`, `Velocity`, …).
-const components_import_path_fmt = "components/{s}.zig";
+const components_import_path_fmt = "../../components/{s}.zig";
 
 /// Caller-facing configuration. `flow_name` is the stem of the
 /// source `.flow.zon` file — used as the first argument to
@@ -152,7 +155,7 @@ pub fn renderFlowZig(
 
     // Component imports: every type-name referenced by a
     // `GetComponent` or `SetField` node needs a matching
-    // `@import("components/<Name>.zig").<Name>` so the generated
+    // `@import("../../components/<Name>.zig").<Name>` so the generated
     // file resolves under the assembler's project layout. We sort
     // for deterministic output and de-duplicate so a single type
     // referenced from multiple nodes emits only one import. See
