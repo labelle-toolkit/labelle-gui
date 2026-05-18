@@ -11,9 +11,33 @@ jobs:
     runs-on: ubuntu-latest
     name: Build & Unit Tests (Linux)
 
+    # build.zig.zon depends on `../labelle-engine` (#107 — PIE
+    # viewport). Both checkouts go into named subdirs so the sibling
+    # path resolves; all `run:` steps live inside labelle-gui via
+    # `defaults.run.working-directory`.
+    defaults:
+      run:
+        working-directory: labelle-gui
+
     steps:
-      - name: Checkout
+      - name: Checkout labelle-gui
         uses: actions/checkout@v4
+        with:
+          path: labelle-gui
+
+      - name: Checkout labelle-engine sibling
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-engine
+          ref: main
+          path: labelle-engine
+
+      - name: Checkout labelle-core sibling
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-core
+          ref: main
+          path: labelle-core
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
@@ -29,8 +53,8 @@ jobs:
         with:
           path: |
             ~/.cache/zig
-            .zig-cache
-          key: zig-${{ runner.os }}-${{ hashFiles('build.zig.zon', 'build.zig') }}
+            labelle-gui/.zig-cache
+          key: zig-${{ runner.os }}-${{ hashFiles('labelle-gui/build.zig.zon', 'labelle-gui/build.zig') }}
           restore-keys: |
             zig-${{ runner.os }}-
 
@@ -56,7 +80,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: labelle-gui-Linux
-          path: zig-out/bin/
+          # `working-directory` doesn't apply to `uses:` action steps,
+          # so the path needs the explicit prefix.
+          path: labelle-gui/zig-out/bin/
           if-no-files-found: error
 
   # ImGui Test Engine harness — downloads the gui-tests binary built by
@@ -97,13 +123,37 @@ jobs:
             libxi6
 
       - name: Run UI tests under Xvfb
+        # Also asserts the test engine actually ran tests. PR #106 fixed
+        # a silent-pass bug (#105) where non-pub gui/run callbacks made
+        # `std.meta.hasFn` return false, so every TE test no-op-passed.
+        # The binary now exits 2 when zero tests run, but we re-check
+        # the printed summary here so the regression class can't ship
+        # again even if the in-binary guard ever breaks.
         run: |
           export DISPLAY=:99
           Xvfb :99 -screen 0 1280x720x24 &
           XVFB_PID=$!
           sleep 2
-          ./zig-out/bin/gui-tests
+          set +e
+          ./zig-out/bin/gui-tests 2>&1 | tee gui-tests.log
+          STATUS=${PIPESTATUS[0]}
+          set -e
           kill $XVFB_PID 2>/dev/null || true
+          # ImGui Test Engine prints "(<passed>/<tested> tests passed)"
+          # (imgui_te_exporters.cpp:47). Extract <tested>; fail loudly if
+          # it's missing or zero — a possible TE callback visibility
+          # regression (see #105).
+          TESTED=$(grep -oE '\([0-9]+/[0-9]+ tests passed\)' gui-tests.log | tail -n1 | grep -oE '/[0-9]+' | tr -d '/')
+          if [ -z "$TESTED" ]; then
+            echo "::error::no '(N/M tests passed)' summary line found in gui-tests output — possible TE callback visibility regression, see #105"
+            exit 1
+          fi
+          if [ "$TESTED" -le 0 ]; then
+            echo "::error::gui-tests reported 0 tests run — possible TE callback visibility regression, see #105"
+            exit 1
+          fi
+          echo "gui-tests ran $TESTED test(s)"
+          exit $STATUS
 
   # Process-launch sanity check — confirms the production binary starts,
   # doesn't crash for a few seconds, and renders something. Separate from

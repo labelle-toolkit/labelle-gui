@@ -111,6 +111,8 @@ fn renderButtons(app: *App) void {
         if (zgui.button("Run preview##preview_run", .{ .w = 140 })) {
             if (has_project) app.startPreview();
         }
+        zgui.sameLine(.{});
+        renderScenePicker(app);
         if (!has_project) {
             zgui.sameLine(.{});
             zgui.textDisabled("(no project open)", .{});
@@ -118,6 +120,68 @@ fn renderButtons(app: *App) void {
     } else {
         if (zgui.button("Stop preview##preview_stop", .{ .w = 140 })) {
             app.stopPreview();
+        }
+    }
+}
+
+/// Scene picker dropdown to the right of "Run preview" (#132). Lists the
+/// project's `scenes/*.jsonc` files; the chosen entry sets
+/// `App.preview_scene_override`, which `startPreview` forwards to
+/// `labelle run --scene=<name>`. The `<initial>` entry resets the
+/// override to null so the next Run falls back to `project.labelle`'s
+/// `initial_scene` field.
+fn renderScenePicker(app: *App) void {
+    const proj = app.project_manager.current_project orelse {
+        // No project open — picker is meaningless. Don't crowd the
+        // panel; the "(no project open)" hint already shows.
+        return;
+    };
+
+    // Resolve the scene list lazily. `scenesAvailable` caches against
+    // the project's lifetime; the call is cheap on repeat renders.
+    const scenes = proj.scenesAvailable(app.allocator) catch &[_][]const u8{};
+
+    // Preview label — the picker shows `<initial>` when no override is
+    // set, otherwise the current chosen scene name. Bounded buffer so
+    // we can null-terminate for the C combo API.
+    var preview_buf: [160]u8 = undefined;
+    const preview_str: [:0]const u8 = blk: {
+        const src: []const u8 = app.preview_scene_override orelse "<initial>";
+        const n = @min(src.len, preview_buf.len - 1);
+        @memcpy(preview_buf[0..n], src[0..n]);
+        preview_buf[n] = 0;
+        break :blk preview_buf[0..n :0];
+    };
+
+    zgui.setNextItemWidth(160);
+    if (!zgui.beginCombo("##preview_scene", .{ .preview_value = preview_str.ptr })) return;
+    defer zgui.endCombo();
+
+    // `<initial>` resets the override to null — produces argv without
+    // `--scene=…` so the launcher honors `project.labelle`'s
+    // `initial_scene` field. This is the v1-shipping default; we want
+    // it to be the very first item so users can always get back to it.
+    if (zgui.selectable("<initial>", .{ .selected = app.preview_scene_override == null })) {
+        app.preview_scene_override = null;
+    }
+
+    for (scenes) |name| {
+        // Each entry needs a NUL-terminated label for selectable's
+        // C ABI. Names from `scenesAvailable` are arena-allocated
+        // without a NUL sentinel; copy into a per-iteration buffer.
+        var label_buf: [128]u8 = undefined;
+        if (name.len >= label_buf.len) continue;
+        @memcpy(label_buf[0..name.len], name);
+        label_buf[name.len] = 0;
+        const label = label_buf[0..name.len :0];
+
+        const selected =
+            app.preview_scene_override != null and
+            std.mem.eql(u8, app.preview_scene_override.?, name);
+        if (zgui.selectable(label, .{ .selected = selected })) {
+            // Borrow from the project arena — the slice lives until
+            // the next project transition (which clears the override).
+            app.preview_scene_override = name;
         }
     }
 }

@@ -1,6 +1,6 @@
 .{
     .name = .labelle_gui,
-    .version = "0.2.1",
+    .version = "0.4.0",
     .fingerprint = 0x3fd05a33857eec15,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
@@ -21,8 +21,15 @@
             .hash = "nfd-0.1.0-y82kbsSLBgCxj9gDvxK7fxPFYnI3oe2wWx6M9ykp9Gio",
         },
         .zspec = .{
-            .url = "https://github.com/apotema/zspec/archive/v0.9.1.tar.gz",
-            .hash = "zspec-0.9.1-jaKLbbX4AwBKANdetxzzWc3UTO0UY0lcJJzTagQHlt5K",
+            .url = "https://github.com/apotema/zspec/archive/v0.9.2.tar.gz",
+            // Hash prefix says `0.9.1` because upstream's own
+            // `build.zig.zon` still declares `.version = "0.9.1"` at
+            // the v0.9.2 tag — Zig's package manager bakes that
+            // string into the hash and rejects manual edits with a
+            // "hash mismatch" error. The base64 portion is the only
+            // integrity-relevant part; the prefix is cosmetic
+            // metadata sourced from upstream.
+            .hash = "zspec-0.9.1-jaKLbXgMBACFwbNjflhbMyP113leoYjboxn-1UOP-FGw",
         },
         .zstbi = .{
             .url = "git+https://github.com/zig-gamedev/zstbi?ref=main#3813f5f113b26f644cfa01a30155cc76b3526e91",
@@ -30,6 +37,16 @@
         },
         .flow_codegen = .{
             .path = "flow-codegen",
+        },
+        // labelle-engine via sibling-path dep — same pattern
+        // labelle-assembler uses for `../labelle-gui/flow-codegen`.
+        // Dev-time and CI both check out the engine as a sibling
+        // (see `.github/workflows/ci.yml`). Release builds swap in
+        // a `git+https://...?ref=vX.Y.Z#<hash>` pin at build time;
+        // the path here is the dev-time default, not the source of
+        // truth for shipped binaries.
+        .engine = .{
+            .path = "../labelle-engine",
         },
     },
     .paths = .{

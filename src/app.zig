@@ -26,6 +26,9 @@ const prefab_mod = @import("modules/prefab.zig");
 const flow_mod = @import("modules/flow.zig");
 const gizmo_mod = @import("modules/gizmo.zig");
 const entity_inspector_mod = @import("modules/entity_inspector.zig");
+const game_view_mod = @import("modules/game_view.zig");
+const game_view = @import("game_view.zig");
+const io_global = @import("io_global.zig");
 const flow_runtime_mod = @import("modules/flow_runtime.zig");
 const close_scene_dialog = @import("dialogs/close_scene.zig");
 const atlas = @import("atlas.zig");
@@ -53,6 +56,12 @@ pub const OpenTab = union(enum) {
     /// `.flow.zon` schema.
     flow: flow_mod.FlowState,
     gizmo: gizmo_mod.GizmoState,
+    /// Live game view (#128). Routing marker only — the consumer +
+    /// GL texture state live on `App.game_view`. No per-tab struct
+    /// because there's only one preview session at a time, and the
+    /// tab body just dispatches into `modules/game_view.zig`'s
+    /// existing renderer.
+    game_view: void,
 
     pub fn deinit(self: *OpenTab, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -60,6 +69,7 @@ pub const OpenTab = union(enum) {
             .prefab => |*p| p.deinit(allocator),
             .flow => |*f| f.deinit(allocator),
             .gizmo => |*g| g.deinit(allocator),
+            .game_view => {},
         }
     }
 
@@ -69,6 +79,7 @@ pub const OpenTab = union(enum) {
             .prefab => |*p| prefab_mod.render(p, app),
             .flow => |*f| flow_mod.render(f, app),
             .gizmo => |*g| gizmo_mod.render(g, app),
+            .game_view => game_view_mod.renderTab(app),
         }
     }
 
@@ -78,6 +89,7 @@ pub const OpenTab = union(enum) {
             .prefab => |*p| prefab_mod.savePrefab(p, app),
             .flow => |*f| flow_mod.saveFlow(f, app),
             .gizmo => |*g| gizmo_mod.saveGizmo(g, app),
+            .game_view => {},
         }
     }
 
@@ -87,6 +99,7 @@ pub const OpenTab = union(enum) {
             .prefab => |p| p.display_name,
             .flow => |f| f.display_name,
             .gizmo => |g| g.display_name,
+            .game_view => "▶ Game View",
         };
     }
 
@@ -96,6 +109,7 @@ pub const OpenTab = union(enum) {
             .prefab => |p| p.path,
             .flow => |f| f.path,
             .gizmo => |g| g.path,
+            .game_view => "<runtime>",
         };
     }
 
@@ -105,6 +119,7 @@ pub const OpenTab = union(enum) {
             .prefab => |p| p.is_dirty,
             .flow => |f| f.is_dirty,
             .gizmo => |g| g.is_dirty,
+            .game_view => false,
         };
     }
 };
@@ -128,6 +143,15 @@ pub const App = struct {
     /// module. The module reads this via its `Module.is_open` pointer.
     show_compiler_output: bool = false,
     compiler_output_scroll_to_bottom: bool = false,
+    /// Tail buffer for the Compiler Output panel's live preview view
+    /// (#127). The panel pulls newly-arrived stderr bytes from
+    /// `preview.PreviewSession.consumeStderr` each frame and appends
+    /// them here, so the build phase's progress is visible live
+    /// instead of only on `.crashed`. Capped to keep the buffer from
+    /// growing without bound on a chatty subprocess; older bytes are
+    /// discarded from the front when the cap is hit. Reset on every
+    /// fresh `startPreview`.
+    preview_tail: std.ArrayList(u8) = .empty,
 
     show_project_settings: bool = false,
     project_settings: project_settings_mod.ProjectSettings = .{},
@@ -139,6 +163,25 @@ pub const App = struct {
     /// action. The Preview panel reads this via its `Module.is_open`
     /// pointer; clicking Run preview also force-opens it.
     show_preview: bool = false,
+    /// Scene name (no extension) the user picked from the Run-button
+    /// dropdown (#132). When non-null, passed as `--scene=<name>` to
+    /// `labelle run`. `null` falls back to `project.labelle`'s
+    /// `initial_scene` field — the pre-#132 behavior.
+    ///
+    /// Borrowed from the active project's arena (scene name strings
+    /// returned by `Project.scenesAvailable`). Reset to null on project
+    /// transition (`closeAllTabs` codepath in `renderFrame`) so a stale
+    /// pointer from the old project's arena can't leak into a fresh
+    /// `preview.start` call.
+    preview_scene_override: ?[]const u8 = null,
+
+    /// Game View panel state (#107). Owns the SHM consumer + GL
+    /// texture for the live game frames. Toggleable from the View
+    /// menu; until the editor-side preview transport is restored
+    /// (separate follow-up), the consumer is attached either via
+    /// `App.attachGameView` or the `LABELLE_GAME_VIEW_SHM` env var.
+    show_game_view: bool = false,
+    game_view: game_view.GameView = undefined,
 
     /// Phase 3 (#84): Entity Inspector panel toggle.
     show_entity_inspector: bool = false,
@@ -229,7 +272,7 @@ pub const App = struct {
 
     /// Fixed-size storage for registered modules. Grow the array literal
     /// when adding modules; Zig will tell you if it overflows.
-    modules: [7]module.Module = undefined,
+    modules: [8]module.Module = undefined,
     registry: module.Registry = .{ .modules = &.{} },
 
     const Self = @This();
@@ -245,6 +288,7 @@ pub const App = struct {
             .tree_view = tree_view.TreeView.init(allocator),
             .compiler = compiler.Compiler.init(allocator),
             .preview = preview.PreviewSession.init(allocator),
+            .game_view = game_view.GameView.init(allocator),
             .prefs = user_prefs,
             .startup_prefs = user_prefs,
         };
@@ -254,6 +298,31 @@ pub const App = struct {
         // routing through `App`. Initialize after `preview` so the
         // pointer is stable for the lifetime of the App.
         app.entity_inspector = entity_inspector_mod.EntityInspector.init(allocator, &app.preview);
+
+        // Wire the preview session's `frame_offer` listener — the
+        // editor-side end of #112's transport restore + #107's Game
+        // View panel meet here. When the engine emits `frame_offer`
+        // the transport calls back into App, which attaches the
+        // Game View consumer to the advertised SHM region. Tests
+        // can drive this end-to-end via `bindListener` +
+        // `LABELLE_GAME_VIEW_SHM`, the production path uses
+        // `start(project)` + `labelle run` spawn.
+        app.preview.on_frame_offer = .{
+            .ctx = app,
+            .func = struct {
+                fn cb(ctx: *anyopaque, shm_name: [:0]const u8, width: u32, height: u32, format: []const u8) void {
+                    _ = width;
+                    _ = height;
+                    const a: *App = @ptrCast(@alignCast(ctx));
+                    a.attachGameView(shm_name, format) catch |err| {
+                        std.log.warn(
+                            "preview: attachGameView('{s}', '{s}') failed: {s}",
+                            .{ shm_name, format, @errorName(err) },
+                        );
+                    };
+                }
+            }.cb,
+        };
 
         // Wire the preview session's binary-frame listeners. Both are
         // single-consumer in Phase 3; future panels that need the same
@@ -298,7 +367,26 @@ pub const App = struct {
         app.modules[4] = preview_mod.makeModule(app);
         app.modules[5] = entity_inspector_mod.makeModule(app);
         app.modules[6] = flow_runtime_mod.makeModule(app);
+        app.modules[7] = game_view_mod.makeModule(app);
         app.registry = .{ .modules = &app.modules };
+
+        // Honor LABELLE_GAME_VIEW_SHM as a manual attach path until
+        // the preview-transport restore wires this up automatically.
+        // Empty / unset → no attach. Lookup errors (missing region,
+        // bad magic) are logged but don't fail App.init — the user
+        // can still drive the editor without preview. GameView.attach
+        // dupes the name into its own buffer.
+        if (io_global.environ().getAlloc(allocator, "LABELLE_GAME_VIEW_SHM") catch null) |raw| {
+            defer allocator.free(raw);
+            if (raw.len > 0) {
+                // Env-var hook is shm-only; the iosurface dispatch
+                // arrives through the engine's `frame_offer` JSON.
+                app.game_view.attach(raw, "bgra8") catch |err| {
+                    std.log.warn("game_view: attach('{s}') failed: {s}", .{ raw, @errorName(err) });
+                };
+                if (app.game_view.isAttached()) app.show_game_view = true;
+            }
+        }
 
         return app;
     }
@@ -306,6 +394,7 @@ pub const App = struct {
     pub fn deinit(self: *Self) void {
         self.closeAllTabs();
         self.open_tabs.deinit(self.allocator);
+        self.preview_tail.deinit(self.allocator);
         if (self.atlas_index) |*idx| idx.deinit();
         if (self.gizmo_index) |*idx| idx.deinit();
         if (self.prefab_index) |*idx| idx.deinit();
@@ -318,7 +407,59 @@ pub const App = struct {
         self.tree_view.deinit();
         self.compiler.deinit();
         self.preview.deinit();
+        self.game_view.deinit();
         self.allocator.destroy(self);
+    }
+
+    /// Open the SHM region the engine advertised in `frame_offer`
+    /// (#107). Convenience wrapper that surfaces the panel
+    /// automatically on a successful attach.
+    ///
+    /// `format` mirrors the engine's `frame_offer.format` field —
+    /// `"bgra8"` (the default for legacy callers) routes to the SHM
+    /// CPU upload path, `"iosurface_bgra8"` routes to the macOS
+    /// zero-copy path. Anything else falls back to SHM.
+    pub fn attachGameView(self: *Self, shm_name: []const u8, format: []const u8) !void {
+        try self.game_view.attach(shm_name, format);
+        // Backwards-compat: the floating "Game View" panel registered
+        // via the Module Registry is still available for users who
+        // want a docked-elsewhere layout. The tab below is the
+        // default surface; both share `renderViewportContent` so
+        // they stay in lockstep.
+        self.show_game_view = true;
+        // #128: also open the Game View as a tab in the main content
+        // area so users see the live frame inline with the editor
+        // tabs they were working in. Logged + swallowed because an
+        // OOM here shouldn't fail the attach — the panel still works.
+        self.openGameViewTab() catch |err| {
+            std.log.warn("attachGameView: openGameViewTab failed: {s}", .{@errorName(err)});
+        };
+        // Reply with `frame_accept` so the engine flips its
+        // `frame_state` to `.accepted` and starts publishing —
+        // without this, `signalSlotReady`/`publishFrame*` bounce
+        // with `StreamNotActive` and the Game View stays at
+        // "waiting for first frame" forever.
+        self.preview.sendFrameAccept();
+    }
+
+    /// Push a `.game_view` tab onto `open_tabs` (or focus an existing
+    /// one) and queue a one-shot focus request so the next frame
+    /// brings it forward. Idempotent — multiple `frame_offer`s in a
+    /// session refocus instead of duplicating tabs. #128.
+    fn openGameViewTab(self: *Self) !void {
+        for (self.open_tabs.items, 0..) |t, i| {
+            switch (t) {
+                .game_view => {
+                    self.focus_tab_idx = i;
+                    return;
+                },
+                else => {},
+            }
+        }
+        try self.open_tabs.append(self.allocator, .{ .game_view = {} });
+        const new_idx = self.open_tabs.items.len - 1;
+        self.active_tab_idx = new_idx;
+        self.focus_tab_idx = new_idx;
     }
 
     /// Rebuild the atlas index from the active project's
@@ -502,6 +643,19 @@ pub const App = struct {
     /// about unsaved changes via `requestCloseTab` first.
     pub fn closeTab(self: *Self, idx: usize) void {
         if (idx >= self.open_tabs.items.len) return;
+        // #128: closing the Game View tab is the runtime-view "stop"
+        // affordance — there's no dirty-doc dialog; tear down the
+        // preview subprocess + consumer eagerly. Done before the
+        // tab is removed so `.game_view`-specific cleanup still has
+        // an attached consumer to work with.
+        switch (self.open_tabs.items[idx]) {
+            .game_view => {
+                self.preview.stop();
+                self.game_view.detach();
+                self.show_game_view = false;
+            },
+            else => {},
+        }
         var removed = self.open_tabs.orderedRemove(idx);
         removed.deinit(self.allocator);
 
@@ -576,6 +730,11 @@ pub const App = struct {
                 self.rebuildAtlasIndex();
                 self.rebuildGizmoIndex();
                 self.rebuildPrefabIndex();
+                // The override borrowed a string from the previous
+                // project's arena, which is freed on the transition.
+                // Drop it so the next Run uses `initial_scene` until
+                // the user picks again (#132).
+                self.preview_scene_override = null;
             }
         } else {
             self.rebuildAtlasIndex();
@@ -778,13 +937,58 @@ pub const App = struct {
             self.setStatus("Error syncing project files!");
             return;
         };
-        self.preview.start(proj) catch |err| {
+        // Reset the panel's live-tail buffer before the session
+        // starts — old bytes from a previous Run shouldn't leak into
+        // the new session's output.
+        self.preview_tail.clearRetainingCapacity();
+        self.preview.start(proj, self.preview_scene_override) catch |err| {
             std.log.err("Error starting preview: {}", .{err});
             self.setStatus("Error starting preview!");
             return;
         };
         self.setStatus("Preview starting...");
         self.show_preview = true;
+        // Force-open the Compiler Output panel so the user sees the
+        // subprocess's stderr live during the (potentially 30-60s)
+        // cold `zig build` phase. Manual close via the panel × keeps
+        // it closed for the rest of this Run; the next `startPreview`
+        // call re-opens it on the next Run (#127).
+        self.show_compiler_output = true;
+        self.compiler_output_scroll_to_bottom = true;
+    }
+
+    /// Append `bytes` to the Compiler Output panel's live preview
+    /// tail buffer (#127). Bounded by `preview_tail_cap` — when the
+    /// buffer would exceed the cap, the oldest bytes are dropped from
+    /// the front so the *recent* tail (where the build error or panic
+    /// trace lives) is what the user sees. Called from the panel's
+    /// per-frame `consumeStderr` drain; safe to call with an empty
+    /// slice.
+    pub fn appendPreviewTail(self: *Self, bytes: []const u8) void {
+        if (bytes.len == 0) return;
+        // Cap matches `preview.stderr_buf`'s cap (16 KiB) so the panel
+        // never holds more than two windows' worth of stderr in flight.
+        const preview_tail_cap: usize = 16 * 1024;
+        if (bytes.len >= preview_tail_cap) {
+            // Single record already exceeds the cap — keep only the
+            // tail end.
+            self.preview_tail.clearRetainingCapacity();
+            const start = bytes.len - preview_tail_cap;
+            self.preview_tail.appendSlice(self.allocator, bytes[start..]) catch return;
+            return;
+        }
+        // Drop from the front if appending `bytes` would overflow.
+        if (self.preview_tail.items.len + bytes.len > preview_tail_cap) {
+            const need_to_drop = self.preview_tail.items.len + bytes.len - preview_tail_cap;
+            const remaining = self.preview_tail.items.len - need_to_drop;
+            std.mem.copyForwards(
+                u8,
+                self.preview_tail.items[0..remaining],
+                self.preview_tail.items[need_to_drop..],
+            );
+            self.preview_tail.shrinkRetainingCapacity(remaining);
+        }
+        self.preview_tail.appendSlice(self.allocator, bytes) catch return;
     }
 
     pub fn stopPreview(self: *Self) void {

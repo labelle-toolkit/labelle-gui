@@ -49,6 +49,17 @@ pub fn build(b: *std.Build) void {
     });
     const flow_codegen_module = flow_codegen.module("flow_codegen");
 
+    // labelle-engine — for the PIE viewport (#107). We pull the
+    // engine in solely for `preview_mode.preview_shm.Consumer`
+    // (cross-process pixel ring reader) and the protocol types.
+    // The engine's own deps (labelle-core etc.) come along for the
+    // ride but the editor only links the preview surface.
+    const engine = b.dependency("engine", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const engine_module = engine.module("engine");
+
     // Main executable
     const exe = b.addExecutable(.{
         .name = "labelle-gui",
@@ -72,6 +83,19 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("zstbi", zstbi.module("root"));
 
     exe.root_module.addImport("flow_codegen", flow_codegen_module);
+
+    exe.root_module.addImport("engine", engine_module);
+
+    // macOS-only: link the frameworks `src/iosurface.zig` calls into
+    // (`IOSurfaceLookup`, `CFRelease`, `CGLTexImageIOSurface2D`).
+    // The bindings are no-ops on other platforms (every public API
+    // returns `error.PlatformUnsupported`), so the links stay
+    // mac-gated. See labelle-gui#108.
+    if (target.result.os.tag == .macos) {
+        exe.root_module.linkFramework("IOSurface", .{});
+        exe.root_module.linkFramework("CoreFoundation", .{});
+        exe.root_module.linkFramework("OpenGL", .{});
+    }
 
     // Windows-specific: embed DPI awareness manifest
     if (target.result.os.tag == .windows) {
@@ -105,6 +129,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "zopengl", .module = zopengl.module("root") },
                 .{ .name = "zstbi", .module = zstbi.module("root") },
                 .{ .name = "flow_codegen", .module = flow_codegen_module },
+                .{ .name = "engine", .module = engine_module },
             },
         }),
         .test_runner = .{ .path = zspec.path("src/runner.zig"), .mode = .simple },
@@ -147,6 +172,27 @@ pub fn build(b: *std.Build) void {
     gui_tests_exe.root_module.linkLibrary(zgui_te.artifact("imgui"));
     gui_tests_exe.root_module.addImport("zstbi", zstbi.module("root"));
     gui_tests_exe.root_module.addImport("flow_codegen", flow_codegen_module);
+    // App.renderFrame transitively imports nfd via the file-dialog
+    // code path; without this addImport the test binary fails to
+    // compile as soon as the previously-dead `Callbacks.gui`/`run`
+    // bodies are analyzed (this addition originally landed in #106
+    // and was inadvertently dropped during #115's review-fix
+    // cherry-pick rebase).
+    gui_tests_exe.root_module.addImport("nfd", nfd.module("nfd"));
+    gui_tests_exe.root_module.addImport("engine", engine_module);
+
+    // macOS-only frameworks — same set as the production `exe` above.
+    // The iosurface dispatch test (PIE viewport) drives the real
+    // `iosurface.Consumer` + `bindSurface`, which call into
+    // `CGLTexImageIOSurface2D` / `CGLGetCurrentContext`. Without the
+    // OpenGL framework, the gui-tests binary fails to link on macOS
+    // even though only one TE test exercises the path. See
+    // labelle-gui#108 for the upstream rationale.
+    if (target.result.os.tag == .macos) {
+        gui_tests_exe.root_module.linkFramework("IOSurface", .{});
+        gui_tests_exe.root_module.linkFramework("CoreFoundation", .{});
+        gui_tests_exe.root_module.linkFramework("OpenGL", .{});
+    }
 
     const run_gui_tests = b.addRunArtifact(gui_tests_exe);
     const gui_test_step = b.step("gui-test", "Run the UI test runner");

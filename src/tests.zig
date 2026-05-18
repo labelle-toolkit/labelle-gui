@@ -19,6 +19,8 @@ const flow_types = @import("flows/types.zig");
 const prefs = @import("prefs.zig");
 const prefab_contents = @import("modules/inspector/prefab_contents.zig");
 const io_global = @import("io_global.zig");
+const game_view = @import("game_view.zig");
+const test_fixtures = @import("test_fixtures.zig");
 
 /// Wall-clock seconds since the Unix epoch; replacement for the
 /// `std.time.timestamp` helper removed in Zig 0.16. Used only to
@@ -1886,9 +1888,11 @@ pub const ProjectFileTests = struct {
         const temp_dir = try createTempDir(allocator);
         defer deleteTempDir(allocator, temp_dir);
 
-        // Build a project with one resource directly via the arena so
-        // the slice is owned correctly. Save then reload via a fresh
-        // ProjectManager and assert the resource came back intact.
+        // Save a project carrying one Factory-built ResourceDef, reload
+        // via a fresh ProjectManager, assert the resource came back
+        // intact. Factory.defineFrom validates each field name against
+        // ResourceDef at comptime — a typo in `test_fixtures/resource.zon`
+        // fails the build, not the test.
         var pm = project.ProjectManager.init(allocator);
         defer pm.deinit();
         try pm.newProject("with_resources");
@@ -1896,11 +1900,7 @@ pub const ProjectFileTests = struct {
         const proj = pm.current_project.?;
         const a = proj.arena.allocator();
         const resources = try a.alloc(project.ResourceDef, 1);
-        resources[0] = .{
-            .name = try a.dupe(u8, "sprites"),
-            .json = try a.dupe(u8, "assets/sprites.json"),
-            .texture = try a.dupe(u8, "assets/sprites.png"),
-        };
+        resources[0] = test_fixtures.ResourceFactory.build(.{});
         proj.config.resources = resources;
 
         try pm.saveProject(temp_dir);
@@ -1914,6 +1914,58 @@ pub const ProjectFileTests = struct {
         try expect.toBeTrue(std.mem.eql(u8, loaded[0].name, "sprites"));
         try expect.toBeTrue(std.mem.eql(u8, loaded[0].json, "assets/sprites.json"));
         try expect.toBeTrue(std.mem.eql(u8, loaded[0].texture, "assets/sprites.png"));
+    }
+
+    test "ProjectConfigFactory overrides round-trip through save + load" {
+        // Proof-of-value for the Factory pattern (precursor to #120's
+        // `project_settings_edit_save` triage): build a non-default
+        // ProjectConfig with several overrides via Factory.build,
+        // round-trip through saveProject/loadProject, assert every
+        // override survived. Replaces what would otherwise be a
+        // multi-line struct literal plus arena.dupe per string field.
+        const allocator = std.testing.allocator;
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+        try pm.newProject("factory_overrides");
+
+        const proj = pm.current_project.?;
+        proj.config = test_fixtures.ProjectConfigFactory.build(.{
+            .name = "factory_overrides",
+            .title = "Factory Overrides",
+            .width = 1920,
+            .height = 1080,
+            .backend = .sokol,
+            .initial_scene = "splash",
+            .engine_version = "1.36.0",
+        });
+
+        try pm.saveProject(temp_dir);
+
+        var pm2 = project.ProjectManager.init(allocator);
+        defer pm2.deinit();
+        try pm2.loadProject(temp_dir);
+
+        const cfg = pm2.current_project.?.config;
+        try expect.toBeTrue(std.mem.eql(u8, cfg.name, "factory_overrides"));
+        try expect.toBeTrue(std.mem.eql(u8, cfg.title, "Factory Overrides"));
+        try expect.equal(cfg.width, 1920);
+        try expect.equal(cfg.height, 1080);
+        try expect.equal(cfg.backend, .sokol);
+        try expect.toBeTrue(std.mem.eql(u8, cfg.initial_scene, "splash"));
+        try expect.toBeTrue(std.mem.eql(u8, cfg.engine_version, "1.36.0"));
+        // Non-overridden fields keep their ProjectConfigFactory
+        // defaults — proves the factory's defaults pass through
+        // saveProject + loadProject untouched.
+        try expect.equal(cfg.ecs, .zig_ecs);
+        try expect.equal(cfg.target_fps, 60);
+        try expect.toBeTrue(std.mem.eql(u8, cfg.description, ""));
+        try expect.toBeTrue(std.mem.eql(u8, cfg.core_version, "1.12.0"));
+        try expect.toBeTrue(std.mem.eql(u8, cfg.gfx_version, "1.10.0"));
+        try expect.toBeTrue(std.mem.eql(u8, cfg.assembler_version, "0.20.0"));
+        try expect.equal(cfg.resources.len, 0);
     }
 
     // Regression: ../flying-platform-labelle/project.labelle (and any
@@ -2196,6 +2248,183 @@ pub const ProjectFileTests = struct {
         try expect.toBeTrue(std.mem.eql(u8, pm2.current_project.?.config.name, "round_trip"));
         try expect.equal(pm2.current_project.?.config.backend, .raylib);
         try expect.equal(pm2.current_project.?.config.ecs, .zig_ecs);
+    }
+
+    // Regression for #125: opening flying-platform-labelle in the gui
+    // and triggering a save silently overwrote `engine_version` /
+    // `assembler_version` / etc. with the gui's compiled-in defaults.
+    // Load + save must preserve non-default version pins on the
+    // managed modeled fields.
+    test "loadProject preserves non-default version pins through save round-trip" {
+        const allocator = std.testing.allocator;
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        const labelle_path = try std.fs.path.join(allocator, &.{ temp_dir, "project.labelle" });
+        defer allocator.free(labelle_path);
+
+        // Pin every version field to an obviously-non-default value so
+        // a load that silently fell back to defaults would be caught
+        // immediately on any field. Field order mirrors the real
+        // flying-platform-labelle file (versions trail the body and
+        // `.labelle_version` is interspersed with the managed pins).
+        const original =
+            \\.{
+            \\    .name = "pinned_project",
+            \\    .title = "Pinned",
+            \\    .width = 1024,
+            \\    .height = 768,
+            \\    .target_fps = 60,
+            \\    .backend = .sokol,
+            \\    .ecs = .zig_ecs,
+            \\    .initial_scene = "loading",
+            \\    .states = .{ "loading", "playing" },
+            \\    .core_version = "9.9.9",
+            \\    .engine_version = "1.99.0",
+            \\    .gfx_version = "9.9.9",
+            \\    .labelle_version = "1.36.0",
+            \\    .assembler_version = "9.9.9",
+            \\}
+            \\
+        ;
+        std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = labelle_path,
+            .data = original,
+        }) catch unreachable;
+
+        // Step 1 of the triage: assert the load picked the pins up,
+        // not the ProjectConfig defaults. Catches a regression in
+        // either the parser call or the field name list.
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+        try pm.loadProject(temp_dir);
+
+        const loaded_cfg = pm.current_project.?.config;
+        try expect.toBeTrue(std.mem.eql(u8, loaded_cfg.engine_version, "1.99.0"));
+        try expect.toBeTrue(std.mem.eql(u8, loaded_cfg.assembler_version, "9.9.9"));
+        try expect.toBeTrue(std.mem.eql(u8, loaded_cfg.core_version, "9.9.9"));
+        try expect.toBeTrue(std.mem.eql(u8, loaded_cfg.gfx_version, "9.9.9"));
+
+        // Step 2: round-trip through save + load and re-assert. Save
+        // emits from the in-memory ProjectConfig; if a downstream
+        // code path is overwriting it with defaults, this catches it.
+        try pm.saveProject(temp_dir);
+
+        var pm2 = project.ProjectManager.init(allocator);
+        defer pm2.deinit();
+        try pm2.loadProject(temp_dir);
+
+        const reloaded = pm2.current_project.?.config;
+        try expect.toBeTrue(std.mem.eql(u8, reloaded.engine_version, "1.99.0"));
+        try expect.toBeTrue(std.mem.eql(u8, reloaded.assembler_version, "9.9.9"));
+        try expect.toBeTrue(std.mem.eql(u8, reloaded.core_version, "9.9.9"));
+        try expect.toBeTrue(std.mem.eql(u8, reloaded.gfx_version, "9.9.9"));
+    }
+
+    // Same as the previous test but mirroring the exact layout of
+    // ../flying-platform-labelle/project.labelle (resources block,
+    // plugins block, layers block between top fields and version
+    // pins). Catches any save-order or extras-interaction bug that
+    // a minimal synthetic file wouldn't hit.
+    test "flying-platform-shaped project preserves version pins" {
+        const allocator = std.testing.allocator;
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        const labelle_path = try std.fs.path.join(allocator, &.{ temp_dir, "project.labelle" });
+        defer allocator.free(labelle_path);
+
+        const original =
+            \\.{
+            \\    .name = "flying_platform",
+            \\    .title = "Flying Platform",
+            \\    .width = 1024,
+            \\    .height = 768,
+            \\    .target_fps = 60,
+            \\    .backend = .sokol,
+            \\    .ecs = .zig_ecs,
+            \\    .initial_scene = "loading",
+            \\    .states = .{ "loading", "playing", "debug", "menu" },
+            \\    .gui = .{ .plugin = "imgui" },
+            \\    .resources = .{
+            \\        .{ .name = "background", .json = "assets/background.json", .texture = "assets/background.png" },
+            \\    },
+            \\    .plugins = .{
+            \\        .{ .name = "imgui", .repo = "github.com/labelle-toolkit/labelle-imgui", .version = "0.3.1" },
+            \\    },
+            \\    .layers = .{
+            \\        .{ .name = "world", .order = 1, .space = .world },
+            \\    },
+            \\    .core_version = "1.12.0",
+            \\    .engine_version = "1.37.3",
+            \\    .gfx_version = "1.10.0",
+            \\    .labelle_version = "1.36.0",
+            \\    .assembler_version = "0.20.0",
+            \\}
+            \\
+        ;
+        std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = labelle_path,
+            .data = original,
+        }) catch unreachable;
+
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+        try pm.loadProject(temp_dir);
+        try pm.saveProject(temp_dir);
+
+        const saved = try std.Io.Dir.cwd().readFileAlloc(io_global.io(), labelle_path, allocator, .limited(1024 * 1024));
+        defer allocator.free(saved);
+
+        // Managed pins must survive intact.
+        try expect.toBeTrue(std.mem.indexOf(u8, saved, ".engine_version = \"1.37.3\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, saved, ".assembler_version = \"0.20.0\"") != null);
+        // Plugin .version must survive intact (unmodeled extras).
+        try expect.toBeTrue(std.mem.indexOf(u8, saved, ".version = \"0.3.1\"") != null);
+    }
+
+    // Regression for #125 (plugin half): plugins are unmodeled in the
+    // gui's ProjectConfig, so each plugin entry — including its
+    // `.version` sub-field — must survive a load/save round-trip
+    // verbatim via the extras pass-through.
+    test "plugin entry .version survives load/save round-trip" {
+        const allocator = std.testing.allocator;
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        const labelle_path = try std.fs.path.join(allocator, &.{ temp_dir, "project.labelle" });
+        defer allocator.free(labelle_path);
+
+        const original =
+            \\.{
+            \\    .name = "plugged",
+            \\    .plugins = .{
+            \\        .{ .name = "imgui", .repo = "github.com/labelle-toolkit/labelle-imgui", .version = "0.3.1" },
+            \\        .{ .name = "fsm", .repo = "github.com/labelle-toolkit/labelle-fsm", .version = "0.1.0" },
+            \\    },
+            \\}
+            \\
+        ;
+        std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = labelle_path,
+            .data = original,
+        }) catch unreachable;
+
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+        try pm.loadProject(temp_dir);
+        try pm.saveProject(temp_dir);
+
+        const saved = try std.Io.Dir.cwd().readFileAlloc(io_global.io(), labelle_path, allocator, .limited(1024 * 1024));
+        defer allocator.free(saved);
+
+        // Plugin entry `.version` must be byte-identical to the input
+        // for both plugins.
+        try expect.toBeTrue(std.mem.indexOf(u8, saved, ".version = \"0.3.1\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, saved, ".version = \"0.1.0\"") != null);
+        // And the rest of each plugin entry must also survive.
+        try expect.toBeTrue(std.mem.indexOf(u8, saved, "github.com/labelle-toolkit/labelle-imgui") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, saved, "github.com/labelle-toolkit/labelle-fsm") != null);
     }
 };
 
@@ -2928,5 +3157,974 @@ pub const PrefabContentsTests = struct {
             .{ .prefab = "only" },
         };
         try expect.equal(prefab_contents.consecutivePrefabRunEnd(&children, 0, "only"), 1);
+    }
+};
+
+pub const ScenesAvailableTests = struct {
+    // `Project.scenesAvailable` is the data source for the Run-button
+    // scene picker (#132). The picker assumes basenames, alphabetical
+    // order, top-level `.jsonc` only. These tests lock those shape
+    // contracts so a future tweak (e.g. recursing into subdirs) flags
+    // up before it surprises the UI code.
+
+    fn createTempDir(allocator: std.mem.Allocator) ![]const u8 {
+        const tmp_base = "/tmp";
+        const ts = timestampSeconds();
+        // Disambiguate by both ts and an incrementing index so two tests
+        // running back-to-back inside the same second don't collide on
+        // the same temp dir.
+        const Counter = struct {
+            var i: u64 = 0;
+        };
+        Counter.i += 1;
+        const dir_name = try std.fmt.allocPrint(allocator, "{s}/labelle_scenes_{d}_{d}", .{ tmp_base, ts, Counter.i });
+        try std.Io.Dir.cwd().createDir(io_global.io(), dir_name, .default_dir);
+        return dir_name;
+    }
+
+    fn deleteTempDir(allocator: std.mem.Allocator, dir_path: []const u8) void {
+        std.Io.Dir.cwd().deleteTree(io_global.io(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+
+    fn touchFile(allocator: std.mem.Allocator, dir_path: []const u8, name: []const u8) !void {
+        const path = try std.fs.path.join(allocator, &.{ dir_path, name });
+        defer allocator.free(path);
+        try std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = path,
+            .data = "{ \"entities\": {} }\n",
+        });
+    }
+
+    test "returns empty slice when project has no dir" {
+        const allocator = std.testing.allocator;
+        const proj = try project.Project.create(allocator, "no_dir");
+        defer proj.deinit();
+        const scenes = try proj.scenesAvailable(allocator);
+        try expect.equal(scenes.len, 0);
+    }
+
+    test "returns empty slice when scenes/ is missing" {
+        const allocator = std.testing.allocator;
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+        try pm.newProject("missing_scenes");
+        // Don't call saveProject — it scaffolds `scenes/`. Force-set the
+        // dir so the lookup runs.
+        pm.current_project.?.dir = try pm.current_project.?.arena.allocator().dupe(u8, temp_dir);
+
+        const scenes = try pm.current_project.?.scenesAvailable(allocator);
+        try expect.equal(scenes.len, 0);
+    }
+
+    test "lists *.jsonc files alphabetically by stem" {
+        const allocator = std.testing.allocator;
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+        try pm.newProject("scenes_test");
+        try pm.saveProject(temp_dir);
+
+        const scenes_dir = try std.fs.path.join(allocator, &.{ temp_dir, "scenes" });
+        defer allocator.free(scenes_dir);
+
+        // Drop files in a non-alphabetical order to prove the sort step
+        // runs.
+        try touchFile(allocator, scenes_dir, "main.jsonc");
+        try touchFile(allocator, scenes_dir, "debug.jsonc");
+        try touchFile(allocator, scenes_dir, "menu.jsonc");
+
+        const scenes = try pm.current_project.?.scenesAvailable(allocator);
+        try expect.equal(scenes.len, 3);
+        try std.testing.expectEqualStrings(scenes[0], "debug");
+        try std.testing.expectEqualStrings(scenes[1], "main");
+        try std.testing.expectEqualStrings(scenes[2], "menu");
+    }
+
+    test "ignores non-jsonc files and subdirectories" {
+        const allocator = std.testing.allocator;
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+        try pm.newProject("scenes_test");
+        try pm.saveProject(temp_dir);
+
+        const scenes_dir = try std.fs.path.join(allocator, &.{ temp_dir, "scenes" });
+        defer allocator.free(scenes_dir);
+
+        try touchFile(allocator, scenes_dir, "main.jsonc");
+        try touchFile(allocator, scenes_dir, "README.md");
+        try touchFile(allocator, scenes_dir, "main.json"); // wrong extension
+
+        // Subdir scenes are out of scope for the v1 picker — the
+        // launcher's `--scene=<name>` flag only accepts a single name,
+        // not a path. Drop a nested file to assert it's skipped.
+        const nested = try std.fs.path.join(allocator, &.{ scenes_dir, "debug" });
+        defer allocator.free(nested);
+        try std.Io.Dir.cwd().createDir(io_global.io(), nested, .default_dir);
+        try touchFile(allocator, nested, "main.jsonc");
+
+        const scenes = try pm.current_project.?.scenesAvailable(allocator);
+        try expect.equal(scenes.len, 1);
+        try std.testing.expectEqualStrings(scenes[0], "main");
+    }
+
+    test "caches the result across repeated calls" {
+        // The picker hits this on every render; make sure repeat calls
+        // return the same slice (identity check) rather than re-walking
+        // the filesystem and reallocating.
+        const allocator = std.testing.allocator;
+        const temp_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, temp_dir);
+
+        var pm = project.ProjectManager.init(allocator);
+        defer pm.deinit();
+        try pm.newProject("scenes_cache");
+        try pm.saveProject(temp_dir);
+
+        const scenes_dir = try std.fs.path.join(allocator, &.{ temp_dir, "scenes" });
+        defer allocator.free(scenes_dir);
+        try touchFile(allocator, scenes_dir, "main.jsonc");
+
+        const first = try pm.current_project.?.scenesAvailable(allocator);
+        const second = try pm.current_project.?.scenesAvailable(allocator);
+        try expect.equal(first.ptr, second.ptr);
+        try expect.equal(first.len, second.len);
+    }
+};
+
+pub const PreviewSpawnArgvTests = struct {
+    // Regression-lock the argv shape `preview.start` passes to
+    // `std.process.spawn` (#131 / #132). The launcher integration is
+    // covered by `zig build smoke`; this is the pure-formatter side.
+
+    test "no scene override matches the post-#130 argv shape (env-var, no --preview-mode)" {
+        var argv_buf: [16][]const u8 = undefined;
+        var scene_buf: [128]u8 = undefined;
+        const argv = try preview.buildSpawnArgv(
+            &argv_buf,
+            &scene_buf,
+            "/projects/game",
+            null,
+        );
+        try expect.equal(argv.len, 3);
+        try std.testing.expectEqualStrings(argv[0], "labelle");
+        try std.testing.expectEqualStrings(argv[1], "run");
+        try std.testing.expectEqualStrings(argv[2], "/projects/game");
+        // Regression-lock the bug from PR #130: argv MUST NOT include
+        // `--preview-mode` — the labelle CLI doesn't define it. The
+        // host:port goes through `LABELLE_PREVIEW` env var instead.
+        for (argv) |a| try expect.toBeFalse(std.mem.eql(u8, a, "--preview-mode"));
+    }
+
+    test "scene override appends --scene=<name>" {
+        var argv_buf: [16][]const u8 = undefined;
+        var scene_buf: [128]u8 = undefined;
+        const argv = try preview.buildSpawnArgv(
+            &argv_buf,
+            &scene_buf,
+            "/projects/game",
+            "level2",
+        );
+        try expect.equal(argv.len, 4);
+        try std.testing.expectEqualStrings(argv[3], "--scene=level2");
+    }
+
+    test "OOM when scene name overflows the scene buffer" {
+        // Names this long can't reach the launcher (the picker only
+        // surfaces filenames the OS already accepted), but the bounded
+        // buffer should reject them cleanly rather than truncating.
+        var argv_buf: [16][]const u8 = undefined;
+        var scene_buf: [128]u8 = undefined;
+        const oversize = "x" ** 200;
+        const got = preview.buildSpawnArgv(
+            &argv_buf,
+            &scene_buf,
+            "/d",
+            oversize[0..],
+        );
+        try std.testing.expectError(error.OutOfMemory, got);
+    }
+};
+
+pub const PreviewTransportTests = struct {
+    // Drives `PreviewSession` end-to-end against an in-test fake
+    // engine that dials the editor's listener and writes JSON
+    // frames. Subprocess spawn is **not** exercised here — tests
+    // use `bindListener` instead of `start(proj)` to skip the
+    // `labelle run` invocation.
+
+    const Timespec = extern struct { sec: isize, nsec: isize };
+    extern "c" fn nanosleep(req: *const Timespec, rem: ?*Timespec) c_int;
+    fn sleepMs(ms: u64) void {
+        const ts: Timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * 1_000_000) };
+        _ = nanosleep(&ts, null);
+    }
+
+    extern "c" fn connect(fd: c_int, addr: *const std.posix.sockaddr.in, len: std.posix.socklen_t) c_int;
+    extern "c" fn write(fd: c_int, buf: [*]const u8, len: usize) isize;
+    extern "c" fn close(fd: c_int) c_int;
+
+    /// Dial the editor's listener as if we were a freshly-spawned
+    /// engine. Returns the connected fd; caller writes JSON frames
+    /// via `write(2)`.
+    fn dialEditor(port: u16) !c_int {
+        const sock_fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+        if (sock_fd < 0) return error.SocketFailed;
+        const addr: std.posix.sockaddr.in = .{
+            .family = std.posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, port),
+            .addr = std.mem.nativeToBig(u32, 0x7F000001),
+            .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        };
+        const rc = connect(@intCast(sock_fd), &addr, @sizeOf(@TypeOf(addr)));
+        if (rc < 0) return error.ConnectFailed;
+        return @intCast(sock_fd);
+    }
+
+    fn sendJsonLine(fd: c_int, body: []const u8) !void {
+        var off: usize = 0;
+        while (off < body.len) {
+            const n = write(fd, body.ptr + off, body.len - off);
+            if (n <= 0) return error.WriteFailed;
+            off += @intCast(n);
+        }
+    }
+
+    /// Poll the session until `predicate` returns true or the
+    /// deadline expires. Mirrors the engine-side `waitFor` pattern.
+    fn waitUntilState(p: *preview.PreviewSession, target: preview.State, deadline_ms: u64) !void {
+        var slept: u64 = 0;
+        while (slept < deadline_ms) {
+            p.poll();
+            if (p.state == target) return;
+            sleepMs(2);
+            slept += 2;
+        }
+        return error.DeadlineExceeded;
+    }
+
+    test "bindListener picks a port and lands in .listening" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+
+        try sess.bindListener();
+        try expect.equal(sess.state, preview.State.listening);
+        try expect.toBeTrue(sess.port != null);
+        try expect.toBeTrue(sess.port.? != 0);
+    }
+
+    test "hello frame transitions .connecting → .running and records engine_pid" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        try sess.bindListener();
+
+        const port = sess.port.?;
+        const fd = try dialEditor(port);
+        // give the kernel a beat to land the SYN
+        try waitUntilState(&sess, .connecting, 500);
+
+        try sendJsonLine(fd, "{\"kind\":\"hello\",\"engine_version\":\"1.37.1\",\"pid\":12345,\"protocol_version\":1}\n");
+        try waitUntilState(&sess, .running, 500);
+        try expect.equal(sess.engine_pid.?, @as(i64, 12345));
+
+        _ = close(fd);
+    }
+
+    test "frame_offer fires on_frame_offer callback with shm_name + dims + format" {
+        const Capture = struct {
+            var got_name: [64]u8 = [_]u8{0} ** 64;
+            var got_name_len: usize = 0;
+            var got_width: u32 = 0;
+            var got_height: u32 = 0;
+            var got_format: [64]u8 = [_]u8{0} ** 64;
+            var got_format_len: usize = 0;
+            var fired: bool = false;
+
+            fn cb(_: *anyopaque, name: [:0]const u8, w: u32, h: u32, format: []const u8) void {
+                fired = true;
+                got_name_len = @min(name.len, got_name.len);
+                @memcpy(got_name[0..got_name_len], name[0..got_name_len]);
+                got_width = w;
+                got_height = h;
+                got_format_len = @min(format.len, got_format.len);
+                @memcpy(got_format[0..got_format_len], format[0..got_format_len]);
+            }
+        };
+        Capture.fired = false;
+        Capture.got_name_len = 0;
+        Capture.got_width = 0;
+        Capture.got_height = 0;
+        Capture.got_format_len = 0;
+
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        try sess.bindListener();
+        sess.on_frame_offer = .{ .ctx = &Capture.fired, .func = Capture.cb };
+
+        const fd = try dialEditor(sess.port.?);
+        try waitUntilState(&sess, .connecting, 500);
+        try sendJsonLine(fd, "{\"kind\":\"hello\",\"engine_version\":\"x\",\"pid\":1,\"protocol_version\":1}\n");
+        try waitUntilState(&sess, .running, 500);
+
+        try sendJsonLine(fd,
+            "{\"kind\":\"frame_offer\",\"shm_name\":\"/lbl-test\",\"width\":640,\"height\":360,\"format\":\"bgra8\",\"ring_size\":3,\"slot_size_bytes\":921600}\n");
+
+        // poll for ~500 ms waiting for the callback
+        var i: u32 = 0;
+        while (i < 250 and !Capture.fired) : (i += 1) {
+            sess.poll();
+            sleepMs(2);
+        }
+        try expect.toBeTrue(Capture.fired);
+        try std.testing.expectEqualStrings(Capture.got_name[0..Capture.got_name_len], "/lbl-test");
+        try expect.equal(Capture.got_width, @as(u32, 640));
+        try expect.equal(Capture.got_height, @as(u32, 360));
+        try std.testing.expectEqualStrings(Capture.got_format[0..Capture.got_format_len], "bgra8");
+
+        _ = close(fd);
+    }
+
+    test "frame_offer forwards format=iosurface_bgra8 to the callback" {
+        // The format-dispatch wiring lives in App.attachGameView / the
+        // GameView consumer; this test stops one level shy of that, at
+        // the JSON parser. We assert the parser hands the borrowed
+        // slice through verbatim — App reads it to pick shm vs iosurface
+        // transport (`src/game_view.zig`).
+        const Capture = struct {
+            var got_format: [64]u8 = [_]u8{0} ** 64;
+            var got_format_len: usize = 0;
+            var fired: bool = false;
+
+            fn cb(_: *anyopaque, _: [:0]const u8, _: u32, _: u32, format: []const u8) void {
+                fired = true;
+                got_format_len = @min(format.len, got_format.len);
+                @memcpy(got_format[0..got_format_len], format[0..got_format_len]);
+            }
+        };
+        Capture.fired = false;
+        Capture.got_format_len = 0;
+
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        try sess.bindListener();
+        sess.on_frame_offer = .{ .ctx = &Capture.fired, .func = Capture.cb };
+
+        const fd = try dialEditor(sess.port.?);
+        try waitUntilState(&sess, .connecting, 500);
+        try sendJsonLine(fd, "{\"kind\":\"hello\",\"engine_version\":\"x\",\"pid\":1,\"protocol_version\":1}\n");
+        try waitUntilState(&sess, .running, 500);
+
+        try sendJsonLine(fd,
+            "{\"kind\":\"frame_offer\",\"shm_name\":\"/lbl-ios\",\"width\":1280,\"height\":720,\"format\":\"iosurface_bgra8\",\"ring_size\":3}\n");
+
+        var i: u32 = 0;
+        while (i < 250 and !Capture.fired) : (i += 1) {
+            sess.poll();
+            sleepMs(2);
+        }
+        try expect.toBeTrue(Capture.fired);
+        try std.testing.expectEqualStrings(Capture.got_format[0..Capture.got_format_len], "iosurface_bgra8");
+
+        _ = close(fd);
+    }
+
+    test "bye frame transitions .running → .stopped and records reason" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        try sess.bindListener();
+
+        const fd = try dialEditor(sess.port.?);
+        try waitUntilState(&sess, .connecting, 500);
+        try sendJsonLine(fd, "{\"kind\":\"hello\",\"engine_version\":\"\",\"pid\":7,\"protocol_version\":1}\n");
+        try waitUntilState(&sess, .running, 500);
+        try sendJsonLine(fd, "{\"kind\":\"bye\",\"reason\":\"normal\"}\n");
+        try waitUntilState(&sess, .stopped, 500);
+        try std.testing.expectEqualStrings(sess.bye_reason.?, "normal");
+
+        _ = close(fd);
+    }
+
+    test "EOF without bye lands in .crashed" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        try sess.bindListener();
+
+        const fd = try dialEditor(sess.port.?);
+        try waitUntilState(&sess, .connecting, 500);
+        try sendJsonLine(fd, "{\"kind\":\"hello\",\"engine_version\":\"\",\"pid\":7,\"protocol_version\":1}\n");
+        try waitUntilState(&sess, .running, 500);
+
+        // Hard-close the engine fd without bye.
+        _ = close(fd);
+        try waitUntilState(&sess, .crashed, 500);
+    }
+};
+
+pub const PreviewLiveStderrTests = struct {
+    // Covers the #127 live-tail mechanism:
+    //  - `consumeStderr` returns newly-arrived bytes once and advances
+    //    the internal cursor so a second call returns an empty slice.
+    //  - The cursor resets on `bindListener` so a fresh Run doesn't
+    //    inherit a stale cursor.
+    //
+    // Driven directly against `stderr_buf` (an exported field on the
+    // session struct) so the test stays hermetic — no real subprocess
+    // is spawned. The end-to-end `drainChildStderr` path is exercised
+    // by the subprocess-exit test below and by `zig build smoke`.
+
+    test "consumeStderr yields fresh bytes once and advances the cursor" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        try sess.bindListener();
+
+        // Simulate two batches of stderr arriving from a hypothetical
+        // subprocess. `drainChildStderr` would do this for us in the
+        // production path; we inject directly to stay subprocess-free.
+        try sess.stderr_buf.appendSlice(std.testing.allocator, "compiling foo.zig\n");
+        const first = sess.consumeStderr();
+        try std.testing.expectEqualStrings(first, "compiling foo.zig\n");
+
+        // No new bytes arrived since the last consume — the next call
+        // returns an empty slice (panel renders nothing new this frame).
+        const empty = sess.consumeStderr();
+        try expect.equal(empty.len, @as(usize, 0));
+
+        // A second batch arrives. `consumeStderr` returns only the new
+        // bytes, not the original batch (cursor was advanced past it).
+        try sess.stderr_buf.appendSlice(std.testing.allocator, "compiling bar.zig\n");
+        const second = sess.consumeStderr();
+        try std.testing.expectEqualStrings(second, "compiling bar.zig\n");
+
+        // The full buffer is still accessible via `capturedStderr`
+        // (the crash-tail surface) so the on-crash panel still shows
+        // everything the subprocess wrote across the whole session.
+        try std.testing.expectEqualStrings(sess.capturedStderr(), "compiling foo.zig\ncompiling bar.zig\n");
+    }
+
+    test "bindListener resets the consumeStderr cursor and buffer" {
+        // Run #1 leaves a non-empty stderr_buf and a partially-consumed
+        // cursor. Run #2 (`bindListener`) must reset both — otherwise
+        // the panel would see stale bytes from the previous build.
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        try sess.bindListener();
+        try sess.stderr_buf.appendSlice(std.testing.allocator, "stale output\n");
+        _ = sess.consumeStderr();
+        try expect.equal(sess.stderr_cursor, @as(usize, "stale output\n".len));
+
+        // Land in `.stopped` (the legal restart-from state) before the
+        // fresh `bindListener` — same path the user takes when they
+        // press Stop and then Run again.
+        sess.stop();
+        try sess.bindListener();
+        try expect.equal(sess.stderr_buf.items.len, @as(usize, 0));
+        try expect.equal(sess.stderr_cursor, @as(usize, 0));
+        const fresh = sess.consumeStderr();
+        try expect.equal(fresh.len, @as(usize, 0));
+    }
+
+    // tryWaitChild integration: a real subprocess (`/usr/bin/false`)
+    // is spawned, it exits with code 1 immediately, and `poll` is
+    // expected to land the session in `.crashed` *before* the
+    // 60-second `connecting_timeout_ms` window — the whole point of
+    // the subprocess-exit early-crash detection (#127, #136).
+    //
+    // `/usr/bin/false` is part of the POSIX base on every machine
+    // this codebase is expected to run on (macOS, Linux, CI). No
+    // network or labelle-cli needed.
+    const Timespec = extern struct { sec: isize, nsec: isize };
+    extern "c" fn nanosleep(req: *const Timespec, rem: ?*Timespec) c_int;
+    fn sleepMs(ms: u64) void {
+        const ts: Timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * 1_000_000) };
+        _ = nanosleep(&ts, null);
+    }
+
+    test "stderr_buf rotates when over cap so live tail keeps surfacing recent bytes" {
+        // The non-rotating version of `drainChildStderr` froze at 16
+        // KiB — once full it stopped appending, hiding the build
+        // error that lands at the END of zig's output. The rotating
+        // version drops oldest bytes from the front and adjusts the
+        // consumeStderr cursor so the live-tail consumer keeps
+        // observing fresh data.
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+
+        // Fill exactly to the cap with 'A's, drain via consumeStderr
+        // so the cursor advances to the end, then push 1024 'B's
+        // past the cap.
+        const cap: usize = 16 * 1024;
+        var filler: [1024]u8 = undefined;
+        @memset(&filler, 'A');
+        var pushed: usize = 0;
+        while (pushed < cap) {
+            sess.appendStderrChunk(&filler);
+            pushed += filler.len;
+        }
+        try expect.equal(sess.stderr_buf.items.len, cap);
+        const drained_first = sess.consumeStderr();
+        try expect.equal(drained_first.len, cap);
+        try expect.equal(sess.stderr_cursor, cap);
+
+        // Push a B-block past the cap — front should drop and the
+        // cursor should slide back so subsequent reads see ONLY the
+        // freshly-arrived bytes (not stale A's).
+        var b_block: [1024]u8 = undefined;
+        @memset(&b_block, 'B');
+        sess.appendStderrChunk(&b_block);
+        try expect.equal(sess.stderr_buf.items.len, cap);
+        // Last 1024 bytes are B's, rest are still A's.
+        try expect.toBeTrue(sess.stderr_buf.items[cap - 1] == 'B');
+        try expect.toBeTrue(sess.stderr_buf.items[0] == 'A');
+        const drained_second = sess.consumeStderr();
+        // We dropped 1024 from the front and appended 1024 — cursor
+        // had been at `cap` (i.e. fully drained), shifted to
+        // `cap - 1024`, then `appendSlice` grew the buffer to `cap`
+        // again. So fresh = exactly the 1024 newest bytes.
+        try expect.equal(drained_second.len, @as(usize, 1024));
+        try expect.toBeTrue(drained_second[0] == 'B');
+        try expect.toBeTrue(drained_second[drained_second.len - 1] == 'B');
+    }
+
+    test "a single oversized chunk keeps only the tail of the chunk" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        const cap: usize = 16 * 1024;
+        const chunk = std.testing.allocator.alloc(u8, cap + 4096) catch unreachable;
+        defer std.testing.allocator.free(chunk);
+        @memset(chunk[0..4096], 'A');
+        @memset(chunk[4096..], 'B');
+        sess.appendStderrChunk(chunk);
+        // The leading 'A's should be entirely dropped — only the
+        // tail 16 KiB of 'B's survives.
+        try expect.equal(sess.stderr_buf.items.len, cap);
+        try expect.toBeTrue(sess.stderr_buf.items[0] == 'B');
+        try expect.toBeTrue(sess.stderr_buf.items[cap - 1] == 'B');
+        try expect.equal(sess.stderr_cursor, @as(usize, 0));
+    }
+
+    test "subprocess-exit early detection transitions .listening → .crashed before the 60s timeout" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        try sess.bindListener();
+        try expect.equal(sess.state, preview.State.listening);
+
+        // Spawn a child that exits immediately with a non-zero code.
+        // The `/usr/bin/false` binary is present on macOS, Linux,
+        // and the CI image. Stderr piped so `drainChildStderr` has a
+        // valid fd to poll (the production path always pipes stderr).
+        const argv = &[_][]const u8{"/usr/bin/false"};
+        const child = std.process.spawn(io_global.io(), .{
+            .argv = argv,
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .pipe,
+        }) catch |err| {
+            // If we're on an exotic platform without /usr/bin/false,
+            // skip rather than fail — the production preview path
+            // depends on `labelle` being on PATH anyway, which is
+            // a stricter environmental assumption.
+            std.debug.print("skip: /usr/bin/false unavailable ({s})\n", .{@errorName(err)});
+            return error.SkipZigTest;
+        };
+        sess.child = child;
+
+        // Wait for the child to exit and `poll` to observe it via
+        // `waitpid(WNOHANG)`. 2 s is generous — `/usr/bin/false`
+        // exits in microseconds, and the cap is intentionally far
+        // below the 60 s `connecting_timeout_ms` backstop so the
+        // assertion proves the early-detection path (not the fallback).
+        var slept: u64 = 0;
+        while (slept < 2000) {
+            sess.poll();
+            if (sess.state == .crashed) break;
+            sleepMs(5);
+            slept += 5;
+        }
+        try expect.equal(sess.state, preview.State.crashed);
+        // The reason should reflect the exit code, not the timeout
+        // message ("engine never connected") — that's how we know
+        // the early-detection branch fired.
+        const reason = sess.bye_reason orelse "";
+        try expect.toBeTrue(std.mem.indexOf(u8, reason, "labelle exited") != null);
+    }
+};
+
+pub const IOSurfaceLayoutTests = struct {
+    // The iosurface.ControlBlock layout has to match what the engine's
+    // (future) iosurface producer writes into shm slot 0. Layout
+    // changes break the protocol — keep these comptime-correlated to
+    // catch a drift between either side.
+
+    const iosurface = @import("iosurface.zig");
+
+    test "ControlBlock magic is the four-CC the producer expects" {
+        // 'IOSRFCL1' big-endian → 0x494F535246434C31. The PoC's
+        // producer expects this exact value; the engine producer
+        // follow-up will match.
+        try expect.equal(iosurface.ControlBlock.MAGIC, @as(u64, 0x494F535246434C31));
+    }
+
+    test "ControlBlock size matches the documented layout" {
+        // 24 fixed bytes (magic + ring_size + pixel_format + width +
+        // height) + MAX_RING * 4 (ids) + 16 pad. The comptime assert
+        // inside iosurface.zig guards this; the test reads the asserted
+        // value so a drift surfaces as a test failure too.
+        const expected = 24 + iosurface.MAX_RING * 4 + 16;
+        try expect.equal(@sizeOf(iosurface.ControlBlock), expected);
+    }
+
+    test "BGRA8 pixel format constant matches CGLTexImageIOSurface2D's expectation" {
+        // 'BGRA' four-CC = 0x42475241.
+        try expect.equal(iosurface.kPixelFormat_BGRA8, @as(u32, 0x42475241));
+    }
+
+    test "MAX_RING bounds the ControlBlock id array" {
+        // Catches a silent reduction of MAX_RING that'd shrink the
+        // struct under what the engine producer might still send.
+        try expect.equal(iosurface.MAX_RING, @as(u32, 8));
+    }
+};
+
+pub const PreviewBinaryPlaneTests = struct {
+    // Drives `PreviewSession` end-to-end against an in-test fake
+    // engine that dials the editor's listener and writes hand-built
+    // binary plane frames (the format `labelle-engine`'s
+    // `preview_mode.zig` emits via `writeBinaryFrame`). Mirrors
+    // `PreviewTransportTests` for the JSON control plane (#112).
+
+    const Timespec = extern struct { sec: isize, nsec: isize };
+    extern "c" fn nanosleep(req: *const Timespec, rem: ?*Timespec) c_int;
+    fn sleepMs(ms: u64) void {
+        const ts: Timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * 1_000_000) };
+        _ = nanosleep(&ts, null);
+    }
+
+    extern "c" fn connect(fd: c_int, addr: *const std.posix.sockaddr.in, len: std.posix.socklen_t) c_int;
+    extern "c" fn write(fd: c_int, buf: [*]const u8, len: usize) isize;
+    extern "c" fn close(fd: c_int) c_int;
+
+    fn dialEditor(port: u16) !c_int {
+        const sock_fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+        if (sock_fd < 0) return error.SocketFailed;
+        const addr: std.posix.sockaddr.in = .{
+            .family = std.posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, port),
+            .addr = std.mem.nativeToBig(u32, 0x7F000001),
+            .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        };
+        const rc = connect(@intCast(sock_fd), &addr, @sizeOf(@TypeOf(addr)));
+        if (rc < 0) return error.ConnectFailed;
+        return @intCast(sock_fd);
+    }
+
+    fn writeAll(fd: c_int, bytes: []const u8) !void {
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const n = write(fd, bytes.ptr + off, bytes.len - off);
+            if (n <= 0) return error.WriteFailed;
+            off += @intCast(n);
+        }
+    }
+
+    fn waitUntilState(p: *preview.PreviewSession, target: preview.State, deadline_ms: u64) !void {
+        var slept: u64 = 0;
+        while (slept < deadline_ms) {
+            p.poll();
+            if (p.state == target) return;
+            sleepMs(2);
+            slept += 2;
+        }
+        return error.DeadlineExceeded;
+    }
+
+    // Boilerplate: bind editor listener, dial from the fake engine,
+    // send `hello`, wait until `.running`. Returns the engine-side
+    // fd. Caller closes it.
+    fn connectPair(sess: *preview.PreviewSession) !c_int {
+        try sess.bindListener();
+        const fd = try dialEditor(sess.port.?);
+        try waitUntilState(sess, .connecting, 500);
+        try writeAll(fd, "{\"kind\":\"hello\",\"engine_version\":\"\",\"pid\":1,\"protocol_version\":1}\n");
+        try waitUntilState(sess, .running, 500);
+        return fd;
+    }
+
+    // Write a binary frame header [u8 magic] [u8 kind] [u32 len-LE]
+    // followed by `payload`, mirroring engine-side `writeBinaryFrame`.
+    fn writeBinaryFrame(fd: c_int, kind: preview.BinaryFrameKind, payload: []const u8) !void {
+        var header: [6]u8 = undefined;
+        header[0] = preview.binary_magic;
+        header[1] = @intFromEnum(kind);
+        std.mem.writeInt(u32, header[2..6], @intCast(payload.len), .little);
+        try writeAll(fd, &header);
+        if (payload.len > 0) try writeAll(fd, payload);
+    }
+
+    // Poll the session until `predicate` returns true or the deadline
+    // expires. Used for callback-firing tests where state doesn't
+    // transition.
+    fn waitUntil(sess: *preview.PreviewSession, ctx: anytype, predicate: *const fn (@TypeOf(ctx)) bool, deadline_ms: u64) !void {
+        var slept: u64 = 0;
+        while (slept < deadline_ms) {
+            sess.poll();
+            if (predicate(ctx)) return;
+            sleepMs(2);
+            slept += 2;
+        }
+        return error.DeadlineExceeded;
+    }
+
+    test "component_changed binary frame fires on_component_changed callback" {
+        const Capture = struct {
+            var fired: bool = false;
+            var got_entity: u64 = 0;
+            var got_name: [64]u8 = [_]u8{0} ** 64;
+            var got_name_len: usize = 0;
+            var got_bytes: [128]u8 = [_]u8{0} ** 128;
+            var got_bytes_len: usize = 0;
+
+            fn cb(_: *anyopaque, entity_id: u64, name: []const u8, bytes: []const u8) void {
+                fired = true;
+                got_entity = entity_id;
+                got_name_len = @min(name.len, got_name.len);
+                @memcpy(got_name[0..got_name_len], name[0..got_name_len]);
+                got_bytes_len = @min(bytes.len, got_bytes.len);
+                @memcpy(got_bytes[0..got_bytes_len], bytes[0..got_bytes_len]);
+            }
+        };
+        Capture.fired = false;
+        Capture.got_entity = 0;
+        Capture.got_name_len = 0;
+        Capture.got_bytes_len = 0;
+
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        sess.on_component_changed = .{ .ctx = &Capture.fired, .func = Capture.cb };
+        const fd = try connectPair(&sess);
+        defer _ = close(fd);
+
+        // Payload: [u64 entity_id=42] [u16 name_len=8] ["Position"]
+        //          [u32 data_len=4] [0xDE 0xAD 0xBE 0xEF]
+        const name = "Position";
+        const data = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
+        var payload_buf: [256]u8 = undefined;
+        var off: usize = 0;
+        std.mem.writeInt(u64, payload_buf[off..][0..8], 42, .little);
+        off += 8;
+        std.mem.writeInt(u16, payload_buf[off..][0..2], @intCast(name.len), .little);
+        off += 2;
+        @memcpy(payload_buf[off .. off + name.len], name);
+        off += name.len;
+        std.mem.writeInt(u32, payload_buf[off..][0..4], @intCast(data.len), .little);
+        off += 4;
+        @memcpy(payload_buf[off .. off + data.len], &data);
+        off += data.len;
+
+        try writeBinaryFrame(fd, .component_changed, payload_buf[0..off]);
+
+        const wait = struct {
+            fn fired(_: *bool) bool {
+                return Capture.fired;
+            }
+        };
+        try waitUntil(&sess, &Capture.fired, wait.fired, 500);
+
+        try expect.toBeTrue(Capture.fired);
+        try expect.equal(Capture.got_entity, @as(u64, 42));
+        try std.testing.expectEqualStrings(Capture.got_name[0..Capture.got_name_len], "Position");
+        try std.testing.expectEqualSlices(u8, Capture.got_bytes[0..Capture.got_bytes_len], &data);
+    }
+
+    test "node_entered binary frame fires on_node_entered callback" {
+        const Capture = struct {
+            var fired: bool = false;
+            var got_flow: [64]u8 = [_]u8{0} ** 64;
+            var got_flow_len: usize = 0;
+            var got_node: u32 = 0;
+
+            fn cb(_: *anyopaque, flow_name: []const u8, node_id: u32) void {
+                fired = true;
+                got_flow_len = @min(flow_name.len, got_flow.len);
+                @memcpy(got_flow[0..got_flow_len], flow_name[0..got_flow_len]);
+                got_node = node_id;
+            }
+        };
+        Capture.fired = false;
+        Capture.got_flow_len = 0;
+        Capture.got_node = 0;
+
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        sess.on_node_entered = .{ .ctx = &Capture.fired, .func = Capture.cb };
+        const fd = try connectPair(&sess);
+        defer _ = close(fd);
+
+        // Payload: [u16 flow_name_len=20] ["player_state_machine"] [u32 node_id=7]
+        const flow_name = "player_state_machine";
+        var payload_buf: [128]u8 = undefined;
+        var off: usize = 0;
+        std.mem.writeInt(u16, payload_buf[off..][0..2], @intCast(flow_name.len), .little);
+        off += 2;
+        @memcpy(payload_buf[off .. off + flow_name.len], flow_name);
+        off += flow_name.len;
+        std.mem.writeInt(u32, payload_buf[off..][0..4], 7, .little);
+        off += 4;
+
+        try writeBinaryFrame(fd, .node_entered, payload_buf[0..off]);
+
+        const wait = struct {
+            fn fired(_: *bool) bool {
+                return Capture.fired;
+            }
+        };
+        try waitUntil(&sess, &Capture.fired, wait.fired, 500);
+
+        try expect.toBeTrue(Capture.fired);
+        try std.testing.expectEqualStrings(Capture.got_flow[0..Capture.got_flow_len], "player_state_machine");
+        try expect.equal(Capture.got_node, @as(u32, 7));
+    }
+
+    // `entity_created` doesn't have a callback slot today (the
+    // Entity Inspector doesn't model "new entity announced" yet) —
+    // just verify the decoder consumes the bytes so following
+    // frames stay aligned.
+    test "entity_created binary frame is consumed (no callback)" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        const fd = try connectPair(&sess);
+        defer _ = close(fd);
+
+        // [u64 entity_id=99] [u16 name_len=6] ["player"]
+        const name = "player";
+        var payload_buf: [64]u8 = undefined;
+        var off: usize = 0;
+        std.mem.writeInt(u64, payload_buf[off..][0..8], 99, .little);
+        off += 8;
+        std.mem.writeInt(u16, payload_buf[off..][0..2], @intCast(name.len), .little);
+        off += 2;
+        @memcpy(payload_buf[off .. off + name.len], name);
+        off += name.len;
+
+        try writeBinaryFrame(fd, .entity_created, payload_buf[0..off]);
+
+        // Follow up with a heartbeat — the only way to confirm the
+        // decoder didn't get stuck on the binary frame's length
+        // prefix is to see a later JSON frame still parses.
+        try writeAll(fd, "{\"kind\":\"heartbeat\",\"t\":555}\n");
+        const wait = struct {
+            fn hb(p: *preview.PreviewSession) bool {
+                return (p.last_heartbeat_ms orelse 0) == 555;
+            }
+        };
+        try waitUntil(&sess, &sess, wait.hb, 500);
+        try expect.equal(sess.last_heartbeat_ms.?, @as(i64, 555));
+        try expect.equal(sess.state, preview.State.running);
+    }
+
+    // `entity_destroyed` has no callback slot today either — confirm
+    // the 8-byte payload is consumed and the stream stays aligned.
+    test "entity_destroyed binary frame is consumed (no callback)" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        const fd = try connectPair(&sess);
+        defer _ = close(fd);
+
+        var payload: [8]u8 = undefined;
+        std.mem.writeInt(u64, &payload, 123, .little);
+        try writeBinaryFrame(fd, .entity_destroyed, &payload);
+
+        try writeAll(fd, "{\"kind\":\"heartbeat\",\"t\":777}\n");
+        const wait = struct {
+            fn hb(p: *preview.PreviewSession) bool {
+                return (p.last_heartbeat_ms orelse 0) == 777;
+            }
+        };
+        try waitUntil(&sess, &sess, wait.hb, 500);
+        try expect.equal(sess.last_heartbeat_ms.?, @as(i64, 777));
+    }
+
+    // `pin_value` has no callback slot today (consumer tracked in
+    // #100) — confirm the variable-length payload is fully consumed
+    // so the stream stays aligned for the next frame.
+    test "pin_value binary frame is consumed (no callback)" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        const fd = try connectPair(&sess);
+        defer _ = close(fd);
+
+        // Payload: [u16 flow_len] [flow bytes] [u32 node_id]
+        //          [u16 pin_len] [pin bytes] [f64 value bits]
+        const flow_name = "main_flow";
+        const pin_name = "out";
+        var payload_buf: [128]u8 = undefined;
+        var off: usize = 0;
+        std.mem.writeInt(u16, payload_buf[off..][0..2], @intCast(flow_name.len), .little);
+        off += 2;
+        @memcpy(payload_buf[off .. off + flow_name.len], flow_name);
+        off += flow_name.len;
+        std.mem.writeInt(u32, payload_buf[off..][0..4], 13, .little);
+        off += 4;
+        std.mem.writeInt(u16, payload_buf[off..][0..2], @intCast(pin_name.len), .little);
+        off += 2;
+        @memcpy(payload_buf[off .. off + pin_name.len], pin_name);
+        off += pin_name.len;
+        const value: f64 = 3.14;
+        const bits: u64 = @bitCast(value);
+        std.mem.writeInt(u64, payload_buf[off..][0..8], bits, .little);
+        off += 8;
+
+        try writeBinaryFrame(fd, .pin_value, payload_buf[0..off]);
+
+        try writeAll(fd, "{\"kind\":\"heartbeat\",\"t\":1234}\n");
+        const wait = struct {
+            fn hb(p: *preview.PreviewSession) bool {
+                return (p.last_heartbeat_ms orelse 0) == 1234;
+            }
+        };
+        try waitUntil(&sess, &sess, wait.hb, 500);
+        try expect.equal(sess.last_heartbeat_ms.?, @as(i64, 1234));
+    }
+};
+
+pub const GameViewLatencyTests = struct {
+    // GameView.meanLatencyNs is pure math over its latency_ring; no
+    // GL context needed. Compose the struct manually to test the
+    // bookkeeping in isolation. attach()/poll() are exercised
+    // end-to-end in the gui-tests TE binary (display + headless GL).
+
+    test "meanLatencyNs returns 0 before any samples" {
+        var gv = game_view.GameView.init(std.testing.allocator);
+        defer gv.deinit();
+        try expect.equal(gv.meanLatencyNs(), @as(u64, 0));
+    }
+
+    test "meanLatencyNs averages every populated slot" {
+        var gv = game_view.GameView.init(std.testing.allocator);
+        defer gv.deinit();
+        gv.latency_ring[0] = 1_000_000;
+        gv.latency_ring[1] = 2_000_000;
+        gv.latency_ring[2] = 3_000_000;
+        gv.latency_count = 3;
+        // (1 + 2 + 3) / 3 == 2 ms.
+        try expect.equal(gv.meanLatencyNs(), @as(u64, 2_000_000));
+    }
+
+    test "meanLatencyNs uses latency_count, not the full capacity" {
+        // Guards against averaging across uninitialized slots after a
+        // fresh attach but before the ring fills.
+        var gv = game_view.GameView.init(std.testing.allocator);
+        defer gv.deinit();
+        gv.latency_ring[0] = 5_000_000;
+        // Slots [1..120) are zero-initialized; only slot 0 counts.
+        gv.latency_count = 1;
+        try expect.equal(gv.meanLatencyNs(), @as(u64, 5_000_000));
     }
 };

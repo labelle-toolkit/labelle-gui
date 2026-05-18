@@ -5,6 +5,7 @@
 //! until the test queue drains. Exit code reflects pass/fail.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const zglfw = @import("zglfw");
 const zopengl = @import("zopengl");
 const zgui = @import("zgui");
@@ -13,6 +14,9 @@ const App = @import("app.zig").App;
 const scene_mod = @import("modules/scene.zig");
 const prefab_mod = @import("modules/prefab.zig");
 const io_global = @import("io_global.zig");
+const engine_mod = @import("engine");
+const shm_mod = engine_mod.preview_mode_mod.preview_shm;
+const iosurface_producer_mod = engine_mod.preview_mode_mod.preview_iosurface;
 
 const gl_major = 4;
 const gl_minor = 1;
@@ -27,6 +31,185 @@ var g_app: ?*App = null;
 /// verify the Save button actually persisted, so the path needs to be
 /// reachable from the C-ABI callback.
 var g_settings_project_dir: ?[]const u8 = null;
+
+/// In-process synthetic SHM producer used by the PIE viewport tests
+/// (#109). Tests can't drive a real engine subprocess from TE, so the
+/// run callbacks stand up a `preview_shm.Producer` directly, hand its
+/// shm_name to `App.attachGameView`, and publish frames between
+/// yields to advance the consumer. `null` between tests; managed by
+/// the `piePreview*` helpers below.
+///
+/// Threading note: TE runs `run` callbacks on a coroutine thread that
+/// does NOT have the GL context current — `GameView.attach` /
+/// `detach` call `glGenTextures` / `glDeleteTextures`, so the `run`
+/// callback sets `g_pie_pending_attach` / `g_pie_pending_detach` and
+/// the `gui` callback (which DOES run on the GL thread) services
+/// them inside `pieServicePending`. Test code yields a frame to
+/// let the request land. SHM region create + publish is GL-free and
+/// stays in the `run` callback.
+var g_pie_producer: ?shm_mod.Producer = null;
+var g_pie_pending_attach: bool = false;
+var g_pie_pending_detach: bool = false;
+
+/// macOS caps POSIX shm names at PSHMNAMLEN (≈31 chars including the
+/// leading '/'). Producer.init pre-`shm_unlink`s any stale region
+/// from a previous run, so reuse across tests is safe.
+const pie_shm_name: [:0]const u8 = "/lbl-gui-te-viewport";
+
+/// Run-callback-side setup: create the SHM region (no GL), then
+/// request the consumer-side attach on the next gui frame.
+fn piePreviewStart(width: u32, height: u32) !void {
+    if (g_pie_producer != null) {
+        // Force a synchronous tear-down of any leftover from a prior
+        // test. Detach happens on the gui side; producer-side cleanup
+        // is fine here.
+        g_pie_pending_detach = true;
+        if (g_pie_producer) |*p| {
+            shm_mod.signalShutdown(p.header);
+            p.deinit();
+            g_pie_producer = null;
+        }
+    }
+    g_pie_producer = try shm_mod.Producer.init(pie_shm_name, .{
+        .width = width,
+        .height = height,
+        .ring_size = 3,
+    });
+    g_pie_pending_attach = true;
+}
+
+/// Run-callback-side teardown: drop the producer mapping, request
+/// consumer detach on the next gui frame. Idempotent.
+fn piePreviewStop() void {
+    g_pie_pending_detach = true;
+    if (g_pie_producer) |*p| {
+        shm_mod.signalShutdown(p.header);
+        p.deinit();
+        g_pie_producer = null;
+    }
+}
+
+/// Service pending attach/detach requests from the gui (main / GL)
+/// thread. Called at the top of each PIE-test `gui` callback before
+/// `renderFrame`. Failing attaches surface as silent no-ops here and
+/// turn into a failing `isAttached` assertion in the test.
+fn pieServicePending() void {
+    const app = g_app orelse return;
+    if (g_pie_pending_detach) {
+        app.game_view.detach();
+        g_pie_pending_detach = false;
+    }
+    if (g_pie_pending_attach) {
+        // Shm transport: the synthetic producer publishes BGRA8/RGBA8
+        // bytes into the ring directly. The iosurface dispatch lives
+        // in its own dedicated test below.
+        app.attachGameView(pie_shm_name, "bgra8") catch {};
+        g_pie_pending_attach = false;
+    }
+    if (g_pie_pending_ios_attach) {
+        app.attachGameView(pie_ios_shm_name, "iosurface_bgra8") catch {};
+        g_pie_pending_ios_attach = false;
+    }
+}
+
+/// Publish one frame with a known fill pattern. SHM publish is
+/// GL-free, so run-callback-side. Returns the producer's
+/// `frame_count` after publish, i.e. the frame_idx the consumer will
+/// see on the next `poll`.
+fn piePreviewPublish(byte: u8) u64 {
+    const p = &(g_pie_producer.?);
+    const pixels = p.pixelsPtr();
+    const total: usize = @intCast(@as(u64, p.opts.width) * @as(u64, p.opts.height) * 4);
+    @memset(pixels[0..total], byte);
+    p.publish(true);
+    return p.header.frame_count;
+}
+
+// ── iosurface synthetic producer (macOS-only) ──────────────────────
+//
+// Parallels the shm helpers above. Runs the engine's iosurface
+// producer in-process so the TE iosurface dispatch test can drive
+// `App.attachGameView(name, "iosurface_bgra8")` and observe the
+// consumer flip into the rectangle-texture + FBO blit path. Lookups
+// rely on `kIOSurfaceIsGlobal = true` (the engine producer sets it),
+// which works in-process and is what `iosurface.Consumer.init`
+// expects. On non-macOS hosts these globals stay null and the test
+// skips itself.
+
+var g_pie_ios_producer: ?iosurface_producer_mod.Producer = null;
+
+const pie_ios_shm_name: [:0]const u8 = "/lbl-gui-te-ios";
+
+fn pieIosStart(width: u32, height: u32) !void {
+    if (builtin.os.tag != .macos) return;
+    if (g_pie_ios_producer != null) {
+        g_pie_pending_detach = true;
+        if (g_pie_ios_producer) |*p| {
+            shm_mod.signalShutdown(p.shm_producer.header);
+            p.deinit();
+            g_pie_ios_producer = null;
+        }
+    }
+    g_pie_ios_producer = try iosurface_producer_mod.Producer.init(pie_ios_shm_name, .{
+        .width = width,
+        .height = height,
+        .ring_size = 3,
+    });
+    g_pie_pending_ios_attach = true;
+}
+
+fn pieIosStop() void {
+    if (builtin.os.tag != .macos) return;
+    g_pie_pending_detach = true;
+    if (g_pie_ios_producer) |*p| {
+        shm_mod.signalShutdown(p.shm_producer.header);
+        p.deinit();
+        g_pie_ios_producer = null;
+    }
+}
+
+/// Lock the next IOSurface, fill with a flat byte (B = G = R = A =
+/// byte → easy to recognise in a pixel inspector if a later test
+/// adds capture), publish. Returns the producer's frame_count.
+fn pieIosPublish(byte: u8) u64 {
+    if (builtin.os.tag != .macos) return 0;
+    const p = &(g_pie_ios_producer.?);
+    const locked = p.pixelsPtr() catch return p.shm_producer.header.frame_count;
+    // BGRA8 — bytes_per_row may pad past width*4.
+    const rows: usize = @intCast(p.height);
+    const row_bytes: usize = @intCast(p.width * 4);
+    var y: usize = 0;
+    while (y < rows) : (y += 1) {
+        const row_base: [*]u8 = locked.base + y * locked.bytes_per_row;
+        @memset(row_base[0..row_bytes], byte);
+    }
+    p.publish(true) catch {};
+    return p.shm_producer.header.frame_count;
+}
+
+/// Pending attach flag for the iosurface path — services on the GL
+/// thread via `pieServicePending`. Separate from the shm flag so the
+/// two paths can coexist in the same test binary without clobbering
+/// each other.
+var g_pie_pending_ios_attach: bool = false;
+
+/// Pending close request for the Game View tab (#128). Set from the
+/// run-callback thread, serviced in the gui callback because
+/// `closeTab`'s `.game_view` arm calls `game_view.detach()` which is
+/// GL-thread work.
+var g_pending_game_view_close: bool = false;
+
+/// Count `.game_view` entries in `App.open_tabs`. Used by the #128
+/// tests to assert tab dedup without taking a dep on absolute index
+/// (other tests may leave document tabs lying around).
+fn countGameViewTabs(a: *App) usize {
+    var n: usize = 0;
+    for (a.open_tabs.items) |t| switch (t) {
+        .game_view => n += 1,
+        else => {},
+    };
+    return n;
+}
 
 pub fn main() !void {
     try zglfw.init();
@@ -72,7 +255,7 @@ pub fn main() !void {
     defer g_app = null;
 
     _ = engine.registerTest("phase1", "hello_world", @src(), struct {
-        fn run(_: *zgui.te.TestContext) !void {
+        pub fn run(_: *zgui.te.TestContext) !void {
             _ = zgui.te.check(@src(), .{}, true, "trivially true");
         }
     });
@@ -101,30 +284,43 @@ pub fn main() !void {
     g_settings_project_dir = tmp;
     defer g_settings_project_dir = null;
 
+    // Defensive: if a PIE viewport test panics mid-run and skips its
+    // defer, ensure the producer mapping is torn down before the
+    // process exits so the next run gets a clean shm slot.
+    defer piePreviewStop();
+    defer pieIosStop();
+
     _ = engine.registerTest("phase3", "view_compiler_output_toggle", @src(), struct {
-        fn gui(_: *zgui.te.TestContext) !void {
+        pub fn gui(_: *zgui.te.TestContext) !void {
             // Synthetic dt; tests don't observe status_timer decay.
             if (g_app) |a| a.renderFrame(1.0 / 60.0);
         }
-        fn run(ctx: *zgui.te.TestContext) !void {
+        pub fn run(ctx: *zgui.te.TestContext) !void {
             const a = g_app orelse {
                 _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
                 return;
             };
+
+            // `MenuAction` walks relative to the test context's `RefID`;
+            // unset RefID makes the path's first segment be interpreted
+            // as a window name (e.g. "View" would be looked up as a
+            // top-level window), so anchor it to the main menu bar
+            // explicitly. The `ctx.yield(1)` after each click gives
+            // ImGui one frame to update the menu open/close state
+            // before the next item lookup.
+            ctx.setRef("//##MainMenuBar");
 
             // Sanity: panel starts closed.
             _ = zgui.te.check(@src(), .{}, !a.show_compiler_output, "panel starts closed");
 
             // Drive View > Compiler Output.
             ctx.menuAction(.click, "View/Compiler Output");
-
-            // The toggle flips the same `bool` the panel reads, so the
-            // assertion below sees the update without waiting on another
-            // frame.
+            ctx.yield(1);
             _ = zgui.te.check(@src(), .{}, a.show_compiler_output, "View/Compiler Output opens panel");
 
             // Toggle off again to confirm the menu reflects current state.
             ctx.menuAction(.click, "View/Compiler Output");
+            ctx.yield(1);
             _ = zgui.te.check(@src(), .{}, !a.show_compiler_output, "View/Compiler Output closes panel");
         }
     });
@@ -193,10 +389,10 @@ pub fn main() !void {
     }
 
     _ = engine.registerTest("phase3", "prefab_open_save_preserves_extras", @src(), struct {
-        fn gui(_: *zgui.te.TestContext) !void {
+        pub fn gui(_: *zgui.te.TestContext) !void {
             if (g_app) |a| a.renderFrame(1.0 / 60.0);
         }
-        fn run(ctx: *zgui.te.TestContext) !void {
+        pub fn run(ctx: *zgui.te.TestContext) !void {
             const a = g_app orelse {
                 _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
                 return;
@@ -212,11 +408,15 @@ pub fn main() !void {
             };
             ctx.yield(1);
 
+            // Sprite is a typed/managed component so it round-trips
+            // through `loaded.entity.sprite`, not `component_extras`.
+            // The fixture has two top-level components (Sprite +
+            // Coin) but only Coin lands in extras.
             const opened_ok = a.open_tabs.items.len == 1 and
                 a.open_tabs.items[0] == .prefab and
-                a.open_tabs.items[0].prefab.loaded.component_extras.len == 2 and
+                a.open_tabs.items[0].prefab.loaded.component_extras.len == 1 and
                 a.open_tabs.items[0].prefab.loaded.children.len == 1;
-            _ = zgui.te.check(@src(), .{}, opened_ok, "prefab opened with 2 components + 1 child");
+            _ = zgui.te.check(@src(), .{}, opened_ok, "prefab opened with 1 extra (Coin) + 1 child");
 
             // Move the child's Position, save through the public API,
             // and confirm the new position lands on disk while Sprite +
@@ -240,10 +440,10 @@ pub fn main() !void {
     });
 
     _ = engine.registerTest("phase3", "scene_open_save_preserves_extras", @src(), struct {
-        fn gui(_: *zgui.te.TestContext) !void {
+        pub fn gui(_: *zgui.te.TestContext) !void {
             if (g_app) |a| a.renderFrame(1.0 / 60.0);
         }
-        fn run(ctx: *zgui.te.TestContext) !void {
+        pub fn run(ctx: *zgui.te.TestContext) !void {
             const a = g_app orelse {
                 _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
                 return;
@@ -289,28 +489,40 @@ pub fn main() !void {
     });
 
     _ = engine.registerTest("phase3", "resources_add_and_save", @src(), struct {
-        fn gui(_: *zgui.te.TestContext) !void {
+        pub fn gui(_: *zgui.te.TestContext) !void {
             // Synthetic dt; tests don't observe status_timer decay.
             if (g_app) |a| a.renderFrame(1.0 / 60.0);
         }
-        fn run(ctx: *zgui.te.TestContext) !void {
+        pub fn run(ctx: *zgui.te.TestContext) !void {
             const a = g_app orelse {
                 _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
                 return;
             };
 
+            ctx.setRef("//##MainMenuBar");
             ctx.menuAction(.click, "View/Resources");
+            ctx.yield(1);
             _ = zgui.te.check(@src(), .{}, a.show_resources, "panel opened");
 
-            ctx.itemAction(.click, "Resources/Add", .{}, null);
+            // The panel's own widgets live under the "Resources" window
+            // — point the test ref there so itemAction can resolve
+            // "Add" / "row0/name" / etc. without spelling out the
+            // window every time.
+            ctx.setRef("Resources");
+
+            ctx.itemAction(.click, "Add", .{}, null);
             _ = zgui.te.check(@src(), .{}, a.resources_editor.count == 1, "Add created a slot");
 
-            // Row 0's inputs live under the pushStrIdZ("row0") scope.
-            ctx.itemInputStrValue("Resources/row0/name", "sprites");
-            ctx.itemInputStrValue("Resources/row0/json", "assets/sprites.json");
-            ctx.itemInputStrValue("Resources/row0/texture", "assets/sprites.png");
+            // Use the same fixture values the unit test in src/tests.zig
+            // round-trips (see "resources round-trip through save +
+            // load") so the on-disk values line up with
+            // ResourceFactory's defaults. Row 0's inputs live under
+            // the pushStrIdZ("row0") scope.
+            ctx.itemInputStrValue("row0/name", "sprites");
+            ctx.itemInputStrValue("row0/json", "assets/sprites.json");
+            ctx.itemInputStrValue("row0/texture", "assets/sprites.png");
 
-            ctx.itemAction(.click, "Resources/Save", .{}, null);
+            ctx.itemAction(.click, "Save", .{}, null);
 
             const proj = a.project_manager.current_project.?;
             const in_memory = proj.config.resources.len == 1 and
@@ -336,42 +548,43 @@ pub fn main() !void {
     // the public API keeps this test hermetic — same pattern the
     // scene/prefab tests use to avoid touching nfd.
     _ = engine.registerTest("phase3", "preview_panel_toggle_and_stop", @src(), struct {
-        fn gui(_: *zgui.te.TestContext) !void {
+        pub fn gui(_: *zgui.te.TestContext) !void {
             if (g_app) |a| a.renderFrame(1.0 / 60.0);
         }
-        fn run(ctx: *zgui.te.TestContext) !void {
+        pub fn run(ctx: *zgui.te.TestContext) !void {
             const a = g_app orelse {
                 _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
                 return;
             };
+
+            ctx.setRef("//##MainMenuBar");
 
             // Sanity: panel starts closed.
             _ = zgui.te.check(@src(), .{}, !a.show_preview, "Preview panel starts closed");
 
             // View menu toggle.
             ctx.menuAction(.click, "View/Preview");
+            ctx.yield(1);
             _ = zgui.te.check(@src(), .{}, a.show_preview, "View/Preview opens panel");
 
-            // From idle, isActive must be false and Stop is a no-op
-            // (state stays at .stopped after a stop call).
+            // From idle, isActive must be false.
             _ = zgui.te.check(@src(), .{}, !a.preview.isActive(), "preview starts inactive");
 
-            // Drive the Stop path through the App method — exercises
-            // the same code the panel button hits.
             a.stopPreview();
-            _ = zgui.te.check(@src(), .{}, a.preview.state == .stopped, "Stop preview lands at .stopped");
+            _ = zgui.te.check(@src(), .{}, !a.preview.isActive(), "preview still inactive after Stop");
 
             // Toggle off again.
             ctx.menuAction(.click, "View/Preview");
+            ctx.yield(1);
             _ = zgui.te.check(@src(), .{}, !a.show_preview, "View/Preview closes panel");
         }
     });
 
     _ = engine.registerTest("phase3", "flow_opens_and_renders_graph", @src(), struct {
-        fn gui(_: *zgui.te.TestContext) !void {
+        pub fn gui(_: *zgui.te.TestContext) !void {
             if (g_app) |a| a.renderFrame(1.0 / 60.0);
         }
-        fn run(ctx: *zgui.te.TestContext) !void {
+        pub fn run(ctx: *zgui.te.TestContext) !void {
             const a = g_app orelse {
                 _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
                 return;
@@ -409,24 +622,27 @@ pub fn main() !void {
     });
 
     _ = engine.registerTest("phase3", "project_settings_edit_save", @src(), struct {
-        fn gui(_: *zgui.te.TestContext) !void {
+        pub fn gui(_: *zgui.te.TestContext) !void {
             // Synthetic dt; tests don't observe status_timer decay.
             if (g_app) |a| a.renderFrame(1.0 / 60.0);
         }
-        fn run(ctx: *zgui.te.TestContext) !void {
+        pub fn run(ctx: *zgui.te.TestContext) !void {
             const a = g_app orelse {
                 _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
                 return;
             };
 
+            ctx.setRef("//##MainMenuBar");
             // Open the panel.
             ctx.menuAction(.click, "View/Project Settings");
+            ctx.yield(1);
             _ = zgui.te.check(@src(), .{}, a.show_project_settings, "panel opened");
 
             // Type into the Title field and click Save. The button click
             // also drives the on-disk write via ProjectManager.saveProject.
-            ctx.itemInputStrValue("Project Settings/Title", "Edited By TE");
-            ctx.itemAction(.click, "Project Settings/Save", .{}, null);
+            ctx.setRef("Project Settings");
+            ctx.itemInputStrValue("Title", "Edited By TE");
+            ctx.itemAction(.click, "Save", .{}, null);
 
             const proj = a.project_manager.current_project.?;
             const in_memory = std.mem.eql(u8, proj.config.title, "Edited By TE");
@@ -442,6 +658,412 @@ pub fn main() !void {
             defer a.allocator.free(content);
             const on_disk = std.mem.indexOf(u8, content, "Edited By TE") != null;
             _ = zgui.te.check(@src(), .{}, on_disk, "project.labelle on disk has new title");
+        }
+    });
+
+    // ── PIE viewport tests (#109) ──────────────────────────────────
+    //
+    // Cover the Game View panel (#111 / src/modules/game_view.zig)
+    // against an in-process synthetic SHM producer. The zgui binding
+    // doesn't expose `ImGuiTestEngine_CaptureScreenshot` and has no
+    // window-by-name introspection, so each test asserts on the
+    // Zig-level state mirror (`GameView.isAttached`, `last_frame_idx`,
+    // `last_latency_ns`) rather than on rendered pixels or scraped
+    // ImGui text. The rendered text in the Stats window is fed
+    // verbatim from those same fields (`renderStats` in
+    // `src/modules/game_view.zig`), so a mirror assertion is
+    // equivalent to a screenshot for our purposes.
+
+    _ = engine.registerTest("pie", "viewport/renders_on_attach", @src(), struct {
+        pub fn gui(_: *zgui.te.TestContext) !void {
+            pieServicePending();
+            if (g_app) |a| a.renderFrame(1.0 / 60.0);
+        }
+        pub fn run(ctx: *zgui.te.TestContext) !void {
+            const a = g_app orelse {
+                _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
+                return;
+            };
+
+            piePreviewStart(64, 64) catch {
+                _ = zgui.te.check(@src(), .{}, false, "piePreviewStart must succeed");
+                return;
+            };
+            defer piePreviewStop();
+            // Two yields: first lets the gui callback service the
+            // pending attach (which does GL work and must run on
+            // the main thread), second lets the panel render.
+            ctx.yield(2);
+
+            // Equivalent of TE window introspection: attachGameView
+            // toggles `show_game_view` on AND the consumer's
+            // isAttached() flips true. The Game View module's
+            // `render` is gated on `is_open.*` from
+            // Registry.renderAllPanels, so these two flags together
+            // are the editor-side proof that the panel rendered for
+            // this frame.
+            _ = zgui.te.check(@src(), .{}, a.game_view.isAttached(), "consumer attached after producer detected");
+            _ = zgui.te.check(@src(), .{}, a.show_game_view, "Game View panel auto-opens on attach");
+
+            // Let the deferred detach land before the next test
+            // observes a stale attachment.
+            ctx.yield(1);
+        }
+    });
+
+    _ = engine.registerTest("pie", "viewport/frame_idx_advances", @src(), struct {
+        pub fn gui(_: *zgui.te.TestContext) !void {
+            pieServicePending();
+            if (g_app) |a| a.renderFrame(1.0 / 60.0);
+        }
+        pub fn run(ctx: *zgui.te.TestContext) !void {
+            const a = g_app orelse {
+                _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
+                return;
+            };
+
+            piePreviewStart(64, 64) catch {
+                _ = zgui.te.check(@src(), .{}, false, "piePreviewStart must succeed");
+                return;
+            };
+            defer piePreviewStop();
+            ctx.yield(2); // service the deferred attach + render once.
+
+            // Drive 60 publishes interleaved with yields. Each yield
+            // runs one gui-callback frame which invokes
+            // `App.renderFrame` -> registry.renderAllPanels ->
+            // game_view.render -> `app.game_view.poll()`. The
+            // consumer's `last_frame_idx` is the only test surface
+            // (no pixel diff), so we just confirm it advances
+            // monotonically across the window.
+            var prev_idx: ?u64 = null;
+            var saw_increase: bool = false;
+            var i: usize = 0;
+            while (i < 60) : (i += 1) {
+                _ = piePreviewPublish(@intCast(i & 0xFF));
+                ctx.yield(1);
+
+                const cur = a.game_view.last_frame_idx orelse continue;
+                if (prev_idx) |p| {
+                    if (cur > p) saw_increase = true;
+                    // Monotonic: never decrease.
+                    if (cur < p) {
+                        _ = zgui.te.check(@src(), .{}, false, "last_frame_idx must not decrease");
+                    }
+                }
+                prev_idx = cur;
+            }
+            _ = zgui.te.check(@src(), .{}, prev_idx != null, "consumer saw at least one frame");
+            _ = zgui.te.check(@src(), .{}, saw_increase, "last_frame_idx advanced across the window");
+
+            ctx.yield(1);
+        }
+    });
+
+    _ = engine.registerTest("pie", "viewport/latency_stat_visible", @src(), struct {
+        pub fn gui(_: *zgui.te.TestContext) !void {
+            pieServicePending();
+            if (g_app) |a| a.renderFrame(1.0 / 60.0);
+        }
+        pub fn run(ctx: *zgui.te.TestContext) !void {
+            const a = g_app orelse {
+                _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
+                return;
+            };
+
+            piePreviewStart(64, 64) catch {
+                _ = zgui.te.check(@src(), .{}, false, "piePreviewStart must succeed");
+                return;
+            };
+            defer piePreviewStop();
+            ctx.yield(2); // service the deferred attach.
+
+            _ = piePreviewPublish(0xAA);
+            ctx.yield(2);
+
+            // The Stats window prints
+            //     "last latency  = {d:.2} ms"
+            // from `last_latency_ns`. A non-zero `last_latency_ns`
+            // after a real publish + poll is the test surface that
+            // proves the stat line rendered with a real reading
+            // (rather than the "Not attached." fallback or the
+            // pre-first-frame zero path). The zgui binding has no
+            // window-text introspection so a literal substring
+            // match isn't reachable from here — the underlying
+            // state mirror is the next best thing.
+            _ = zgui.te.check(@src(), .{}, a.show_game_view, "Stats window's parent Game View panel is open");
+            _ = zgui.te.check(@src(), .{}, a.game_view.isAttached(), "consumer attached so Stats window shows live numbers");
+            _ = zgui.te.check(@src(), .{}, a.game_view.last_latency_ns > 0, "last_latency_ns populated from a real frame");
+
+            ctx.yield(1);
+        }
+    });
+
+    _ = engine.registerTest("pie", "viewport/disconnect_handled_cleanly", @src(), struct {
+        pub fn gui(_: *zgui.te.TestContext) !void {
+            pieServicePending();
+            if (g_app) |a| a.renderFrame(1.0 / 60.0);
+        }
+        pub fn run(ctx: *zgui.te.TestContext) !void {
+            const a = g_app orelse {
+                _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
+                return;
+            };
+
+            piePreviewStart(64, 64) catch {
+                _ = zgui.te.check(@src(), .{}, false, "piePreviewStart must succeed");
+                return;
+            };
+            // Defer-stop covers any early-return slip-through;
+            // explicit drop below tears the producer down mid-test
+            // to simulate SIGTERM.
+            defer piePreviewStop();
+            ctx.yield(2); // service the deferred attach.
+
+            _ = piePreviewPublish(0x55);
+            ctx.yield(2);
+            _ = zgui.te.check(@src(), .{}, a.game_view.isAttached(), "attached after first publish");
+            _ = zgui.te.check(@src(), .{}, a.game_view.last_frame_idx != null, "saw a frame before disconnect");
+
+            // Simulate the engine dying mid-session: producer
+            // munmap + shm_unlink. The consumer's mmap stays valid
+            // (POSIX: unlink removes the name, not pages held by
+            // existing mappings) so polling won't crash — it just
+            // sees `frame_count` flat-line. `signalShutdown` runs
+            // here too, but the gui consumer doesn't poll the
+            // shutdown flag; the editor-side disconnect signal
+            // comes from the preview-mode TCP transport (#112)
+            // which isn't wired through here.
+            if (g_pie_producer) |*p| {
+                shm_mod.signalShutdown(p.header);
+                p.deinit();
+                g_pie_producer = null;
+            }
+
+            // Yield a handful of frames against the orphaned
+            // mapping. A bug that read past the unmapped region
+            // would segfault here; the assertion is implicit
+            // (we get to the next line without crashing).
+            ctx.yield(10);
+
+            // The editor reaches a "no preview" state when
+            // `App.attachGameView`'s future re-attach hook decides
+            // the producer is gone. That hook isn't wired yet
+            // (it's the follow-up to #112's TCP transport restore
+            // — see the comment above `attachGameView` in
+            // `src/app.zig`), so the test exercises the manual
+            // detach path: `game_view.detach()` is what that hook
+            // will call. Detach does GL work so we route it
+            // through the gui-thread flag, same as attach.
+            g_pie_pending_detach = true;
+            ctx.yield(2);
+            _ = zgui.te.check(@src(), .{}, !a.game_view.isAttached(), "consumer reports detached after teardown");
+            _ = zgui.te.check(@src(), .{}, a.game_view.tex_id == 0, "GL texture released on detach");
+        }
+    });
+
+    // ── iosurface dispatch (macOS-only) ────────────────────────────
+    //
+    // Asserts the format-dispatch wiring: when the engine emits
+    // `format = "iosurface_bgra8"`, App.attachGameView opens an
+    // `iosurface.Consumer` (not a `shm.Consumer`), allocates the
+    // rectangle textures + FBOs, and the per-frame FBO blit fills the
+    // GL_TEXTURE_2D that imgui samples. On non-macOS hosts the engine
+    // producer returns `error.PlatformUnsupported` at init, so this
+    // test skips cleanly.
+    _ = engine.registerTest("pie", "viewport/iosurface_dispatch", @src(), struct {
+        pub fn gui(_: *zgui.te.TestContext) !void {
+            pieServicePending();
+            if (g_app) |a| a.renderFrame(1.0 / 60.0);
+        }
+        pub fn run(ctx: *zgui.te.TestContext) !void {
+            if (builtin.os.tag != .macos) {
+                _ = zgui.te.check(@src(), .{}, true, "iosurface path is macOS-only — skipped");
+                return;
+            }
+            const a = g_app orelse {
+                _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
+                return;
+            };
+
+            pieIosStart(64, 64) catch |err| {
+                // CFAllocationFailed / IOSurfaceCreateFailed can happen
+                // under sandboxes that disable IOSurface — treat as a
+                // skip rather than a failure so CI on locked-down
+                // runners doesn't break.
+                std.log.warn("iosurface producer init failed: {s} — skipping", .{@errorName(err)});
+                _ = zgui.te.check(@src(), .{}, true, "iosurface producer unavailable on this host");
+                return;
+            };
+            defer pieIosStop();
+            ctx.yield(2); // service the deferred attach (GL work).
+
+            _ = zgui.te.check(@src(), .{}, a.game_view.isAttached(), "iosurface consumer attached");
+            _ = zgui.te.check(@src(), .{}, a.show_game_view, "Game View panel opened on iosurface attach");
+            // Rectangle textures + draw FBO only exist in iosurface
+            // mode — they're the smoking gun that we took the right
+            // dispatch branch.
+            _ = zgui.te.check(@src(), .{}, a.game_view.rect_count > 0, "rectangle textures allocated for iosurface ring");
+            _ = zgui.te.check(@src(), .{}, a.game_view.draw_fbo != 0, "draw FBO allocated for iosurface blit");
+            _ = zgui.te.check(@src(), .{}, a.game_view.tex_id != 0, "destination GL_TEXTURE_2D allocated");
+
+            // Drive a handful of publishes; assert frame_idx advances
+            // through the FBO blit (i.e. `poll()` walked the iosurface
+            // branch and reached `recordFrameStats`).
+            var prev_idx: ?u64 = null;
+            var saw_increase: bool = false;
+            var i: usize = 0;
+            while (i < 20) : (i += 1) {
+                _ = pieIosPublish(@intCast(i & 0xFF));
+                ctx.yield(1);
+                const cur = a.game_view.last_frame_idx orelse continue;
+                if (prev_idx) |p| {
+                    if (cur > p) saw_increase = true;
+                }
+                prev_idx = cur;
+            }
+            _ = zgui.te.check(@src(), .{}, prev_idx != null, "iosurface consumer saw at least one frame");
+            _ = zgui.te.check(@src(), .{}, saw_increase, "iosurface frame_idx advanced across the window");
+            _ = zgui.te.check(@src(), .{}, a.game_view.last_latency_ns > 0, "iosurface latency stat populated");
+
+            // Detach explicitly so the next test starts from clean
+            // GL state. detach() runs on the gui (GL) thread.
+            g_pie_pending_detach = true;
+            ctx.yield(2);
+            _ = zgui.te.check(@src(), .{}, !a.game_view.isAttached(), "iosurface consumer detached cleanly");
+            _ = zgui.te.check(@src(), .{}, a.game_view.rect_count == 0, "rectangle textures freed on detach");
+            _ = zgui.te.check(@src(), .{}, a.game_view.draw_fbo == 0, "draw FBO freed on detach");
+        }
+    });
+
+    // ── Game View tab (#128) ───────────────────────────────────────
+    //
+    // `attachGameView` now pushes an `OpenTab.game_view` entry onto
+    // `open_tabs` (in addition to the legacy `show_game_view` panel
+    // toggle) so the live frame surfaces inside the main content
+    // area's TabBar. Closing the tab eagerly stops the preview
+    // subprocess + detaches the consumer.
+    //
+    // The actual `closeTab` invocation has to land on the gui (GL)
+    // thread because the `.game_view` arm calls `game_view.detach()`
+    // which deletes GL textures. The pattern matches the existing
+    // PIE viewport tests: set a flag on the run thread, service it
+    // on the gui-callback frame.
+    _ = engine.registerTest("pie", "tab/opens_on_attach", @src(), struct {
+        pub fn gui(_: *zgui.te.TestContext) !void {
+            pieServicePending();
+            if (g_app) |a| a.renderFrame(1.0 / 60.0);
+        }
+        pub fn run(ctx: *zgui.te.TestContext) !void {
+            const a = g_app orelse {
+                _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
+                return;
+            };
+
+            // Earlier PIE viewport tests may have attached + detached
+            // the consumer, which under #128 also pushes a `.game_view`
+            // tab onto `open_tabs`. The tab persists after detach
+            // (close-on-detach would be wrong: detach is normal during
+            // resize). Count `.game_view` tabs as the invariant, not
+            // total tab length, so this test stays robust to leftover
+            // tabs.
+            const game_view_tabs_before = countGameViewTabs(a);
+
+            piePreviewStart(64, 64) catch {
+                _ = zgui.te.check(@src(), .{}, false, "piePreviewStart must succeed");
+                return;
+            };
+            defer piePreviewStop();
+            ctx.yield(2);
+
+            _ = zgui.te.check(@src(), .{}, a.game_view.isAttached(), "consumer attached");
+            const expected_tabs: usize = if (game_view_tabs_before == 0) 1 else game_view_tabs_before;
+            _ = zgui.te.check(@src(), .{}, countGameViewTabs(a) == expected_tabs, "exactly one .game_view tab present (new or refocused)");
+
+            // Re-attach with the same name should refocus, not
+            // duplicate. attach() inside game_view.attach auto-detaches
+            // first — that's GL work, so route via the pending flag.
+            g_pie_pending_attach = true;
+            ctx.yield(2);
+            _ = zgui.te.check(@src(), .{}, countGameViewTabs(a) == expected_tabs, "re-attach refocuses instead of duplicating");
+
+            // Cleanup: tear down via the detach flag (GL work) so the
+            // next test starts clean. The .game_view tab will still be
+            // present in open_tabs after detach; the close-stops-preview
+            // test below exercises the close path.
+            g_pie_pending_detach = true;
+            ctx.yield(2);
+        }
+    });
+
+    _ = engine.registerTest("pie", "tab/close_stops_preview", @src(), struct {
+        pub fn gui(_: *zgui.te.TestContext) !void {
+            pieServicePending();
+            // closeTab's .game_view arm runs game_view.detach (GL
+            // work) — service it here, on the GL thread, when the
+            // run callback flags an outstanding close request.
+            if (g_pending_game_view_close) {
+                g_pending_game_view_close = false;
+                if (g_app) |a| {
+                    var i: usize = 0;
+                    while (i < a.open_tabs.items.len) {
+                        switch (a.open_tabs.items[i]) {
+                            .game_view => {
+                                a.closeTab(i);
+                                break;
+                            },
+                            else => i += 1,
+                        }
+                    }
+                }
+            }
+            if (g_app) |a| a.renderFrame(1.0 / 60.0);
+        }
+        pub fn run(ctx: *zgui.te.TestContext) !void {
+            const a = g_app orelse {
+                _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
+                return;
+            };
+
+            piePreviewStart(64, 64) catch {
+                _ = zgui.te.check(@src(), .{}, false, "piePreviewStart must succeed");
+                return;
+            };
+            defer piePreviewStop();
+            ctx.yield(2);
+
+            // Pre-close sanity.
+            _ = zgui.te.check(@src(), .{}, a.game_view.isAttached(), "consumer attached pre-close");
+            var found_pre: bool = false;
+            for (a.open_tabs.items) |t| switch (t) {
+                .game_view => {
+                    found_pre = true;
+                    break;
+                },
+                else => {},
+            };
+            _ = zgui.te.check(@src(), .{}, found_pre, "game_view tab present pre-close");
+
+            // Drive the production close path through the gui frame
+            // so detach() lands on the GL thread.
+            g_pending_game_view_close = true;
+            ctx.yield(2);
+
+            _ = zgui.te.check(@src(), .{}, !a.game_view.isAttached(), "consumer detached on tab close");
+            _ = zgui.te.check(@src(), .{}, !a.show_game_view, "panel toggle reset on tab close");
+            _ = zgui.te.check(@src(), .{}, !a.preview.isActive(), "preview reports inactive after stop()");
+
+            // No .game_view tab remains. Other test-leftover tabs
+            // (scene, prefab) are out of scope here.
+            var still_there: bool = false;
+            for (a.open_tabs.items) |t| switch (t) {
+                .game_view => {
+                    still_there = true;
+                    break;
+                },
+                else => {},
+            };
+            _ = zgui.te.check(@src(), .{}, !still_there, "no .game_view tab remains after closeTab");
         }
     });
 

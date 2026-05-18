@@ -73,9 +73,9 @@ pub const ProjectConfig = struct {
     ecs: EcsChoice = .zig_ecs,
     initial_scene: []const u8 = "main",
     core_version: []const u8 = "1.12.0",
-    engine_version: []const u8 = "1.35.0",
+    engine_version: []const u8 = "1.37.3",
     gfx_version: []const u8 = "1.10.0",
-    assembler_version: []const u8 = "0.17.0",
+    assembler_version: []const u8 = "0.20.0",
     /// Sprite atlas resources — name + JSON manifest + texture file. The
     /// engine consumes these via the generated `main.zig` (see assembler
     /// codegen). Defaults to empty; the editor adds entries.
@@ -99,6 +99,15 @@ pub const Project = struct {
     /// comma. Empty for projects authored by the gui.
     extras: []const []const u8,
     is_dirty: bool,
+    /// Cached result of `scenesAvailable`. Built lazily on first call;
+    /// owned by the project's arena and invalidated implicitly when the
+    /// Project is destroyed (project new/load/close bumps
+    /// `ProjectManager.generation` and recreates the Project). Walks
+    /// the top-level `<dir>/scenes/*.jsonc` only — subdirectory scenes
+    /// (e.g. `scenes/debug/main.jsonc`) are out of scope for the v1
+    /// picker; can grow later when the project tree starts exposing
+    /// nested scene folders.
+    scenes_cache: ?[]const []const u8 = null,
 
     const Self = @This();
 
@@ -120,6 +129,7 @@ pub const Project = struct {
             .config = .{ .name = name_copy },
             .extras = &.{},
             .is_dirty = true,
+            .scenes_cache = null,
         };
         return project;
     }
@@ -136,6 +146,72 @@ pub const Project = struct {
 
     pub fn getProjectDir(self: *const Self) ?[]const u8 {
         return self.dir;
+    }
+
+    /// Return the list of scene basenames (extension stripped) found at
+    /// `<dir>/scenes/*.jsonc`, sorted alphabetically. Cached against the
+    /// project's lifetime — the cache is built on the first call and
+    /// owned by `arena`. Project transitions (new/load/close) recreate
+    /// the Project entirely, so the cache invalidates implicitly.
+    ///
+    /// The `alloc` parameter is unused today (the arena is the real
+    /// owner) but exposed in the signature so future callers can pass a
+    /// short-lived allocator if cache-invalidation grows beyond
+    /// per-project lifetime — e.g. a "Refresh" button.
+    ///
+    /// Returns an empty slice if `dir` is null (unsaved project) or the
+    /// `scenes/` subdirectory is missing.
+    pub fn scenesAvailable(self: *Self, alloc: std.mem.Allocator) ![]const []const u8 {
+        _ = alloc;
+        if (self.scenes_cache) |c| return c;
+
+        const arena_alloc = self.arena.allocator();
+        const dir_path = self.dir orelse {
+            self.scenes_cache = &.{};
+            return &.{};
+        };
+
+        const scenes_dir_path = std.fs.path.join(arena_alloc, &.{ dir_path, ProjectFolders.scenes }) catch {
+            self.scenes_cache = &.{};
+            return &.{};
+        };
+
+        const io = io_global.io();
+        var scenes_dir = std.Io.Dir.cwd().openDir(io, scenes_dir_path, .{ .iterate = true }) catch {
+            // Missing scenes/ subdir is the default for new projects —
+            // not an error from the picker's perspective.
+            self.scenes_cache = &.{};
+            return &.{};
+        };
+        defer scenes_dir.close(io);
+
+        var names: std.ArrayListUnmanaged([]const u8) = .empty;
+        // Names live in the arena, so no separate cleanup needed on the
+        // success path — the arena deinit catches everything.
+
+        var it = scenes_dir.iterate();
+        while (it.next(io) catch null) |dirent| {
+            if (dirent.kind != .file) continue;
+            if (!std.mem.endsWith(u8, dirent.name, ".jsonc")) continue;
+            const stem = dirent.name[0 .. dirent.name.len - ".jsonc".len];
+            if (stem.len == 0) continue;
+            const copy = arena_alloc.dupe(u8, stem) catch continue;
+            names.append(arena_alloc, copy) catch continue;
+        }
+
+        const mut_slice: [][]const u8 = names.toOwnedSlice(arena_alloc) catch {
+            self.scenes_cache = &.{};
+            return &.{};
+        };
+        std.mem.sort([]const u8, mut_slice, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lessThan);
+
+        const slice: []const []const u8 = mut_slice;
+        self.scenes_cache = slice;
+        return slice;
     }
 };
 
@@ -277,6 +353,7 @@ pub const ProjectManager = struct {
             .config = parsed,
             .extras = extras,
             .is_dirty = false,
+            .scenes_cache = null,
         };
 
         if (self.current_project) |old| old.deinit();
