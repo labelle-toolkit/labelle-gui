@@ -60,6 +60,19 @@ fn renderViewport(app: *App) void {
     renderViewportContent(app);
 }
 
+// ── Drag-release tracking (cursor finding on labelle-gui#146) ──
+// `isMouseReleased` was previously nested under `isItemHovered`, so a
+// press-on-image → drag-off → release-outside sequence dropped the
+// `down=false` event and the engine saw the button stuck down forever.
+// We now track which buttons have an outstanding `down=true` that we
+// emitted, and flush a `down=false` on the release frame regardless of
+// hover. We also stash the last in-image IOSurface coords so the
+// release-outside path can resend `sendMousePos` for positional
+// context (the engine pairs button events with the most recent pos).
+var button_down_sent: [3]bool = .{ false, false, false };
+var last_in_image_sx: f32 = 0.0;
+var last_in_image_sy: f32 = 0.0;
+
 /// Inner content — drawn either inside the tab's container OR inside
 /// the standalone panel's begin/end. No window chrome here.
 fn renderViewportContent(app: *App) void {
@@ -126,9 +139,9 @@ fn renderViewportContent(app: *App) void {
     zgui.image(tex_ref, .{ .w = draw_w, .h = draw_h });
 
     // ── Mouse → game input uplink (#143) ──
-    // Only fire while the image is hovered. Convert screen → image
-    // → IOSurface coords (scale by tex / draw ratio). Without a clip
-    // check, clicks anywhere on the panel would bleed into the game.
+    // Hover-gated half: position uplink + click detection. Clicks only
+    // count when the press starts on the image — otherwise UI clicks
+    // anywhere on the editor would bleed into the game.
     if (zgui.isItemHovered(.{})) {
         const mp = zgui.getMousePos();
         const dx_img = mp[0] - img_screen_pos[0];
@@ -138,18 +151,42 @@ fn renderViewportContent(app: *App) void {
         const sx: f32 = dx_img * scale_x;
         const sy: f32 = dy_img * scale_y;
         app.preview.sendMousePos(sx, sy);
+        // Stash for the release-outside path below.
+        last_in_image_sx = sx;
+        last_in_image_sy = sy;
 
         // ImGui mouse buttons: 0 = left, 1 = right, 2 = middle.
-        // `isMouseClicked`/`isMouseReleased` fire on the exact frame
-        // of the transition, so each user press maps to one
-        // `mouse_button down=true` followed by `down=false`.
+        // `isMouseClicked` fires on the exact frame of the press
+        // transition; the matching `down=false` is sent below
+        // regardless of hover (cursor finding on labelle-gui#146).
         inline for (.{
             .{ .btn = zgui.MouseButton.left, .idx = @as(i32, 0) },
             .{ .btn = zgui.MouseButton.right, .idx = @as(i32, 1) },
             .{ .btn = zgui.MouseButton.middle, .idx = @as(i32, 2) },
         }) |entry| {
-            if (zgui.isMouseClicked(entry.btn)) app.preview.sendMouseButton(entry.idx, true);
-            if (zgui.isMouseReleased(entry.btn)) app.preview.sendMouseButton(entry.idx, false);
+            if (zgui.isMouseClicked(entry.btn)) {
+                app.preview.sendMouseButton(entry.idx, true);
+                button_down_sent[@intCast(entry.idx)] = true;
+            }
+        }
+    }
+
+    // Release flush — runs every frame, hover or not. If we ever sent
+    // a `down=true` via this tab and ImGui now reports the release,
+    // mirror a `down=false` so the engine doesn't keep the button
+    // stuck after a press-drag-off-release. Pair it with one final
+    // `sendMousePos` at the last in-image coord so the engine has
+    // positional context for the click (#146).
+    inline for (.{
+        .{ .btn = zgui.MouseButton.left, .idx = @as(i32, 0) },
+        .{ .btn = zgui.MouseButton.right, .idx = @as(i32, 1) },
+        .{ .btn = zgui.MouseButton.middle, .idx = @as(i32, 2) },
+    }) |entry| {
+        const slot: usize = @intCast(entry.idx);
+        if (button_down_sent[slot] and zgui.isMouseReleased(entry.btn)) {
+            app.preview.sendMousePos(last_in_image_sx, last_in_image_sy);
+            app.preview.sendMouseButton(entry.idx, false);
+            button_down_sent[slot] = false;
         }
     }
 }
