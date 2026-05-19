@@ -421,16 +421,20 @@ pub const App = struct {
     /// zero-copy path. Anything else falls back to SHM.
     pub fn attachGameView(self: *Self, shm_name: []const u8, format: []const u8) !void {
         try self.game_view.attach(shm_name, format);
-        // Backwards-compat: the floating "Game View" panel registered
-        // via the Module Registry is still available for users who
-        // want a docked-elsewhere layout. The tab below is the
-        // default surface; both share `renderViewportContent` so
-        // they stay in lockstep.
-        self.show_game_view = true;
-        // #128: also open the Game View as a tab in the main content
-        // area so users see the live frame inline with the editor
-        // tabs they were working in. Logged + swallowed because an
-        // OOM here shouldn't fail the attach — the panel still works.
+        // #145: the docked tab is the default auto-open surface after
+        // a preview attach. The floating "Game View" panel registered
+        // via the Module Registry remains available as a manual
+        // opt-in via the View menu (users who want a docked-elsewhere
+        // layout). Both surfaces share `renderViewportContent` so
+        // whichever is toggled on stays in lockstep with the live
+        // attachment. We intentionally do NOT flip `show_game_view`
+        // here — doing so opened both surfaces simultaneously and
+        // rendered the same live frame twice (#145).
+        // #128: open the Game View as a tab in the main content area
+        // so users see the live frame inline with the editor tabs
+        // they were working in. Logged + swallowed because an OOM
+        // here shouldn't fail the attach — the floating panel still
+        // works as a fallback if the user opens it from the menu.
         self.openGameViewTab() catch |err| {
             std.log.warn("attachGameView: openGameViewTab failed: {s}", .{@errorName(err)});
         };

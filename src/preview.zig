@@ -560,6 +560,38 @@ pub const PreviewSession = struct {
         }
     }
 
+    /// Send `{"kind":"mouse_pos","x":X,"y":Y}\n` to the engine.
+    /// Drains best-effort; partial-write loss is acceptable for mouse
+    /// telemetry. Coordinates are in IOSurface pixel space (not screen
+    /// space) — the editor's Game View tab converts before calling.
+    /// labelle-assembler#143.
+    pub fn sendMousePos(self: *Self, x: f32, y: f32) void {
+        if (self.conn_fd < 0) return;
+        var buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "{{\"kind\":\"mouse_pos\",\"x\":{d:.2},\"y\":{d:.2}}}\n", .{ x, y }) catch return;
+        var off: usize = 0;
+        while (off < msg.len) {
+            const n = write(self.conn_fd, msg.ptr + off, msg.len - off);
+            if (n <= 0) return;
+            off += @intCast(n);
+        }
+    }
+
+    /// Send `{"kind":"mouse_button","button":B,"down":D}\n`.
+    /// `button` follows ImGuiMouseButton convention (0 = left, 1 = right,
+    /// 2 = middle). labelle-assembler#143.
+    pub fn sendMouseButton(self: *Self, button: i32, down: bool) void {
+        if (self.conn_fd < 0) return;
+        var buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "{{\"kind\":\"mouse_button\",\"button\":{d},\"down\":{s}}}\n", .{ button, if (down) "true" else "false" }) catch return;
+        var off: usize = 0;
+        while (off < msg.len) {
+            const n = write(self.conn_fd, msg.ptr + off, msg.len - off);
+            if (n <= 0) return;
+            off += @intCast(n);
+        }
+    }
+
     pub fn watchEntity(self: *Self, entity_id: u64) !void {
         _ = self;
         _ = entity_id;
