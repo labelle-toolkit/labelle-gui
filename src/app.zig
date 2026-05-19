@@ -707,6 +707,19 @@ pub const App = struct {
         self.status_timer = config.ui.status_message_duration;
     }
 
+    /// Sync a new inspector-splitter width back to `self.prefs` and
+    /// persist. Called by the scene + prefab editors on drag-release
+    /// so the splitter widget itself can stay prefs-free. The equality
+    /// guard avoids churning the file when a click ends without an
+    /// actual drag.
+    pub fn saveInspectorWidth(self: *Self, width: f32) void {
+        if (self.prefs.inspector_width == width) return;
+        self.prefs.inspector_width = width;
+        prefs_mod.save(self.allocator, self.prefs) catch |err| {
+            std.log.warn("prefs: could not persist inspector_width: {s}", .{@errorName(err)});
+        };
+    }
+
     /// One UI frame. `dt_seconds` is the wall-clock time since the last
     /// frame, used to decrement transient timers (status messages, etc.)
     /// so they last a consistent duration regardless of frame rate.

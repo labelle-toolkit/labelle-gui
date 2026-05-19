@@ -145,8 +145,6 @@ pub const SceneState = struct {
     }
 };
 
-/// Returns the file basename with its `.jsonc` extension stripped.
-/// `path` must outlive the returned slice (we just slice into it).
 const splitter = @import("splitter.zig");
 
 /// Render a single open scene as the content of a tab. Caller has
@@ -210,7 +208,7 @@ pub fn render(s: *SceneState, app: *App) void {
     // it to nothing.
     const total_w = zgui.getContentRegionAvail()[0];
     const sameline_gap = zgui.getStyle().item_spacing[0];
-    const viewport_w = @max(splitter.min_viewport_width, total_w - s.inspector_width - splitter.handle_w - 2 * sameline_gap);
+    const viewport_w = splitter.viewportWidth(total_w, s.inspector_width, sameline_gap);
 
     const atlas_index_ptr: ?*const @import("../atlas.zig").Index = if (app.atlas_index) |*ix| ix else null;
     const gizmo_index_ptr: ?*const @import("../gizmos.zig").Index = if (app.gizmo_index) |*ix| ix else null;
@@ -223,7 +221,7 @@ pub fn render(s: *SceneState, app: *App) void {
     }
     zgui.endChild();
     zgui.sameLine(.{});
-    splitter.render(&s.inspector_width, total_w, app);
+    if (splitter.render(&s.inspector_width, total_w)) app.saveInspectorWidth(s.inspector_width);
     zgui.sameLine(.{});
     if (zgui.beginChild("##inspector_col", .{
         .w = s.inspector_width,

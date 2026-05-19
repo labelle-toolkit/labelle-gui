@@ -4,27 +4,30 @@
 //! Rendered as a thin invisible button sitting in the `split_gap`
 //! between the two `beginChild` calls. When the user drags it with
 //! the left mouse button, the inspector width grows or shrinks; the
-//! viewport eats the remainder. On drag-release, the new width is
-//! persisted to prefs so it sticks across editor restarts.
+//! viewport eats the remainder. `render` returns `true` on the frame
+//! the drag releases — the caller persists the new width to prefs at
+//! its own discretion, keeping prefs I/O out of this widget.
 //!
 //! Caller layout shape:
 //!
+//!     const viewport_w = splitter.viewportWidth(total_w, state.inspector_width, sameline_gap);
 //!     beginChild "##viewport_col"  width = viewport_w
 //!     endChild
 //!     sameLine()
-//!     splitter.render(&state.inspector_width, total_w, app)   ← here
+//!     const released = splitter.render(&state.inspector_width, total_w);   ← here
 //!     sameLine()
 //!     beginChild "##inspector_col" width = state.inspector_width
 //!     endChild
+//!     if (released) save_prefs(...);
 //!
 //! Two clamps cooperate to keep both panes usable:
 //!
 //!  - Inspector width never drops below `prefs.min_inspector_width`
 //!    (and never exceeds `prefs.max_inspector_width`).
 //!  - Viewport width is then clamped to `min_viewport_width` by the
-//!    caller's existing `@max(min_viewport_width, total_w - inspector_w - gap)`
-//!    formula — if the window shrinks below the sum, the inspector
-//!    visually loses pixels rather than the viewport disappearing.
+//!    `viewportWidth` helper — if the window shrinks below the sum,
+//!    the inspector visually loses pixels rather than the viewport
+//!    disappearing.
 //!
 //! The clamp math itself lives in `clampInspectorWidth` so it's
 //! testable without an imgui draw context (see `tests.zig`).
@@ -33,7 +36,6 @@ const std = @import("std");
 const zgui = @import("zgui");
 
 const prefs_mod = @import("../prefs.zig");
-const App = @import("../app.zig").App;
 
 /// Horizontal pixels for the splitter handle. Wide enough to grab
 /// comfortably; narrow enough not to dominate the gap. The visual
@@ -46,6 +48,21 @@ pub const handle_w: f32 = 6;
 /// it here to decide how much the user can shrink the inspector
 /// without squashing the viewport beyond reason.
 pub const min_viewport_width: f32 = 120;
+
+/// Width to hand to `beginChild "##viewport_col"`. Both editors
+/// share this formula; centralizing it here means a layout tweak
+/// (extra `sameLine`, padding shift) lands in one place instead of
+/// drifting across call sites.
+pub fn viewportWidth(total_w: f32, inspector_width: f32, sameline_gap: f32) f32 {
+    return @max(min_viewport_width, total_w - inspector_width - handle_w - 2 * sameline_gap);
+}
+
+// zgui packs colors as ABGR: IM_COL32(R,G,B,A) = (A<<24) | (B<<16) | (G<<8) | R,
+// i.e. `0xAA_BB_GG_RR`. The splitter only ever paints white-with-alpha, so a
+// tiny helper keeps the literal alpha-byte readable at the call sites.
+fn whiteWithAlpha(alpha: u8) u32 {
+    return (@as(u32, alpha) << 24) | 0x00_ff_ff_ff;
+}
 
 /// Clamp a requested inspector width to the bounds the splitter
 /// enforces every frame. Pulled out of `render` so the clamp math
@@ -83,8 +100,9 @@ pub fn clampInspectorWidth(value: f32, available_w: f32, sameline_gap: f32) f32 
 }
 
 /// Render the splitter handle and apply drag deltas to
-/// `inspector_width.*`. On mouse-release after a drag, syncs the
-/// chosen width to `app.prefs` and persists it.
+/// `inspector_width.*`. Returns `true` on the frame the drag
+/// releases so the caller can persist the new width — the splitter
+/// itself never touches prefs or the filesystem.
 ///
 /// `available_w` is the total row width the two columns + handle
 /// share (typically the parent's `getContentRegionAvail()[0]`
@@ -96,9 +114,8 @@ pub fn clampInspectorWidth(value: f32, available_w: f32, sameline_gap: f32) f32 
 ///
 /// The caller is responsible for placing the handle on the right
 /// line via `sameLine()` (see the doc comment above for the layout
-/// shape). Returns nothing — width mutations are written through
-/// the pointer.
-pub fn render(inspector_width: *f32, available_w: f32, app: *App) void {
+/// shape).
+pub fn render(inspector_width: *f32, available_w: f32) bool {
     // Match the viewport/inspector children's height so the handle
     // spans the full split. Heights of 0 in beginChild mean "fill
     // remaining," and the children here use that — so the handle
@@ -122,7 +139,7 @@ pub fn render(inspector_width: *f32, available_w: f32, app: *App) void {
     const min = zgui.getItemRectMin();
     const max = zgui.getItemRectMax();
     if (hovered or active) {
-        const col: u32 = if (active) 0xff_ff_ff_ff else 0xa0_ff_ff_ff;
+        const col: u32 = if (active) whiteWithAlpha(0xff) else whiteWithAlpha(0xa0);
         dl.addRectFilled(.{ .pmin = min, .pmax = max, .col = col });
         zgui.setMouseCursor(.resize_ew);
     } else {
@@ -132,14 +149,13 @@ pub fn render(inspector_width: *f32, available_w: f32, app: *App) void {
         dl.addRectFilled(.{
             .pmin = .{ cx - 0.5, min[1] },
             .pmax = .{ cx + 0.5, max[1] },
-            .col = 0x40_ff_ff_ff,
+            .col = whiteWithAlpha(0x40),
         });
     }
 
     // Single source of truth for the clamp bounds this frame. Drag
     // handler and reactive resize handler both read from this — if
-    // the math changes, both paths see the change at once (gemini /
-    // PR review #142 catch).
+    // the math changes, both paths see the change at once.
     const sameline_gap = zgui.getStyle().item_spacing[0];
 
     // Drag handling: accumulate the per-frame X delta into the
@@ -158,17 +174,9 @@ pub fn render(inspector_width: *f32, available_w: f32, app: *App) void {
     // the inspector would only update on the next drag.
     inspector_width.* = clampInspectorWidth(inspector_width.*, available_w, sameline_gap);
 
-    // Persist on release. We compare against the prefs value so a
-    // hover-without-drag doesn't churn the file. The drag-released
-    // signal is the frame after isItemActive flips back to false
-    // while we still hold the button — but isItemDeactivated covers
-    // exactly that.
-    if (zgui.isItemDeactivated()) {
-        if (app.prefs.inspector_width != inspector_width.*) {
-            app.prefs.inspector_width = inspector_width.*;
-            prefs_mod.save(app.allocator, app.prefs) catch |err| {
-                std.log.warn("prefs: could not persist inspector_width: {s}", .{@errorName(err)});
-            };
-        }
-    }
+    // Drag-released signal: the frame after `isItemActive` flips back
+    // to false while the user still holds the button. The caller
+    // owns the persistence decision (e.g. compare against prefs and
+    // skip a no-op write).
+    return zgui.isItemDeactivated();
 }
