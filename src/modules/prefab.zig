@@ -22,8 +22,7 @@ const scene_io = @import("../scene_io.zig");
 const inspector = @import("inspector.zig");
 const viewport = @import("viewport.zig");
 
-const inspector_w: f32 = 300;
-const split_gap: f32 = 8;
+const splitter = @import("splitter.zig");
 
 pub const PrefabState = struct {
     arena: *std.heap.ArenaAllocator,
@@ -49,6 +48,10 @@ pub const PrefabState = struct {
     grid_step: f32 = 16,
     /// When true, child drag-to-move snaps to the grid above.
     snap_enabled: bool = false,
+    /// Inspector column width in pixels. Same shape as `SceneState`:
+    /// seeded from `app.prefs.inspector_width` on open, updated by
+    /// the splitter handler, written back to prefs on drag-release (#140).
+    inspector_width: f32 = @import("../prefs.zig").default_inspector_width,
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !PrefabState {
         const arena = try allocator.create(std.heap.ArenaAllocator);
@@ -112,7 +115,8 @@ pub fn render(s: *PrefabState, app: *App) void {
 
     // Two-column body, same shape as the scene editor.
     const total_w = zgui.getContentRegionAvail()[0];
-    const viewport_w = @max(120.0, total_w - inspector_w - split_gap);
+    const sameline_gap = zgui.getStyle().item_spacing[0];
+    const viewport_w = splitter.viewportWidth(total_w, s.inspector_width, sameline_gap);
 
     const atlas_index_ptr: ?*const @import("../atlas.zig").Index = if (app.atlas_index) |*ix| ix else null;
     const gizmo_index_ptr: ?*const @import("../gizmos.zig").Index = if (app.gizmo_index) |*ix| ix else null;
@@ -140,8 +144,10 @@ pub fn render(s: *PrefabState, app: *App) void {
     }
     zgui.endChild();
     zgui.sameLine(.{});
+    if (splitter.render(&s.inspector_width, total_w)) app.saveInspectorWidth(s.inspector_width);
+    zgui.sameLine(.{});
     if (zgui.beginChild("##prefab_inspector_col", .{
-        .w = 0,
+        .w = s.inspector_width,
         .h = 0,
         .child_flags = .{ .border = true },
     })) {

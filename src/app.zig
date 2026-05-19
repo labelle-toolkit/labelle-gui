@@ -550,6 +550,10 @@ pub const App = struct {
 
         var state = try scene_mod.SceneState.open(self.allocator, path);
         errdefer state.deinit(self.allocator);
+        // Seed inspector width from prefs so the user's preferred
+        // split carries across sessions (#140). In-tab drags update
+        // both this field and prefs.
+        state.inspector_width = self.prefs.inspector_width;
         try self.open_tabs.append(self.allocator, .{ .scene = state });
         const new_idx = self.open_tabs.items.len - 1;
         self.active_tab_idx = new_idx;
@@ -566,6 +570,7 @@ pub const App = struct {
 
         var state = try prefab_mod.PrefabState.open(self.allocator, path);
         errdefer state.deinit(self.allocator);
+        state.inspector_width = self.prefs.inspector_width;
         try self.open_tabs.append(self.allocator, .{ .prefab = state });
         const new_idx = self.open_tabs.items.len - 1;
         self.active_tab_idx = new_idx;
@@ -704,6 +709,19 @@ pub const App = struct {
         const n = @min(message.len, self.status_message.len - 1);
         @memcpy(self.status_message[0..n], message[0..n]);
         self.status_timer = config.ui.status_message_duration;
+    }
+
+    /// Sync a new inspector-splitter width back to `self.prefs` and
+    /// persist. Called by the scene + prefab editors on drag-release
+    /// so the splitter widget itself can stay prefs-free. The equality
+    /// guard avoids churning the file when a click ends without an
+    /// actual drag.
+    pub fn saveInspectorWidth(self: *Self, width: f32) void {
+        if (self.prefs.inspector_width == width) return;
+        self.prefs.inspector_width = width;
+        prefs_mod.save(self.allocator, self.prefs) catch |err| {
+            std.log.warn("prefs: could not persist inspector_width: {s}", .{@errorName(err)});
+        };
     }
 
     /// One UI frame. `dt_seconds` is the wall-clock time since the last

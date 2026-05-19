@@ -108,6 +108,13 @@ pub const SceneState = struct {
     /// When true, drag-to-move snaps to the grid above. Off by default
     /// so existing behavior is preserved.
     snap_enabled: bool = false,
+    /// Inspector column width in pixels. Per-tab so dragging the
+    /// splitter on one scene doesn't reflow others. Seeded from
+    /// `app.prefs.inspector_width` at open time; updated by the
+    /// splitter drag handler in `render`; written back to prefs on
+    /// drag-release so the chosen width persists across editor
+    /// restarts (#140).
+    inspector_width: f32 = @import("../prefs.zig").default_inspector_width,
 
     /// Load a scene from disk and wrap it in a fresh SceneState. The
     /// returned state owns an arena holding the path + display name,
@@ -138,10 +145,7 @@ pub const SceneState = struct {
     }
 };
 
-/// Returns the file basename with its `.jsonc` extension stripped.
-/// `path` must outlive the returned slice (we just slice into it).
-const inspector_w: f32 = 300;
-const split_gap: f32 = 8;
+const splitter = @import("splitter.zig");
 
 /// Render a single open scene as the content of a tab. Caller has
 /// already entered the tab item; we just paint the body. Layout is
@@ -197,9 +201,14 @@ pub fn render(s: *SceneState, app: *App) void {
     if (zgui.button("Save", .{})) saveScene(s, app);
     zgui.separator();
 
-    // Two-column body: viewport on the left, inspector on the right.
+    // Two-column body: viewport on the left, inspector on the right,
+    // splitter handle in the middle. The viewport eats the remainder
+    // after the inspector + handle + the two `sameLine` gaps take
+    // their share — clamped so shrinking the window doesn't squash
+    // it to nothing.
     const total_w = zgui.getContentRegionAvail()[0];
-    const viewport_w = @max(120.0, total_w - inspector_w - split_gap);
+    const sameline_gap = zgui.getStyle().item_spacing[0];
+    const viewport_w = splitter.viewportWidth(total_w, s.inspector_width, sameline_gap);
 
     const atlas_index_ptr: ?*const @import("../atlas.zig").Index = if (app.atlas_index) |*ix| ix else null;
     const gizmo_index_ptr: ?*const @import("../gizmos.zig").Index = if (app.gizmo_index) |*ix| ix else null;
@@ -212,8 +221,10 @@ pub fn render(s: *SceneState, app: *App) void {
     }
     zgui.endChild();
     zgui.sameLine(.{});
+    if (splitter.render(&s.inspector_width, total_w)) app.saveInspectorWidth(s.inspector_width);
+    zgui.sameLine(.{});
     if (zgui.beginChild("##inspector_col", .{
-        .w = 0,
+        .w = s.inspector_width,
         .h = 0,
         .child_flags = .{ .border = true },
     })) {
