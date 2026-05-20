@@ -325,6 +325,32 @@ pub fn main() !void {
         }
     });
 
+    _ = engine.registerTest("phase3", "view_atlas_viewer_toggle", @src(), struct {
+        pub fn gui(_: *zgui.te.TestContext) !void {
+            if (g_app) |a| a.renderFrame(1.0 / 60.0);
+        }
+        pub fn run(ctx: *zgui.te.TestContext) !void {
+            const a = g_app orelse {
+                _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
+                return;
+            };
+            ctx.setRef("//##MainMenuBar");
+
+            _ = zgui.te.check(@src(), .{}, !a.show_atlas_viewer, "panel starts closed");
+
+            // Open it — with no project loaded the panel takes the
+            // "no atlases" path; yielding a few frames exercises the
+            // render code and would trip any imgui assertion.
+            ctx.menuAction(.click, "View/Atlas Viewer");
+            ctx.yield(3);
+            _ = zgui.te.check(@src(), .{}, a.show_atlas_viewer, "View/Atlas Viewer opens panel");
+
+            ctx.menuAction(.click, "View/Atlas Viewer");
+            ctx.yield(1);
+            _ = zgui.te.check(@src(), .{}, !a.show_atlas_viewer, "View/Atlas Viewer closes panel");
+        }
+    });
+
     // Drop a scene file with a Sprite component into the temp project
     // so the Scene module's save test can exercise round-trip
     // preservation through the Save button.

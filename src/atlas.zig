@@ -23,6 +23,18 @@ pub const Frame = struct {
     y: u32,
     w: u32,
     h: u32,
+    /// 90° rotation flag — TexturePacker can rotate frames to pack tighter.
+    rotated: bool = false,
+    /// Whether transparent margins were trimmed off the source image.
+    trimmed: bool = false,
+    /// Pivot as a fraction of the sprite (0..1); defaults to centre.
+    pivot: [2]f32 = .{ 0.5, 0.5 },
+    /// Untrimmed source dimensions. Equal to `w`/`h` when not trimmed.
+    source_w: u32 = 0,
+    source_h: u32 = 0,
+    /// Offset of the trimmed rect within the source (`spriteSourceSize`).
+    offset_x: i32 = 0,
+    offset_y: i32 = 0,
 };
 
 pub const SpriteRef = struct {
@@ -142,6 +154,19 @@ fn loadOne(allocator: std.mem.Allocator, project_dir: []const u8, r: Resource) !
     const tex_path = try std.fs.path.join(allocator, &.{ project_dir, r.texture });
     defer allocator.free(tex_path);
 
+    return loadFromPaths(allocator, r.name, json_path, tex_path);
+}
+
+/// Load a single atlas from explicit JSON + PNG paths (not project-
+/// relative). Used by the Atlas Viewer to show atlases that aren't in
+/// the project's `resources` — e.g. a freshly packed sheet. Caller
+/// frees the returned atlas via `Atlas.deinit`.
+pub fn loadFromPaths(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    json_path: []const u8,
+    tex_path: []const u8,
+) !Atlas {
     // Decode PNG. zstbi-backed; runs on the main thread for now —
     // editor atlases are small enough that synchronous load is fine.
     const tex_path_z = try allocator.dupeZ(u8, tex_path);
@@ -172,7 +197,7 @@ fn loadOne(allocator: std.mem.Allocator, project_dir: []const u8, r: Resource) !
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
     var atlas: Atlas = .{
-        .name = try allocator.dupe(u8, r.name),
+        .name = try allocator.dupe(u8, name),
         .texture_id = tex_id,
         .width = img.width,
         .height = img.height,
@@ -220,9 +245,35 @@ pub fn parseFramesFromJsonText(allocator: std.mem.Allocator, raw: []const u8, at
         const w = jsonU32(frame_v.object.get("w")) orelse continue;
         const h = jsonU32(frame_v.object.get("h")) orelse continue;
 
+        var frame: Frame = .{ .x = x, .y = y, .w = w, .h = h, .source_w = w, .source_h = h };
+        if (entry.object.get("rotated")) |v| {
+            if (v == .bool) frame.rotated = v.bool;
+        }
+        if (entry.object.get("trimmed")) |v| {
+            if (v == .bool) frame.trimmed = v.bool;
+        }
+        if (entry.object.get("pivot")) |pv| {
+            if (pv == .object) {
+                if (jsonF32(pv.object.get("x"))) |fx| frame.pivot[0] = fx;
+                if (jsonF32(pv.object.get("y"))) |fy| frame.pivot[1] = fy;
+            }
+        }
+        if (entry.object.get("sourceSize")) |sv| {
+            if (sv == .object) {
+                if (jsonU32(sv.object.get("w"))) |sw| frame.source_w = sw;
+                if (jsonU32(sv.object.get("h"))) |sh| frame.source_h = sh;
+            }
+        }
+        if (entry.object.get("spriteSourceSize")) |sss| {
+            if (sss == .object) {
+                if (jsonI32(sss.object.get("x"))) |ox| frame.offset_x = ox;
+                if (jsonI32(sss.object.get("y"))) |oy| frame.offset_y = oy;
+            }
+        }
+
         const name_copy = try allocator.dupe(u8, kv.key_ptr.*);
         errdefer allocator.free(name_copy);
-        try atlas.frames.put(allocator, name_copy, .{ .x = x, .y = y, .w = w, .h = h });
+        try atlas.frames.put(allocator, name_copy, frame);
     }
 }
 
@@ -231,6 +282,24 @@ fn jsonU32(v: ?std.json.Value) ?u32 {
     return switch (val) {
         .integer => |i| if (i >= 0) @intCast(i) else null,
         .float => |f| if (f >= 0) @intFromFloat(f) else null,
+        else => null,
+    };
+}
+
+fn jsonI32(v: ?std.json.Value) ?i32 {
+    const val = v orelse return null;
+    return switch (val) {
+        .integer => |i| @intCast(i),
+        .float => |f| @intFromFloat(f),
+        else => null,
+    };
+}
+
+fn jsonF32(v: ?std.json.Value) ?f32 {
+    const val = v orelse return null;
+    return switch (val) {
+        .float => |f| @floatCast(f),
+        .integer => |i| @floatFromInt(i),
         else => null,
     };
 }

@@ -27,6 +27,7 @@ const flow_mod = @import("modules/flow.zig");
 const gizmo_mod = @import("modules/gizmo.zig");
 const entity_inspector_mod = @import("modules/entity_inspector.zig");
 const game_view_mod = @import("modules/game_view.zig");
+const atlas_viewer_mod = @import("modules/atlas_viewer.zig");
 const game_view = @import("game_view.zig");
 const io_global = @import("io_global.zig");
 const flow_runtime_mod = @import("modules/flow_runtime.zig");
@@ -183,6 +184,12 @@ pub const App = struct {
     show_game_view: bool = false,
     game_view: game_view.GameView = undefined,
 
+    /// Atlas Viewer panel toggle (#148).
+    show_atlas_viewer: bool = false,
+    /// Atlas Viewer panel state — selected atlas/sprite, zoom, and any
+    /// packed-and-opened atlases.
+    atlas_viewer: atlas_viewer_mod.AtlasViewer = .{},
+
     /// Phase 3 (#84): Entity Inspector panel toggle.
     show_entity_inspector: bool = false,
     /// Entity Inspector state — fed by `PreviewSession`'s
@@ -272,7 +279,7 @@ pub const App = struct {
 
     /// Fixed-size storage for registered modules. Grow the array literal
     /// when adding modules; Zig will tell you if it overflows.
-    modules: [8]module.Module = undefined,
+    modules: [9]module.Module = undefined,
     registry: module.Registry = .{ .modules = &.{} },
 
     const Self = @This();
@@ -368,6 +375,7 @@ pub const App = struct {
         app.modules[5] = entity_inspector_mod.makeModule(app);
         app.modules[6] = flow_runtime_mod.makeModule(app);
         app.modules[7] = game_view_mod.makeModule(app);
+        app.modules[8] = atlas_viewer_mod.makeModule(app);
         app.registry = .{ .modules = &app.modules };
 
         // Honor LABELLE_GAME_VIEW_SHM as a manual attach path until
