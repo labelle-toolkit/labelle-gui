@@ -14,6 +14,11 @@
 //!   - Right column: inspector showing the selected node's source
 //!     line + raw Zig snippet and a sidebar list of every
 //!     `entry_point` node (click → centre the canvas on that root).
+//!     The selected-node inspector also carries an "Open in editor"
+//!     button (issue #42, Phase 4 — reverse navigation): it hands the
+//!     source file + the node's line off to the user's external
+//!     editor via `src/flows/reveal.zig`, closing the loop from the
+//!     derived graph back to the Zig the LLM wrote.
 //!
 //! `FlowState` owns:
 //!   - an arena for path/display name + source bytes
@@ -34,6 +39,7 @@ const App = @import("../app.zig").App;
 const scene_io = @import("../scene_io.zig");
 const projector = @import("../flows/projector.zig");
 const flow_types = @import("../flows/types.zig");
+const reveal = @import("../flows/reveal.zig");
 const io_global = @import("../io_global.zig");
 
 const Graph = flow_types.Graph;
@@ -215,7 +221,7 @@ pub fn render(s: *FlowState, app: *App) void {
         .h = 0,
         .child_flags = .{ .border = true },
     })) {
-        renderSidebar(s);
+        renderSidebar(s, app);
     }
     zgui.endChild();
 }
@@ -292,7 +298,7 @@ fn renderCanvas(s: *FlowState, allocator: std.mem.Allocator) void {
     renderPulse(s);
 }
 
-fn renderSidebar(s: *FlowState) void {
+fn renderSidebar(s: *FlowState, app: *App) void {
     zgui.text("Entry points", .{});
     zgui.separator();
 
@@ -322,10 +328,10 @@ fn renderSidebar(s: *FlowState) void {
     zgui.separator();
     zgui.text("Selection", .{});
     zgui.separator();
-    renderSelectedInspector(s);
+    renderSelectedInspector(s, app);
 }
 
-fn renderSelectedInspector(s: *FlowState) void {
+fn renderSelectedInspector(s: *FlowState, app: *App) void {
     const graph = s.graph orelse return;
     // Read the editor's current selection. We need to bind the
     // editor first because `getSelectedNodes` is global state.
@@ -347,11 +353,40 @@ fn renderSelectedInspector(s: *FlowState) void {
     zgui.text("{s}", .{node.label});
     zgui.textDisabled("category: {s}", .{@tagName(node.category)});
     zgui.textDisabled("source line: {d}", .{node.source_line});
+
+    // Reverse navigation (issue #42, Phase 4): hand the source file +
+    // line off to the user's external editor. The graph is a derived
+    // view; "jump to source" closes the loop back to the Zig the LLM
+    // (or a human) actually wrote. `revealSelected` reports failure
+    // through the status bar — there's no built-in editor to fall
+    // back to.
+    if (zgui.button("Open in editor", .{ .w = -1 })) {
+        revealSelected(s, app, node.source_line);
+    }
     zgui.separator();
 
     if (s.source) |src| {
         const line_text = lineAt(src, node.source_line);
         zgui.textWrapped("{s}", .{line_text});
+    }
+}
+
+/// Reveal the flow's source file at `line` in the user's editor.
+/// Best-effort: a launch failure is logged + surfaced on the status
+/// bar rather than propagated — a missing `$EDITOR` / `xdg-open`
+/// shouldn't take the gui down. See `src/flows/reveal.zig`.
+fn revealSelected(s: *FlowState, app: *App, line: u32) void {
+    const result = reveal.reveal(app.allocator, s.path, line) catch |err| {
+        std.log.warn("flow {s}: open-in-editor failed: {s}", .{ s.path, @errorName(err) });
+        app.setStatus("Could not open the source file in an editor.");
+        return;
+    };
+    if (result.has_line) {
+        app.setStatus("Opened source at the selected line.");
+    } else {
+        // The OS file handler can't be told a line — say so, so the
+        // user isn't surprised the cursor didn't move.
+        app.setStatus("Opened source file (set $EDITOR for line-precise jumps).");
     }
 }
 

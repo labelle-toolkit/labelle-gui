@@ -16,6 +16,7 @@ const gizmos = @import("gizmos.zig");
 const preview = @import("preview.zig");
 const flow_projector = @import("flows/projector.zig");
 const flow_types = @import("flows/types.zig");
+const flow_reveal = @import("flows/reveal.zig");
 const prefs = @import("prefs.zig");
 const prefab_contents = @import("modules/inspector/prefab_contents.zig");
 const io_global = @import("io_global.zig");
@@ -3057,6 +3058,93 @@ pub const FlowsRendererTests = struct {
         var g = try projectStr(source);
         defer g.deinit();
         try expect.equal(g.entry_points.len, 1);
+    }
+};
+
+// ─── Flows reverse navigation (issue #42, Phase 4) ────────────────────
+
+pub const FlowsRevealTests = struct {
+    test "vscode-style editor gets --goto file:line" {
+        var argv_buf: [8][]const u8 = undefined;
+        var scratch: [128]u8 = undefined;
+        const plan = flow_reveal.planReveal(&argv_buf, &scratch, "code", "/p/scripts/flows/a.zig", 42);
+        try expect.toBeTrue(plan.has_line);
+        try expect.equal(plan.argv.len, @as(usize, 3));
+        try expect.toBeTrue(std.mem.eql(u8, plan.argv[0], "code"));
+        try expect.toBeTrue(std.mem.eql(u8, plan.argv[1], "--goto"));
+        try expect.toBeTrue(std.mem.eql(u8, plan.argv[2], "/p/scripts/flows/a.zig:42"));
+    }
+
+    test "vim-style editor gets +line before the file" {
+        var argv_buf: [8][]const u8 = undefined;
+        var scratch: [128]u8 = undefined;
+        const plan = flow_reveal.planReveal(&argv_buf, &scratch, "nvim", "a.zig", 7);
+        try expect.toBeTrue(plan.has_line);
+        try expect.equal(plan.argv.len, @as(usize, 3));
+        try expect.toBeTrue(std.mem.eql(u8, plan.argv[1], "+7"));
+        try expect.toBeTrue(std.mem.eql(u8, plan.argv[2], "a.zig"));
+    }
+
+    test "sublime-style editor gets --line N file" {
+        var argv_buf: [8][]const u8 = undefined;
+        var scratch: [128]u8 = undefined;
+        const plan = flow_reveal.planReveal(&argv_buf, &scratch, "subl", "a.zig", 12);
+        try expect.toBeTrue(plan.has_line);
+        try expect.equal(plan.argv.len, @as(usize, 4));
+        try expect.toBeTrue(std.mem.eql(u8, plan.argv[1], "--line"));
+        try expect.toBeTrue(std.mem.eql(u8, plan.argv[2], "12"));
+        try expect.toBeTrue(std.mem.eql(u8, plan.argv[3], "a.zig"));
+    }
+
+    test "editor command with embedded flags keeps the flags" {
+        var argv_buf: [8][]const u8 = undefined;
+        var scratch: [128]u8 = undefined;
+        const plan = flow_reveal.planReveal(&argv_buf, &scratch, "code --wait", "a.zig", 3);
+        try expect.toBeTrue(plan.has_line);
+        try expect.equal(plan.argv.len, @as(usize, 4));
+        try expect.toBeTrue(std.mem.eql(u8, plan.argv[0], "code"));
+        try expect.toBeTrue(std.mem.eql(u8, plan.argv[1], "--wait"));
+        try expect.toBeTrue(std.mem.eql(u8, plan.argv[2], "--goto"));
+    }
+
+    test "absolute editor path is matched by basename" {
+        var argv_buf: [8][]const u8 = undefined;
+        var scratch: [128]u8 = undefined;
+        const plan = flow_reveal.planReveal(&argv_buf, &scratch, "/usr/local/bin/cursor", "a.zig", 9);
+        try expect.toBeTrue(plan.has_line);
+        try expect.toBeTrue(std.mem.eql(u8, plan.argv[1], "--goto"));
+    }
+
+    test "Windows .exe suffix is stripped before matching" {
+        var argv_buf: [8][]const u8 = undefined;
+        var scratch: [128]u8 = undefined;
+        const plan = flow_reveal.planReveal(&argv_buf, &scratch, "Code.exe", "a.zig", 1);
+        try expect.toBeTrue(plan.has_line);
+        try expect.toBeTrue(std.mem.eql(u8, plan.argv[1], "--goto"));
+    }
+
+    test "null editor falls back to the OS file handler" {
+        var argv_buf: [8][]const u8 = undefined;
+        var scratch: [128]u8 = undefined;
+        const plan = flow_reveal.planReveal(&argv_buf, &scratch, null, "a.zig", 5);
+        try expect.toBeFalse(plan.has_line);
+        try expect.toBeTrue(plan.argv.len >= 2);
+        try expect.toBeTrue(std.mem.eql(u8, plan.argv[plan.argv.len - 1], "a.zig"));
+    }
+
+    test "unknown editor falls back to the OS file handler" {
+        var argv_buf: [8][]const u8 = undefined;
+        var scratch: [128]u8 = undefined;
+        const plan = flow_reveal.planReveal(&argv_buf, &scratch, "some-exotic-editor", "a.zig", 5);
+        try expect.toBeFalse(plan.has_line);
+        try expect.toBeTrue(std.mem.eql(u8, plan.argv[plan.argv.len - 1], "a.zig"));
+    }
+
+    test "empty editor string falls back to the OS file handler" {
+        var argv_buf: [8][]const u8 = undefined;
+        var scratch: [128]u8 = undefined;
+        const plan = flow_reveal.planReveal(&argv_buf, &scratch, "", "a.zig", 5);
+        try expect.toBeFalse(plan.has_line);
     }
 };
 
