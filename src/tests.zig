@@ -5243,4 +5243,70 @@ pub const FlowDocSubflowTests = struct {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         try expect.toBeTrue(flow_doc.referencedFlowPath(&buf, "bare.flow.jsonc", "x") == null);
     }
+
+    test "sameFileOnDisk detects identical path strings" {
+        try expect.toBeTrue(flow_doc.sameFileOnDisk(
+            "/proj/scripts/flows/a.flow.jsonc",
+            "/proj/scripts/flows/a.flow.jsonc",
+        ));
+    }
+
+    test "sameFileOnDisk catches a self-reference reached via a non-canonical path" {
+        // A `flow_ref` that resolves to the *same file on disk* through
+        // `.`/`..` segments must still be flagged: a raw byte compare
+        // would miss it and the Subflow node would mis-show the current
+        // flow's own pins.
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const dir = try std.fs.path.join(std.testing.allocator, &.{
+            ".zig-cache", "tmp", &tmp.sub_path,
+        });
+        defer std.testing.allocator.free(dir);
+
+        const canonical = try std.fs.path.join(std.testing.allocator, &.{
+            dir, "self.flow.jsonc",
+        });
+        defer std.testing.allocator.free(canonical);
+        std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = canonical,
+            .data = "{ \"event\": \"on_tick\", \"nodes\": [], \"edges\": [] }",
+        }) catch unreachable;
+
+        // Same file, reached through a `.` segment in the directory.
+        const non_canonical = try std.fs.path.join(std.testing.allocator, &.{
+            dir, ".", "self.flow.jsonc",
+        });
+        defer std.testing.allocator.free(non_canonical);
+
+        try expect.toBeTrue(flow_doc.sameFileOnDisk(canonical, non_canonical));
+    }
+
+    test "sameFileOnDisk distinguishes two different existing files" {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const dir = try std.fs.path.join(std.testing.allocator, &.{
+            ".zig-cache", "tmp", &tmp.sub_path,
+        });
+        defer std.testing.allocator.free(dir);
+
+        const a = try std.fs.path.join(std.testing.allocator, &.{ dir, "a.flow.jsonc" });
+        defer std.testing.allocator.free(a);
+        const b = try std.fs.path.join(std.testing.allocator, &.{ dir, "b.flow.jsonc" });
+        defer std.testing.allocator.free(b);
+        const body = "{ \"event\": \"on_tick\", \"nodes\": [], \"edges\": [] }";
+        std.Io.Dir.cwd().writeFile(io_global.io(), .{ .sub_path = a, .data = body }) catch unreachable;
+        std.Io.Dir.cwd().writeFile(io_global.io(), .{ .sub_path = b, .data = body }) catch unreachable;
+
+        try expect.toBeTrue(!flow_doc.sameFileOnDisk(a, b));
+    }
+
+    test "sameFileOnDisk falls back to raw compare when a path is missing" {
+        // Neither file exists — canonicalization is impossible, so the
+        // helper falls back to a raw byte compare. Distinct strings are
+        // (conservatively) reported as different files.
+        try expect.toBeTrue(!flow_doc.sameFileOnDisk(
+            "/no/such/dir/a.flow.jsonc",
+            "/no/such/dir/b.flow.jsonc",
+        ));
+    }
 };

@@ -560,6 +560,12 @@ fn linkId(e: flow_io.Edge) u64 {
 
 const PinDir = enum { input, output };
 
+/// A frame-scoped set of pin names, used to de-duplicate the pins a
+/// `Subflow` node emits within one direction. Keyed by the name bytes;
+/// keys borrow the referenced doc's storage (valid for the frame) so
+/// nothing is duped into the set.
+const PinNameSet = std.StringHashMap(void);
+
 /// Deterministic global pin id from a node id, pin name, and
 /// direction. Layout: bits 0–29 a name hash, bits 30–61 the node id,
 /// bit 62 the direction (set for outputs). Bit 63 is left clear so the
@@ -586,9 +592,27 @@ fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Nod
             // so edge authoring can map a pin id back to its node.
             const resolved = resolveSubflow(s, allocator, n.flow_ref);
             if (resolved) |ref_doc| {
+                // A `pinId` is a hash of (node id, name, direction) —
+                // two pins on this node that share a name *and*
+                // direction collide on the same id, which makes the
+                // node editor mis-associate links. A referenced flow
+                // with duplicate `param` names or duplicate `Output`
+                // names would do exactly that, so de-duplicate by name
+                // within each direction before emitting pins. (Input
+                // vs output never collide: `pinId` puts direction in
+                // bit 62, so a param and an Output sharing a name still
+                // get distinct ids — only same-direction names need
+                // de-duplication.)
+                var seen_in = PinNameSet.init(allocator);
+                defer seen_in.deinit();
+                var seen_out = PinNameSet.init(allocator);
+                defer seen_out.deinit();
+
                 // Inputs: one pin per declared parameter of the
                 // referenced flow.
                 for (ref_doc.params) |p| {
+                    const dup = (seen_in.fetchPut(p.name, {}) catch null) != null;
+                    if (dup) continue;
                     ne.beginPin(pinId(n.id, p.name, .input), .input);
                     zgui.text("> {s}", .{p.name});
                     ne.endPin();
@@ -598,6 +622,8 @@ fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Nod
                 // flow, named by the Output node's result-pin name.
                 for (ref_doc.nodes) |rn| {
                     if (rn.kind != .output) continue;
+                    const dup = (seen_out.fetchPut(rn.output_name, {}) catch null) != null;
+                    if (dup) continue;
                     ne.beginPin(pinId(n.id, rn.output_name, .output), .output);
                     zgui.text("{s} >", .{rn.output_name});
                     ne.endPin();
@@ -606,9 +632,15 @@ fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Nod
             } else {
                 // Unresolved — referenced file missing or unparseable.
                 // Fall back to the binding-derived input pins so the
-                // node still wires, and show a subtle hint.
+                // node still wires, and show a subtle hint. Bindings
+                // are de-duplicated by name for the same reason as the
+                // resolved-pin path above.
                 zgui.textDisabled("(unresolved — pins from bindings)", .{});
+                var seen_bind = PinNameSet.init(allocator);
+                defer seen_bind.deinit();
                 for (n.bindings) |b| {
+                    const dup = (seen_bind.fetchPut(b.name, {}) catch null) != null;
+                    if (dup) continue;
                     ne.beginPin(pinId(n.id, b.name, .input), .input);
                     zgui.text("> {s}", .{b.name});
                     ne.endPin();
@@ -693,8 +725,12 @@ fn resolveSubflow(
     const ref_path = referencedFlowPath(&path_buf, s.path, flow_ref) orelse return null;
 
     // A flow may not reference itself — that would recurse and is a
-    // malformed graph anyway. Treat it as unresolved.
-    if (std.mem.eql(u8, ref_path, s.path)) return null;
+    // malformed graph anyway. Treat it as unresolved. The comparison
+    // canonicalizes both paths (`.`, `..`, symlinks) so a self-reference
+    // reached through a non-canonical `flow_ref` — e.g. `./enemy_tick`
+    // or `../flows/enemy_tick` — is still caught and doesn't make the
+    // node display the *current* flow's own pins.
+    if (sameFileOnDisk(ref_path, s.path)) return null;
 
     // Stat the referenced file for its mtime. A failed stat (missing
     // file) leaves `cur_mtime` null — still cacheable as "unresolved".
@@ -766,6 +802,31 @@ fn loadReferencedFlow(allocator: std.mem.Allocator, ref_path: []const u8) ?flow_
 pub fn referencedFlowPath(buf: []u8, current_path: []const u8, flow_ref: []const u8) ?[]const u8 {
     const dir = std.fs.path.dirname(current_path) orelse return null;
     return std.fmt.bufPrint(buf, "{s}/{s}{s}", .{ dir, flow_ref, flow_io.extension }) catch null;
+}
+
+/// True when `a` and `b` name the *same file on disk*. Both paths are
+/// canonicalized (resolving `.`, `..`, and symlinks via `realPathFile`)
+/// before comparison, so a self-reference reached through a
+/// non-canonical `flow_ref` is detected even though the raw path
+/// strings differ.
+///
+/// When either path can't be canonicalized — most commonly because the
+/// referenced file doesn't exist yet — the canonical comparison is
+/// impossible, so this falls back to a raw byte-equality check. That
+/// fallback is conservative: an unresolvable `ref_path` simply isn't
+/// flagged as a self-reference and `resolveSubflow` then fails its
+/// `stat` and reports the node as unresolved anyway.
+///
+/// Public for unit testing.
+pub fn sameFileOnDisk(a: []const u8, b: []const u8) bool {
+    if (std.mem.eql(u8, a, b)) return true;
+    const io = io_global.io();
+    const cwd = std.Io.Dir.cwd();
+    var buf_a: [std.fs.max_path_bytes]u8 = undefined;
+    var buf_b: [std.fs.max_path_bytes]u8 = undefined;
+    const len_a = cwd.realPathFile(io, a, &buf_a) catch return false;
+    const len_b = cwd.realPathFile(io, b, &buf_b) catch return false;
+    return std.mem.eql(u8, buf_a[0..len_a], buf_b[0..len_b]);
 }
 
 // ─── Inspector ──────────────────────────────────────────────────────────
