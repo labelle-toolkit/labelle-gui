@@ -3880,56 +3880,90 @@ pub const PreviewLiveStderrTests = struct {
     // #79: a clean (code 0) child exit while the session is `.running`
     // is the engine shutting itself down — the user closed the game
     // window. It must land in `.stopped`, NOT `.crashed`, even when no
-    // `bye` frame ever arrives. `/usr/bin/true` exits 0 immediately.
+    // `bye` frame ever arrives.
     //
-    // This exercises the *real* EOF-vs-waitpid race: a genuine engine
-    // shutdown closes its TCP socket as it tears down, so a single
-    // `poll` sees the socket EOF (`tryRead`) *before* `waitpid` reaps
-    // the child (`tryWaitChild`). The session has a live `conn_fd`
-    // here — `tryRead` runs first, observes EOF, and must defer to the
-    // clean-exit detection instead of unconditionally `markCrashed`.
-    // The earlier version of this test forced `.running` with
-    // `conn_fd == -1`, so `tryRead` early-returned and never saw EOF —
-    // it passed even with the race bug present.
-    test "clean child exit while running lands in .stopped not .crashed" {
+    // This drives the *real* EOF-vs-waitpid race deterministically. A
+    // genuine engine shutdown closes its TCP socket as part of process
+    // teardown — the kernel can deliver the socket FIN (so `read`
+    // returns 0) while the process is still mid-exit and NOT yet a
+    // reapable zombie. At the `poll` that sees that EOF,
+    // `waitpid(WNOHANG)` still returns 0. The buggy code `markCrashed`s
+    // on that EOF (`tryWaitChild` can't yet see the exit code) and lands
+    // `.crashed`; the fixed code records the EOF as *pending*, waits for
+    // a later poll to reap the child, and lands `.stopped` with the real
+    // exit code.
+    //
+    // Two subtleties this test gets right (the earlier version got both
+    // wrong, so it passed even with the bug present):
+    //
+    //  1. The child is spawned AFTER `bindListener` but BEFORE the
+    //     engine socket is dialed. After `dialEditor`, a freshly forked
+    //     child would inherit a copy of the connection fd (no
+    //     `O_CLOEXEC`), so `close(engine_fd)` in the test would NOT
+    //     deliver a FIN — the editor's `conn_fd` would never see EOF
+    //     until the child itself exited, and by then `waitpid` reaps it
+    //     the same tick. No race. Spawning before `dialEditor` means the
+    //     connection fd doesn't exist at fork time. (Spawning before
+    //     `bindListener` doesn't work either — `bindListener` kills and
+    //     nulls any pre-existing `sess.child` as leftover-cycle cleanup.)
+    //
+    //  2. `close(engine_fd)` happens while the child is provably still
+    //     sleeping, and a short sleep guarantees the loopback FIN is
+    //     delivered before the racing `poll`. That poll sees EOF with
+    //     the child un-reapable — the precise #79 window.
+    test "clean child exit while running lands in .stopped not .crashed (EOF races waitpid)" {
         var sess = preview.PreviewSession.init(std.testing.allocator);
         defer sess.deinit();
 
-        // Establish a real connected engine socket and reach `.running`
-        // via the `hello` handshake, so `sess.conn_fd >= 0` and
-        // `tryRead` is live.
+        // Bind the listener first (it would kill a pre-existing child),
+        // then spawn the engine subprocess — before any connection
+        // socket exists — so the child cannot inherit the connection fd.
+        // The child stays alive ~800 ms then exits cleanly (code 0): the
+        // subprocess half of a normal Run → play → close-window
+        // shutdown, slow enough that the race window is open during the
+        // handshake + the racing poll below.
         try sess.bindListener();
-        const engine_fd = try dialEditor(sess.port.?);
-        try waitUntilState(&sess, .connecting, 500);
-        try sendJsonLine(engine_fd, "{\"kind\":\"hello\",\"engine_version\":\"\",\"pid\":1,\"protocol_version\":1}\n");
-        try waitUntilState(&sess, .running, 500);
-
-        // Attach a child that exits cleanly (code 0) — the subprocess
-        // half of a normal Run → play → close-window shutdown.
-        const argv = &[_][]const u8{"/usr/bin/true"};
+        const argv = &[_][]const u8{ "/bin/sleep", "0.8" };
         const child = std.process.spawn(io_global.io(), .{
             .argv = argv,
             .stdin = .ignore,
             .stdout = .ignore,
             .stderr = .pipe,
         }) catch |err| {
-            _ = close(engine_fd);
-            std.debug.print("skip: /usr/bin/true unavailable ({s})\n", .{@errorName(err)});
+            std.debug.print("skip: /bin/sleep unavailable ({s})\n", .{@errorName(err)});
             return error.SkipZigTest;
         };
         sess.child = child;
 
-        // Let the child fully exit, then close the engine-side socket —
-        // this is the shutdown ordering a real engine produces (socket
-        // FIN delivered, zombie waiting to be reaped). The very next
-        // `poll` now has BOTH a pending EOF on `conn_fd` and a
-        // reapable zombie, racing exactly as #79 describes.
-        sleepMs(100);
-        _ = close(engine_fd);
-        sleepMs(20);
+        // Now establish a real connected engine socket and reach
+        // `.running` via the `hello` handshake, so `sess.conn_fd >= 0`
+        // and `tryRead` is live. This connection fd post-dates the fork,
+        // so the child does not hold a copy of it.
+        const engine_fd = try dialEditor(sess.port.?);
+        try waitUntilState(&sess, .connecting, 500);
+        try sendJsonLine(engine_fd, "{\"kind\":\"hello\",\"engine_version\":\"\",\"pid\":1,\"protocol_version\":1}\n");
+        try waitUntilState(&sess, .running, 500);
 
+        // Close the engine-side socket NOW, while the child is still
+        // sleeping (not yet a zombie). The short sleep guarantees the
+        // loopback FIN has been delivered so the next `poll`'s `tryRead`
+        // deterministically observes EOF — but it's far below the
+        // child's 0.8 s lifetime, so `waitpid(WNOHANG)` still returns 0
+        // (child un-reapable) at that same poll. That is the exact #79
+        // race. The buggy code crashes here; the fixed code records the
+        // EOF as pending and stays `.running`.
+        _ = close(engine_fd);
+        sleepMs(40);
+        sess.poll();
+        // Right after the racing poll: the buggy build has already
+        // transitioned to `.crashed` on the EOF. The fixed build is
+        // still `.running` with the EOF deferred — this is the
+        // assertion that actually catches the bug.
+        try expect.equal(sess.state, preview.State.running);
+
+        // Now let the sleep finish and subsequent polls reap it.
         var slept: u64 = 0;
-        while (slept < 2000) {
+        while (slept < 3000) {
             sess.poll();
             if (sess.state != .running) break;
             sleepMs(5);
@@ -3938,9 +3972,66 @@ pub const PreviewLiveStderrTests = struct {
         try expect.equal(sess.state, preview.State.stopped);
         // The reason must come from the clean exit-code path, not the
         // EOF "connection closed" crash string — that's how we know
-        // `tryRead` deferred to `tryWaitChild` rather than preempting it.
+        // the deferred EOF resolved via `tryWaitChild`'s exit status.
         const reason = sess.bye_reason orelse "";
         try expect.toBeTrue(std.mem.indexOf(u8, reason, "labelle exited") != null);
+    }
+
+    // #79 counterpart: the deferred-EOF fix must NOT swallow a genuine
+    // mid-session crash. Same race ordering — socket EOF observed while
+    // the child is still un-reapable — but here the child exits with a
+    // non-zero code. The session must still land `.crashed`, and the
+    // reason must carry the exit code (proving the crash verdict came
+    // from the reaped exit status, not the generic EOF string).
+    test "non-zero child exit while running still lands in .crashed (EOF races waitpid)" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+
+        // Bind first, then spawn before dialing (see the clean-exit test
+        // above for the fd-inheritance / `bindListener`-kill reasons).
+        // `sh -c 'sleep 0.8; exit 3'` — alive long enough to lose the
+        // race, then a non-zero exit standing in for a real engine
+        // crash.
+        try sess.bindListener();
+        const argv = &[_][]const u8{ "/bin/sh", "-c", "sleep 0.8; exit 3" };
+        const child = std.process.spawn(io_global.io(), .{
+            .argv = argv,
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .pipe,
+        }) catch |err| {
+            std.debug.print("skip: /bin/sh unavailable ({s})\n", .{@errorName(err)});
+            return error.SkipZigTest;
+        };
+        sess.child = child;
+
+        const engine_fd = try dialEditor(sess.port.?);
+        try waitUntilState(&sess, .connecting, 500);
+        try sendJsonLine(engine_fd, "{\"kind\":\"hello\",\"engine_version\":\"\",\"pid\":1,\"protocol_version\":1}\n");
+        try waitUntilState(&sess, .running, 500);
+
+        // EOF the socket while the child is still running, then poll
+        // into the race window — same ordering as the clean-exit test.
+        _ = close(engine_fd);
+        sleepMs(40);
+        sess.poll();
+        // The deferred-EOF fix keeps the session `.running` here — the
+        // crash verdict must come from the reaped exit code, not the EOF.
+        try expect.equal(sess.state, preview.State.running);
+
+        var slept: u64 = 0;
+        while (slept < 3000) {
+            sess.poll();
+            if (sess.state != .running) break;
+            sleepMs(5);
+            slept += 5;
+        }
+        try expect.equal(sess.state, preview.State.crashed);
+        // Exit code 3 must surface — confirms the crash verdict came
+        // from the reaped exit status, not the "connection closed" EOF
+        // fallback.
+        const reason = sess.bye_reason orelse "";
+        try expect.toBeTrue(std.mem.indexOf(u8, reason, "code 3") != null);
     }
 };
 

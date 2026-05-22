@@ -143,6 +143,20 @@ pub const connecting_timeout_ms: i64 = 60_000;
 /// engine has been silent for a span no live engine would produce.
 pub const heartbeat_timeout_ms: i64 = 3_000;
 
+/// Grace window for resolving a deferred socket EOF (#79).
+///
+/// `tryRead` records a socket EOF without an accompanying `bye` as
+/// *pending* (`eof_at_ms`) rather than crashing immediately, because a
+/// clean engine shutdown EOFs the socket before its process becomes a
+/// reapable zombie. `poll` then waits for `tryWaitChild` to reap the
+/// subprocess and report its true exit status. This is the upper bound
+/// on that wait: once the socket has been EOFed this long and the child
+/// *still* hasn't been reaped, the session resolves to `.crashed` as a
+/// backstop (e.g. a wrapper process wedged after its child died). The
+/// happy path resolves in the very next poll or two — a process whose
+/// socket the kernel already closed is microseconds from reapable.
+pub const eof_resolve_grace_ms: i64 = 2_000;
+
 /// Callback slot — fires on the first `frame_offer` JSON frame the
 /// engine sends after the `hello` handshake. The App wires this to
 /// `attachGameView(shm_name, format)` (#107 → #112 end-to-end seam).
@@ -290,6 +304,25 @@ pub const PreviewSession = struct {
     /// frame, and is what the heartbeat watchdog measures against.
     /// Set when the `hello` handshake completes; `null` before that.
     last_rx_ms: ?i64 = null,
+    /// Monotonic millisecond timestamp of a *deferred* socket EOF (#79).
+    ///
+    /// When `tryRead` observes EOF on `conn_fd` in a non-terminal state
+    /// without a preceding `bye`, it does NOT immediately `markCrashed`.
+    /// A clean engine shutdown (Run → play → close window) closes its
+    /// socket as part of process teardown — the kernel can deliver the
+    /// socket FIN (so `read` returns 0) *before* the process becomes a
+    /// reapable zombie, so `waitpid(WNOHANG)` still returns 0 at the
+    /// poll that sees the EOF. Crashing on the EOF would misreport that
+    /// clean exit as `.crashed` — the exact #79 bug.
+    ///
+    /// Instead the EOF is recorded here and the crashed-vs-stopped
+    /// decision is deferred to `resolvePendingEof` in `poll`, which
+    /// waits for `tryWaitChild` to reap the subprocess and read its real
+    /// exit status (code 0 → `.stopped`, anything else → `.crashed`).
+    /// If the child is already gone with no clean landing, or stays
+    /// unreaped past `eof_resolve_grace_ms`, the EOF resolves to a
+    /// genuine `.crashed`. `null` = no EOF pending.
+    eof_at_ms: ?i64 = null,
 
     const Self = @This();
 
@@ -386,6 +419,9 @@ pub const PreviewSession = struct {
         // previous session (#79).
         self.last_rx_ms = null;
         self.last_heartbeat_ms = null;
+        // Drop any deferred-EOF marker from a prior cycle (#79) so the
+        // first poll of this fresh Run can't resolve a stale EOF.
+        self.eof_at_ms = null;
     }
 
     /// Production entry: bind + spawn `labelle run <project_dir>`
@@ -485,6 +521,8 @@ pub const PreviewSession = struct {
             self.listener = null;
         }
         self.connect_start_ms = null;
+        // A manual Stop overrides any deferred-EOF resolution (#79).
+        self.eof_at_ms = null;
         // Don't reset `state` if it's already `.crashed` — `poll`
         // landed us there for a reason and the UI still needs to
         // show "preview crashed". Only `.listening`/`.connecting`/
@@ -526,6 +564,17 @@ pub const PreviewSession = struct {
         // alive, so this is cheap on the happy path.
         if (self.state == .listening or self.state == .connecting or self.state == .running) {
             self.tryWaitChild();
+        }
+
+        // Resolve a deferred socket EOF (#79). `tryRead` records an
+        // unexpected EOF as *pending* rather than crashing on the spot,
+        // because a clean engine shutdown closes its socket before its
+        // process is reapable — see `eof_at_ms` / `resolvePendingEof`.
+        // This runs after `tryWaitChild` above so the exit status it
+        // reaped (clean → `.stopped`, crash → `.crashed`) is already
+        // reflected in `self.state` by the time the EOF is settled.
+        if (self.eof_at_ms != null) {
+            self.resolvePendingEof();
         }
 
         // Heartbeat watchdog (#79). The engine emits a `heartbeat`
@@ -791,26 +840,81 @@ pub const PreviewSession = struct {
         }
 
         // Post-parse: if we hit EOF in the read loop, decide
-        // crashed-vs-stopped based on whether the bye actually
-        // landed (handleFrame sets state=.stopped + bye_reason).
-        // The `.stopped` check matches both the bye-then-close
-        // clean shutdown and a manual `stop()` racing the EOF.
-        if (saw_eof and self.state != .stopped and self.bye_reason == null) {
+        // crashed-vs-stopped. If a `bye` frame landed (handleFrame set
+        // state=.stopped + bye_reason) or a manual `stop()` raced the
+        // EOF, we're already terminal — nothing to do.
+        if (saw_eof and self.state != .stopped and self.state != .crashed and self.bye_reason == null) {
             // A clean engine exit (Run → play → close window) closes
-            // its socket as it tears down, so EOF here usually *beats*
-            // the `waitpid` reap in `poll`'s subprocess-exit path (#79).
-            // Treating that EOF as an unconditional crash misreports a
-            // normal shutdown — the exact bug #79 is about. Before
-            // declaring "connection closed", give `tryWaitChild` a
-            // chance to reap the child: a code-0 exit from a `.running`
-            // session lands `.stopped` there and we must not crash.
-            // `tryWaitChild` early-returns when the child is still
-            // alive (a true mid-session socket crash), so the genuine
-            // crash path below still fires.
-            if (self.state == .running) self.tryWaitChild();
-            if (self.state != .stopped and self.state != .crashed and self.bye_reason == null) {
-                self.markCrashed("connection closed");
+            // its socket as part of process teardown. The kernel can
+            // deliver the socket FIN — so this `read` returns 0 — while
+            // the engine process is still mid-exit and NOT yet a
+            // reapable zombie. At that instant `waitpid(WNOHANG)` (in
+            // `tryWaitChild`) returns 0, so calling it here would NOT
+            // reap the child and NOT learn the exit code. Crashing on
+            // the EOF unconditionally — or after a `tryWaitChild` that
+            // can't yet see the exit — misreports a normal shutdown as
+            // `.crashed`. That is the exact #79 race.
+            //
+            // So don't decide here. Record the EOF as pending and let
+            // `poll`'s `resolvePendingEof` settle it once `tryWaitChild`
+            // has actually reaped the subprocess and read its true exit
+            // status: code 0 → `.stopped`, non-zero / signal → genuine
+            // `.crashed`. The dead socket is closed now (no further
+            // reads are possible on an EOFed fd) so a subsequent
+            // `tryRead` early-returns on `conn_fd < 0`.
+            if (self.eof_at_ms == null) self.eof_at_ms = nowMs();
+            if (self.conn_fd >= 0) {
+                _ = close(self.conn_fd);
+                self.conn_fd = -1;
             }
+        }
+    }
+
+    /// Settle a deferred socket EOF recorded by `tryRead` (#79). Called
+    /// from `poll` *after* `tryWaitChild` has had its chance to reap the
+    /// subprocess this tick.
+    ///
+    /// Resolution order:
+    ///  - State already terminal (`.stopped`/`.crashed`) — `tryWaitChild`
+    ///    or a late `bye` settled it. Clear the pending flag, done.
+    ///  - Child reaped but the session is somehow still non-terminal, or
+    ///    there is no child at all — the engine is gone and no clean
+    ///    landing happened, so the EOF is a genuine crash.
+    ///  - Child still alive/unreaped within the grace window — keep
+    ///    waiting; the next poll's `tryWaitChild` should reap it.
+    ///  - Grace window elapsed with the child still unreaped — backstop
+    ///    crash (e.g. a wrapper process wedged after its child died).
+    fn resolvePendingEof(self: *Self) void {
+        const eof_t = self.eof_at_ms orelse return;
+
+        // `tryWaitChild` (clean exit) or a late `bye` already landed us
+        // in a terminal state — the pending EOF is moot.
+        if (self.state == .stopped or self.state == .crashed) {
+            self.eof_at_ms = null;
+            return;
+        }
+
+        // Is the subprocess still around and reapable-pending? `child`
+        // is null in the loopback test fixture; `child.id` is null once
+        // `tryWaitChild` has reaped it. Either way there is no exit
+        // status still coming, so the EOF is the final word: a crash.
+        const child_pending = blk: {
+            const child = self.child orelse break :blk false;
+            break :blk child.id != null;
+        };
+        if (!child_pending) {
+            self.markCrashed("connection closed");
+            self.eof_at_ms = null;
+            return;
+        }
+
+        // Child still alive — `tryWaitChild` ran this tick and saw
+        // `waitpid` return 0. Give it more polls to reap, bounded so a
+        // wrapper that EOFed its socket but never exits can't wedge the
+        // session in a stale `.running` forever.
+        if (nowMs() - eof_t > eof_resolve_grace_ms) {
+            self.markCrashed("connection closed");
+            self.eof_at_ms = null;
         }
     }
 
