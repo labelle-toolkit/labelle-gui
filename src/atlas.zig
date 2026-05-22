@@ -289,8 +289,13 @@ fn jsonU32(v: ?std.json.Value) ?u32 {
 fn jsonI32(v: ?std.json.Value) ?i32 {
     const val = v orelse return null;
     return switch (val) {
-        .integer => |i| @intCast(i),
-        .float => |f| @intFromFloat(f),
+        .integer => |i| std.math.cast(i32, i),
+        .float => |f| if (std.math.isFinite(f) and
+            f >= @as(f64, @floatFromInt(std.math.minInt(i32))) and
+            f <= @as(f64, @floatFromInt(std.math.maxInt(i32))))
+            @intFromFloat(f)
+        else
+            null,
         else => null,
     };
 }

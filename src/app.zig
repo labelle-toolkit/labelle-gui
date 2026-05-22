@@ -407,6 +407,9 @@ pub const App = struct {
         if (self.gizmo_index) |*idx| idx.deinit();
         if (self.prefab_index) |*idx| idx.deinit();
         if (self.pending_open_prefab_path) |p| self.allocator.free(p);
+        // Modules that opted into Registry-managed cleanup via
+        // `on_deinit` (e.g. atlas_viewer's GL textures + heap state).
+        self.registry.deinitAll(self);
         // Phase 3 state. Entity Inspector frees its component table;
         // Flow Runtime frees its subscribed-flow name copies.
         self.entity_inspector.deinit();
