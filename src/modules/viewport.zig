@@ -499,8 +499,8 @@ fn drawSpriteValueAt(
 ) bool {
     const name = std.mem.sliceTo(&sprite.sprite_name, 0);
     // Resolve the sprite name → TextureRef + UV rect via the shared
-    // atlas_ui helper (same resolve the resources panel's thumbnails
-    // and the game view use).
+    // atlas_ui helper (the same resolve the resources panel's sprite
+    // thumbnails use).
     const r = atlas_ui.resolve(idx, name) orelse return false;
 
     // World-space size of one screen pixel of the sprite. No DPI

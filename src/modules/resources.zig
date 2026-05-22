@@ -129,9 +129,10 @@ fn renderThumbnails(app: *App, res_name: []const u8) void {
     };
     if (a.frames.count() == 0) return;
 
-    // Wrap thumbnails to the panel width.
+    // Wrap thumbnails to the panel width. Spacing comes from the live
+    // ImGui style so the grid tracks theme / HiDPI changes.
     const avail_w = zgui.getContentRegionAvail()[0];
-    const style_spacing = 6.0;
+    const style_spacing = zgui.getStyle().item_spacing[0];
     const per_row: usize = @max(1, @as(usize, @intFromFloat(
         avail_w / (thumb_size + style_spacing),
     )));

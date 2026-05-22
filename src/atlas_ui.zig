@@ -1,10 +1,11 @@
 //! Shared atlas → imgui binding helpers.
 //!
-//! `viewport.zig` and `game_view.zig` both resolve a sprite name to a
-//! GL texture id + UV sub-rect by hand; `inspector.zig` flags missing
-//! sprites. This module centralises the resolve + UV math so any panel
-//! can bind an atlas frame to a `zgui` widget (`image`, `imageButton`,
-//! `addImage`) without re-deriving it.
+//! Several editor panels bind an atlas frame to a `zgui` widget:
+//! `viewport.zig` draws sprites on the canvas and the resources panel
+//! renders sprite thumbnails (`inspector.zig` also flags missing
+//! sprites). This module centralises the sprite-name → GL texture id +
+//! UV sub-rect resolve so panels can call `image` / `imageButton` /
+//! `addImage` without each re-deriving it.
 //!
 //! Lifetime note: a `Resolved` is built fresh from the live
 //! `atlas.Index` and must never be cached across frames. The index is
