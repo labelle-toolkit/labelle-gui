@@ -36,7 +36,6 @@ const App = @import("../app.zig").App;
 const flow_io = @import("../flow_io.zig");
 const io_global = @import("../io_global.zig");
 const flow_cycle = @import("../flow_cycle.zig");
-const io_global = @import("../io_global.zig");
 
 const inspector_w: f32 = 340;
 const split_gap: f32 = 8;

@@ -15,7 +15,6 @@ const gizmo_io = @import("gizmo_io.zig");
 const flow_io = @import("flow_io.zig");
 const flow_doc = @import("modules/flow_doc.zig");
 const flow_cycle = @import("flow_cycle.zig");
-const flow_doc = @import("modules/flow_doc.zig");
 const gizmos = @import("gizmos.zig");
 const preview = @import("preview.zig");
 const flow_projector = @import("flows/projector.zig");
