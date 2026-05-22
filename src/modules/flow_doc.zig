@@ -852,11 +852,16 @@ fn renderOtherField(s: *FlowDocState, n: *flow_io.Node, spec: flow_io.OtherField
             // widget edits the bare inner text. Decode into a stack
             // buffer — see `.op_combo` above: a per-frame doc-arena
             // allocation here would leak while the node stays selected.
-            var decode_buf: IdentBuf = undefined;
-            const decoded = flow_io.decodeStringValueBuf(&decode_buf, current);
             var buf: IdentBuf = undefined;
-            seedBuf(&buf, decoded);
-            if (zgui.inputText("##other_text", .{ .buf = &buf })) {
+            const decoded = flow_io.decodeStringValueBufChecked(&buf, current);
+            if (decoded.truncated) {
+                // The value is longer than the inline editor can hold.
+                // Editing the truncated view and saving would overwrite
+                // the real stored value with a partial copy — silent
+                // data loss. Show a read-only, disabled widget instead
+                // so the original `extras` value round-trips untouched.
+                renderTooLongField(current);
+            } else if (zgui.inputText("##other_text", .{ .buf = &buf })) {
                 const raw = std.mem.sliceTo(&buf, 0);
                 const encoded = flow_io.encodeStringValue(a, raw) catch return;
                 flow_io.setExtraValue(a, n, spec.key, encoded) catch return;
@@ -867,14 +872,23 @@ fn renderOtherField(s: *FlowDocState, n: *flow_io.Node, spec: flow_io.OtherField
             // `Literal.value` is any JSON type — edit the canonical text
             // directly and normalise so a save can't emit invalid JSON.
             var buf: ValueBuf = undefined;
-            seedBuf(&buf, current);
-            if (zgui.inputText("##other_literal", .{ .buf = &buf })) {
-                const raw = std.mem.sliceTo(&buf, 0);
-                const norm = flow_io.normalizeValueText(a, raw) catch return;
-                flow_io.setExtraValue(a, n, spec.key, norm) catch return;
-                s.is_dirty = true;
+            // `ValueBuf` reserves one byte for the widget's NUL
+            // sentinel; a `value` of `buf.len` chars or more can't be
+            // seeded losslessly, so seeding it and committing on the
+            // first `inputText` keystroke would write back a truncated
+            // literal. Detect that and fall back to a read-only view.
+            if (current.len > buf.len - 1) {
+                renderTooLongField(current);
+            } else {
+                seedBuf(&buf, current);
+                if (zgui.inputText("##other_literal", .{ .buf = &buf })) {
+                    const raw = std.mem.sliceTo(&buf, 0);
+                    const norm = flow_io.normalizeValueText(a, raw) catch return;
+                    flow_io.setExtraValue(a, n, spec.key, norm) catch return;
+                    s.is_dirty = true;
+                }
+                zgui.textDisabled("(JSON literal — e.g. 25, 1.5, \"txt\", true)", .{});
             }
-            zgui.textDisabled("(JSON literal — e.g. 25, 1.5, \"txt\", true)", .{});
         },
     }
 
@@ -893,6 +907,26 @@ fn renderOtherField(s: *FlowDocState, n: *flow_io.Node, spec: flow_io.OtherField
             zgui.bulletText("{s}: {s}", .{ kv.key, kv.value_text });
         }
     }
+}
+
+/// Render a recognised field whose stored value is too long for the
+/// inline editor. The value is shown in a disabled (read-only) input so
+/// the user can see it in full-ish, with a hint explaining why it can't
+/// be edited here. Crucially, nothing is written back: the original
+/// `extras` value is left untouched so a save round-trips it verbatim.
+fn renderTooLongField(value: []const u8) void {
+    zgui.beginDisabled(.{ .disabled = true });
+    // A stack buffer just for display — wider than the edit buffers so
+    // the user sees as much as practical. The widget is disabled, so
+    // even a truncated preview here can never be committed.
+    var view: [1024:0]u8 = undefined;
+    seedBuf(&view, value);
+    _ = zgui.inputText("##other_too_long", .{ .buf = &view });
+    zgui.endDisabled();
+    zgui.textDisabled(
+        "(value too long to edit inline — edit the .flow.jsonc file directly)",
+        .{},
+    );
 }
 
 // ─── Mutators ───────────────────────────────────────────────────────────

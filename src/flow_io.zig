@@ -308,6 +308,76 @@ pub fn decodeStringValueBuf(buf: []u8, value_text: []const u8) []const u8 {
     return buf[0..inner.len];
 }
 
+/// Result of `decodeStringValueBufChecked` — the decoded slice plus a
+/// flag telling the caller the value did not fit the buffer verbatim.
+pub const DecodedValue = struct {
+    /// The decoded (or, on fall-through, verbatim) text — a slice into
+    /// the caller's buffer, possibly truncated.
+    text: []const u8,
+    /// True when the canonical/decoded text was longer than the buffer
+    /// and `text` is therefore a truncated, lossy view. A caller that
+    /// would write `text` back must instead treat the field as
+    /// read-only so the original value round-trips untouched.
+    truncated: bool,
+};
+
+/// Like `decodeStringValueBuf`, but also reports whether the value was
+/// too long to represent in `buf` without loss. An inline editor must
+/// check `truncated` and refuse to write the field when it is set —
+/// editing a truncated view and saving it would corrupt the stored
+/// value (silent data loss).
+///
+/// `truncated` is true when either the decoded inner string, or the
+/// verbatim canonical text used on fall-through, would not fit in
+/// `buf` (which always reserves one byte for the input-widget
+/// sentinel). When false the returned `text` is the exact, complete
+/// value and is safe to edit.
+pub fn decodeStringValueBufChecked(buf: []u8, value_text: []const u8) DecodedValue {
+    std.debug.assert(buf.len > 0);
+    // One byte is reserved for the editor's NUL sentinel, so a value of
+    // exactly `buf.len` would still be truncated by the widget.
+    const cap = buf.len - 1;
+    const trimmed = std.mem.trim(u8, value_text, " \t\r\n");
+
+    // Non-string canonical values (numbers, bools, null) are edited
+    // verbatim; they fit only when shorter than the editable capacity.
+    if (trimmed.len < 2 or trimmed[0] != '"') {
+        const n = @min(cap, trimmed.len);
+        @memcpy(buf[0..n], trimmed[0..n]);
+        return .{ .text = buf[0..n], .truncated = trimmed.len > cap };
+    }
+
+    var scratch: [1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        fba.allocator(),
+        trimmed,
+        .{},
+    ) catch {
+        // Unparseable — fall through to the verbatim canonical text.
+        const n = @min(cap, trimmed.len);
+        @memcpy(buf[0..n], trimmed[0..n]);
+        return .{ .text = buf[0..n], .truncated = trimmed.len > cap };
+    };
+    defer parsed.deinit();
+    if (parsed.value != .string) {
+        const n = @min(cap, trimmed.len);
+        @memcpy(buf[0..n], trimmed[0..n]);
+        return .{ .text = buf[0..n], .truncated = trimmed.len > cap };
+    }
+    const inner = parsed.value.string;
+    if (inner.len > cap) {
+        // The decoded text won't fit; surface a truncated verbatim view
+        // and mark it lossy so the editor stays read-only.
+        const n = @min(cap, trimmed.len);
+        @memcpy(buf[0..n], trimmed[0..n]);
+        return .{ .text = buf[0..n], .truncated = true };
+    }
+    @memcpy(buf[0..inner.len], inner);
+    return .{ .text = buf[0..inner.len], .truncated = false };
+}
+
 /// Canonical JSON text for a plain string value — the form a `.text`
 /// widget's input must be stored as so the writer emits valid JSON.
 pub fn encodeStringValue(a: std.mem.Allocator, raw: []const u8) ![]const u8 {

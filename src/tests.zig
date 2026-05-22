@@ -4857,6 +4857,115 @@ pub const FlowIoTests = struct {
         }
     }
 
+    test "decodeStringValueBufChecked reports a clean fit as not truncated" {
+        var buf: [128]u8 = undefined;
+        // A short JSON string decodes and fits — safe to edit.
+        const got = flow_io.decodeStringValueBufChecked(&buf, "\"Position\"");
+        try expect.toBeTrue(!got.truncated);
+        try expect.toBeTrue(std.mem.eql(u8, got.text, "Position"));
+
+        // A short non-string canonical value fits verbatim.
+        const num = flow_io.decodeStringValueBufChecked(&buf, "42");
+        try expect.toBeTrue(!num.truncated);
+        try expect.toBeTrue(std.mem.eql(u8, num.text, "42"));
+    }
+
+    test "decodeStringValueBufChecked flags a too-long decoded string" {
+        // The decoded inner text (`abcdefghij`, 10 chars) exceeds the
+        // editable capacity of a 4-byte buffer (3 usable chars).
+        var small: [4]u8 = undefined;
+        const got = flow_io.decodeStringValueBufChecked(&small, "\"abcdefghij\"");
+        try expect.toBeTrue(got.truncated);
+        // The view never overruns the buffer.
+        try expect.toBeTrue(got.text.len <= small.len);
+    }
+
+    test "decodeStringValueBufChecked flags a too-long non-string literal" {
+        // A bare number longer than the editable capacity is truncated
+        // — editing it would corrupt the literal, so it's flagged.
+        var small: [4]u8 = undefined;
+        const got = flow_io.decodeStringValueBufChecked(&small, "123456789");
+        try expect.toBeTrue(got.truncated);
+
+        // A value of exactly `buf.len` chars still doesn't fit: one byte
+        // is reserved for the editor's NUL sentinel.
+        var four: [4]u8 = undefined;
+        const exact = flow_io.decodeStringValueBufChecked(&four, "1234");
+        try expect.toBeTrue(exact.truncated);
+    }
+
+    test "a too-long .text field value survives a load -> save round-trip" {
+        const a = std.testing.allocator;
+        // A `GetComponent.component` whose decoded string is far longer
+        // than the inspector's 128-byte identifier edit buffer. The
+        // inspector must refuse to edit it; the writer must still emit
+        // it unchanged.
+        const long_name = "X" ** 300;
+        const src = std.fmt.allocPrint(a,
+            \\{{ "event": {{ "type": "OnCreate" }},
+            \\  "nodes": [ {{ "id": 1, "type": "GetComponent", "component": "{s}", "pos": [0, 0] }} ],
+            \\  "edges": [] }}
+        , .{long_name}) catch unreachable;
+        defer a.free(src);
+
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+
+        // The inspector's `.text` path would decode into an `IdentBuf`
+        // (128 bytes); a 300-char value must come back flagged.
+        const stored = flow_io.extraValue(doc.nodes[0], "component").?;
+        var ident_buf: [128]u8 = undefined;
+        const decoded = flow_io.decodeStringValueBufChecked(&ident_buf, stored);
+        try expect.toBeTrue(decoded.truncated);
+
+        // An untouched too-long value must round-trip verbatim — the
+        // editor skips the write, so `extras` is unchanged.
+        const text = try flow_io.render(a, doc);
+        defer a.free(text);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, long_name) != null);
+
+        // And the re-save stays deterministic.
+        var doc2 = try flow_io.parse(a, text);
+        defer doc2.deinit();
+        const text2 = try flow_io.render(a, doc2);
+        defer a.free(text2);
+        try expect.toBeTrue(std.mem.eql(u8, text, text2));
+    }
+
+    test "a too-long Literal value survives a load -> save round-trip" {
+        const a = std.testing.allocator;
+        // A `Literal.value` JSON string longer than the inspector's
+        // 256-byte `ValueBuf`. Seeding it would truncate; the inspector
+        // must keep the field read-only and leave `extras` untouched.
+        const long_lit = "\"" ++ ("y" ** 400) ++ "\"";
+        const src = std.fmt.allocPrint(a,
+            \\{{ "event": {{ "type": "OnCall" }},
+            \\  "nodes": [ {{ "id": 1, "type": "Literal", "value": {s}, "pos": [0, 0] }} ],
+            \\  "edges": [] }}
+        , .{long_lit}) catch unreachable;
+        defer a.free(src);
+
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+
+        // The stored canonical text is longer than the 256-byte buffer
+        // (255 usable) — the inspector's literal path treats it as
+        // read-only.
+        const stored = flow_io.extraValue(doc.nodes[0], "value").?;
+        try expect.toBeTrue(stored.len > 255);
+
+        // The untouched literal round-trips verbatim and deterministically.
+        const text = try flow_io.render(a, doc);
+        defer a.free(text);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "y" ** 400) != null);
+
+        var doc2 = try flow_io.parse(a, text);
+        defer doc2.deinit();
+        const text2 = try flow_io.render(a, doc2);
+        defer a.free(text2);
+        try expect.toBeTrue(std.mem.eql(u8, text, text2));
+    }
+
     test "displayNameFromPath strips the .flow.jsonc extension" {
         try expect.toBeTrue(std.mem.eql(
             u8,
