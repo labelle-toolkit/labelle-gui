@@ -5576,6 +5576,97 @@ pub const FlowCycleTests = struct {
         try expect.toBeTrue(status == .clean);
     }
 
+    /// Build a `flow_io.FlowDoc` carrying one `Subflow` node per entry
+    /// in `flow_refs`. Only `nodes` is populated — `buildRefsFingerprint`
+    /// reads nothing else. Caller owns `nodes` (allocated on `a`).
+    fn docWithSubflowRefs(
+        a: std.mem.Allocator,
+        flow_refs: []const []const u8,
+    ) !flow_io.FlowDoc {
+        const nodes = try a.alloc(flow_io.Node, flow_refs.len);
+        for (flow_refs, 0..) |r, i| {
+            nodes[i] = .{
+                .id = @intCast(i + 1),
+                .type_name = "Subflow",
+                .kind = .subflow,
+                .flow_ref = r,
+            };
+        }
+        return .{ .arena = undefined, .nodes = nodes };
+    }
+
+    test "buildRefsFingerprint distinguishes ref sets that collide under newline-joining" {
+        // A `flow_ref` is a JSON string and may contain a newline.
+        // Joining refs with `\n` is ambiguous: one ref "a\nb" produces
+        // the exact same bytes as two refs "a", "b". The fingerprint
+        // must keep these distinct so a changed reference set is never
+        // mistaken for "unchanged" and the cycle check re-runs.
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        const doc_one = try docWithSubflowRefs(a, &.{"a\nb"});
+        const doc_two = try docWithSubflowRefs(a, &.{ "a", "b" });
+
+        var fp_one = try flow_doc.buildRefsFingerprint(a, doc_one);
+        defer fp_one.deinit(a);
+        var fp_two = try flow_doc.buildRefsFingerprint(a, doc_two);
+        defer fp_two.deinit(a);
+
+        try expect.toBeTrue(!std.mem.eql(u8, fp_one.items, fp_two.items));
+    }
+
+    test "buildRefsFingerprint is stable for an identical ref set" {
+        // Same refs in the same order must produce identical bytes —
+        // otherwise the check would re-run every frame.
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        const doc_a = try docWithSubflowRefs(a, &.{ "alpha", "beta\ngamma" });
+        const doc_b = try docWithSubflowRefs(a, &.{ "alpha", "beta\ngamma" });
+
+        var fp_a = try flow_doc.buildRefsFingerprint(a, doc_a);
+        defer fp_a.deinit(a);
+        var fp_b = try flow_doc.buildRefsFingerprint(a, doc_b);
+        defer fp_b.deinit(a);
+
+        try expect.toBeTrue(std.mem.eql(u8, fp_a.items, fp_b.items));
+    }
+
+    test "buildRefsFingerprint encoding cannot be reproduced by a different ref split" {
+        // Length-prefixing must defeat *every* re-split, not just the
+        // newline case. A plain NUL separator is also insufficient — a
+        // `flow_ref` may contain a NUL — so ["x\x00y"] and ["x", "y"]
+        // must differ too, as must order-only changes.
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        const sets = [_][]const []const u8{
+            &.{"xy"},
+            &.{ "x", "y" },
+            &.{ "y", "x" },
+            &.{"x\x00y"},
+            &.{ "x\ny", "z" },
+            &.{ "x", "y\nz" },
+        };
+        var seen: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (seen.items) |s| a.free(s);
+            seen.deinit(a);
+        }
+        for (sets) |set| {
+            const doc = try docWithSubflowRefs(a, set);
+            var fp = try flow_doc.buildRefsFingerprint(a, doc);
+            defer fp.deinit(a);
+            for (seen.items) |prev| {
+                try expect.toBeTrue(!std.mem.eql(u8, prev, fp.items));
+            }
+            try seen.append(a, try a.dupe(u8, fp.items));
+        }
+    }
+
     fn createTempDir(allocator: std.mem.Allocator) ![]const u8 {
         const ts = timestampSeconds();
         const dir_name = try std.fmt.allocPrint(

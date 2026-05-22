@@ -161,8 +161,10 @@ pub const FlowDocState = struct {
     /// against — `refreshCycleCheck` re-runs when any of them changes.
     cycle_report: ?flow_cycle.Report = null,
     /// Snapshot of the `Subflow` `flow_ref` set the last cycle check
-    /// ran against, joined by `\n`. When the live set diverges from
-    /// this the check is re-run. Owned by the child/GPA allocator
+    /// ran against, encoded by `buildRefsFingerprint` (each ref
+    /// length-prefixed so the encoding is unambiguous for any ref
+    /// content). When the live set diverges from this the check is
+    /// re-run. Owned by the child/GPA allocator
     /// (`arena.child_allocator`), *not* the tab arena: it is replaced on
     /// every actual re-check, and arena `free` is a no-op, so persisting
     /// it on the arena would leak the prior snapshot on each
@@ -287,6 +289,35 @@ pub fn referencedFilesChanged(report: *const flow_cycle.Report) bool {
     return false;
 }
 
+/// Build the invalidation fingerprint of the open document's live
+/// `Subflow` `flow_ref` set. `refreshCycleCheck` compares this against
+/// the stored `cycle_refs_snapshot` to decide whether the reference set
+/// changed since the last check.
+///
+/// Each ref is **length-prefixed** — its byte length as a fixed-width
+/// little-endian `u64`, then the raw bytes — so the encoding is
+/// unambiguous for any `flow_ref` content. A plain separator (newline,
+/// NUL, …) is not enough: a `flow_ref` is a JSON string and may contain
+/// that separator byte itself, so one ref `"a\nb"` would otherwise
+/// encode the exact same bytes as two refs `"a"`, `"b"` and the check
+/// would wrongly skip re-analysis. With the length prefix no
+/// concatenation of one ref set can collide with a different set.
+///
+/// Empty refs are skipped — same filter as `liveSubflowRefs`, so the
+/// fingerprint and the analysis input agree. Owned by `a`.
+pub fn buildRefsFingerprint(a: std.mem.Allocator, doc: flow_io.FlowDoc) !std.ArrayList(u8) {
+    var snap: std.ArrayList(u8) = .empty;
+    errdefer snap.deinit(a);
+    for (doc.nodes) |n| {
+        if (n.kind != .subflow or n.flow_ref.len == 0) continue;
+        var len_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &len_buf, n.flow_ref.len, .little);
+        try snap.appendSlice(a, &len_buf);
+        try snap.appendSlice(a, n.flow_ref);
+    }
+    return snap;
+}
+
 /// Re-run the `Subflow` reference-cycle check if the live reference set
 /// has changed since the last run, if any referenced flow file changed
 /// on disk, or if no check has run yet. Resolves referenced flows from
@@ -294,7 +325,8 @@ pub fn referencedFilesChanged(report: *const flow_cycle.Report) bool {
 /// document path's parent.
 ///
 /// Cheap to call every frame: when nothing changed this only builds and
-/// compares a short joined string and stats a handful of files.
+/// compares a short length-prefixed fingerprint and stats a handful of
+/// files.
 fn refreshCycleCheck(s: *FlowDocState) void {
     // The tab arena (`ArenaAllocator.free` is a no-op) is never used
     // for the cycle-check scratch *or* the persisted snapshot — both
@@ -305,15 +337,12 @@ fn refreshCycleCheck(s: *FlowDocState) void {
     // dead snapshot per invalidation.
     const child = s.arena.child_allocator;
 
-    // Build a `\n`-joined snapshot of the current Subflow refs on the
-    // child allocator so it is reclaimed every frame.
-    var snap: std.ArrayList(u8) = .empty;
+    // Build a length-prefixed fingerprint of the current Subflow refs
+    // on the child allocator so it is reclaimed every frame. The
+    // length prefix keeps the encoding unambiguous for any ref content
+    // (see `buildRefsFingerprint`).
+    var snap = buildRefsFingerprint(child, s.doc) catch return;
     defer snap.deinit(child);
-    for (s.doc.nodes) |n| {
-        if (n.kind != .subflow or n.flow_ref.len == 0) continue;
-        snap.appendSlice(child, n.flow_ref) catch return;
-        snap.append(child, '\n') catch return;
-    }
 
     // Skip the re-analysis only when a check has run, the open flow's
     // own reference set is unchanged, *and* none of the referenced
