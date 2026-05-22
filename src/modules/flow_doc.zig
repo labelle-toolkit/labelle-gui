@@ -213,7 +213,11 @@ fn recordPin(s: *FlowDocState, node_id: u32, name: []const u8, dir: PinDir) void
         .node_id = node_id,
         .name = name,
         .dir = dir,
-    }) catch {};
+    }) catch |err| {
+        // A dropped pin can't be resolved this frame, so a drag onto it
+        // silently rejects — surface the cause rather than swallowing it.
+        std.log.err("flow: record pin failed: {s}", .{@errorName(err)});
+    };
 }
 
 /// Look an editor pin id up in the per-frame registry.
@@ -240,21 +244,44 @@ fn edgeIndex(s: *FlowDocState, from: PinEntry, to: PinEntry) ?usize {
     return null;
 }
 
-/// Index of the (first) edge that has `pin` as one of its endpoints —
-/// matched on the side that agrees with the pin's direction (an output
-/// pin matches `from`, an input pin matches `to`). Used to recognise a
-/// re-route gesture: a drag that starts on a pin already wired into an
-/// edge is moving that edge's endpoint rather than creating a new edge.
-fn edgeWithEndpoint(s: *FlowDocState, pin: PinEntry) ?usize {
+/// Whether `e` has `pin` as the endpoint on the side that agrees with
+/// the pin's direction — an output pin matches `from`, an input pin
+/// matches `to`.
+fn edgeTouchesPin(e: flow_io.Edge, pin: PinEntry) bool {
+    return switch (pin.dir) {
+        .output => e.from_node == pin.node_id and
+            std.mem.eql(u8, e.from_pin, pin.name),
+        .input => e.to_node == pin.node_id and
+            std.mem.eql(u8, e.to_pin, pin.name),
+    };
+}
+
+/// Resolve the single edge a re-route gesture grabbed by its `pin`
+/// endpoint. The node editor has no native link-reconnect gesture: a
+/// re-route surfaces as a plain same-direction pin drag, so all the
+/// editor reports is the *pin* the drag started on — never which link
+/// on that pin the user grabbed. When the pin owns exactly one edge
+/// that is unambiguous. When it owns several — fan-out from one output,
+/// or fan-in into one input — the gesture genuinely can't be resolved,
+/// so this returns `.ambiguous` rather than guessing and rewriting an
+/// arbitrary (wrong) edge. A pin with no edge yields `.none`.
+const EndpointEdge = union(enum) {
+    /// No edge on this pin — a same-direction drag from it is invalid.
+    none,
+    /// Exactly one edge on this pin — re-route it.
+    one: usize,
+    /// Several edges share this pin — which one was grabbed is unknown.
+    ambiguous,
+};
+
+fn edgeWithEndpoint(s: *FlowDocState, pin: PinEntry) EndpointEdge {
+    var found: ?usize = null;
     for (s.doc.edges, 0..) |e, i| {
-        switch (pin.dir) {
-            .output => if (e.from_node == pin.node_id and
-                std.mem.eql(u8, e.from_pin, pin.name)) return i,
-            .input => if (e.to_node == pin.node_id and
-                std.mem.eql(u8, e.to_pin, pin.name)) return i,
-        }
+        if (!edgeTouchesPin(e, pin)) continue;
+        if (found != null) return .ambiguous;
+        found = i;
     }
-    return null;
+    return if (found) |i| .{ .one = i } else .none;
 }
 
 /// Drive the node-editor create-link query. This handles both edge
@@ -274,10 +301,11 @@ fn edgeWithEndpoint(s: *FlowDocState, pin: PinEntry) ?usize {
 /// Either way an invalid drop is rejected and leaves the document
 /// unchanged. The tab is only marked dirty once a mutation commits.
 fn handleLinkCreate(s: *FlowDocState) void {
-    if (!ne.beginCreate()) {
-        ne.endCreate();
-        return;
-    }
+    // `endCreate` must only run when `beginCreate` returned true — that
+    // is the imgui-node-editor API contract. Pair them with a guard
+    // clause + `defer` so the editor's create-item state never ends
+    // without a matching begin.
+    if (!ne.beginCreate()) return;
     defer ne.endCreate();
 
     var start_id: ?u64 = null;
@@ -320,7 +348,11 @@ fn handleLinkCreate(s: *FlowDocState) void {
     }
 
     // `acceptNewItem` returns true on the frame the user releases the
-    // drag — only then do we commit the edge.
+    // drag — only then is there an edge to commit. The node editor does
+    // not retain links itself: `doc.edges` is the sole source of truth,
+    // re-emitted via `ne.link()` every frame. So a failed `appendEdge`
+    // can't leave the canvas and the document disagreeing — the edge is
+    // simply absent on the next frame's link pass. Log and move on.
     if (ne.acceptNewItem(.{ 0.3, 1.0, 0.4, 1.0 }, 2.0)) {
         appendEdge(s, out_pin, in_pin) catch |err| {
             std.log.err("flow: add edge failed: {s}", .{@errorName(err)});
@@ -332,8 +364,12 @@ fn handleLinkCreate(s: *FlowDocState) void {
 /// the pin the drag started on (the grabbed link end); `to_pin` is
 /// where it was dropped. To be a valid re-route:
 ///
-///   - `from_pin` must already be an endpoint of exactly one edge (the
-///     edge being re-routed),
+///   - `from_pin` must own **exactly one** edge — the edge being
+///     re-routed. The node editor reports only the grabbed *pin*, not
+///     which link on it the user grabbed, so when the pin owns several
+///     edges (fan-out from an output, fan-in into an input) the gesture
+///     is ambiguous and is rejected rather than rewriting a guessed,
+///     possibly wrong edge,
 ///   - `to_pin` must be a different pin from `from_pin`,
 ///   - the rewritten edge must still join two distinct nodes and not
 ///     duplicate another existing edge.
@@ -348,11 +384,16 @@ fn handleLinkReroute(s: *FlowDocState, from_pin: PinEntry, to_pin: PinEntry) voi
         _ = ne.rejectNewItem(.{ 1.0, 0.3, 0.3, 1.0 }, 2.0);
         return;
     }
-    // The grabbed pin must own an edge — otherwise there is nothing to
-    // re-route and a same-direction drag is simply invalid.
-    const edge_idx = edgeWithEndpoint(s, from_pin) orelse {
-        _ = ne.rejectNewItem(.{ 1.0, 0.3, 0.3, 1.0 }, 2.0);
-        return;
+    // The grabbed pin must own exactly one edge. `.none` → nothing to
+    // re-route (an invalid same-direction drag); `.ambiguous` → the pin
+    // is shared by several edges and the editor can't tell us which one
+    // was grabbed, so decline rather than rewrite the wrong link.
+    const edge_idx = switch (edgeWithEndpoint(s, from_pin)) {
+        .one => |i| i,
+        .none, .ambiguous => {
+            _ = ne.rejectNewItem(.{ 1.0, 0.3, 0.3, 1.0 }, 2.0);
+            return;
+        },
     };
 
     // Compute the post-reroute endpoints and validate them exactly as a
@@ -385,18 +426,22 @@ fn handleLinkReroute(s: *FlowDocState, from_pin: PinEntry, to_pin: PinEntry) voi
 /// Drive the node-editor delete query — removes any edge the user
 /// selected and deleted on the canvas.
 fn handleLinkDelete(s: *FlowDocState) void {
-    if (!ne.beginDelete()) {
-        ne.endDelete();
-        return;
-    }
+    // `endDelete` must only run when `beginDelete` returned true — same
+    // imgui-node-editor API contract as the create scope above.
+    if (!ne.beginDelete()) return;
     defer ne.endDelete();
 
     var del_id: u64 = 0;
     while (ne.queryDeletedLink(&del_id, null, null)) {
-        if (ne.acceptDeletedItem(true)) {
-            deleteEdgeByLinkId(s, del_id) catch |err| {
-                std.log.err("flow: delete edge failed: {s}", .{@errorName(err)});
-            };
+        // Mutate the document first; only commit the editor's delete
+        // (`acceptDeletedItem`) once the edge is actually gone, and
+        // reject it otherwise — so the canvas and `doc.edges` can never
+        // disagree after a failed mutation.
+        if (deleteEdgeByLinkId(s, del_id)) {
+            _ = ne.acceptDeletedItem(true);
+        } else |err| {
+            std.log.err("flow: delete edge failed: {s}", .{@errorName(err)});
+            ne.rejectDeletedItem();
         }
     }
     // Node deletion is handled by the inspector's "Delete node" button;
