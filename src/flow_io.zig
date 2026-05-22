@@ -156,6 +156,258 @@ pub const KeyValue = struct {
     value_text: []const u8,
 };
 
+// ─── Typed editing of `.other` node fields ─────────────────────────────
+//
+// `Subflow`/`Param`/`Output` are modeled structurally above. Every other
+// node type is `.other` and carries its type-specific keys verbatim in
+// `extras`. The editor still wants to *field-edit* a handful of common
+// node types — without promoting them to first-class `NodeKind`s, which
+// would mean per-type writer branches. Instead the editor uses the
+// `OtherFieldSpec` table: for a recognised `type_name` it names the one
+// key the inspector exposes as a widget; the value stays in `extras`, so
+// the existing deterministic writer emits it unchanged and genuinely
+// unknown keys keep round-tripping verbatim.
+
+/// How the inspector should render a recognised `.other` field.
+pub const OtherFieldWidget = enum {
+    /// Free-form text edited as a JSON string value.
+    text,
+    /// A fixed choice list (currently only `BinOp.op`).
+    op_combo,
+    /// A JSON literal of any type (`Literal.value`) — normalised on edit.
+    literal,
+};
+
+/// Names the single editable field for a recognised `.other` node type.
+pub const OtherFieldSpec = struct {
+    /// The node `type` string this spec matches (e.g. `"BinOp"`).
+    type_name: []const u8,
+    /// The `extras` key the inspector edits (e.g. `"op"`).
+    key: []const u8,
+    /// Inspector label shown next to the widget.
+    label: []const u8,
+    widget: OtherFieldWidget,
+};
+
+/// The closed list of `BinOp.op` values offered by the combo box.
+pub const bin_ops = [_][]const u8{ "add", "sub", "mul", "div" };
+
+/// Recognised `.other` node types and their one editable field. Keeping
+/// this in `flow_io` (next to the model) makes it unit-testable without
+/// a GUI and keeps the editor a thin consumer.
+pub const other_field_specs = [_]OtherFieldSpec{
+    .{ .type_name = "BinOp", .key = "op", .label = "Operator", .widget = .op_combo },
+    .{ .type_name = "GetComponent", .key = "component", .label = "Component", .widget = .text },
+    .{ .type_name = "SetField", .key = "target", .label = "Target", .widget = .text },
+    .{ .type_name = "Literal", .key = "value", .label = "Value", .widget = .literal },
+    .{ .type_name = "Identifier", .key = "name", .label = "Name", .widget = .text },
+    .{ .type_name = "Call", .key = "callee", .label = "Callee", .widget = .text },
+};
+
+/// Return the editable-field spec for a node `type_name`, or null when
+/// the type is genuinely unknown (the inspector then shows the verbatim
+/// fallback view).
+pub fn otherFieldSpec(type_name: []const u8) ?OtherFieldSpec {
+    for (other_field_specs) |spec| {
+        if (std.mem.eql(u8, spec.type_name, type_name)) return spec;
+    }
+    return null;
+}
+
+/// Look up the verbatim value text of an `extras` key, or null when the
+/// node doesn't carry that key.
+pub fn extraValue(node: Node, key: []const u8) ?[]const u8 {
+    for (node.extras) |kv| {
+        if (std.mem.eql(u8, kv.key, key)) return kv.value_text;
+    }
+    return null;
+}
+
+/// Set (or insert) an `extras` key on `node` to `value_text`, keeping the
+/// slice sorted so the writer stays deterministic. `value_text` must
+/// already be canonical JSON value text — callers pass the output of
+/// `jsonValueToText` or `normalizeValueText`. The new slice and its
+/// strings are allocated on `a`; the previous slice is left for the
+/// arena to reclaim.
+pub fn setExtraValue(
+    a: std.mem.Allocator,
+    node: *Node,
+    key: []const u8,
+    value_text: []const u8,
+) !void {
+    for (node.extras) |*kv| {
+        if (std.mem.eql(u8, kv.key, key)) {
+            kv.value_text = try a.dupe(u8, value_text);
+            return;
+        }
+    }
+    const out = try a.alloc(KeyValue, node.extras.len + 1);
+    @memcpy(out[0..node.extras.len], node.extras);
+    out[node.extras.len] = .{
+        .key = try a.dupe(u8, key),
+        .value_text = try a.dupe(u8, value_text),
+    };
+    sortKeyValues(out);
+    node.extras = out;
+}
+
+/// Decode a JSON-string `extras` value (e.g. `"add"`) back to its raw
+/// inner text for display in a text widget. When the stored value isn't
+/// a JSON string (a `Literal.value` may be a number or bool) the
+/// canonical text is returned unchanged. Result is owned by `a`.
+pub fn decodeStringValue(a: std.mem.Allocator, value_text: []const u8) ![]const u8 {
+    const trimmed = std.mem.trim(u8, value_text, " \t\r\n");
+    if (trimmed.len < 2 or trimmed[0] != '"') return a.dupe(u8, trimmed);
+    var parsed = std.json.parseFromSlice(std.json.Value, a, trimmed, .{}) catch {
+        return a.dupe(u8, trimmed);
+    };
+    defer parsed.deinit();
+    if (parsed.value != .string) return a.dupe(u8, trimmed);
+    return a.dupe(u8, parsed.value.string);
+}
+
+/// Buffer-backed variant of `decodeStringValue` — decodes a JSON-string
+/// `extras` value into the caller-provided `buf` and returns a slice
+/// into it, allocating nothing on any persistent allocator. Used by
+/// per-frame inspector widgets so they don't leak onto the document
+/// arena (one decode per frame for as long as a node stays selected).
+///
+/// The transient JSON parse runs against an internal stack-backed
+/// `FixedBufferAllocator` whose scratch space is reclaimed on return —
+/// nothing it allocates escapes.
+///
+/// When the stored value isn't a JSON string, or the decoded text would
+/// not fit in `buf`, the canonical text is copied verbatim (truncated to
+/// `buf` if necessary) — the same fall-through `decodeStringValue` uses.
+///
+/// `buf` is written as a valid NUL-terminated edit buffer: one byte is
+/// reserved for the `0` sentinel, so the copied text is at most
+/// `buf.len - 1` bytes and a `0` is always written immediately after it.
+/// This lets a widget consume `buf` directly via `inputText` / `sliceTo`
+/// without trailing garbage past the value.
+pub fn decodeStringValueBuf(buf: []u8, value_text: []const u8) []const u8 {
+    std.debug.assert(buf.len > 0);
+    // One byte is reserved for the editor's NUL sentinel.
+    const cap = buf.len - 1;
+    const trimmed = std.mem.trim(u8, value_text, " \t\r\n");
+    const verbatim = blk: {
+        const n = @min(cap, trimmed.len);
+        @memcpy(buf[0..n], trimmed[0..n]);
+        buf[n] = 0;
+        break :blk buf[0..n];
+    };
+    if (trimmed.len < 2 or trimmed[0] != '"') return verbatim;
+
+    // Scratch space for the transient parse. A JSON-string `extras`
+    // value is small (an operator word, a component/identifier name);
+    // 1 KiB comfortably covers any realistic field plus parser slack,
+    // and the fall-through handles anything larger gracefully.
+    var scratch: [1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        fba.allocator(),
+        trimmed,
+        .{},
+    ) catch return verbatim;
+    defer parsed.deinit();
+    if (parsed.value != .string) return verbatim;
+    const inner = parsed.value.string;
+    if (inner.len > cap) return verbatim;
+    @memcpy(buf[0..inner.len], inner);
+    buf[inner.len] = 0;
+    return buf[0..inner.len];
+}
+
+/// Result of `decodeStringValueBufChecked` — the decoded slice plus a
+/// flag telling the caller the value did not fit the buffer verbatim.
+pub const DecodedValue = struct {
+    /// The decoded (or, on fall-through, verbatim) text — a slice into
+    /// the caller's buffer, possibly truncated.
+    text: []const u8,
+    /// True when the canonical/decoded text was longer than the buffer
+    /// and `text` is therefore a truncated, lossy view. A caller that
+    /// would write `text` back must instead treat the field as
+    /// read-only so the original value round-trips untouched.
+    truncated: bool,
+};
+
+/// Like `decodeStringValueBuf`, but also reports whether the value was
+/// too long to represent in `buf` without loss. An inline editor must
+/// check `truncated` and refuse to write the field when it is set —
+/// editing a truncated view and saving it would corrupt the stored
+/// value (silent data loss).
+///
+/// `truncated` is true when either the decoded inner string, or the
+/// verbatim canonical text used on fall-through, would not fit in
+/// `buf` (which always reserves one byte for the input-widget
+/// sentinel). When false the returned `text` is the exact, complete
+/// value and is safe to edit.
+///
+/// The returned text is always written as a valid NUL-terminated edit
+/// buffer: a `0` sentinel is placed immediately after the copied text
+/// (within the byte reserved for it), so a caller may hand `buf`
+/// straight to `inputText` / `sliceTo` without trailing garbage past
+/// the value.
+pub fn decodeStringValueBufChecked(buf: []u8, value_text: []const u8) DecodedValue {
+    std.debug.assert(buf.len > 0);
+    // One byte is reserved for the editor's NUL sentinel, so a value of
+    // exactly `buf.len` would still be truncated by the widget.
+    const cap = buf.len - 1;
+    const trimmed = std.mem.trim(u8, value_text, " \t\r\n");
+
+    // Copy at most `cap` bytes of `text` into `buf`, write the `0`
+    // sentinel after it, and return the result as a `DecodedValue`.
+    const verbatim = struct {
+        fn fill(b: []u8, c: usize, text: []const u8, lossy: bool) DecodedValue {
+            const n = @min(c, text.len);
+            @memcpy(b[0..n], text[0..n]);
+            b[n] = 0;
+            return .{ .text = b[0..n], .truncated = lossy };
+        }
+    }.fill;
+
+    // Non-string canonical values (numbers, bools, null) are edited
+    // verbatim; they fit only when shorter than the editable capacity.
+    if (trimmed.len < 2 or trimmed[0] != '"') {
+        return verbatim(buf, cap, trimmed, trimmed.len > cap);
+    }
+
+    var scratch: [1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        fba.allocator(),
+        trimmed,
+        .{},
+    ) catch {
+        // Unparseable — fall through to the verbatim canonical text.
+        return verbatim(buf, cap, trimmed, trimmed.len > cap);
+    };
+    defer parsed.deinit();
+    if (parsed.value != .string) {
+        return verbatim(buf, cap, trimmed, trimmed.len > cap);
+    }
+    const inner = parsed.value.string;
+    if (inner.len > cap) {
+        // The decoded text won't fit; surface a truncated verbatim view
+        // and mark it lossy so the editor stays read-only.
+        return verbatim(buf, cap, trimmed, true);
+    }
+    @memcpy(buf[0..inner.len], inner);
+    buf[inner.len] = 0;
+    return .{ .text = buf[0..inner.len], .truncated = false };
+}
+
+/// Canonical JSON text for a plain string value — the form a `.text`
+/// widget's input must be stored as so the writer emits valid JSON.
+pub fn encodeStringValue(a: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    try writeJsonString(a, &out, raw);
+    return out.toOwnedSlice(a);
+}
+
 /// One graph edge — same `{node, pin}` shape on both ends as `.flow.zon`
 /// used (RFC §2, `links` → `edges` is a rename only).
 pub const Edge = struct {
@@ -1096,6 +1348,78 @@ test "huge flow file saves and round-trips at scale" {
     const disk_text = try render(a, disk_doc);
     defer a.free(disk_text);
     try std.testing.expectEqualStrings(text1, disk_text);
+}
+
+test "otherFieldSpec recognises the field-editable .other node types" {
+    try std.testing.expectEqual(OtherFieldWidget.op_combo, otherFieldSpec("BinOp").?.widget);
+    try std.testing.expectEqualStrings("op", otherFieldSpec("BinOp").?.key);
+    try std.testing.expectEqualStrings("component", otherFieldSpec("GetComponent").?.key);
+    try std.testing.expectEqualStrings("target", otherFieldSpec("SetField").?.key);
+    try std.testing.expectEqual(OtherFieldWidget.literal, otherFieldSpec("Literal").?.widget);
+    try std.testing.expectEqualStrings("name", otherFieldSpec("Identifier").?.key);
+    try std.testing.expectEqualStrings("callee", otherFieldSpec("Call").?.key);
+    // A genuinely-unknown type has no spec — inspector falls back to the
+    // verbatim view.
+    try std.testing.expect(otherFieldSpec("SomeFutureNode") == null);
+}
+
+test "setExtraValue updates an existing key and keeps extras sorted" {
+    const src =
+        \\{
+        \\  "nodes": [ { "id": 1, "type": "BinOp", "op": "add", "zlast": 1, "pos": [0, 0] } ],
+        \\  "edges": []
+        \\}
+    ;
+    var doc = try parse(std.testing.allocator, src);
+    defer doc.deinit();
+    const a = doc.allocator();
+
+    try std.testing.expectEqualStrings("\"add\"", extraValue(doc.nodes[0], "op").?);
+    try setExtraValue(a, &doc.nodes[0], "op", "\"mul\"");
+    try std.testing.expectEqualStrings("\"mul\"", extraValue(doc.nodes[0], "op").?);
+
+    // The edited graph still renders to deterministic, idempotent text.
+    const text1 = try render(std.testing.allocator, doc);
+    defer std.testing.allocator.free(text1);
+    var doc2 = try parse(std.testing.allocator, text1);
+    defer doc2.deinit();
+    const text2 = try render(std.testing.allocator, doc2);
+    defer std.testing.allocator.free(text2);
+    try std.testing.expectEqualStrings(text1, text2);
+    try std.testing.expect(std.mem.indexOf(u8, text1, "\"op\": \"mul\"") != null);
+}
+
+test "setExtraValue inserts a missing key in sorted order" {
+    const src =
+        \\{ "nodes": [ { "id": 1, "type": "GetComponent", "pos": [0, 0] } ], "edges": [] }
+    ;
+    var doc = try parse(std.testing.allocator, src);
+    defer doc.deinit();
+    const a = doc.allocator();
+
+    try std.testing.expect(extraValue(doc.nodes[0], "component") == null);
+    try setExtraValue(a, &doc.nodes[0], "component", "\"Position\"");
+    try std.testing.expectEqualStrings("\"Position\"", extraValue(doc.nodes[0], "component").?);
+
+    const text = try render(std.testing.allocator, doc);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"component\": \"Position\"") != null);
+}
+
+test "decodeStringValue / encodeStringValue round-trip" {
+    const a = std.testing.allocator;
+    const decoded = try decodeStringValue(a, "\"Position\"");
+    defer a.free(decoded);
+    try std.testing.expectEqualStrings("Position", decoded);
+
+    const encoded = try encodeStringValue(a, "Position");
+    defer a.free(encoded);
+    try std.testing.expectEqualStrings("\"Position\"", encoded);
+
+    // A non-string literal value is returned as-is by decode.
+    const num = try decodeStringValue(a, "1.5");
+    defer a.free(num);
+    try std.testing.expectEqualStrings("1.5", num);
 }
 
 test "binding order is deterministic after an edit reorders the slice" {

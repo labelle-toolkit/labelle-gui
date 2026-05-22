@@ -17,13 +17,16 @@
 //!     node palette (add `Subflow` / `Param` / `Output` / a custom
 //!     typed node) and the selected node's editable fields.
 //!
-//! Scope (v1): structural editing — add/remove nodes, edit the typed
-//! fields of the three composition node types, edit `params`, edit the
-//! event type, move nodes on the canvas. Edge creation by dragging
-//! pins and a load-time cycle check across `Subflow` references are
-//! deferred — see the PR notes. Unknown node types (`BinOp`, …) and
-//! their fields round-trip verbatim through `flow_io` but aren't
-//! field-editable here.
+//! Scope: structural editing — add/remove nodes, edit the typed fields
+//! of the three composition node types, edit `params`, edit the event
+//! type, move nodes on the canvas. The inspector also field-edits a set
+//! of recognised non-composition node types (`BinOp`, `GetComponent`,
+//! `SetField`, `Literal`, `Identifier`, `Call`) via the
+//! `flow_io.other_field_specs` table — each exposes one widget over its
+//! `extras` value, so the deterministic writer emits it unchanged.
+//! Genuinely-unknown node types still fall back to the verbatim view.
+//! Edge creation by dragging pins and a load-time cycle check across
+//! `Subflow` references are deferred — see the PR notes.
 
 const std = @import("std");
 const zgui = @import("zgui");
@@ -715,10 +718,16 @@ fn renderSelectedNode(s: *FlowDocState) void {
             }
         },
         .other => {
-            zgui.textDisabled("This node type is not field-editable in v1.", .{});
-            zgui.textDisabled("Its fields round-trip verbatim:", .{});
-            for (n.extras) |kv| {
-                zgui.bulletText("{s}: {s}", .{ kv.key, kv.value_text });
+            if (flow_io.otherFieldSpec(n.type_name)) |spec| {
+                renderOtherField(s, n, spec);
+            } else {
+                // A genuinely-unknown node type: no widget, just the
+                // verbatim round-tripped fields.
+                zgui.textDisabled("This node type is not field-editable.", .{});
+                zgui.textDisabled("Its fields round-trip verbatim:", .{});
+                for (n.extras) |kv| {
+                    zgui.bulletText("{s}: {s}", .{ kv.key, kv.value_text });
+                }
             }
         },
     }
@@ -787,6 +796,148 @@ fn renderBindingsEditor(s: *FlowDocState, n: *flow_io.Node) void {
             std.log.err("flow: remove binding failed: {s}", .{@errorName(err)});
         }
     }
+}
+
+/// Inspector editing for a recognised `.other` node type (`BinOp`,
+/// `GetComponent`, `SetField`, `Literal`, `Identifier`, `Call`). The
+/// value lives in `n.extras` under `spec.key`; the widget writes the
+/// canonical JSON text back there via `flow_io.setExtraValue`, so the
+/// deterministic writer emits it unchanged and any other (genuinely
+/// unknown) key on the node still round-trips verbatim.
+fn renderOtherField(s: *FlowDocState, n: *flow_io.Node, spec: flow_io.OtherFieldSpec) void {
+    const a = s.doc.allocator();
+    const current = flow_io.extraValue(n.*, spec.key) orelse "";
+
+    zgui.text("{s}", .{spec.label});
+    switch (spec.widget) {
+        .op_combo => {
+            // `op` is stored as a JSON string (`"add"`); decode to the
+            // bare word to match against the choice list. Decode into a
+            // stack buffer — this runs every frame, so allocating on the
+            // doc arena here would leak for as long as the node stays
+            // selected.
+            var decode_buf: IdentBuf = undefined;
+            const decoded = flow_io.decodeStringValueBufChecked(&decode_buf, current);
+            if (decoded.truncated) {
+                // A stored `op` longer than the identifier buffer can't
+                // be matched against the choice list without loss — the
+                // combo would show a blank selection, and picking any
+                // operator would silently overwrite the full stored
+                // value on save. Treat it like the `.text` too-long case:
+                // show a read-only view and write nothing, so the
+                // original `op` round-trips verbatim.
+                renderTooLongField(current);
+            } else {
+                // A missing or invalid stored `op` is treated as *no
+                // selection* (blank preview) rather than silently
+                // previewing the first choice. Otherwise picking the
+                // displayed default (`add`) wouldn't register as a change
+                // and could never be committed — the combo would show
+                // `add` without it ever being written to the node.
+                var sel: ?usize = null;
+                for (flow_io.bin_ops, 0..) |op, i| {
+                    if (std.mem.eql(u8, op, decoded.text)) sel = i;
+                }
+                var preview_z: IdentBuf = undefined;
+                seedBuf(&preview_z, if (sel) |i| flow_io.bin_ops[i] else "");
+                if (zgui.beginCombo("##other_op", .{ .preview_value = &preview_z })) {
+                    for (flow_io.bin_ops, 0..) |op, i| {
+                        var op_z: IdentBuf = undefined;
+                        seedBuf(&op_z, op);
+                        if (zgui.selectable(&op_z, .{ .selected = sel == i })) {
+                            // `selectable` fires on every click — commit
+                            // even when the picked op equals the previewed
+                            // one, so selecting `add` on a node with no
+                            // valid `op` still writes and marks dirty.
+                            const encoded = flow_io.encodeStringValue(a, op) catch return;
+                            flow_io.setExtraValue(a, n, spec.key, encoded) catch return;
+                            s.is_dirty = true;
+                        }
+                    }
+                    zgui.endCombo();
+                }
+            }
+        },
+        .text => {
+            // Identifier-like fields are stored as JSON strings; the
+            // widget edits the bare inner text. Decode into a stack
+            // buffer — see `.op_combo` above: a per-frame doc-arena
+            // allocation here would leak while the node stays selected.
+            var buf: IdentBuf = undefined;
+            const decoded = flow_io.decodeStringValueBufChecked(&buf, current);
+            if (decoded.truncated) {
+                // The value is longer than the inline editor can hold.
+                // Editing the truncated view and saving would overwrite
+                // the real stored value with a partial copy — silent
+                // data loss. Show a read-only, disabled widget instead
+                // so the original `extras` value round-trips untouched.
+                renderTooLongField(current);
+            } else if (zgui.inputText("##other_text", .{ .buf = &buf })) {
+                const raw = std.mem.sliceTo(&buf, 0);
+                const encoded = flow_io.encodeStringValue(a, raw) catch return;
+                flow_io.setExtraValue(a, n, spec.key, encoded) catch return;
+                s.is_dirty = true;
+            }
+        },
+        .literal => {
+            // `Literal.value` is any JSON type — edit the canonical text
+            // directly and normalise so a save can't emit invalid JSON.
+            var buf: ValueBuf = undefined;
+            // `ValueBuf` reserves one byte for the widget's NUL
+            // sentinel; a `value` of `buf.len` chars or more can't be
+            // seeded losslessly, so seeding it and committing on the
+            // first `inputText` keystroke would write back a truncated
+            // literal. Detect that and fall back to a read-only view.
+            if (current.len > buf.len - 1) {
+                renderTooLongField(current);
+            } else {
+                seedBuf(&buf, current);
+                if (zgui.inputText("##other_literal", .{ .buf = &buf })) {
+                    const raw = std.mem.sliceTo(&buf, 0);
+                    const norm = flow_io.normalizeValueText(a, raw) catch return;
+                    flow_io.setExtraValue(a, n, spec.key, norm) catch return;
+                    s.is_dirty = true;
+                }
+                zgui.textDisabled("(JSON literal — e.g. 25, 1.5, \"txt\", true)", .{});
+            }
+        },
+    }
+
+    // Any other keys on the node (beyond the one editable field) still
+    // round-trip; surface them so the user sees nothing is hidden.
+    var has_other = false;
+    for (n.extras) |kv| {
+        if (std.mem.eql(u8, kv.key, spec.key)) continue;
+        has_other = true;
+    }
+    if (has_other) {
+        zgui.spacing();
+        zgui.textDisabled("Other fields (round-trip verbatim):", .{});
+        for (n.extras) |kv| {
+            if (std.mem.eql(u8, kv.key, spec.key)) continue;
+            zgui.bulletText("{s}: {s}", .{ kv.key, kv.value_text });
+        }
+    }
+}
+
+/// Render a recognised field whose stored value is too long for the
+/// inline editor. The value is shown in a disabled (read-only) input so
+/// the user can see it in full-ish, with a hint explaining why it can't
+/// be edited here. Crucially, nothing is written back: the original
+/// `extras` value is left untouched so a save round-trips it verbatim.
+fn renderTooLongField(value: []const u8) void {
+    zgui.beginDisabled(.{ .disabled = true });
+    // A stack buffer just for display — wider than the edit buffers so
+    // the user sees as much as practical. The widget is disabled, so
+    // even a truncated preview here can never be committed.
+    var view: [1024:0]u8 = undefined;
+    seedBuf(&view, value);
+    _ = zgui.inputText("##other_too_long", .{ .buf = &view });
+    zgui.endDisabled();
+    zgui.textDisabled(
+        "(value too long to edit inline — edit the .flow.jsonc file directly)",
+        .{},
+    );
 }
 
 // ─── Mutators ───────────────────────────────────────────────────────────

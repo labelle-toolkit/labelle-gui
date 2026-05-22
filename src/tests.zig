@@ -4723,6 +4723,343 @@ pub const FlowIoTests = struct {
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"value\"") != null);
     }
 
+    test "otherFieldSpec maps field-editable node types to one extras key" {
+        try expect.toBeTrue(flow_io.otherFieldSpec("BinOp").?.widget == .op_combo);
+        try expect.toBeTrue(std.mem.eql(u8, flow_io.otherFieldSpec("BinOp").?.key, "op"));
+        try expect.toBeTrue(std.mem.eql(u8, flow_io.otherFieldSpec("GetComponent").?.key, "component"));
+        try expect.toBeTrue(std.mem.eql(u8, flow_io.otherFieldSpec("SetField").?.key, "target"));
+        try expect.toBeTrue(flow_io.otherFieldSpec("Literal").?.widget == .literal);
+        try expect.toBeTrue(std.mem.eql(u8, flow_io.otherFieldSpec("Identifier").?.key, "name"));
+        try expect.toBeTrue(std.mem.eql(u8, flow_io.otherFieldSpec("Call").?.key, "callee"));
+        // A genuinely-unknown node type has no spec → verbatim fallback.
+        try expect.toBeTrue(flow_io.otherFieldSpec("MysteryNode") == null);
+    }
+
+    test "editing an .other field via setExtraValue stays deterministic" {
+        const a = std.testing.allocator;
+        const src =
+            \\{
+            \\  "event": { "type": "OnCreate" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "BinOp", "op": "add", "pos": [0, 0] },
+            \\    { "id": 2, "type": "GetComponent", "pos": [10, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+        const da = doc.allocator();
+
+        // Edit BinOp.op (existing key) and GetComponent.component (new key).
+        try flow_io.setExtraValue(da, &doc.nodes[0], "op", "\"mul\"");
+        try flow_io.setExtraValue(da, &doc.nodes[1], "component", "\"Position\"");
+
+        const text1 = try flow_io.render(a, doc);
+        defer a.free(text1);
+        var doc2 = try flow_io.parse(a, text1);
+        defer doc2.deinit();
+        const text2 = try flow_io.render(a, doc2);
+        defer a.free(text2);
+
+        // Re-save is byte-identical and the edits are present.
+        try expect.toBeTrue(std.mem.eql(u8, text1, text2));
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"op\": \"mul\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"component\": \"Position\"") != null);
+    }
+
+    test "editing an .other field keeps unrelated extras keys verbatim" {
+        const a = std.testing.allocator;
+        const src =
+            \\{ "event": { "type": "OnCall" },
+            \\  "nodes": [ { "id": 1, "type": "Literal", "value": 1, "note": "keep me", "pos": [0, 0] } ],
+            \\  "edges": [] }
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+        const da = doc.allocator();
+
+        try flow_io.setExtraValue(da, &doc.nodes[0], "value", "2.5");
+        const text = try flow_io.render(a, doc);
+        defer a.free(text);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"value\": 2.5") != null);
+        // The unknown `note` key is untouched.
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"note\": \"keep me\"") != null);
+    }
+
+    test "string value text decodes and re-encodes round-trip" {
+        const a = std.testing.allocator;
+        const decoded = try flow_io.decodeStringValue(a, "\"Position\"");
+        defer a.free(decoded);
+        try expect.toBeTrue(std.mem.eql(u8, decoded, "Position"));
+
+        const encoded = try flow_io.encodeStringValue(a, "Velocity");
+        defer a.free(encoded);
+        try expect.toBeTrue(std.mem.eql(u8, encoded, "\"Velocity\""));
+    }
+
+    test "decodeStringValueBuf decodes into a stack buffer without allocating" {
+        var buf: [128]u8 = undefined;
+
+        // A JSON string decodes to its bare inner text.
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            flow_io.decodeStringValueBuf(&buf, "\"Position\""),
+            "Position",
+        ));
+        // Whitespace around the value is trimmed before decoding.
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            flow_io.decodeStringValueBuf(&buf, "  \"add\" "),
+            "add",
+        ));
+        // A non-string canonical value (number/bool) comes back verbatim.
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            flow_io.decodeStringValueBuf(&buf, "42"),
+            "42",
+        ));
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            flow_io.decodeStringValueBuf(&buf, "true"),
+            "true",
+        ));
+        // An empty value yields an empty slice (no out-of-bounds).
+        try expect.toBeTrue(flow_io.decodeStringValueBuf(&buf, "").len == 0);
+    }
+
+    test "decodeStringValueBuf NUL-terminates the result for edit reuse" {
+        // The result must be a valid NUL-terminated edit buffer: a `0`
+        // sentinel sits immediately after the copied text so a widget can
+        // consume `buf` directly without trailing garbage past the value.
+        var buf: [128]u8 = undefined;
+        @memset(&buf, 0xAA); // poison so a missing sentinel would show
+
+        const decoded = flow_io.decodeStringValueBuf(&buf, "\"Position\"");
+        try expect.toBeTrue(buf[decoded.len] == 0);
+        try expect.toBeTrue(std.mem.eql(u8, std.mem.sliceTo(&buf, 0), "Position"));
+
+        @memset(&buf, 0xAA);
+        const num = flow_io.decodeStringValueBuf(&buf, "42");
+        try expect.toBeTrue(buf[num.len] == 0);
+        try expect.toBeTrue(std.mem.eql(u8, std.mem.sliceTo(&buf, 0), "42"));
+
+        // Even the verbatim overflow fall-through terminates within the
+        // reserved sentinel byte.
+        var small: [4]u8 = undefined;
+        @memset(&small, 0xAA);
+        const over = flow_io.decodeStringValueBuf(&small, "\"abcdefghij\"");
+        try expect.toBeTrue(over.len < small.len);
+        try expect.toBeTrue(small[over.len] == 0);
+    }
+
+    test "decodeStringValueBuf falls through when the decoded text overflows buf" {
+        // A decoded string longer than the buffer can't be copied in;
+        // the canonical (quoted) text is returned verbatim, truncated to
+        // the buffer rather than overrunning it.
+        var small: [4]u8 = undefined;
+        const out = flow_io.decodeStringValueBuf(&small, "\"abcdefghij\"");
+        try expect.toBeTrue(out.len <= small.len);
+        // Verbatim fall-through keeps the leading quote of the raw text.
+        try expect.toBeTrue(out[0] == '"');
+    }
+
+    test "decodeStringValueBuf agrees with decodeStringValue" {
+        const a = std.testing.allocator;
+        const cases = [_][]const u8{
+            "\"Position\"", "\"add\"", "123", "false", "\"\"",
+        };
+        for (cases) |c| {
+            var buf: [128]u8 = undefined;
+            const allocd = try flow_io.decodeStringValue(a, c);
+            defer a.free(allocd);
+            try expect.toBeTrue(std.mem.eql(
+                u8,
+                flow_io.decodeStringValueBuf(&buf, c),
+                allocd,
+            ));
+        }
+    }
+
+    test "decodeStringValueBufChecked reports a clean fit as not truncated" {
+        var buf: [128]u8 = undefined;
+        // A short JSON string decodes and fits — safe to edit.
+        const got = flow_io.decodeStringValueBufChecked(&buf, "\"Position\"");
+        try expect.toBeTrue(!got.truncated);
+        try expect.toBeTrue(std.mem.eql(u8, got.text, "Position"));
+
+        // A short non-string canonical value fits verbatim.
+        const num = flow_io.decodeStringValueBufChecked(&buf, "42");
+        try expect.toBeTrue(!num.truncated);
+        try expect.toBeTrue(std.mem.eql(u8, num.text, "42"));
+    }
+
+    test "decodeStringValueBufChecked NUL-terminates the result for edit reuse" {
+        // The `.text` inspector hands this buffer straight to `inputText`
+        // / `sliceTo`; a `0` sentinel must sit immediately after the
+        // decoded text so the widget shows no trailing garbage and a save
+        // can't persist a corrupted `extras` string.
+        var buf: [128]u8 = undefined;
+        @memset(&buf, 0xAA); // poison so a missing sentinel would show
+
+        const got = flow_io.decodeStringValueBufChecked(&buf, "\"Position\"");
+        try expect.toBeTrue(!got.truncated);
+        try expect.toBeTrue(buf[got.text.len] == 0);
+        try expect.toBeTrue(std.mem.eql(u8, std.mem.sliceTo(&buf, 0), "Position"));
+
+        // Non-string verbatim path also terminates.
+        @memset(&buf, 0xAA);
+        const num = flow_io.decodeStringValueBufChecked(&buf, "1.5");
+        try expect.toBeTrue(buf[num.text.len] == 0);
+        try expect.toBeTrue(std.mem.eql(u8, std.mem.sliceTo(&buf, 0), "1.5"));
+
+        // A truncated (too-long) decoded view still terminates within the
+        // reserved sentinel byte — the view never overruns the buffer.
+        var small: [4]u8 = undefined;
+        @memset(&small, 0xAA);
+        const over = flow_io.decodeStringValueBufChecked(&small, "\"abcdefghij\"");
+        try expect.toBeTrue(over.truncated);
+        try expect.toBeTrue(over.text.len < small.len);
+        try expect.toBeTrue(small[over.text.len] == 0);
+    }
+
+    test "decodeStringValueBufChecked flags a too-long decoded string" {
+        // The decoded inner text (`abcdefghij`, 10 chars) exceeds the
+        // editable capacity of a 4-byte buffer (3 usable chars).
+        var small: [4]u8 = undefined;
+        const got = flow_io.decodeStringValueBufChecked(&small, "\"abcdefghij\"");
+        try expect.toBeTrue(got.truncated);
+        // The view never overruns the buffer.
+        try expect.toBeTrue(got.text.len <= small.len);
+    }
+
+    test "decodeStringValueBufChecked flags a too-long non-string literal" {
+        // A bare number longer than the editable capacity is truncated
+        // — editing it would corrupt the literal, so it's flagged.
+        var small: [4]u8 = undefined;
+        const got = flow_io.decodeStringValueBufChecked(&small, "123456789");
+        try expect.toBeTrue(got.truncated);
+
+        // A value of exactly `buf.len` chars still doesn't fit: one byte
+        // is reserved for the editor's NUL sentinel.
+        var four: [4]u8 = undefined;
+        const exact = flow_io.decodeStringValueBufChecked(&four, "1234");
+        try expect.toBeTrue(exact.truncated);
+    }
+
+    test "a too-long .text field value survives a load -> save round-trip" {
+        const a = std.testing.allocator;
+        // A `GetComponent.component` whose decoded string is far longer
+        // than the inspector's 128-byte identifier edit buffer. The
+        // inspector must refuse to edit it; the writer must still emit
+        // it unchanged.
+        const long_name = "X" ** 300;
+        const src = std.fmt.allocPrint(a,
+            \\{{ "event": {{ "type": "OnCreate" }},
+            \\  "nodes": [ {{ "id": 1, "type": "GetComponent", "component": "{s}", "pos": [0, 0] }} ],
+            \\  "edges": [] }}
+        , .{long_name}) catch unreachable;
+        defer a.free(src);
+
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+
+        // The inspector's `.text` path would decode into an `IdentBuf`
+        // (128 bytes); a 300-char value must come back flagged.
+        const stored = flow_io.extraValue(doc.nodes[0], "component").?;
+        var ident_buf: [128]u8 = undefined;
+        const decoded = flow_io.decodeStringValueBufChecked(&ident_buf, stored);
+        try expect.toBeTrue(decoded.truncated);
+
+        // An untouched too-long value must round-trip verbatim — the
+        // editor skips the write, so `extras` is unchanged.
+        const text = try flow_io.render(a, doc);
+        defer a.free(text);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, long_name) != null);
+
+        // And the re-save stays deterministic.
+        var doc2 = try flow_io.parse(a, text);
+        defer doc2.deinit();
+        const text2 = try flow_io.render(a, doc2);
+        defer a.free(text2);
+        try expect.toBeTrue(std.mem.eql(u8, text, text2));
+    }
+
+    test "a too-long Literal value survives a load -> save round-trip" {
+        const a = std.testing.allocator;
+        // A `Literal.value` JSON string longer than the inspector's
+        // 256-byte `ValueBuf`. Seeding it would truncate; the inspector
+        // must keep the field read-only and leave `extras` untouched.
+        const long_lit = "\"" ++ ("y" ** 400) ++ "\"";
+        const src = std.fmt.allocPrint(a,
+            \\{{ "event": {{ "type": "OnCall" }},
+            \\  "nodes": [ {{ "id": 1, "type": "Literal", "value": {s}, "pos": [0, 0] }} ],
+            \\  "edges": [] }}
+        , .{long_lit}) catch unreachable;
+        defer a.free(src);
+
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+
+        // The stored canonical text is longer than the 256-byte buffer
+        // (255 usable) — the inspector's literal path treats it as
+        // read-only.
+        const stored = flow_io.extraValue(doc.nodes[0], "value").?;
+        try expect.toBeTrue(stored.len > 255);
+
+        // The untouched literal round-trips verbatim and deterministically.
+        const text = try flow_io.render(a, doc);
+        defer a.free(text);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "y" ** 400) != null);
+
+        var doc2 = try flow_io.parse(a, text);
+        defer doc2.deinit();
+        const text2 = try flow_io.render(a, doc2);
+        defer a.free(text2);
+        try expect.toBeTrue(std.mem.eql(u8, text, text2));
+    }
+
+    test "a too-long BinOp op survives a load -> save round-trip" {
+        const a = std.testing.allocator;
+        // A `BinOp.op` JSON string whose decoded text is far longer than
+        // the inspector's 128-byte identifier edit buffer. The `.op_combo`
+        // path must detect the truncation (via `decodeStringValueBufChecked`)
+        // and refuse to write — picking an operator would otherwise
+        // silently clobber the full stored value on save.
+        const long_op = "z" ** 300;
+        const src = std.fmt.allocPrint(a,
+            \\{{ "event": {{ "type": "OnCreate" }},
+            \\  "nodes": [ {{ "id": 1, "type": "BinOp", "op": "{s}", "pos": [0, 0] }} ],
+            \\  "edges": [] }}
+        , .{long_op}) catch unreachable;
+        defer a.free(src);
+
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+
+        // The inspector's `.op_combo` path decodes into an `IdentBuf`
+        // (128 bytes); a 300-char value must come back flagged truncated
+        // so the combo goes read-only instead of allowing a write.
+        const stored = flow_io.extraValue(doc.nodes[0], "op").?;
+        var ident_buf: [128]u8 = undefined;
+        const decoded = flow_io.decodeStringValueBufChecked(&ident_buf, stored);
+        try expect.toBeTrue(decoded.truncated);
+
+        // An untouched too-long `op` must round-trip verbatim — the
+        // editor skips the write, so `extras` is unchanged.
+        const text = try flow_io.render(a, doc);
+        defer a.free(text);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, long_op) != null);
+
+        // And the re-save stays deterministic.
+        var doc2 = try flow_io.parse(a, text);
+        defer doc2.deinit();
+        const text2 = try flow_io.render(a, doc2);
+        defer a.free(text2);
+        try expect.toBeTrue(std.mem.eql(u8, text, text2));
+    }
+
     test "displayNameFromPath strips the .flow.jsonc extension" {
         try expect.toBeTrue(std.mem.eql(
             u8,
