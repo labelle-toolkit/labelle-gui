@@ -3658,6 +3658,86 @@ pub const PreviewTransportTests = struct {
         _ = close(fd);
         try waitUntilState(&sess, .crashed, 500);
     }
+
+    // ── #79: heartbeat watchdog ───────────────────────────────────
+    // A `.running` session whose engine goes silent (socket still
+    // open, no traffic) must land in `.crashed` once the watchdog
+    // window elapses — without this the editor sat in a stale
+    // `.running` forever showing a frozen "last heartbeat".
+
+    test "heartbeat watchdog fires when a connected engine goes silent" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        try sess.bindListener();
+
+        const fd = try dialEditor(sess.port.?);
+        try waitUntilState(&sess, .connecting, 500);
+        try sendJsonLine(fd, "{\"kind\":\"hello\",\"engine_version\":\"\",\"pid\":7,\"protocol_version\":1}\n");
+        try waitUntilState(&sess, .running, 500);
+
+        // Engine never writes again, but the socket stays open — the
+        // wedged-but-connected case. The watchdog should trip after
+        // `heartbeat_timeout_ms`. Poll well past the window.
+        const deadline: u64 = @intCast(preview.heartbeat_timeout_ms + 2_000);
+        try waitUntilState(&sess, .crashed, deadline);
+        const reason = sess.bye_reason orelse "";
+        try expect.toBeTrue(std.mem.indexOf(u8, reason, "heartbeat") != null);
+
+        _ = close(fd);
+    }
+
+    test "heartbeat traffic keeps a session in .running past the watchdog window" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        try sess.bindListener();
+
+        const fd = try dialEditor(sess.port.?);
+        try waitUntilState(&sess, .connecting, 500);
+        try sendJsonLine(fd, "{\"kind\":\"hello\",\"engine_version\":\"\",\"pid\":7,\"protocol_version\":1}\n");
+        try waitUntilState(&sess, .running, 500);
+
+        // Drip heartbeats for longer than `heartbeat_timeout_ms`,
+        // spaced well inside the window. The session must NOT trip
+        // the watchdog — a live engine should never see a false
+        // `.crashed`.
+        const span: i64 = preview.heartbeat_timeout_ms + 1_000;
+        var elapsed: i64 = 0;
+        const step: i64 = @divTrunc(preview.heartbeat_timeout_ms, 4);
+        while (elapsed < span) : (elapsed += step) {
+            try sendJsonLine(fd, "{\"kind\":\"heartbeat\",\"t\":1}\n");
+            var s: i64 = 0;
+            while (s < step) : (s += 10) {
+                sess.poll();
+                sleepMs(10);
+            }
+            try expect.equal(sess.state, preview.State.running);
+        }
+
+        try sendJsonLine(fd, "{\"kind\":\"bye\",\"reason\":\"normal\"}\n");
+        try waitUntilState(&sess, .stopped, 500);
+
+        _ = close(fd);
+    }
+
+    test "heartbeatAgeMs is null before hello and bounded after" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        try sess.bindListener();
+        // No engine yet — no receive clock.
+        try expect.toBeTrue(sess.heartbeatAgeMs() == null);
+
+        const fd = try dialEditor(sess.port.?);
+        try waitUntilState(&sess, .connecting, 500);
+        try sendJsonLine(fd, "{\"kind\":\"hello\",\"engine_version\":\"\",\"pid\":7,\"protocol_version\":1}\n");
+        try waitUntilState(&sess, .running, 500);
+
+        // After the handshake the age is a real, small value.
+        const age = sess.heartbeatAgeMs() orelse return error.AgeMissing;
+        try expect.toBeTrue(age >= 0);
+        try expect.toBeTrue(age < preview.heartbeat_timeout_ms);
+
+        _ = close(fd);
+    }
 };
 
 pub const PreviewLiveStderrTests = struct {
@@ -3737,6 +3817,46 @@ pub const PreviewLiveStderrTests = struct {
     fn sleepMs(ms: u64) void {
         const ts: Timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * 1_000_000) };
         _ = nanosleep(&ts, null);
+    }
+
+    extern "c" fn connect(fd: c_int, addr: *const std.posix.sockaddr.in, len: std.posix.socklen_t) c_int;
+    extern "c" fn write(fd: c_int, buf: [*]const u8, len: usize) isize;
+    extern "c" fn close(fd: c_int) c_int;
+
+    /// Dial the editor's listener as a freshly-spawned engine would.
+    /// Mirrors `PreviewTransportTests.dialEditor`.
+    fn dialEditor(port: u16) !c_int {
+        const sock_fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+        if (sock_fd < 0) return error.SocketFailed;
+        const addr: std.posix.sockaddr.in = .{
+            .family = std.posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, port),
+            .addr = std.mem.nativeToBig(u32, 0x7F000001),
+            .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        };
+        const rc = connect(@intCast(sock_fd), &addr, @sizeOf(@TypeOf(addr)));
+        if (rc < 0) return error.ConnectFailed;
+        return @intCast(sock_fd);
+    }
+
+    fn sendJsonLine(fd: c_int, body: []const u8) !void {
+        var off: usize = 0;
+        while (off < body.len) {
+            const n = write(fd, body.ptr + off, body.len - off);
+            if (n <= 0) return error.WriteFailed;
+            off += @intCast(n);
+        }
+    }
+
+    fn waitUntilState(p: *preview.PreviewSession, target: preview.State, deadline_ms: u64) !void {
+        var slept: u64 = 0;
+        while (slept < deadline_ms) {
+            p.poll();
+            if (p.state == target) return;
+            sleepMs(2);
+            slept += 2;
+        }
+        return error.DeadlineExceeded;
     }
 
     test "stderr_buf rotates when over cap so live tail keeps surfacing recent bytes" {
@@ -3846,6 +3966,163 @@ pub const PreviewLiveStderrTests = struct {
         // the early-detection branch fired.
         const reason = sess.bye_reason orelse "";
         try expect.toBeTrue(std.mem.indexOf(u8, reason, "labelle exited") != null);
+    }
+
+    // #79: a clean (code 0) child exit while the session is `.running`
+    // is the engine shutting itself down — the user closed the game
+    // window. It must land in `.stopped`, NOT `.crashed`, even when no
+    // `bye` frame ever arrives.
+    //
+    // This drives the *real* EOF-vs-waitpid race deterministically. A
+    // genuine engine shutdown closes its TCP socket as part of process
+    // teardown — the kernel can deliver the socket FIN (so `read`
+    // returns 0) while the process is still mid-exit and NOT yet a
+    // reapable zombie. At the `poll` that sees that EOF,
+    // `waitpid(WNOHANG)` still returns 0. The buggy code `markCrashed`s
+    // on that EOF (`tryWaitChild` can't yet see the exit code) and lands
+    // `.crashed`; the fixed code records the EOF as *pending*, waits for
+    // a later poll to reap the child, and lands `.stopped` with the real
+    // exit code.
+    //
+    // Two subtleties this test gets right (the earlier version got both
+    // wrong, so it passed even with the bug present):
+    //
+    //  1. The child is spawned AFTER `bindListener` but BEFORE the
+    //     engine socket is dialed. After `dialEditor`, a freshly forked
+    //     child would inherit a copy of the connection fd (no
+    //     `O_CLOEXEC`), so `close(engine_fd)` in the test would NOT
+    //     deliver a FIN — the editor's `conn_fd` would never see EOF
+    //     until the child itself exited, and by then `waitpid` reaps it
+    //     the same tick. No race. Spawning before `dialEditor` means the
+    //     connection fd doesn't exist at fork time. (Spawning before
+    //     `bindListener` doesn't work either — `bindListener` kills and
+    //     nulls any pre-existing `sess.child` as leftover-cycle cleanup.)
+    //
+    //  2. `close(engine_fd)` happens while the child is provably still
+    //     sleeping, and a short sleep guarantees the loopback FIN is
+    //     delivered before the racing `poll`. That poll sees EOF with
+    //     the child un-reapable — the precise #79 window.
+    test "clean child exit while running lands in .stopped not .crashed (EOF races waitpid)" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+
+        // Bind the listener first (it would kill a pre-existing child),
+        // then spawn the engine subprocess — before any connection
+        // socket exists — so the child cannot inherit the connection fd.
+        // The child stays alive ~800 ms then exits cleanly (code 0): the
+        // subprocess half of a normal Run → play → close-window
+        // shutdown, slow enough that the race window is open during the
+        // handshake + the racing poll below.
+        try sess.bindListener();
+        const argv = &[_][]const u8{ "/bin/sleep", "0.8" };
+        const child = std.process.spawn(io_global.io(), .{
+            .argv = argv,
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .pipe,
+        }) catch |err| {
+            std.debug.print("skip: /bin/sleep unavailable ({s})\n", .{@errorName(err)});
+            return error.SkipZigTest;
+        };
+        sess.child = child;
+
+        // Now establish a real connected engine socket and reach
+        // `.running` via the `hello` handshake, so `sess.conn_fd >= 0`
+        // and `tryRead` is live. This connection fd post-dates the fork,
+        // so the child does not hold a copy of it.
+        const engine_fd = try dialEditor(sess.port.?);
+        try waitUntilState(&sess, .connecting, 500);
+        try sendJsonLine(engine_fd, "{\"kind\":\"hello\",\"engine_version\":\"\",\"pid\":1,\"protocol_version\":1}\n");
+        try waitUntilState(&sess, .running, 500);
+
+        // Close the engine-side socket NOW, while the child is still
+        // sleeping (not yet a zombie). The short sleep guarantees the
+        // loopback FIN has been delivered so the next `poll`'s `tryRead`
+        // deterministically observes EOF — but it's far below the
+        // child's 0.8 s lifetime, so `waitpid(WNOHANG)` still returns 0
+        // (child un-reapable) at that same poll. That is the exact #79
+        // race. The buggy code crashes here; the fixed code records the
+        // EOF as pending and stays `.running`.
+        _ = close(engine_fd);
+        sleepMs(40);
+        sess.poll();
+        // Right after the racing poll: the buggy build has already
+        // transitioned to `.crashed` on the EOF. The fixed build is
+        // still `.running` with the EOF deferred — this is the
+        // assertion that actually catches the bug.
+        try expect.equal(sess.state, preview.State.running);
+
+        // Now let the sleep finish and subsequent polls reap it.
+        var slept: u64 = 0;
+        while (slept < 3000) {
+            sess.poll();
+            if (sess.state != .running) break;
+            sleepMs(5);
+            slept += 5;
+        }
+        try expect.equal(sess.state, preview.State.stopped);
+        // The reason must come from the clean exit-code path, not the
+        // EOF "connection closed" crash string — that's how we know
+        // the deferred EOF resolved via `tryWaitChild`'s exit status.
+        const reason = sess.bye_reason orelse "";
+        try expect.toBeTrue(std.mem.indexOf(u8, reason, "labelle exited") != null);
+    }
+
+    // #79 counterpart: the deferred-EOF fix must NOT swallow a genuine
+    // mid-session crash. Same race ordering — socket EOF observed while
+    // the child is still un-reapable — but here the child exits with a
+    // non-zero code. The session must still land `.crashed`, and the
+    // reason must carry the exit code (proving the crash verdict came
+    // from the reaped exit status, not the generic EOF string).
+    test "non-zero child exit while running still lands in .crashed (EOF races waitpid)" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+
+        // Bind first, then spawn before dialing (see the clean-exit test
+        // above for the fd-inheritance / `bindListener`-kill reasons).
+        // `sh -c 'sleep 0.8; exit 3'` — alive long enough to lose the
+        // race, then a non-zero exit standing in for a real engine
+        // crash.
+        try sess.bindListener();
+        const argv = &[_][]const u8{ "/bin/sh", "-c", "sleep 0.8; exit 3" };
+        const child = std.process.spawn(io_global.io(), .{
+            .argv = argv,
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .pipe,
+        }) catch |err| {
+            std.debug.print("skip: /bin/sh unavailable ({s})\n", .{@errorName(err)});
+            return error.SkipZigTest;
+        };
+        sess.child = child;
+
+        const engine_fd = try dialEditor(sess.port.?);
+        try waitUntilState(&sess, .connecting, 500);
+        try sendJsonLine(engine_fd, "{\"kind\":\"hello\",\"engine_version\":\"\",\"pid\":1,\"protocol_version\":1}\n");
+        try waitUntilState(&sess, .running, 500);
+
+        // EOF the socket while the child is still running, then poll
+        // into the race window — same ordering as the clean-exit test.
+        _ = close(engine_fd);
+        sleepMs(40);
+        sess.poll();
+        // The deferred-EOF fix keeps the session `.running` here — the
+        // crash verdict must come from the reaped exit code, not the EOF.
+        try expect.equal(sess.state, preview.State.running);
+
+        var slept: u64 = 0;
+        while (slept < 3000) {
+            sess.poll();
+            if (sess.state != .running) break;
+            sleepMs(5);
+            slept += 5;
+        }
+        try expect.equal(sess.state, preview.State.crashed);
+        // Exit code 3 must surface — confirms the crash verdict came
+        // from the reaped exit status, not the "connection closed" EOF
+        // fallback.
+        const reason = sess.bye_reason orelse "";
+        try expect.toBeTrue(std.mem.indexOf(u8, reason, "code 3") != null);
     }
 };
 

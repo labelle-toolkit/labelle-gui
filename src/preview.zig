@@ -122,6 +122,41 @@ pub const Bye = struct {
 /// — see #134-follow-up. For now, generous flat budget.
 pub const connecting_timeout_ms: i64 = 60_000;
 
+/// Heartbeat watchdog window for the `.running` state (#79).
+///
+/// The engine emits a `heartbeat` frame every
+/// `preview_mode.heartbeat_interval_ms` (250 ms today). If the editor
+/// goes this long without receiving *any* inbound traffic — heartbeat,
+/// frame_published, telemetry, anything — the engine is presumed dead
+/// or wedged and the session is declared `.crashed`.
+///
+/// Why a watchdog is needed at all: a hard engine crash usually EOFs
+/// the TCP socket, which `tryRead` already catches. But a *wedged*
+/// engine (game-thread deadlock, infinite loop, paused under a
+/// debugger) keeps the socket open with no data flowing — without
+/// this watchdog the editor would sit in `.running` forever, showing
+/// a stale "last heartbeat" the user can't tell is frozen.
+///
+/// The window is deliberately generous — 12 intervals — so a GC
+/// pause, a slow frame, or a brief scheduler hiccup on the engine
+/// side never trips a false `.crashed`. It only fires when the
+/// engine has been silent for a span no live engine would produce.
+pub const heartbeat_timeout_ms: i64 = 3_000;
+
+/// Grace window for resolving a deferred socket EOF (#79).
+///
+/// `tryRead` records a socket EOF without an accompanying `bye` as
+/// *pending* (`eof_at_ms`) rather than crashing immediately, because a
+/// clean engine shutdown EOFs the socket before its process becomes a
+/// reapable zombie. `poll` then waits for `tryWaitChild` to reap the
+/// subprocess and report its true exit status. This is the upper bound
+/// on that wait: once the socket has been EOFed this long and the child
+/// *still* hasn't been reaped, the session resolves to `.crashed` as a
+/// backstop (e.g. a wrapper process wedged after its child died). The
+/// happy path resolves in the very next poll or two — a process whose
+/// socket the kernel already closed is microseconds from reapable.
+pub const eof_resolve_grace_ms: i64 = 2_000;
+
 /// Callback slot — fires on the first `frame_offer` JSON frame the
 /// engine sends after the `hello` handshake. The App wires this to
 /// `attachGameView(shm_name, format)` (#107 → #112 end-to-end seam).
@@ -260,6 +295,34 @@ pub const PreviewSession = struct {
     /// Monotonic millisecond clock at start() — used for the
     /// connecting-timeout check inside poll().
     connect_start_ms: ?i64 = null,
+    /// Monotonic millisecond timestamp of the last inbound traffic
+    /// while in `.running` (#79). Distinct from `last_heartbeat_ms`,
+    /// which carries the engine's *own* `t` value off the heartbeat
+    /// frame — that's the engine clock, not comparable to our clock
+    /// and not advanced by non-heartbeat traffic. `last_rx_ms` is
+    /// the editor's local receive clock, refreshed by *any* complete
+    /// frame, and is what the heartbeat watchdog measures against.
+    /// Set when the `hello` handshake completes; `null` before that.
+    last_rx_ms: ?i64 = null,
+    /// Monotonic millisecond timestamp of a *deferred* socket EOF (#79).
+    ///
+    /// When `tryRead` observes EOF on `conn_fd` in a non-terminal state
+    /// without a preceding `bye`, it does NOT immediately `markCrashed`.
+    /// A clean engine shutdown (Run → play → close window) closes its
+    /// socket as part of process teardown — the kernel can deliver the
+    /// socket FIN (so `read` returns 0) *before* the process becomes a
+    /// reapable zombie, so `waitpid(WNOHANG)` still returns 0 at the
+    /// poll that sees the EOF. Crashing on the EOF would misreport that
+    /// clean exit as `.crashed` — the exact #79 bug.
+    ///
+    /// Instead the EOF is recorded here and the crashed-vs-stopped
+    /// decision is deferred to `resolvePendingEof` in `poll`, which
+    /// waits for `tryWaitChild` to reap the subprocess and read its real
+    /// exit status (code 0 → `.stopped`, anything else → `.crashed`).
+    /// If the child is already gone with no clean landing, or stays
+    /// unreaped past `eof_resolve_grace_ms`, the EOF resolves to a
+    /// genuine `.crashed`. `null` = no EOF pending.
+    eof_at_ms: ?i64 = null,
 
     const Self = @This();
 
@@ -350,6 +413,15 @@ pub const PreviewSession = struct {
         self.state = .listening;
         self.connect_start_ms = nowMs();
         self.started_ms = self.connect_start_ms;
+        // The heartbeat watchdog clock only runs in `.running`; clear
+        // any stale value from a prior cycle so the first watchdog
+        // check after `hello` measures from the handshake, not from a
+        // previous session (#79).
+        self.last_rx_ms = null;
+        self.last_heartbeat_ms = null;
+        // Drop any deferred-EOF marker from a prior cycle (#79) so the
+        // first poll of this fresh Run can't resolve a stale EOF.
+        self.eof_at_ms = null;
     }
 
     /// Production entry: bind + spawn `labelle run <project_dir>`
@@ -449,6 +521,8 @@ pub const PreviewSession = struct {
             self.listener = null;
         }
         self.connect_start_ms = null;
+        // A manual Stop overrides any deferred-EOF resolution (#79).
+        self.eof_at_ms = null;
         // Don't reset `state` if it's already `.crashed` — `poll`
         // landed us there for a reason and the UI still needs to
         // show "preview crashed". Only `.listening`/`.connecting`/
@@ -472,19 +546,55 @@ pub const PreviewSession = struct {
             .connecting, .running => self.tryRead(),
         }
 
-        // Subprocess-exit early-crash detection (#127, subsuming the
-        // first half of #136). If the spawned `labelle run` exits —
-        // build failure, panic, immediate `error.FileNotFound` on the
-        // game binary — before the engine dials back and completes
-        // the `hello` handshake, the listener would otherwise wait
-        // the full 60-second `connecting_timeout_ms` window before
-        // declaring `.crashed`. Poll `waitpid(WNOHANG)` here so we
-        // land in `.crashed` immediately, surfacing the exit code in
-        // the `bye_reason` for the panel. The timeout below stays as
-        // a backstop for the case where the child is alive but
-        // wedged.
-        if (self.state == .listening or self.state == .connecting) {
+        // Subprocess-exit detection (#127, extended for #79). If the
+        // spawned `labelle run` exits — build failure, panic, an
+        // immediate `error.FileNotFound` on the game binary, or a
+        // mid-session crash of the game itself — `waitpid(WNOHANG)`
+        // reaps it and lands the session in `.crashed` with the exit
+        // code in `bye_reason`.
+        //
+        // This now also runs in `.running` (#79): a hard engine crash
+        // *usually* EOFs the TCP socket, which `tryRead` catches — but
+        // not always promptly. The kernel can keep a half-open
+        // connection alive (no FIN delivered, or the game's grandchild
+        // died while the CLI wrapper lingers) so `read` returns EAGAIN
+        // forever and the session would otherwise sit in a stale
+        // `.running`. Reaping the child directly closes that gap.
+        // `tryWaitChild` itself early-returns when the child is still
+        // alive, so this is cheap on the happy path.
+        if (self.state == .listening or self.state == .connecting or self.state == .running) {
             self.tryWaitChild();
+        }
+
+        // Resolve a deferred socket EOF (#79). `tryRead` records an
+        // unexpected EOF as *pending* rather than crashing on the spot,
+        // because a clean engine shutdown closes its socket before its
+        // process is reapable — see `eof_at_ms` / `resolvePendingEof`.
+        // This runs after `tryWaitChild` above so the exit status it
+        // reaped (clean → `.stopped`, crash → `.crashed`) is already
+        // reflected in `self.state` by the time the EOF is settled.
+        if (self.eof_at_ms != null) {
+            self.resolvePendingEof();
+        }
+
+        // Heartbeat watchdog (#79). The engine emits a `heartbeat`
+        // every ~250 ms; `tryRead` refreshes `last_rx_ms` on *any*
+        // inbound frame. If that clock goes stale past
+        // `heartbeat_timeout_ms` the engine is wedged (alive but not
+        // talking — deadlock, infinite loop, paused under a debugger)
+        // and we declare `.crashed` so the panel stops showing a
+        // frozen "last heartbeat" the user can't distinguish from a
+        // live one. A genuine engine *exit* is normally caught earlier
+        // by the EOF path in `tryRead` or by `tryWaitChild` above;
+        // this watchdog is the backstop for the silent-but-connected
+        // case those two miss.
+        if (self.state == .running) {
+            if (self.last_rx_ms) |t_rx| {
+                const silent = nowMs() - t_rx;
+                if (silent > heartbeat_timeout_ms) {
+                    self.markCrashed("engine heartbeat timed out");
+                }
+            }
         }
 
         // Connecting-timeout: if no client showed up — or accepted
@@ -521,6 +631,17 @@ pub const PreviewSession = struct {
 
     pub fn capturedStderr(self: *const Self) []const u8 {
         return self.stderr_buf.items;
+    }
+
+    /// Milliseconds since the last inbound frame from the engine, or
+    /// `null` before the `hello` handshake completes (#79). Measured
+    /// against the editor's local monotonic clock — comparable to
+    /// `heartbeat_timeout_ms`, unlike `last_heartbeat_ms` which holds
+    /// the engine's own clock value. The preview panel surfaces this
+    /// so a frozen engine shows a visibly-climbing age.
+    pub fn heartbeatAgeMs(self: *const Self) ?i64 {
+        const t_rx = self.last_rx_ms orelse return null;
+        return nowMs() - t_rx;
     }
 
     /// Yield stderr bytes that have arrived since the last call and
@@ -698,13 +819,20 @@ pub const PreviewSession = struct {
         // frame; anything else → newline-framed JSON. Stops when no
         // complete frame is available (binary frame's length bytes
         // haven't all arrived yet, or no `\n` in the buffer).
+        //
+        // Every fully-decoded frame refreshes the heartbeat watchdog
+        // clock (#79): any inbound traffic — heartbeat, frame frames,
+        // telemetry — proves the engine is alive this instant, so the
+        // watchdog measures silence, not specifically heartbeat gaps.
         while (self.inbox.items.len > 0) {
             if (self.inbox.items[0] == binary_magic) {
                 if (!self.tryReadBinary()) break;
+                self.last_rx_ms = nowMs();
             } else {
                 const nl = std.mem.indexOfScalar(u8, self.inbox.items, '\n') orelse break;
                 const line = self.inbox.items[0..nl];
                 self.handleFrame(line);
+                self.last_rx_ms = nowMs();
                 const remaining = self.inbox.items.len - (nl + 1);
                 std.mem.copyForwards(u8, self.inbox.items[0..remaining], self.inbox.items[nl + 1 ..]);
                 self.inbox.shrinkRetainingCapacity(remaining);
@@ -712,12 +840,81 @@ pub const PreviewSession = struct {
         }
 
         // Post-parse: if we hit EOF in the read loop, decide
-        // crashed-vs-stopped based on whether the bye actually
-        // landed (handleFrame sets state=.stopped + bye_reason).
-        // The `.stopped` check matches both the bye-then-close
-        // clean shutdown and a manual `stop()` racing the EOF.
-        if (saw_eof and self.state != .stopped and self.bye_reason == null) {
+        // crashed-vs-stopped. If a `bye` frame landed (handleFrame set
+        // state=.stopped + bye_reason) or a manual `stop()` raced the
+        // EOF, we're already terminal — nothing to do.
+        if (saw_eof and self.state != .stopped and self.state != .crashed and self.bye_reason == null) {
+            // A clean engine exit (Run → play → close window) closes
+            // its socket as part of process teardown. The kernel can
+            // deliver the socket FIN — so this `read` returns 0 — while
+            // the engine process is still mid-exit and NOT yet a
+            // reapable zombie. At that instant `waitpid(WNOHANG)` (in
+            // `tryWaitChild`) returns 0, so calling it here would NOT
+            // reap the child and NOT learn the exit code. Crashing on
+            // the EOF unconditionally — or after a `tryWaitChild` that
+            // can't yet see the exit — misreports a normal shutdown as
+            // `.crashed`. That is the exact #79 race.
+            //
+            // So don't decide here. Record the EOF as pending and let
+            // `poll`'s `resolvePendingEof` settle it once `tryWaitChild`
+            // has actually reaped the subprocess and read its true exit
+            // status: code 0 → `.stopped`, non-zero / signal → genuine
+            // `.crashed`. The dead socket is closed now (no further
+            // reads are possible on an EOFed fd) so a subsequent
+            // `tryRead` early-returns on `conn_fd < 0`.
+            if (self.eof_at_ms == null) self.eof_at_ms = nowMs();
+            if (self.conn_fd >= 0) {
+                _ = close(self.conn_fd);
+                self.conn_fd = -1;
+            }
+        }
+    }
+
+    /// Settle a deferred socket EOF recorded by `tryRead` (#79). Called
+    /// from `poll` *after* `tryWaitChild` has had its chance to reap the
+    /// subprocess this tick.
+    ///
+    /// Resolution order:
+    ///  - State already terminal (`.stopped`/`.crashed`) — `tryWaitChild`
+    ///    or a late `bye` settled it. Clear the pending flag, done.
+    ///  - Child reaped but the session is somehow still non-terminal, or
+    ///    there is no child at all — the engine is gone and no clean
+    ///    landing happened, so the EOF is a genuine crash.
+    ///  - Child still alive/unreaped within the grace window — keep
+    ///    waiting; the next poll's `tryWaitChild` should reap it.
+    ///  - Grace window elapsed with the child still unreaped — backstop
+    ///    crash (e.g. a wrapper process wedged after its child died).
+    fn resolvePendingEof(self: *Self) void {
+        const eof_t = self.eof_at_ms orelse return;
+
+        // `tryWaitChild` (clean exit) or a late `bye` already landed us
+        // in a terminal state — the pending EOF is moot.
+        if (self.state == .stopped or self.state == .crashed) {
+            self.eof_at_ms = null;
+            return;
+        }
+
+        // Is the subprocess still around and reapable-pending? `child`
+        // is null in the loopback test fixture; `child.id` is null once
+        // `tryWaitChild` has reaped it. Either way there is no exit
+        // status still coming, so the EOF is the final word: a crash.
+        const child_pending = blk: {
+            const child = self.child orelse break :blk false;
+            break :blk child.id != null;
+        };
+        if (!child_pending) {
             self.markCrashed("connection closed");
+            self.eof_at_ms = null;
+            return;
+        }
+
+        // Child still alive — `tryWaitChild` ran this tick and saw
+        // `waitpid` return 0. Give it more polls to reap, bounded so a
+        // wrapper that EOFed its socket but never exits can't wedge the
+        // session in a stale `.running` forever.
+        if (nowMs() - eof_t > eof_resolve_grace_ms) {
+            self.markCrashed("connection closed");
+            self.eof_at_ms = null;
         }
     }
 
@@ -944,10 +1141,20 @@ pub const PreviewSession = struct {
     }
 
     /// Non-blocking `waitpid` on the spawned subprocess. If the child
-    /// has already exited, transition to `.crashed` with the exit
-    /// code (or signal number) embedded in the `bye_reason`. No-op
+    /// has already exited, transition to a terminal state with the
+    /// exit code (or signal number) embedded in `bye_reason`. No-op
     /// when there's no child (test fixtures call `bindListener`
     /// directly) or when the child is still alive.
+    ///
+    /// Terminal-state selection (#79): a child that exits with code 0
+    /// while the session is `.running` shut itself down cleanly — the
+    /// user closed the game window — so the session lands in
+    /// `.stopped`, not `.crashed`. This keeps the "Run preview → play
+    /// → close" cycle from misreporting as a crash even when the
+    /// engine exits without sending an explicit `bye` frame, or when
+    /// the process exit is observed before an in-flight `bye` is read.
+    /// Any non-zero exit, any terminating signal, or an exit during
+    /// the pre-handshake `.listening`/`.connecting` phase is a crash.
     ///
     /// Why bypass `std.process.Child.wait` here: that API blocks until
     /// termination and tears the Child down (sets `id = null`, closes
@@ -969,15 +1176,21 @@ pub const PreviewSession = struct {
         // bits are the terminating signal otherwise. Keep the reason
         // string short — the panel surfaces it inline.
         var reason_buf: [64]u8 = undefined;
+        const exited_normally = (status & 0x7F) == 0;
+        const exit_code: c_int = (status >> 8) & 0xFF;
         const reason: []const u8 = blk: {
-            if ((status & 0x7F) == 0) {
-                const code = (status >> 8) & 0xFF;
-                break :blk std.fmt.bufPrint(&reason_buf, "labelle exited (code {d})", .{code}) catch "labelle exited";
+            if (exited_normally) {
+                break :blk std.fmt.bufPrint(&reason_buf, "labelle exited (code {d})", .{exit_code}) catch "labelle exited";
             } else {
                 const sig = status & 0x7F;
                 break :blk std.fmt.bufPrint(&reason_buf, "labelle killed by signal {d}", .{sig}) catch "labelle killed";
             }
         };
+        // A clean exit (code 0) from an already-`running` session is
+        // the engine shutting itself down — land in `.stopped`. Every
+        // other case (non-zero code, signal, exit before the `hello`
+        // handshake) is a crash. See the doc comment above.
+        const clean_shutdown = exited_normally and exit_code == 0 and self.state == .running;
         // One final stderr drain so the panel surfaces the *last*
         // bytes the child wrote before exiting. Without this, the
         // tail (often the compile error in the `zig build` step) can
@@ -1003,6 +1216,26 @@ pub const PreviewSession = struct {
             child.stdin = null;
         }
         child.id = null;
+
+        if (clean_shutdown) {
+            // Engine exited cleanly without (or before) a `bye` frame.
+            // Mirror the `bye`-handler's terminal landing: record the
+            // reason, close the connection fd, drop the listener, and
+            // settle in `.stopped`.
+            if (self.bye_reason == null) {
+                self.bye_reason = self.allocator.dupe(u8, reason) catch null;
+            }
+            self.state = .stopped;
+            if (self.conn_fd >= 0) {
+                _ = close(self.conn_fd);
+                self.conn_fd = -1;
+            }
+            if (self.listener) |*l| {
+                l.deinit(io_global.io());
+                self.listener = null;
+            }
+            return;
+        }
         self.markCrashed(reason);
     }
 
