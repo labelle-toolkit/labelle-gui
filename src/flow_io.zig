@@ -781,14 +781,19 @@ fn writeCoord(a: std.mem.Allocator, out: *std.ArrayList(u8), v: f32) !void {
     }
 }
 
-/// Write `doc` back to disk at `path`, truncating any existing file.
+/// Write `doc` back to disk at `path`, replacing any existing file.
+/// The write is atomic — see `io_global.writeFileAtomic` — so a crash
+/// mid-save can never corrupt the flow graph on disk.
 pub fn saveToFile(child_allocator: std.mem.Allocator, path: []const u8, doc: FlowDoc) !void {
     const text = try render(child_allocator, doc);
     defer child_allocator.free(text);
-    try std.Io.Dir.cwd().writeFile(io_global.io(), .{
-        .sub_path = path,
-        .data = text,
-    });
+    try io_global.writeFileAtomic(
+        std.Io.Dir.cwd(),
+        io_global.io(),
+        path,
+        text,
+        child_allocator,
+    );
 }
 
 // ─── Path helpers ──────────────────────────────────────────────────────

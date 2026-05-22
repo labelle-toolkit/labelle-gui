@@ -4738,3 +4738,144 @@ pub const FlowIoTests = struct {
         try expect.toBeTrue(!project_tree.isFlowDocPath(dir, "/proj/scenes/a.jsonc"));
     }
 };
+
+/// Covers `io_global.writeFileAtomic` — the shared atomic-save helper
+/// behind `flow_io.saveToFile`, `scene_io.saveScene`, and
+/// `scene_io.savePrefab` (issue #166). The crash-safety guarantee can't
+/// be exercised without fault injection, so these tests pin the
+/// observable contract: the right bytes land at `path`, an overwrite
+/// fully replaces the previous content, and a successful save leaves no
+/// `.tmp` sibling behind.
+pub const AtomicWriteTests = struct {
+    fn createTempDir(allocator: std.mem.Allocator) ![]const u8 {
+        const ts = timestampSeconds();
+        const Counter = struct {
+            var i: u64 = 0;
+        };
+        Counter.i += 1;
+        const dir_name = try std.fmt.allocPrint(
+            allocator,
+            "/tmp/labelle_atomic_{d}_{d}",
+            .{ ts, Counter.i },
+        );
+        try std.Io.Dir.cwd().createDir(io_global.io(), dir_name, .default_dir);
+        return dir_name;
+    }
+
+    fn deleteTempDir(allocator: std.mem.Allocator, dir_path: []const u8) void {
+        std.Io.Dir.cwd().deleteTree(io_global.io(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+
+    fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+        return std.Io.Dir.cwd().readFileAlloc(
+            io_global.io(),
+            path,
+            allocator,
+            .limited(1024 * 1024),
+        );
+    }
+
+    /// Number of directory entries whose name contains ".tmp" — a
+    /// successful atomic save must leave zero of these.
+    fn countTempFiles(dir_path: []const u8) !usize {
+        var dir = try std.Io.Dir.cwd().openDir(io_global.io(), dir_path, .{ .iterate = true });
+        defer dir.close(io_global.io());
+        var it = dir.iterate();
+        var count: usize = 0;
+        while (try it.next(io_global.io())) |entry| {
+            if (std.mem.indexOf(u8, entry.name, ".tmp") != null) count += 1;
+        }
+        return count;
+    }
+
+    test "writes content to a fresh file" {
+        const allocator = std.testing.allocator;
+        const tmp = try createTempDir(allocator);
+        defer deleteTempDir(allocator, tmp);
+
+        const path = try std.fs.path.join(allocator, &.{ tmp, "out.txt" });
+        defer allocator.free(path);
+
+        try io_global.writeFileAtomic(
+            std.Io.Dir.cwd(),
+            io_global.io(),
+            path,
+            "hello atomic world",
+            allocator,
+        );
+
+        const got = try readFile(allocator, path);
+        defer allocator.free(got);
+        try std.testing.expectEqualStrings("hello atomic world", got);
+    }
+
+    test "overwriting an existing file replaces its content" {
+        const allocator = std.testing.allocator;
+        const tmp = try createTempDir(allocator);
+        defer deleteTempDir(allocator, tmp);
+
+        const path = try std.fs.path.join(allocator, &.{ tmp, "scene.jsonc" });
+        defer allocator.free(path);
+
+        // Seed a longer original — a non-atomic truncating write would
+        // leave trailing stale bytes if the new payload were shorter.
+        try std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = path,
+            .data = "ORIGINAL CONTENT THAT IS FAIRLY LONG AND SHOULD BE GONE",
+        });
+
+        try io_global.writeFileAtomic(
+            std.Io.Dir.cwd(),
+            io_global.io(),
+            path,
+            "new",
+            allocator,
+        );
+
+        const got = try readFile(allocator, path);
+        defer allocator.free(got);
+        try std.testing.expectEqualStrings("new", got);
+    }
+
+    test "successful save leaves no leftover temp file" {
+        const allocator = std.testing.allocator;
+        const tmp = try createTempDir(allocator);
+        defer deleteTempDir(allocator, tmp);
+
+        const path = try std.fs.path.join(allocator, &.{ tmp, "prefab.jsonc" });
+        defer allocator.free(path);
+
+        try io_global.writeFileAtomic(
+            std.Io.Dir.cwd(),
+            io_global.io(),
+            path,
+            "{ \"components\": {} }\n",
+            allocator,
+        );
+
+        // Only the destination file should remain — the `.tmp` sibling
+        // must have been renamed away, not left in the directory.
+        try expect.equal(try countTempFiles(tmp), 0);
+    }
+
+    test "scene_io.saveScene writes atomically with no temp leftover" {
+        const allocator = std.testing.allocator;
+        const tmp = try createTempDir(allocator);
+        defer deleteTempDir(allocator, tmp);
+
+        const path = try std.fs.path.join(allocator, &.{ tmp, "main.jsonc" });
+        defer allocator.free(path);
+
+        const src = "{ \"name\": \"main\", \"entities\": [] }\n";
+        var scene = try scene_io.parseScene(allocator, src);
+        defer scene.deinit();
+
+        try scene_io.saveScene(allocator, path, scene);
+
+        const got = try readFile(allocator, path);
+        defer allocator.free(got);
+        try expect.toBeTrue(std.mem.indexOf(u8, got, "\"main\"") != null);
+        try expect.equal(try countTempFiles(tmp), 0);
+    }
+};

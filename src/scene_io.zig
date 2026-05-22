@@ -440,10 +440,13 @@ pub fn parsePrefab(allocator: std.mem.Allocator, raw: []const u8) !LoadedPrefab 
 pub fn savePrefab(allocator: std.mem.Allocator, path: []const u8, loaded: LoadedPrefab) !void {
     const text = try renderPrefabJsonc(allocator, loaded);
     defer allocator.free(text);
-    try std.Io.Dir.cwd().writeFile(io_global.io(), .{
-        .sub_path = path,
-        .data = text,
-    });
+    try io_global.writeFileAtomic(
+        std.Io.Dir.cwd(),
+        io_global.io(),
+        path,
+        text,
+        allocator,
+    );
 }
 
 /// Emit the prefab as `{ "components": { ... }, "children": [ ... ] }`.
@@ -1377,15 +1380,20 @@ fn isManagedPrefabTopLevelKey(name: []const u8) bool {
 
 // ─── Writer ────────────────────────────────────────────────────────────
 
-/// Write the in-memory scene + extras back to disk at `path`. Truncates
-/// any existing file at the path.
+/// Write the in-memory scene + extras back to disk at `path`, replacing
+/// any existing file. The write is atomic — see
+/// `io_global.writeFileAtomic` — so a crash mid-save can never corrupt
+/// the scene on disk.
 pub fn saveScene(allocator: std.mem.Allocator, path: []const u8, loaded: LoadedScene) !void {
     const text = try renderSceneJsonc(allocator, loaded);
     defer allocator.free(text);
-    try std.Io.Dir.cwd().writeFile(io_global.io(), .{
-        .sub_path = path,
-        .data = text,
-    });
+    try io_global.writeFileAtomic(
+        std.Io.Dir.cwd(),
+        io_global.io(),
+        path,
+        text,
+        allocator,
+    );
 }
 
 /// Render the loaded scene back to JSONC. Managed fields (`name`,
