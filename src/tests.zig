@@ -5309,4 +5309,72 @@ pub const FlowDocSubflowTests = struct {
             "/no/such/dir/b.flow.jsonc",
         ));
     }
+
+    // ── ResolvedFlow cache-freshness (issue #161 follow-up) ─────────────
+    //
+    // `resolveSubflow` itself touches `FlowDocState`, which transitively
+    // pulls in the imgui/zgui stack the `zig build test` target
+    // deliberately excludes (build.zig issue #94 note). The staleness
+    // decision is therefore factored into the pure `resolvedFlowIsFresh`
+    // helper, which these tests exercise directly.
+
+    test "resolvedFlowIsFresh: a successful load with matching mtime + size is fresh" {
+        try expect.toBeTrue(flow_doc.resolvedFlowIsFresh(
+            true, // loaded_ok
+            123, // cached mtime
+            456, // cached size
+            123, // current mtime
+            456, // current size
+        ));
+    }
+
+    test "resolvedFlowIsFresh: same mtime but a changed size is stale" {
+        // The same-tick / mtime-preserving rewrite case: the referenced
+        // file's contents changed (size moved) without its mtime
+        // advancing. mtime alone would wrongly report the cache fresh;
+        // pairing it with size catches the rewrite and forces a
+        // re-resolve so the Subflow node's pins stay current.
+        try expect.toBeTrue(!flow_doc.resolvedFlowIsFresh(
+            true,
+            123,
+            456,
+            123, // mtime unchanged
+            512, // size grew
+        ));
+    }
+
+    test "resolvedFlowIsFresh: a changed mtime is stale even when size matches" {
+        try expect.toBeTrue(!flow_doc.resolvedFlowIsFresh(
+            true,
+            123,
+            456,
+            999, // mtime moved
+            456, // size unchanged
+        ));
+    }
+
+    test "resolvedFlowIsFresh: a previously failed load is never fresh" {
+        // `loaded_ok = false` must always re-attempt — a fixed-contents
+        // file has to recover even if mtime + size are unchanged.
+        try expect.toBeTrue(!flow_doc.resolvedFlowIsFresh(
+            false,
+            123,
+            456,
+            123,
+            456,
+        ));
+    }
+
+    test "resolvedFlowIsFresh: a failed stat (null mtime + size) is never fresh" {
+        // A missing/unstattable file leaves both observations null.
+        // Even against a cache entry that also has nulls, treat it as
+        // stale so the next frame re-attempts the load.
+        try expect.toBeTrue(!flow_doc.resolvedFlowIsFresh(
+            true,
+            null,
+            null,
+            null,
+            null,
+        ));
+    }
 };

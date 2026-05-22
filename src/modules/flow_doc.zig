@@ -67,10 +67,12 @@ const PinEntry = struct {
 /// per declared `param`, one output pin per `Output` node — the editor
 /// must load and parse the referenced `.flow.jsonc` file.
 ///
-/// Resolution is keyed by `(name, mtime)`: the parse is reused across
-/// frames and only redone when the referenced file changes on disk,
-/// mirroring the mtime-keyed re-derivation pattern `flow.zig` uses for
-/// its `.zig` source. `doc` is null when the referenced file is
+/// Resolution is keyed by `(name, mtime, size)`: the parse is reused
+/// across frames and only redone when the referenced file changes on
+/// disk, mirroring the mtime-keyed re-derivation pattern `flow.zig`
+/// uses for its `.zig` source. Size is part of the key so a same-tick
+/// rewrite that doesn't advance the mtime still re-resolves. `doc` is
+/// null when the referenced file is
 /// missing or unparseable — the renderer then falls back to the
 /// binding-derived input pins and shows an "unresolved" hint.
 ///
@@ -87,15 +89,22 @@ const ResolvedFlow = struct {
     /// Last-observed mtime of the referenced file (nanoseconds since
     /// the unix epoch). Null when the file could not be stat'd.
     mtime: ?i96 = null,
+    /// Last-observed byte size of the referenced file. Compared
+    /// alongside `mtime`: a same-tick rewrite (two writes within one
+    /// filesystem mtime granule, or a tool that preserves mtime) leaves
+    /// `mtime` unmoved but almost always changes the content length, so
+    /// pairing the two catches stale parses `mtime` alone would miss.
+    /// Null when the file could not be stat'd.
+    size: ?u64 = null,
     /// The parsed referenced flow, or null when it could not be loaded
     /// or parsed. Owns its own arena — freed + replaced on re-resolve
     /// and on tab close.
     doc: ?flow_io.FlowDoc = null,
     /// True when `doc` is the result of a *successful* load. Only then
-    /// is `mtime` authoritative: a failed load leaves this false so the
-    /// next frame re-attempts the load instead of trusting a stale
-    /// mtime (a fixed-contents file must recover even if its mtime
-    /// hasn't moved).
+    /// are `mtime` + `size` authoritative: a failed load leaves this
+    /// false so the next frame re-attempts the load instead of trusting
+    /// a stale mtime/size (a fixed-contents file must recover even if
+    /// its mtime hasn't moved).
     loaded_ok: bool = false,
     /// The `FlowDocState.frame_seq` value at which this entry was last
     /// resolved. Used to collapse repeated resolutions of the same flow
@@ -680,9 +689,10 @@ fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Nod
 /// falls back to the binding-derived pins.
 ///
 /// The result is cached on `FlowDocState.resolved`, keyed by name plus
-/// the referenced file's mtime: the file is parsed once and the parse
-/// reused across frames, re-done only when the file changes on disk
-/// (mirroring `flow.zig`'s mtime-keyed re-derivation). The returned
+/// the referenced file's mtime + size: the file is parsed once and the
+/// parse reused across frames, re-done only when the file changes on
+/// disk (mirroring `flow.zig`'s mtime-keyed re-derivation; size is in
+/// the key too so a same-tick rewrite still re-resolves). The returned
 /// pointer borrows the cache entry's arena — valid until the next call
 /// that re-resolves the same name or the tab closes.
 ///
@@ -696,6 +706,46 @@ fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Nod
 ///     the load — a referenced file fixed in place (contents changed,
 ///     mtime unchanged) recovers instead of staying unresolved.
 fn resolveSubflow(
+    s: *FlowDocState,
+    allocator: std.mem.Allocator,
+    flow_ref: []const u8,
+) ?*const flow_io.FlowDoc {
+    return resolveSubflowImpl(s, allocator, flow_ref);
+}
+
+/// Decide whether a cached `ResolvedFlow` can be reused without
+/// re-parsing the referenced file.
+///
+/// A cache entry is fresh only when its last load *succeeded*
+/// (`loaded_ok`) **and** the referenced file's currently-observed
+/// `mtime` *and* `size` both still match what was cached. Size is
+/// compared alongside mtime so a same-tick rewrite — two writes within
+/// one filesystem mtime granule, or a tool that preserves mtime — is
+/// still detected: the content length changes even when the mtime
+/// doesn't. A failed load (`loaded_ok = false`) is never fresh, so a
+/// fixed-contents file recovers on the next frame even if its mtime +
+/// size haven't moved.
+///
+/// Pure so the no-zgui `zig build test` target can exercise it (the
+/// rest of `resolveSubflow` touches `FlowDocState`, which pulls in the
+/// imgui stack that target excludes).
+pub fn resolvedFlowIsFresh(
+    loaded_ok: bool,
+    cached_mtime: ?i96,
+    cached_size: ?u64,
+    cur_mtime: ?i96,
+    cur_size: ?u64,
+) bool {
+    if (!loaded_ok) return false;
+    // A failed stat leaves both observations null; a null cached side
+    // means nothing authoritative was ever recorded. Either way, don't
+    // trust the cache — re-resolve.
+    if (cur_mtime == null or cur_size == null) return false;
+    if (cached_mtime == null or cached_size == null) return false;
+    return cached_mtime == cur_mtime and cached_size == cur_size;
+}
+
+fn resolveSubflowImpl(
     s: *FlowDocState,
     allocator: std.mem.Allocator,
     flow_ref: []const u8,
@@ -732,23 +782,26 @@ fn resolveSubflow(
     // node display the *current* flow's own pins.
     if (sameFileOnDisk(ref_path, s.path)) return null;
 
-    // Stat the referenced file for its mtime. A failed stat (missing
-    // file) leaves `cur_mtime` null — still cacheable as "unresolved".
-    const cur_mtime: ?i96 = blk: {
+    // Stat the referenced file for its mtime + size. A failed stat
+    // (missing file) leaves both null — still cacheable as "unresolved".
+    // Size is compared alongside mtime so a same-tick rewrite that
+    // doesn't advance the mtime still re-resolves (content length
+    // changes even when the mtime granule doesn't).
+    const cur_mtime: ?i96, const cur_size: ?u64 = blk: {
         const io = io_global.io();
-        const file = std.Io.Dir.cwd().openFile(io, ref_path, .{}) catch break :blk null;
+        const file = std.Io.Dir.cwd().openFile(io, ref_path, .{}) catch break :blk .{ null, null };
         defer file.close(io);
-        const st = file.stat(io) catch break :blk null;
-        break :blk st.mtime.nanoseconds;
+        const st = file.stat(io) catch break :blk .{ null, null };
+        break :blk .{ st.mtime.nanoseconds, st.size };
     };
 
     if (entry) |e| {
         // Cache hit (first time this frame). Reuse the existing parse
         // only when the previous load *succeeded* and the file hasn't
-        // changed on disk. A previously failed load (`loaded_ok` false)
-        // always re-attempts — a fixed file must recover even if its
-        // mtime didn't move.
-        if (e.loaded_ok and e.mtime == cur_mtime) {
+        // changed on disk — both mtime *and* size must match. A
+        // previously failed load (`loaded_ok` false) always re-attempts
+        // — a fixed file must recover even if its mtime didn't move.
+        if (resolvedFlowIsFresh(e.loaded_ok, e.mtime, e.size, cur_mtime, cur_size)) {
             e.last_frame = s.frame_seq;
             return if (e.doc) |*d| d else null;
         }
@@ -756,10 +809,13 @@ fn resolveSubflow(
         e.deinit();
         e.doc = loadReferencedFlow(allocator, ref_path);
         e.loaded_ok = e.doc != null;
-        // Only pin the mtime when the load succeeded; on failure leave
-        // it untouched so the next frame's `cur_mtime` comparison can't
-        // short-circuit the retry.
-        if (e.loaded_ok) e.mtime = cur_mtime;
+        // Only pin the mtime + size when the load succeeded; on failure
+        // leave them untouched so the next frame's freshness comparison
+        // can't short-circuit the retry.
+        if (e.loaded_ok) {
+            e.mtime = cur_mtime;
+            e.size = cur_size;
+        }
         e.last_frame = s.frame_seq;
         return if (e.doc) |*d| d else null;
     }
@@ -771,10 +827,13 @@ fn resolveSubflow(
     var new_entry: ResolvedFlow = .{ .name = name_dup, .last_frame = s.frame_seq };
     new_entry.doc = loadReferencedFlow(allocator, ref_path);
     new_entry.loaded_ok = new_entry.doc != null;
-    // Only treat the mtime as authoritative on a successful load (see
-    // above) — a failed first load keeps `mtime` null and `loaded_ok`
+    // Only treat the mtime + size as authoritative on a successful load
+    // (see above) — a failed first load keeps them null and `loaded_ok`
     // false so the next frame retries.
-    if (new_entry.loaded_ok) new_entry.mtime = cur_mtime;
+    if (new_entry.loaded_ok) {
+        new_entry.mtime = cur_mtime;
+        new_entry.size = cur_size;
+    }
     s.resolved.append(allocator, new_entry) catch {
         // Append failed — free the parse we just did rather than leak.
         var tmp = new_entry;
