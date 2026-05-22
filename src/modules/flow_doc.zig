@@ -165,26 +165,45 @@ fn renderCanvas(s: *FlowDocState) void {
     // Edges. Pin ids are recomputed from the endpoint's node + pin
     // name; a pin that doesn't exist on the node still gets a stable
     // synthetic id so the link draws.
-    for (s.doc.edges, 0..) |e, i| {
+    for (s.doc.edges) |e| {
         const from_pin = pinId(e.from_node, e.from_pin, .output);
         const to_pin = pinId(e.to_node, e.to_pin, .input);
-        const link_id: u64 = 0x1_0000_0000 + @as(u64, @intCast(i));
-        _ = ne.link(link_id, from_pin, to_pin, .{ 0.4, 0.8, 1.0, 1.0 }, 1.5);
+        _ = ne.link(linkId(e), from_pin, to_pin, .{ 0.4, 0.8, 1.0, 1.0 }, 1.5);
     }
+}
+
+/// Deterministic global link id for an edge.
+///
+/// Derived from a hash of the edge's four endpoint components, with bit
+/// 63 forced set so the id can never collide with a node id (small
+/// integers) or a pin id (`pinId` only ever sets bits up to 62). Hashing
+/// the endpoints — rather than using the edge's array index — keeps the
+/// id stable when edges are added or removed, so the node editor's
+/// per-link selection state doesn't jump to a different edge after an
+/// edit.
+fn linkId(e: flow_io.Edge) u64 {
+    var h = std.hash.Wyhash.init(0x11f0);
+    h.update(std.mem.asBytes(&e.from_node));
+    h.update(e.from_pin);
+    h.update(&[_]u8{0}); // delimiter so (pin "ab"|node) ≠ (pin "a"|"b"node)
+    h.update(std.mem.asBytes(&e.to_node));
+    h.update(e.to_pin);
+    return (h.final() & 0x7FFF_FFFF_FFFF_FFFF) | (@as(u64, 1) << 63);
 }
 
 const PinDir = enum { input, output };
 
 /// Deterministic global pin id from a node id, pin name, and
-/// direction. The node id occupies the low 20 bits, a name hash the
-/// next bits, and the direction the top bit — collisions across the
-/// graphs we author are astronomically unlikely and a collision only
-/// costs a mis-drawn link, never data loss.
+/// direction. Layout: bits 0–29 a name hash, bits 30–61 the node id,
+/// bit 62 the direction (set for outputs). Bit 63 is left clear so the
+/// whole pin-id space stays disjoint from link ids (`linkId` always
+/// sets bit 63). Collisions within the name-hash bits are astronomically
+/// unlikely and only cost a mis-drawn link, never data loss.
 fn pinId(node: u32, name: []const u8, dir: PinDir) u64 {
     var h = std.hash.Wyhash.init(node);
     h.update(name);
     const base = (h.final() & 0x3FFF_FFFF) | (@as(u64, node) << 30);
-    return if (dir == .output) base | (1 << 62) else base;
+    return if (dir == .output) base | (@as(u64, 1) << 62) else base;
 }
 
 fn renderNodeBody(s: *FlowDocState, n: flow_io.Node) void {
@@ -290,7 +309,14 @@ fn renderParamsEditor(s: *FlowDocState) void {
         const def_id = std.fmt.bufPrintZ(&id_buf, "##pdef{d}", .{i}) catch "##pd";
         if (zgui.inputText(def_id, .{ .buf = &def_buf })) {
             const txt = std.mem.sliceTo(&def_buf, 0);
-            p.default_text = if (txt.len == 0) null else (dupZ(a, &def_buf) catch p.default_text);
+            // The raw text is normalised to canonical JSON value text so
+            // a save can never emit invalid `.flow.jsonc` — a bare word
+            // becomes a quoted string, `25` stays `25`. Blank → no
+            // default (the param must then be wired or bound).
+            p.default_text = if (txt.len == 0)
+                null
+            else
+                (flow_io.normalizeValueText(a, txt) catch p.default_text);
             s.is_dirty = true;
         }
         zgui.sameLine(.{});
@@ -432,7 +458,10 @@ fn renderBindingsEditor(s: *FlowDocState, n: *flow_io.Node) void {
         seedBuf(&val_buf, b.value_text);
         const val_id = std.fmt.bufPrintZ(&id_buf, "##bv{d}", .{i}) catch "##bv";
         if (zgui.inputText(val_id, .{ .buf = &val_buf })) {
-            b.value_text = dupZ(a, &val_buf) catch b.value_text;
+            // Normalise so the bound literal is always valid JSON text;
+            // see `renderParamsEditor` for the rationale.
+            const txt = std.mem.sliceTo(&val_buf, 0);
+            b.value_text = flow_io.normalizeValueText(a, txt) catch b.value_text;
             s.is_dirty = true;
         }
         zgui.sameLine(.{});
@@ -442,15 +471,25 @@ fn renderBindingsEditor(s: *FlowDocState, n: *flow_io.Node) void {
     zgui.textDisabled("(param name / JSON literal — e.g. 25 or \"txt\")", .{});
 
     if (zgui.button("+ Add binding", .{})) {
-        n.bindings = growBindings(a, n.bindings, .{
+        // Only mark dirty if the grow actually succeeded — a failed
+        // allocation leaves `n.bindings` unchanged.
+        if (growBindings(a, n.bindings, .{
             .name = "param",
             .value_text = "0",
-        }) catch n.bindings;
-        s.is_dirty = true;
+        })) |grown| {
+            n.bindings = grown;
+            s.is_dirty = true;
+        } else |err| {
+            std.log.err("flow: add binding failed: {s}", .{@errorName(err)});
+        }
     }
     if (remove_idx) |idx| {
-        n.bindings = removeAt(flow_io.Binding, a, n.bindings, idx) catch n.bindings;
-        s.is_dirty = true;
+        if (removeAt(flow_io.Binding, a, n.bindings, idx)) |shrunk| {
+            n.bindings = shrunk;
+            s.is_dirty = true;
+        } else |err| {
+            std.log.err("flow: remove binding failed: {s}", .{@errorName(err)});
+        }
     }
 }
 

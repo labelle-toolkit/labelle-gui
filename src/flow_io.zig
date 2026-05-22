@@ -213,6 +213,11 @@ pub const ParseError = error{
     DuplicateNodeId,
     BadNodeType,
     BadEdge,
+    /// A top-level key (`name`, `event`, `params`, `nodes`, `edges`) or a
+    /// nested field held a value of the wrong JSON type. The parser
+    /// rejects malformed schema rather than silently substituting a
+    /// default — a silent default would mask data the author intended.
+    BadSchema,
 } || std.json.ParseError(std.json.Scanner) || std.mem.Allocator.Error;
 
 /// Read and parse a `.flow.jsonc` file from disk.
@@ -250,31 +255,34 @@ pub fn parse(child_allocator: std.mem.Allocator, raw: []const u8) !FlowDoc {
 
     // ── name ──
     if (root.get("name")) |v| {
-        if (v == .string) doc.name = try a.dupe(u8, v.string);
+        if (v != .string) return ParseError.BadSchema;
+        doc.name = try a.dupe(u8, v.string);
     }
 
     // ── event ──
     if (root.get("event")) |v| {
-        if (v == .object) doc.event = try parseEvent(a, v.object);
+        if (v != .object) return ParseError.BadSchema;
+        doc.event = try parseEvent(a, v.object);
     }
 
     // ── params ──
     if (root.get("params")) |v| {
-        if (v == .array) doc.params = try parseParams(a, v.array);
+        if (v != .array) return ParseError.BadSchema;
+        doc.params = try parseParams(a, v.array);
     }
 
     // ── nodes ──
     if (root.get("nodes")) |v| {
-        if (v == .array) {
-            const r = try parseNodes(a, v.array);
-            doc.nodes = r.nodes;
-            doc.max_node_id = r.max_id;
-        }
+        if (v != .array) return ParseError.BadSchema;
+        const r = try parseNodes(a, v.array);
+        doc.nodes = r.nodes;
+        doc.max_node_id = r.max_id;
     }
 
     // ── edges ──
     if (root.get("edges")) |v| {
-        if (v == .array) doc.edges = try parseEdges(a, v.array);
+        if (v != .array) return ParseError.BadSchema;
+        doc.edges = try parseEdges(a, v.array);
     }
 
     return doc;
@@ -287,9 +295,8 @@ fn parseEvent(a: std.mem.Allocator, obj: std.json.ObjectMap) !Event {
     while (it.next()) |entry| {
         const key = entry.key_ptr.*;
         if (std.mem.eql(u8, key, "type")) {
-            if (entry.value_ptr.* == .string) {
-                ev.type_name = try a.dupe(u8, entry.value_ptr.string);
-            }
+            if (entry.value_ptr.* != .string) return ParseError.BadSchema;
+            ev.type_name = try a.dupe(u8, entry.value_ptr.string);
             continue;
         }
         try extras.append(a, .{
@@ -305,13 +312,18 @@ fn parseEvent(a: std.mem.Allocator, obj: std.json.ObjectMap) !Event {
 fn parseParams(a: std.mem.Allocator, arr: std.json.Array) ![]Param {
     var out: std.ArrayList(Param) = .empty;
     for (arr.items) |item| {
-        if (item != .object) continue;
+        if (item != .object) return ParseError.BadSchema;
         const o = item.object;
-        const name = if (o.get("name")) |n| (if (n == .string) n.string else "") else "";
-        const type_name = if (o.get("type")) |t| (if (t == .string) t.string else "f32") else "f32";
+        // `name` and `type` are required identifier strings — a missing
+        // or wrong-typed field is malformed schema, not a defaultable
+        // omission.
+        const name_v = o.get("name") orelse return ParseError.BadSchema;
+        if (name_v != .string) return ParseError.BadSchema;
+        const type_v = o.get("type") orelse return ParseError.BadSchema;
+        if (type_v != .string) return ParseError.BadSchema;
         var p: Param = .{
-            .name = try a.dupe(u8, name),
-            .type_name = try a.dupe(u8, type_name),
+            .name = try a.dupe(u8, name_v.string),
+            .type_name = try a.dupe(u8, type_v.string),
         };
         if (o.get("default")) |d| {
             p.default_text = try jsonValueToText(a, d);
@@ -326,6 +338,7 @@ const NodesResult = struct { nodes: []Node, max_id: u32 };
 fn parseNodes(a: std.mem.Allocator, arr: std.json.Array) !NodesResult {
     var out: std.ArrayList(Node) = .empty;
     var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer seen.deinit(a);
     var max_id: u32 = 0;
 
     for (arr.items) |item| {
@@ -333,10 +346,7 @@ fn parseNodes(a: std.mem.Allocator, arr: std.json.Array) !NodesResult {
         const o = item.object;
 
         const id_v = o.get("id") orelse return ParseError.MissingNodeId;
-        const id: u32 = switch (id_v) {
-            .integer => |n| std.math.cast(u32, n) orelse return ParseError.MissingNodeId,
-            else => return ParseError.MissingNodeId,
-        };
+        const id = jsonIntId(id_v) orelse return ParseError.MissingNodeId;
         if (seen.contains(id)) return ParseError.DuplicateNodeId;
         try seen.put(a, id, {});
         if (id > max_id) max_id = id;
@@ -368,28 +378,27 @@ fn parseNodes(a: std.mem.Allocator, arr: std.json.Array) !NodesResult {
                 std.mem.eql(u8, key, "type") or
                 std.mem.eql(u8, key, "pos")) continue;
 
+            // A modeled structural key with the wrong JSON type is
+            // malformed schema. Tolerating it would route the value
+            // into `extras` and emit a duplicate key on the next save.
             if (kind == .subflow and std.mem.eql(u8, key, "flow")) {
-                if (entry.value_ptr.* == .string) {
-                    node.flow_ref = try a.dupe(u8, entry.value_ptr.string);
-                }
+                if (entry.value_ptr.* != .string) return ParseError.BadSchema;
+                node.flow_ref = try a.dupe(u8, entry.value_ptr.string);
                 continue;
             }
             if (kind == .subflow and std.mem.eql(u8, key, "bindings")) {
-                if (entry.value_ptr.* == .object) {
-                    node.bindings = try parseBindings(a, entry.value_ptr.object);
-                }
+                if (entry.value_ptr.* != .object) return ParseError.BadSchema;
+                node.bindings = try parseBindings(a, entry.value_ptr.object);
                 continue;
             }
             if (kind == .param and std.mem.eql(u8, key, "param")) {
-                if (entry.value_ptr.* == .string) {
-                    node.param_ref = try a.dupe(u8, entry.value_ptr.string);
-                }
+                if (entry.value_ptr.* != .string) return ParseError.BadSchema;
+                node.param_ref = try a.dupe(u8, entry.value_ptr.string);
                 continue;
             }
             if (kind == .output and std.mem.eql(u8, key, "name")) {
-                if (entry.value_ptr.* == .string) {
-                    node.output_name = try a.dupe(u8, entry.value_ptr.string);
-                }
+                if (entry.value_ptr.* != .string) return ParseError.BadSchema;
+                node.output_name = try a.dupe(u8, entry.value_ptr.string);
                 continue;
             }
 
@@ -416,13 +425,14 @@ fn parseBindings(a: std.mem.Allocator, obj: std.json.ObjectMap) ![]Binding {
             .value_text = try jsonValueToText(a, entry.value_ptr.*),
         });
     }
-    // Sort by name for a stable writer order.
-    std.mem.sort(Binding, out.items, {}, struct {
-        fn lt(_: void, x: Binding, y: Binding) bool {
-            return std.mem.lessThan(u8, x.name, y.name);
-        }
-    }.lt);
+    // Sort by name for a stable writer order. The writer re-sorts too
+    // (the editor can reorder bindings between parse and save).
+    std.mem.sort(Binding, out.items, {}, bindingLessThan);
     return out.toOwnedSlice(a);
+}
+
+fn bindingLessThan(_: void, x: Binding, y: Binding) bool {
+    return std.mem.lessThan(u8, x.name, y.name);
 }
 
 fn parseEdges(a: std.mem.Allocator, arr: std.json.Array) ![]Edge {
@@ -449,13 +459,34 @@ const Endpoint = struct { node: u32, pin: []const u8 };
 
 fn parseEndpoint(a: std.mem.Allocator, obj: std.json.ObjectMap) !Endpoint {
     const node_v = obj.get("node") orelse return ParseError.BadEdge;
-    const node: u32 = switch (node_v) {
-        .integer => |n| std.math.cast(u32, n) orelse return ParseError.BadEdge,
-        else => return ParseError.BadEdge,
-    };
+    const node = jsonIntId(node_v) orelse return ParseError.BadEdge;
     const pin_v = obj.get("pin") orelse return ParseError.BadEdge;
     if (pin_v != .string) return ParseError.BadEdge;
     return .{ .node = node, .pin = try a.dupe(u8, pin_v.string) };
+}
+
+/// Read a JSON number expected to be a non-negative `u32` node id.
+/// Accepts a plain integer, and also a float (or `number_string`) that
+/// has no fractional part — hand-authored files and exporters often
+/// write `1.0` where the writer would emit `1`. Returns null when the
+/// value is not a whole number in `u32` range.
+fn jsonIntId(v: std.json.Value) ?u32 {
+    switch (v) {
+        .integer => |n| return std.math.cast(u32, n),
+        .float => |f| {
+            if (@floor(f) != f or f < 0 or f > std.math.maxInt(u32)) return null;
+            return @intFromFloat(f);
+        },
+        .number_string => |s| {
+            const n = std.fmt.parseInt(i64, s, 10) catch {
+                const f = std.fmt.parseFloat(f64, s) catch return null;
+                if (@floor(f) != f or f < 0 or f > std.math.maxInt(u32)) return null;
+                return @intFromFloat(f);
+            };
+            return std.math.cast(u32, n);
+        },
+        else => return null,
+    }
 }
 
 fn jsonNumberAsF32(v: std.json.Value) ?f32 {
@@ -542,6 +573,40 @@ fn writeJsonString(a: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8)
         }
     }
     try out.append(a, '"');
+}
+
+/// Normalise free-form editor input into canonical JSON value text
+/// safe to splice into a `.flow.jsonc` file.
+///
+/// `default`s and `Subflow` bindings are typed into a text box by the
+/// user; that raw text must never reach the writer verbatim, or a save
+/// can produce invalid JSON (e.g. an unquoted word, an unterminated
+/// string). The rule:
+///   - If `input` parses as a single JSON value, return its canonical
+///     text (the same form `jsonValueToText` produces — sorted object
+///     keys, escaped strings, compact).
+///   - Otherwise treat `input` as a plain string literal and return it
+///     JSON-quoted and escaped.
+///
+/// This means `25` → `25`, `10.5` → `10.5`, `true` → `true`,
+/// `"hi"` → `"hi"`, but a bare `hello` → `"hello"` and a stray `"`
+/// → `"\""` rather than corrupting the file. The result is owned by
+/// `a`. An empty / whitespace-only input yields `""` (empty JSON
+/// string) so the field still round-trips as valid JSON.
+pub fn normalizeValueText(a: std.mem.Allocator, input: []const u8) ![]const u8 {
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
+    if (trimmed.len == 0) {
+        return a.dupe(u8, "\"\"");
+    }
+    var parsed = std.json.parseFromSlice(std.json.Value, a, trimmed, .{}) catch {
+        // Not valid JSON — fall back to a quoted string literal.
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(a);
+        try writeJsonString(a, &out, trimmed);
+        return out.toOwnedSlice(a);
+    };
+    defer parsed.deinit();
+    return jsonValueToText(a, parsed.value);
 }
 
 fn sortKeyValues(items: []KeyValue) void {
@@ -667,8 +732,15 @@ fn renderNode(a: std.mem.Allocator, out: *std.ArrayList(u8), n: Node) !void {
             try out.appendSlice(a, ", \"flow\": ");
             try writeJsonString(a, out, n.flow_ref);
             if (n.bindings.len > 0) {
+                // The editor may have renamed or appended bindings since
+                // parse, leaving `n.bindings` unsorted. Sort a local copy
+                // here so the on-disk key order is deterministic and a
+                // re-save is idempotent regardless of edit history.
+                const sorted = try a.dupe(Binding, n.bindings);
+                defer a.free(sorted);
+                std.mem.sort(Binding, sorted, {}, bindingLessThan);
                 try out.appendSlice(a, ", \"bindings\": { ");
-                for (n.bindings, 0..) |b, i| {
+                for (sorted, 0..) |b, i| {
                     if (i > 0) try out.appendSlice(a, ", ");
                     try writeJsonString(a, out, b.name);
                     try out.appendSlice(a, ": ");
@@ -843,4 +915,97 @@ test "empty graph round-trips" {
 test "displayNameFromPath strips extension" {
     try std.testing.expectEqualStrings("enemy_tick", displayNameFromPath("a/b/enemy_tick.flow.jsonc"));
     try std.testing.expectEqualStrings("other.zig", displayNameFromPath("x/other.zig"));
+}
+
+test "parser rejects malformed schema instead of defaulting" {
+    // Wrong-typed top-level keys must error, not silently default.
+    try std.testing.expectError(ParseError.BadSchema, parse(std.testing.allocator,
+        \\{ "name": 42, "nodes": [], "edges": [] }
+    ));
+    try std.testing.expectError(ParseError.BadSchema, parse(std.testing.allocator,
+        \\{ "nodes": {}, "edges": [] }
+    ));
+    try std.testing.expectError(ParseError.BadSchema, parse(std.testing.allocator,
+        \\{ "event": "OnCreate", "nodes": [], "edges": [] }
+    ));
+    // Non-string event type.
+    try std.testing.expectError(ParseError.BadSchema, parse(std.testing.allocator,
+        \\{ "event": { "type": 3 }, "nodes": [], "edges": [] }
+    ));
+    // Param missing required name/type.
+    try std.testing.expectError(ParseError.BadSchema, parse(std.testing.allocator,
+        \\{ "params": [ { "type": "f32" } ], "nodes": [], "edges": [] }
+    ));
+    try std.testing.expectError(ParseError.BadSchema, parse(std.testing.allocator,
+        \\{ "params": [ { "name": 1, "type": "f32" } ], "nodes": [], "edges": [] }
+    ));
+    // Subflow `flow` with the wrong type would otherwise leak into extras.
+    try std.testing.expectError(ParseError.BadSchema, parse(std.testing.allocator,
+        \\{ "nodes": [ { "id": 1, "type": "Subflow", "flow": 9 } ], "edges": [] }
+    ));
+}
+
+test "node and edge ids tolerate float-formatted integers" {
+    const src =
+        \\{
+        \\  "nodes": [ { "id": 1.0, "type": "BinOp" }, { "id": 2.0, "type": "BinOp" } ],
+        \\  "edges": [ { "from": { "node": 1.0, "pin": "x" }, "to": { "node": 2.0, "pin": "a" } } ]
+        \\}
+    ;
+    var doc = try parse(std.testing.allocator, src);
+    defer doc.deinit();
+    try std.testing.expectEqual(@as(u32, 1), doc.nodes[0].id);
+    try std.testing.expectEqual(@as(u32, 2), doc.max_node_id);
+    try std.testing.expectEqual(@as(u32, 1), doc.edges[0].from_node);
+    // A genuine fractional id is still rejected.
+    try std.testing.expectError(ParseError.MissingNodeId, parse(std.testing.allocator,
+        \\{ "nodes": [ { "id": 1.5, "type": "BinOp" } ], "edges": [] }
+    ));
+}
+
+test "normalizeValueText keeps valid JSON, quotes anything else" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { in: []const u8, out: []const u8 }{
+        .{ .in = "25", .out = "25" },
+        .{ .in = "  10.5 ", .out = "10.5" },
+        .{ .in = "true", .out = "true" },
+        .{ .in = "\"hi\"", .out = "\"hi\"" },
+        .{ .in = "hello", .out = "\"hello\"" }, // bare word → quoted
+        .{ .in = "\"", .out = "\"\\\"\"" }, // stray quote → escaped
+        .{ .in = "", .out = "\"\"" }, // blank → empty JSON string
+        .{ .in = "  ", .out = "\"\"" },
+    };
+    for (cases) |c| {
+        const got = try normalizeValueText(a, c.in);
+        defer a.free(got);
+        try std.testing.expectEqualStrings(c.out, got);
+    }
+}
+
+test "binding order is deterministic after an edit reorders the slice" {
+    const src =
+        \\{
+        \\  "nodes": [
+        \\    { "id": 1, "type": "Subflow", "flow": "f",
+        \\      "bindings": { "a": 1, "b": 2 }, "pos": [0, 0] }
+        \\  ],
+        \\  "edges": []
+        \\}
+    ;
+    var doc = try parse(std.testing.allocator, src);
+    defer doc.deinit();
+
+    // Simulate an editor edit that leaves the slice out of sorted order.
+    try std.testing.expectEqual(@as(usize, 2), doc.nodes[0].bindings.len);
+    std.mem.swap(Binding, &doc.nodes[0].bindings[0], &doc.nodes[0].bindings[1]);
+
+    // The writer must still emit a sorted, idempotent result.
+    const text1 = try render(std.testing.allocator, doc);
+    defer std.testing.allocator.free(text1);
+    var doc2 = try parse(std.testing.allocator, text1);
+    defer doc2.deinit();
+    const text2 = try render(std.testing.allocator, doc2);
+    defer std.testing.allocator.free(text2);
+    try std.testing.expectEqualStrings(text1, text2);
+    try std.testing.expect(std.mem.indexOf(u8, text1, "\"a\": 1, \"b\": 2") != null);
 }
