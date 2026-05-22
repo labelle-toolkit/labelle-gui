@@ -12,8 +12,9 @@
 //!     `FlowReferenceCycle` for this; codegen can't generate a finite
 //!     program from an infinitely-nested flow.
 //!   - **An unresolved reference** — a `Subflow` names a flow whose
-//!     `scripts/flows/<name>.flow.jsonc` file doesn't exist or won't
-//!     parse. flow-codegen raises `UnknownFlowRef`.
+//!     effective registry name (RFC §5: the flow's top-level `name`,
+//!     else its filename basename) matches no `.flow.jsonc` file under
+//!     `scripts/flows/`. flow-codegen raises `UnknownFlowRef`.
 //!
 //! The pure walk (`detectCycle`) is decoupled from the filesystem via
 //! a `Resolver` callback so it can be unit-tested with an in-memory
@@ -63,6 +64,11 @@ pub const Chain = struct {
 pub const Report = struct {
     arena: *std.heap.ArenaAllocator,
     status: Status,
+    /// The offending chain rendered as `a → b → c`, built once when the
+    /// report is generated (the chain only changes when the analysis
+    /// re-runs). Empty for a `clean` status. Owned by `arena`, so the
+    /// UI can display it every frame without re-allocating.
+    chain_text: []const u8 = "",
 
     pub fn deinit(self: *Report) void {
         const child = self.arena.child_allocator;
@@ -165,17 +171,29 @@ fn walk(
 
 // ─── Project-backed resolver ────────────────────────────────────────────
 
-/// Resolver context that reads `<flows_dir>/<name>.flow.jsonc` from
-/// disk. Parses each file once and caches its `Subflow` references on
-/// the report arena, so a diamond reference graph reads each file at
-/// most once.
+/// Resolver context that reads referenced flows from a project's
+/// `scripts/flows/` directory.
+///
+/// A `Subflow`'s `flow_ref` is the referenced flow's *effective
+/// registry name* (RFC §5) — its explicit top-level `name`, or the
+/// filename basename when `name` is absent. The on-disk filename can
+/// therefore differ from the registry name a `flow_ref` carries.
+///
+/// To resolve correctly the resolver scans `scripts/flows/*.flow.jsonc`
+/// exactly once (lazily, on first use), parses each flow's effective
+/// name, and builds a `name → path` index. `refs` then keys on that
+/// index. Each referenced flow is parsed at most once; its `Subflow`
+/// references are cached so a diamond reference graph stays cheap.
 const ProjectResolver = struct {
     arena: std.mem.Allocator,
     /// Absolute path of the project's `scripts/flows/` directory.
     flows_dir: []const u8,
     /// flow name → its outgoing Subflow refs (`null` cached for a name
-    /// whose file is missing or unparseable).
+    /// whose flow is missing or unparseable).
     cache: std.StringHashMapUnmanaged(?[]const []const u8) = .empty,
+    /// effective registry name → absolute file path. Built once by
+    /// `ensureIndex`. `null` until the first `refs` call scans the dir.
+    index: ?std.StringHashMapUnmanaged([]const u8) = null,
 
     fn refs(ctx: *anyopaque, name: []const u8) anyerror!?[]const []const u8 {
         const self: *ProjectResolver = @ptrCast(@alignCast(ctx));
@@ -186,20 +204,52 @@ const ProjectResolver = struct {
         return result;
     }
 
-    /// Read and parse `<flows_dir>/<name>.flow.jsonc`, returning the
-    /// distinct non-empty `Subflow` `flow_ref` values it contains.
+    /// Scan `flows_dir` once and index every flow file by its effective
+    /// registry name. A directory that can't be opened yields an empty
+    /// index (every reference then resolves to `unresolved`).
+    fn ensureIndex(self: *ProjectResolver) !*std.StringHashMapUnmanaged([]const u8) {
+        if (self.index) |*idx| return idx;
+        self.index = .empty;
+        const idx = &self.index.?;
+
+        const io = io_global.io();
+        var dir = std.Io.Dir.cwd().openDir(
+            io,
+            self.flows_dir,
+            .{ .iterate = true },
+        ) catch return idx;
+        defer dir.close(io);
+
+        var it = dir.iterate();
+        while (it.next(io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, flow_io.extension)) continue;
+
+            const full = try std.fs.path.join(
+                self.arena,
+                &.{ self.flows_dir, entry.name },
+            );
+            // Effective name = top-level `name`, else filename basename.
+            var doc = flow_io.loadFromFile(self.arena, full) catch continue;
+            const eff = if (doc.name) |n|
+                try self.arena.dupe(u8, n)
+            else
+                try self.arena.dupe(u8, flow_io.displayNameFromPath(entry.name));
+            doc.deinit();
+
+            // First file wins on a duplicate name — deterministic and
+            // matches flow-codegen's "ambiguous registry key" handling.
+            if (!idx.contains(eff)) try idx.put(self.arena, eff, full);
+        }
+        return idx;
+    }
+
+    /// Resolve `name` to its flow file via the registry-name index,
+    /// parse it, and return the distinct non-empty `Subflow` `flow_ref`
+    /// values it contains. `null` when no flow has that effective name.
     fn loadRefs(self: *ProjectResolver, name: []const u8) !?[]const []const u8 {
-        const path = try std.fs.path.join(
-            self.arena,
-            &.{ self.flows_dir, name },
-        );
-        // `name` is a bare flow name; the on-disk file adds the
-        // extension. Build `<flows_dir>/<name>.flow.jsonc`.
-        const full = try std.fmt.allocPrint(
-            self.arena,
-            "{s}{s}",
-            .{ path, flow_io.extension },
-        );
+        const idx = try self.ensureIndex();
+        const full = idx.get(name) orelse return null;
 
         var doc = flow_io.loadFromFile(self.arena, full) catch return null;
         defer doc.deinit();
@@ -274,7 +324,23 @@ pub fn analyze(
     };
 
     const status = try detectCycle(a, entry_name, resolver);
-    return .{ .arena = arena, .status = status };
+
+    // Render the offending chain once, here, while the report is
+    // generated — the chain only changes when the analysis re-runs, so
+    // the UI never needs to rebuild it per frame.
+    var chain_text: []const u8 = "";
+    const chain: ?Chain = switch (status) {
+        .clean => null,
+        .cycle => |c| c,
+        .unresolved => |c| c,
+    };
+    if (chain) |c| {
+        var out: std.ArrayList(u8) = .empty;
+        try c.format(&out, a);
+        chain_text = try out.toOwnedSlice(a);
+    }
+
+    return .{ .arena = arena, .status = status, .chain_text = chain_text };
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────

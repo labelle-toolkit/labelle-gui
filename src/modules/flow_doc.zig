@@ -230,23 +230,26 @@ fn effectiveName(s: *const FlowDocState) []const u8 {
 /// Cheap to call every frame: when the reference set is unchanged this
 /// only builds and compares a short joined string and returns.
 fn refreshCycleCheck(s: *FlowDocState) void {
-    const a = s.arena.allocator();
+    // The tab arena (`ArenaAllocator.free` is a no-op) is never used
+    // for per-frame scratch — the snapshot and refs are built on the
+    // child/GPA allocator and freed before this returns. Only the
+    // single stored snapshot persists, and it lives on the arena.
+    const child = s.arena.child_allocator;
 
-    // Build a `\n`-joined snapshot of the current Subflow refs.
+    // Build a `\n`-joined snapshot of the current Subflow refs on the
+    // child allocator so it is reclaimed every frame.
     var snap: std.ArrayList(u8) = .empty;
-    defer snap.deinit(a);
+    defer snap.deinit(child);
     for (s.doc.nodes) |n| {
         if (n.kind != .subflow or n.flow_ref.len == 0) continue;
-        snap.appendSlice(a, n.flow_ref) catch return;
-        snap.append(a, '\n') catch return;
+        snap.appendSlice(child, n.flow_ref) catch return;
+        snap.append(child, '\n') catch return;
     }
 
     if (s.cycle_report != null and
         std.mem.eql(u8, snap.items, s.cycle_refs_snapshot)) return;
 
     // Reference set changed (or first run) — re-analyze.
-    const child = s.arena.child_allocator;
-
     var refs_arena = std.heap.ArenaAllocator.init(child);
     defer refs_arena.deinit();
     const refs = liveSubflowRefs(refs_arena.allocator(), s.doc) catch return;
@@ -261,13 +264,32 @@ fn refreshCycleCheck(s: *FlowDocState) void {
         refs,
         flows_dir,
     ) catch |err| {
+        // The check failed (e.g. OOM, a filesystem error). Drop the
+        // stale report so the banner reflects "not checked" rather than
+        // a now-incorrect cycle/unresolved status, and clear the
+        // snapshot so the next frame retries instead of trusting a
+        // result that was never produced.
         std.log.err("flow: cycle check failed: {s}", .{@errorName(err)});
+        if (s.cycle_report) |*old| old.deinit();
+        s.cycle_report = null;
+        s.cycle_refs_snapshot = "";
+        return;
+    };
+
+    // Duplicate the snapshot onto the tab arena *before* committing the
+    // new report — if the dup fails we keep the old report/snapshot
+    // pair consistent (rather than leaving an empty snapshot that would
+    // re-run the disk-backed analysis every subsequent frame).
+    const new_snapshot = s.arena.allocator().dupe(u8, snap.items) catch {
+        std.log.err("flow: cycle snapshot alloc failed; keeping prior result", .{});
+        var report = new_report;
+        report.deinit();
         return;
     };
 
     if (s.cycle_report) |*old| old.deinit();
     s.cycle_report = new_report;
-    s.cycle_refs_snapshot = a.dupe(u8, snap.items) catch "";
+    s.cycle_refs_snapshot = new_snapshot;
 }
 
 /// Public entry point — `OpenTab.render` dispatches here.
@@ -317,10 +339,14 @@ pub fn render(s: *FlowDocState, app: *App) void {
 /// flow graph is fine (issue #159).
 fn renderCycleBanner(s: *FlowDocState) void {
     const report = &(if (s.cycle_report) |*r| r else return).*;
+    // `chain_text` was rendered once when the report was generated
+    // (`flow_cycle.analyze`) — the banner just displays it, so the tab
+    // arena doesn't grow per frame. A blank string only happens on a
+    // formatting-alloc failure inside `analyze`; show a placeholder.
+    const text = if (report.chain_text.len > 0) report.chain_text else "?";
     switch (report.status) {
         .clean => return,
-        .cycle => |chain| {
-            const text = chainText(s, chain) orelse "?";
+        .cycle => {
             zgui.textColored(
                 .{ 1.0, 0.35, 0.35, 1.0 },
                 "Subflow reference cycle: {s}",
@@ -331,8 +357,7 @@ fn renderCycleBanner(s: *FlowDocState) void {
                 .{},
             );
         },
-        .unresolved => |chain| {
-            const text = chainText(s, chain) orelse "?";
+        .unresolved => {
             zgui.textColored(
                 .{ 1.0, 0.65, 0.2, 1.0 },
                 "Unresolved Subflow reference: {s}",
@@ -344,16 +369,6 @@ fn renderCycleBanner(s: *FlowDocState) void {
             );
         },
     }
-}
-
-/// Render a `flow_cycle.Chain` to an `a → b → c` string on the tab's
-/// arena. Returns null only on an allocation failure (then the caller
-/// shows a placeholder rather than crashing).
-fn chainText(s: *FlowDocState, chain: flow_cycle.Chain) ?[]const u8 {
-    const a = s.arena.allocator();
-    var out: std.ArrayList(u8) = .empty;
-    chain.format(&out, a) catch return null;
-    return out.toOwnedSlice(a) catch null;
 }
 
 // ─── Canvas ─────────────────────────────────────────────────────────────

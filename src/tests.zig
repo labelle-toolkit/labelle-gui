@@ -5594,4 +5594,142 @@ pub const FlowCycleTests = struct {
         defer report.deinit();
         try expect.toBeTrue(report.status == .clean);
     }
+
+    /// Write `<flows_dir>/<file>.flow.jsonc` carrying an explicit
+    /// top-level `name` (its effective registry name) that differs from
+    /// the filename, with a `Subflow` node per entry in `refs`.
+    fn writeNamedFlow(
+        allocator: std.mem.Allocator,
+        flows_dir: []const u8,
+        file: []const u8,
+        reg_name: []const u8,
+        refs: []const []const u8,
+    ) !void {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(allocator);
+        try buf.print(allocator,
+            "{{ \"name\": \"{s}\", \"event\": {{ \"type\": \"OnCall\" }}, \"nodes\": [",
+            .{reg_name});
+        for (refs, 0..) |r, i| {
+            if (i > 0) try buf.append(allocator, ',');
+            try buf.print(allocator,
+                " {{ \"id\": {d}, \"type\": \"Subflow\", \"flow\": \"{s}\", \"pos\": [0, 0] }}",
+                .{ i + 1, r });
+        }
+        try buf.appendSlice(allocator, " ], \"edges\": [] }\n");
+
+        const path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}{s}",
+            .{ flows_dir, file, flow_io.extension },
+        );
+        defer allocator.free(path);
+        try std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = path,
+            .data = buf.items,
+        });
+    }
+
+    test "analyze resolves a reference by registry name, not filename" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // The open doc "a" references "tick_logic" — a registry name.
+        // On disk that flow lives in `b_file.flow.jsonc`, whose
+        // top-level `name` is "tick_logic". Keying on the filename
+        // would mis-report this as unresolved.
+        try writeNamedFlow(allocator, flows_dir, "b_file", "tick_logic", &.{});
+
+        var report = try flow_cycle.analyze(
+            allocator,
+            "a",
+            &.{"tick_logic"},
+            flows_dir,
+        );
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .clean);
+    }
+
+    test "analyze detects a cycle through registry-name resolution" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // a → reg_b → a, where reg_b's flow file is `b_file.flow.jsonc`
+        // (filename ≠ registry name) and it Subflow-references "a".
+        try writeNamedFlow(allocator, flows_dir, "b_file", "reg_b", &.{"a"});
+
+        var report = try flow_cycle.analyze(
+            allocator,
+            "a",
+            &.{"reg_b"},
+            flows_dir,
+        );
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .cycle);
+    }
+
+    test "analyze flags a reference that matches a filename but not a registry name" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // `b_file.flow.jsonc` has registry name "reg_b". A Subflow that
+        // references the *filename* "b_file" must NOT resolve — only the
+        // effective registry name "reg_b" is a valid target.
+        try writeNamedFlow(allocator, flows_dir, "b_file", "reg_b", &.{});
+
+        var report = try flow_cycle.analyze(
+            allocator,
+            "a",
+            &.{"b_file"},
+            flows_dir,
+        );
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .unresolved);
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            report.status.unresolved.names[report.status.unresolved.names.len - 1],
+            "b_file",
+        ));
+    }
+
+    test "analyze still resolves a flow with no name by its filename" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // `plain.flow.jsonc` has no top-level `name`; its effective
+        // registry name falls back to the filename basename "plain".
+        try writeFlow(allocator, flows_dir, "plain", &.{});
+
+        var report = try flow_cycle.analyze(
+            allocator,
+            "a",
+            &.{"plain"},
+            flows_dir,
+        );
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .clean);
+    }
+
+    test "analyze populates chain_text once for a cycle" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        try writeFlow(allocator, flows_dir, "b", &.{"a"});
+
+        var report = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .cycle);
+        // chain_text is rendered at analysis time: a → b → a.
+        try expect.toBeTrue(report.chain_text.len > 0);
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            report.chain_text,
+            "a \u{2192} b \u{2192} a",
+        ));
+    }
 };
