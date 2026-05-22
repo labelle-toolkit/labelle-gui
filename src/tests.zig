@@ -12,6 +12,7 @@ const project_tree = @import("modules/project_tree.zig");
 const viewport = @import("modules/viewport.zig");
 const atlas = @import("atlas.zig");
 const gizmo_io = @import("gizmo_io.zig");
+const flow_io = @import("flow_io.zig");
 const gizmos = @import("gizmos.zig");
 const preview = @import("preview.zig");
 const flow_projector = @import("flows/projector.zig");
@@ -4176,5 +4177,125 @@ pub const SplitterClampTests = struct {
         // so the clamp range stays consistent. Result: the floor.
         const result = splitter.clampInspectorWidth(500, 100, default_gap);
         try expect.equal(result, @as(f32, prefs.min_inspector_width));
+    }
+};
+
+// ─── flow_io: .flow.jsonc reader / writer (RFC issue #153) ──────────────
+
+/// Covers `flow_io.parse` / `flow_io.render` — the `.flow.jsonc` flat
+/// `nodes`+`edges` schema, the `Subflow`/`Param`/`Output` node types,
+/// and the determinism guarantee that a re-save produces stable bytes.
+pub const FlowIoTests = struct {
+    test "parses the flat nodes+edges schema" {
+        const a = std.testing.allocator;
+        const src =
+            \\{
+            \\  // leading comment
+            \\  "name": "enemy_tick",
+            \\  "event": { "type": "OnCreate", "arg_entity": "entity" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "GetComponent", "pos": [0, 0], "component": "Position" },
+            \\    { "id": 3, "type": "BinOp", "op": "add", "pos": [10, 20] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "x" }, "to": { "node": 3, "pin": "a" } }
+            \\  ]
+            \\}
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+        try expect.toBeTrue(std.mem.eql(u8, doc.name.?, "enemy_tick"));
+        try expect.toBeTrue(std.mem.eql(u8, doc.event.type_name, "OnCreate"));
+        try expect.equal(doc.nodes.len, @as(usize, 2));
+        try expect.equal(doc.edges.len, @as(usize, 1));
+        try expect.equal(doc.max_node_id, @as(u32, 3));
+    }
+
+    test "recognises Subflow / Param / Output node types" {
+        const a = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "combat_subgraph",
+            \\  "event": { "type": "OnCall" },
+            \\  "params": [ { "name": "damage", "type": "f32", "default": 10.0 } ],
+            \\  "nodes": [
+            \\    { "id": 2, "type": "Param", "param": "damage", "pos": [0, 0] },
+            \\    { "id": 9, "type": "Output", "name": "dealt", "pos": [0, 0] },
+            \\    { "id": 7, "type": "Subflow", "flow": "combat_subgraph", "bindings": { "damage": 25.0 }, "pos": [240, 60] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+        try expect.equal(doc.params.len, @as(usize, 1));
+        try expect.toBeTrue(std.mem.eql(u8, doc.params[0].name, "damage"));
+        try expect.toBeTrue(doc.params[0].default_text != null);
+        try expect.toBeTrue(doc.nodes[0].kind == .param);
+        try expect.toBeTrue(std.mem.eql(u8, doc.nodes[0].param_ref, "damage"));
+        try expect.toBeTrue(doc.nodes[1].kind == .output);
+        try expect.toBeTrue(std.mem.eql(u8, doc.nodes[1].output_name, "dealt"));
+        try expect.toBeTrue(doc.nodes[2].kind == .subflow);
+        try expect.toBeTrue(std.mem.eql(u8, doc.nodes[2].flow_ref, "combat_subgraph"));
+        try expect.equal(doc.nodes[2].bindings.len, @as(usize, 1));
+    }
+
+    test "re-save is deterministic and idempotent" {
+        const a = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "x",
+            \\  "event": { "type": "OnCreate", "arg_entity": "entity" },
+            \\  "params": [ { "name": "p", "type": "i32", "default": 3 } ],
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Param", "param": "p", "pos": [0, 0] },
+            \\    { "id": 2, "type": "BinOp", "op": "add", "pos": [5, 7] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "a" } }
+            \\  ]
+            \\}
+        ;
+        var doc1 = try flow_io.parse(a, src);
+        defer doc1.deinit();
+        const text1 = try flow_io.render(a, doc1);
+        defer a.free(text1);
+
+        var doc2 = try flow_io.parse(a, text1);
+        defer doc2.deinit();
+        const text2 = try flow_io.render(a, doc2);
+        defer a.free(text2);
+
+        try expect.toBeTrue(std.mem.eql(u8, text1, text2));
+    }
+
+    test "unknown node fields round-trip verbatim" {
+        const a = std.testing.allocator;
+        const src =
+            \\{ "event": { "type": "OnCall" },
+            \\  "nodes": [ { "id": 1, "type": "Literal", "value": 1.5, "pos": [0, 0] } ],
+            \\  "edges": [] }
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+        const text = try flow_io.render(a, doc);
+        defer a.free(text);
+        // The `value` key survived even though the editor doesn't model it.
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"value\"") != null);
+    }
+
+    test "displayNameFromPath strips the .flow.jsonc extension" {
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            flow_io.displayNameFromPath("a/b/enemy_tick.flow.jsonc"),
+            "enemy_tick",
+        ));
+    }
+
+    test "isFlowDocPath matches only .flow.jsonc under scripts/flows" {
+        const dir = "/proj";
+        try expect.toBeTrue(project_tree.isFlowDocPath(dir, "/proj/scripts/flows/a.flow.jsonc"));
+        try expect.toBeTrue(!project_tree.isFlowDocPath(dir, "/proj/scripts/flows/a.zig"));
+        try expect.toBeTrue(!project_tree.isFlowDocPath(dir, "/proj/scenes/a.jsonc"));
     }
 };

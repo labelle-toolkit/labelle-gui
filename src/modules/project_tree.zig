@@ -11,6 +11,7 @@ const App = @import("../app.zig").App;
 const module = @import("../module.zig");
 const config = @import("../config.zig");
 const project = @import("../project.zig");
+const flow_io = @import("../flow_io.zig");
 
 pub fn makeModule(app: *App) module.Module {
     return .{
@@ -39,16 +40,32 @@ pub fn isPrefabPath(proj_dir: ?[]const u8, path: []const u8) bool {
 
 /// Return true when `path` is a `.zig` file under the project's
 /// `scripts/flows/` directory. Drives routing of tree clicks into
-/// the Flow viewer (issues #48 + #49, umbrella #42).
+/// the read-only Flow *viewer* (issues #48 + #49, umbrella #42).
 ///
-/// Schema choice: the visualization layer is *derived* from Zig
-/// scripts. There is no `.flow.*` file format — the source of
-/// truth is the underlying Zig the engine actually compiles. The
-/// gui's projector (`src/flows/projector.zig`) parses the file via
-/// `std.zig.Ast` and renders it as a node graph.
+/// This viewer projects a hand-written Zig script into a node graph
+/// (`src/flows/projector.zig`, via `std.zig.Ast`). The authored
+/// `.flow.jsonc` content format is a separate route — see
+/// `isFlowDocPath` and the Flows-as-`.flow.jsonc` RFC (issue #153).
 pub fn isFlowPath(proj_dir: ?[]const u8, path: []const u8) bool {
     const dir = proj_dir orelse return false;
     if (!std.mem.endsWith(u8, path, ".zig")) return false;
+    var prefix_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const prefix = std.fmt.bufPrint(
+        &prefix_buf,
+        "{s}/{s}/{s}/",
+        .{ dir, project.ProjectFolders.scripts, "flows" },
+    ) catch return false;
+    return std.mem.startsWith(u8, path, prefix);
+}
+
+/// Return true when `path` is a `.flow.jsonc` file under the project's
+/// `scripts/flows/` directory — the *authored* flow-graph content
+/// format (RFC: Flows as `.flow.jsonc`, issue #153). Routes a tree
+/// click into the flow-graph editor (`modules/flow_doc.zig`). Distinct
+/// from `isFlowPath`, which matches the read-only `.zig` viewer.
+pub fn isFlowDocPath(proj_dir: ?[]const u8, path: []const u8) bool {
+    const dir = proj_dir orelse return false;
+    if (!std.mem.endsWith(u8, path, flow_io.extension)) return false;
     var prefix_buf: [std.fs.max_path_bytes]u8 = undefined;
     const prefix = std.fmt.bufPrint(
         &prefix_buf,
@@ -121,6 +138,11 @@ fn render(app: *App) void {
                         app.openPrefab(path) catch |err| {
                             std.log.err("Failed to open prefab {s}: {s}", .{ path, @errorName(err) });
                             app.setStatus("Error opening prefab!");
+                        };
+                    } else if (isFlowDocPath(proj_dir, path)) {
+                        app.openFlowDoc(path) catch |err| {
+                            std.log.err("Failed to open flow {s}: {s}", .{ path, @errorName(err) });
+                            app.setStatus("Error opening flow!");
                         };
                     } else if (isFlowPath(proj_dir, path)) {
                         app.openFlow(path) catch |err| {
