@@ -437,8 +437,21 @@ fn handleLinkDelete(s: *FlowDocState) void {
         // (`acceptDeletedItem`) once the edge is actually gone, and
         // reject it otherwise — so the canvas and `doc.edges` can never
         // disagree after a failed mutation.
-        if (deleteEdgeByLinkId(s, del_id)) {
-            _ = ne.acceptDeletedItem(true);
+        //
+        // `del_id` is a `linkId` captured when the link was emitted at
+        // the top of this frame. `handleLinkCreate` runs *before* this
+        // and can re-route an edge — which changes that edge's `linkId`
+        // (the id is a hash of the edge's endpoints). So a stale
+        // `del_id` may now match nothing. A no-match must be *rejected*,
+        // not accepted: accepting a no-op delete would leave the edge in
+        // `doc.edges` while the editor believed it gone. `false` here
+        // means "no edge matched"; only `true` is a real removal.
+        if (deleteEdgeByLinkId(s, del_id)) |removed| {
+            if (removed) {
+                _ = ne.acceptDeletedItem(true);
+            } else {
+                ne.rejectDeletedItem();
+            }
         } else |err| {
             std.log.err("flow: delete edge failed: {s}", .{@errorName(err)});
             ne.rejectDeletedItem();
@@ -877,9 +890,13 @@ fn rerouteEdge(s: *FlowDocState, idx: usize, out_pin: PinEntry, in_pin: PinEntry
     s.is_dirty = true;
 }
 
-/// Remove the edge whose `linkId` matches `id`. No-op when nothing
-/// matches (the editor may report a delete for a link we don't own).
-fn deleteEdgeByLinkId(s: *FlowDocState, id: u64) !void {
+/// Remove the edge whose `linkId` matches `id`. Returns `true` when an
+/// edge matched and was removed, `false` when nothing matched — the
+/// editor may report a delete for a link we don't own, or for an id
+/// that went stale after a same-frame re-route changed the edge's
+/// `linkId`. The caller must reject the editor's delete on `false` so
+/// the canvas and `doc.edges` stay in agreement.
+fn deleteEdgeByLinkId(s: *FlowDocState, id: u64) !bool {
     const a = s.doc.allocator();
     var idx: ?usize = null;
     for (s.doc.edges, 0..) |e, i| {
@@ -888,9 +905,10 @@ fn deleteEdgeByLinkId(s: *FlowDocState, id: u64) !void {
             break;
         }
     }
-    const i = idx orelse return;
+    const i = idx orelse return false;
     s.doc.edges = try removeAt(flow_io.Edge, a, s.doc.edges, i);
     s.is_dirty = true;
+    return true;
 }
 
 // ─── Slice helpers ──────────────────────────────────────────────────────
