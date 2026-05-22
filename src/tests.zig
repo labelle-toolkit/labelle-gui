@@ -4799,6 +4799,64 @@ pub const FlowIoTests = struct {
         try expect.toBeTrue(std.mem.eql(u8, encoded, "\"Velocity\""));
     }
 
+    test "decodeStringValueBuf decodes into a stack buffer without allocating" {
+        var buf: [128]u8 = undefined;
+
+        // A JSON string decodes to its bare inner text.
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            flow_io.decodeStringValueBuf(&buf, "\"Position\""),
+            "Position",
+        ));
+        // Whitespace around the value is trimmed before decoding.
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            flow_io.decodeStringValueBuf(&buf, "  \"add\" "),
+            "add",
+        ));
+        // A non-string canonical value (number/bool) comes back verbatim.
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            flow_io.decodeStringValueBuf(&buf, "42"),
+            "42",
+        ));
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            flow_io.decodeStringValueBuf(&buf, "true"),
+            "true",
+        ));
+        // An empty value yields an empty slice (no out-of-bounds).
+        try expect.toBeTrue(flow_io.decodeStringValueBuf(&buf, "").len == 0);
+    }
+
+    test "decodeStringValueBuf falls through when the decoded text overflows buf" {
+        // A decoded string longer than the buffer can't be copied in;
+        // the canonical (quoted) text is returned verbatim, truncated to
+        // the buffer rather than overrunning it.
+        var small: [4]u8 = undefined;
+        const out = flow_io.decodeStringValueBuf(&small, "\"abcdefghij\"");
+        try expect.toBeTrue(out.len <= small.len);
+        // Verbatim fall-through keeps the leading quote of the raw text.
+        try expect.toBeTrue(out[0] == '"');
+    }
+
+    test "decodeStringValueBuf agrees with decodeStringValue" {
+        const a = std.testing.allocator;
+        const cases = [_][]const u8{
+            "\"Position\"", "\"add\"", "123", "false", "\"\"",
+        };
+        for (cases) |c| {
+            var buf: [128]u8 = undefined;
+            const allocd = try flow_io.decodeStringValue(a, c);
+            defer a.free(allocd);
+            try expect.toBeTrue(std.mem.eql(
+                u8,
+                flow_io.decodeStringValueBuf(&buf, c),
+                allocd,
+            ));
+        }
+    }
+
     test "displayNameFromPath strips the .flow.jsonc extension" {
         try expect.toBeTrue(std.mem.eql(
             u8,

@@ -812,19 +812,33 @@ fn renderOtherField(s: *FlowDocState, n: *flow_io.Node, spec: flow_io.OtherField
     switch (spec.widget) {
         .op_combo => {
             // `op` is stored as a JSON string (`"add"`); decode to the
-            // bare word to match against the choice list.
-            const decoded = flow_io.decodeStringValue(a, current) catch current;
-            var sel: usize = 0;
+            // bare word to match against the choice list. Decode into a
+            // stack buffer — this runs every frame, so allocating on the
+            // doc arena here would leak for as long as the node stays
+            // selected.
+            var decode_buf: IdentBuf = undefined;
+            const decoded = flow_io.decodeStringValueBuf(&decode_buf, current);
+            // A missing or invalid stored `op` is treated as *no
+            // selection* (blank preview) rather than silently previewing
+            // the first choice. Otherwise picking the displayed default
+            // (`add`) wouldn't register as a change and could never be
+            // committed — the combo would show `add` without it ever
+            // being written to the node.
+            var sel: ?usize = null;
             for (flow_io.bin_ops, 0..) |op, i| {
                 if (std.mem.eql(u8, op, decoded)) sel = i;
             }
             var preview_z: IdentBuf = undefined;
-            seedBuf(&preview_z, flow_io.bin_ops[sel]);
+            seedBuf(&preview_z, if (sel) |i| flow_io.bin_ops[i] else "");
             if (zgui.beginCombo("##other_op", .{ .preview_value = &preview_z })) {
                 for (flow_io.bin_ops, 0..) |op, i| {
                     var op_z: IdentBuf = undefined;
                     seedBuf(&op_z, op);
-                    if (zgui.selectable(&op_z, .{ .selected = i == sel })) {
+                    if (zgui.selectable(&op_z, .{ .selected = sel == i })) {
+                        // `selectable` fires on every click — commit even
+                        // when the picked op equals the previewed one, so
+                        // selecting `add` on a node with no valid `op`
+                        // still writes and marks the doc dirty.
                         const encoded = flow_io.encodeStringValue(a, op) catch return;
                         flow_io.setExtraValue(a, n, spec.key, encoded) catch return;
                         s.is_dirty = true;
@@ -835,8 +849,11 @@ fn renderOtherField(s: *FlowDocState, n: *flow_io.Node, spec: flow_io.OtherField
         },
         .text => {
             // Identifier-like fields are stored as JSON strings; the
-            // widget edits the bare inner text.
-            const decoded = flow_io.decodeStringValue(a, current) catch current;
+            // widget edits the bare inner text. Decode into a stack
+            // buffer — see `.op_combo` above: a per-frame doc-arena
+            // allocation here would leak while the node stays selected.
+            var decode_buf: IdentBuf = undefined;
+            const decoded = flow_io.decodeStringValueBuf(&decode_buf, current);
             var buf: IdentBuf = undefined;
             seedBuf(&buf, decoded);
             if (zgui.inputText("##other_text", .{ .buf = &buf })) {

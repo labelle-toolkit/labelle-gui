@@ -266,6 +266,48 @@ pub fn decodeStringValue(a: std.mem.Allocator, value_text: []const u8) ![]const 
     return a.dupe(u8, parsed.value.string);
 }
 
+/// Buffer-backed variant of `decodeStringValue` — decodes a JSON-string
+/// `extras` value into the caller-provided `buf` and returns a slice
+/// into it, allocating nothing on any persistent allocator. Used by
+/// per-frame inspector widgets so they don't leak onto the document
+/// arena (one decode per frame for as long as a node stays selected).
+///
+/// The transient JSON parse runs against an internal stack-backed
+/// `FixedBufferAllocator` whose scratch space is reclaimed on return —
+/// nothing it allocates escapes.
+///
+/// When the stored value isn't a JSON string, or the decoded text would
+/// not fit in `buf`, the canonical text is copied verbatim (truncated to
+/// `buf` if necessary) — the same fall-through `decodeStringValue` uses.
+pub fn decodeStringValueBuf(buf: []u8, value_text: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, value_text, " \t\r\n");
+    const verbatim = blk: {
+        const n = @min(buf.len, trimmed.len);
+        @memcpy(buf[0..n], trimmed[0..n]);
+        break :blk buf[0..n];
+    };
+    if (trimmed.len < 2 or trimmed[0] != '"') return verbatim;
+
+    // Scratch space for the transient parse. A JSON-string `extras`
+    // value is small (an operator word, a component/identifier name);
+    // 1 KiB comfortably covers any realistic field plus parser slack,
+    // and the fall-through handles anything larger gracefully.
+    var scratch: [1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        fba.allocator(),
+        trimmed,
+        .{},
+    ) catch return verbatim;
+    defer parsed.deinit();
+    if (parsed.value != .string) return verbatim;
+    const inner = parsed.value.string;
+    if (inner.len > buf.len) return verbatim;
+    @memcpy(buf[0..inner.len], inner);
+    return buf[0..inner.len];
+}
+
 /// Canonical JSON text for a plain string value — the form a `.text`
 /// widget's input must be stored as so the writer emits valid JSON.
 pub fn encodeStringValue(a: std.mem.Allocator, raw: []const u8) ![]const u8 {
