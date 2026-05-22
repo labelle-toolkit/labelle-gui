@@ -3728,6 +3728,46 @@ pub const PreviewLiveStderrTests = struct {
         _ = nanosleep(&ts, null);
     }
 
+    extern "c" fn connect(fd: c_int, addr: *const std.posix.sockaddr.in, len: std.posix.socklen_t) c_int;
+    extern "c" fn write(fd: c_int, buf: [*]const u8, len: usize) isize;
+    extern "c" fn close(fd: c_int) c_int;
+
+    /// Dial the editor's listener as a freshly-spawned engine would.
+    /// Mirrors `PreviewTransportTests.dialEditor`.
+    fn dialEditor(port: u16) !c_int {
+        const sock_fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+        if (sock_fd < 0) return error.SocketFailed;
+        const addr: std.posix.sockaddr.in = .{
+            .family = std.posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, port),
+            .addr = std.mem.nativeToBig(u32, 0x7F000001),
+            .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        };
+        const rc = connect(@intCast(sock_fd), &addr, @sizeOf(@TypeOf(addr)));
+        if (rc < 0) return error.ConnectFailed;
+        return @intCast(sock_fd);
+    }
+
+    fn sendJsonLine(fd: c_int, body: []const u8) !void {
+        var off: usize = 0;
+        while (off < body.len) {
+            const n = write(fd, body.ptr + off, body.len - off);
+            if (n <= 0) return error.WriteFailed;
+            off += @intCast(n);
+        }
+    }
+
+    fn waitUntilState(p: *preview.PreviewSession, target: preview.State, deadline_ms: u64) !void {
+        var slept: u64 = 0;
+        while (slept < deadline_ms) {
+            p.poll();
+            if (p.state == target) return;
+            sleepMs(2);
+            slept += 2;
+        }
+        return error.DeadlineExceeded;
+    }
+
     test "stderr_buf rotates when over cap so live tail keeps surfacing recent bytes" {
         // The non-rotating version of `drainChildStderr` froze at 16
         // KiB — once full it stopped appending, hiding the build
@@ -3841,17 +3881,31 @@ pub const PreviewLiveStderrTests = struct {
     // is the engine shutting itself down — the user closed the game
     // window. It must land in `.stopped`, NOT `.crashed`, even when no
     // `bye` frame ever arrives. `/usr/bin/true` exits 0 immediately.
+    //
+    // This exercises the *real* EOF-vs-waitpid race: a genuine engine
+    // shutdown closes its TCP socket as it tears down, so a single
+    // `poll` sees the socket EOF (`tryRead`) *before* `waitpid` reaps
+    // the child (`tryWaitChild`). The session has a live `conn_fd`
+    // here — `tryRead` runs first, observes EOF, and must defer to the
+    // clean-exit detection instead of unconditionally `markCrashed`.
+    // The earlier version of this test forced `.running` with
+    // `conn_fd == -1`, so `tryRead` early-returned and never saw EOF —
+    // it passed even with the race bug present.
     test "clean child exit while running lands in .stopped not .crashed" {
         var sess = preview.PreviewSession.init(std.testing.allocator);
         defer sess.deinit();
+
+        // Establish a real connected engine socket and reach `.running`
+        // via the `hello` handshake, so `sess.conn_fd >= 0` and
+        // `tryRead` is live.
         try sess.bindListener();
+        const engine_fd = try dialEditor(sess.port.?);
+        try waitUntilState(&sess, .connecting, 500);
+        try sendJsonLine(engine_fd, "{\"kind\":\"hello\",\"engine_version\":\"\",\"pid\":1,\"protocol_version\":1}\n");
+        try waitUntilState(&sess, .running, 500);
 
-        // Force the session into `.running` without a real engine:
-        // the child-exit logic keys off `state`. `last_rx_ms` stays
-        // `null` so the heartbeat watchdog is inert — this test
-        // isolates the clean-exit path in `tryWaitChild`.
-        sess.state = .running;
-
+        // Attach a child that exits cleanly (code 0) — the subprocess
+        // half of a normal Run → play → close-window shutdown.
         const argv = &[_][]const u8{"/usr/bin/true"};
         const child = std.process.spawn(io_global.io(), .{
             .argv = argv,
@@ -3859,10 +3913,20 @@ pub const PreviewLiveStderrTests = struct {
             .stdout = .ignore,
             .stderr = .pipe,
         }) catch |err| {
+            _ = close(engine_fd);
             std.debug.print("skip: /usr/bin/true unavailable ({s})\n", .{@errorName(err)});
             return error.SkipZigTest;
         };
         sess.child = child;
+
+        // Let the child fully exit, then close the engine-side socket —
+        // this is the shutdown ordering a real engine produces (socket
+        // FIN delivered, zombie waiting to be reaped). The very next
+        // `poll` now has BOTH a pending EOF on `conn_fd` and a
+        // reapable zombie, racing exactly as #79 describes.
+        sleepMs(100);
+        _ = close(engine_fd);
+        sleepMs(20);
 
         var slept: u64 = 0;
         while (slept < 2000) {
@@ -3872,6 +3936,11 @@ pub const PreviewLiveStderrTests = struct {
             slept += 5;
         }
         try expect.equal(sess.state, preview.State.stopped);
+        // The reason must come from the clean exit-code path, not the
+        // EOF "connection closed" crash string — that's how we know
+        // `tryRead` deferred to `tryWaitChild` rather than preempting it.
+        const reason = sess.bye_reason orelse "";
+        try expect.toBeTrue(std.mem.indexOf(u8, reason, "labelle exited") != null);
     }
 };
 

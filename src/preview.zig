@@ -796,7 +796,21 @@ pub const PreviewSession = struct {
         // The `.stopped` check matches both the bye-then-close
         // clean shutdown and a manual `stop()` racing the EOF.
         if (saw_eof and self.state != .stopped and self.bye_reason == null) {
-            self.markCrashed("connection closed");
+            // A clean engine exit (Run → play → close window) closes
+            // its socket as it tears down, so EOF here usually *beats*
+            // the `waitpid` reap in `poll`'s subprocess-exit path (#79).
+            // Treating that EOF as an unconditional crash misreports a
+            // normal shutdown — the exact bug #79 is about. Before
+            // declaring "connection closed", give `tryWaitChild` a
+            // chance to reap the child: a code-0 exit from a `.running`
+            // session lands `.stopped` there and we must not crash.
+            // `tryWaitChild` early-returns when the child is still
+            // alive (a true mid-session socket crash), so the genuine
+            // crash path below still fires.
+            if (self.state == .running) self.tryWaitChild();
+            if (self.state != .stopped and self.state != .crashed and self.bye_reason == null) {
+                self.markCrashed("connection closed");
+            }
         }
     }
 
