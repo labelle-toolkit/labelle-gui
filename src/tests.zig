@@ -5500,6 +5500,82 @@ pub const FlowCycleTests = struct {
         try expect.toBeTrue(status == .clean);
     }
 
+    test "detectCycle catches a cycle reachable only through a node first seen on a clean branch" {
+        // Regression for the classic three-state DFS mistake: the
+        // "done" set must mean "fully explored AND acyclic", never just
+        // "seen". `c` is first reached down the clean-looking `entry →
+        // x → c` branch; the real cycle is `b → c → b`. A walk that
+        // marked `c` done on first sight would skip `c` on the later
+        // `entry → b` branch and wrongly report `.clean`.
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var m: MapResolver = .{ .map = .empty };
+        try m.map.put(a, "entry", &.{ "x", "b" });
+        try m.map.put(a, "x", &.{"c"});
+        try m.map.put(a, "b", &.{"c"});
+        try m.map.put(a, "c", &.{"b"});
+
+        const status = try flow_cycle.detectCycle(a, "entry", m.resolver());
+        try expect.toBeTrue(status == .cycle);
+        // Walk descends entry → x → c → b → c; the back edge closes at
+        // `c`, so the offending chain is c → b → c.
+        try expect.equal(status.cycle.names.len, @as(usize, 3));
+        try expect.toBeTrue(std.mem.eql(u8, status.cycle.names[0], "c"));
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            status.cycle.names[status.cycle.names.len - 1],
+            "c",
+        ));
+    }
+
+    test "detectCycle catches a cycle behind a node reached via two clean-prefix paths" {
+        // `d`'s children are walked in order: (1) `c → leaf` is a
+        // genuinely clean subtree that leaves `c`/`leaf` in the done
+        // set; (2) `e → d` then closes the `d → e → d` cycle. The
+        // earlier done-marking of the sibling subtree must not suppress
+        // the cycle on the later branch.
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var m: MapResolver = .{ .map = .empty };
+        try m.map.put(a, "entry", &.{"d"});
+        try m.map.put(a, "d", &.{ "c", "e" });
+        try m.map.put(a, "c", &.{"leaf"});
+        try m.map.put(a, "leaf", &.{});
+        try m.map.put(a, "e", &.{"d"});
+
+        const status = try flow_cycle.detectCycle(a, "entry", m.resolver());
+        try expect.toBeTrue(status == .cycle);
+        try expect.toBeTrue(std.mem.eql(u8, status.cycle.names[0], "d"));
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            status.cycle.names[status.cycle.names.len - 1],
+            "d",
+        ));
+    }
+
+    test "detectCycle treats a node reached via two genuinely clean paths as clean" {
+        // Counterpart false-positive guard: `c` is reached twice, both
+        // paths acyclic. The done-set skip on the second visit must not
+        // be mistaken for a cycle.
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var m: MapResolver = .{ .map = .empty };
+        try m.map.put(a, "a", &.{ "x", "y" });
+        try m.map.put(a, "x", &.{"c"});
+        try m.map.put(a, "y", &.{"c"});
+        try m.map.put(a, "c", &.{"leaf"});
+        try m.map.put(a, "leaf", &.{});
+
+        const status = try flow_cycle.detectCycle(a, "a", m.resolver());
+        try expect.toBeTrue(status == .clean);
+    }
+
     fn createTempDir(allocator: std.mem.Allocator) ![]const u8 {
         const ts = timestampSeconds();
         const dir_name = try std.fmt.allocPrint(

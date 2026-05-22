@@ -162,7 +162,12 @@ pub const FlowDocState = struct {
     cycle_report: ?flow_cycle.Report = null,
     /// Snapshot of the `Subflow` `flow_ref` set the last cycle check
     /// ran against, joined by `\n`. When the live set diverges from
-    /// this the check is re-run. Owned by `arena`.
+    /// this the check is re-run. Owned by the child/GPA allocator
+    /// (`arena.child_allocator`), *not* the tab arena: it is replaced on
+    /// every actual re-check, and arena `free` is a no-op, so persisting
+    /// it on the arena would leak the prior snapshot on each
+    /// invalidation. `refreshCycleCheck` frees the previous snapshot
+    /// before storing a new one; `deinit` frees the last one.
     cycle_refs_snapshot: []const u8 = "",
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !FlowDocState {
@@ -199,6 +204,12 @@ pub const FlowDocState = struct {
         self.resolved.deinit(allocator);
         self.editor.destroy();
         if (self.cycle_report) |*r| r.deinit();
+        // The snapshot lives on the child/GPA allocator (see the field
+        // doc), so it must be freed explicitly — the arena does not own
+        // it. Freeing an empty `""` slice is a safe no-op.
+        if (self.cycle_refs_snapshot.len > 0) {
+            self.arena.child_allocator.free(self.cycle_refs_snapshot);
+        }
         self.doc.deinit();
         self.arena.deinit();
         allocator.destroy(self.arena);
@@ -263,9 +274,12 @@ pub fn referencedFilesChanged(report: *const flow_cycle.Report) bool {
 /// compares a short joined string and stats a handful of files.
 fn refreshCycleCheck(s: *FlowDocState) void {
     // The tab arena (`ArenaAllocator.free` is a no-op) is never used
-    // for per-frame scratch — the snapshot and refs are built on the
-    // child/GPA allocator and freed before this returns. Only the
-    // single stored snapshot persists, and it lives on the arena.
+    // for the cycle-check scratch *or* the persisted snapshot — both
+    // live on the child/GPA allocator. Per-frame scratch is freed
+    // before this returns; the single stored snapshot is freed and
+    // replaced on each actual re-check (and on `deinit`). Keeping it
+    // off the arena means an editing session does not accumulate one
+    // dead snapshot per invalidation.
     const child = s.arena.child_allocator;
 
     // Build a `\n`-joined snapshot of the current Subflow refs on the
@@ -311,15 +325,18 @@ fn refreshCycleCheck(s: *FlowDocState) void {
         std.log.err("flow: cycle check failed: {s}", .{@errorName(err)});
         if (s.cycle_report) |*old| old.deinit();
         s.cycle_report = null;
+        if (s.cycle_refs_snapshot.len > 0) child.free(s.cycle_refs_snapshot);
         s.cycle_refs_snapshot = "";
         return;
     };
 
-    // Duplicate the snapshot onto the tab arena *before* committing the
-    // new report — if the dup fails we keep the old report/snapshot
-    // pair consistent (rather than leaving an empty snapshot that would
-    // re-run the disk-backed analysis every subsequent frame).
-    const new_snapshot = s.arena.allocator().dupe(u8, snap.items) catch {
+    // Duplicate the snapshot onto the child/GPA allocator *before*
+    // committing the new report — if the dup fails we keep the old
+    // report/snapshot pair consistent (rather than leaving an empty
+    // snapshot that would re-run the disk-backed analysis every
+    // subsequent frame). The snapshot stays off the tab arena so the
+    // prior one can actually be reclaimed below.
+    const new_snapshot = child.dupe(u8, snap.items) catch {
         std.log.err("flow: cycle snapshot alloc failed; keeping prior result", .{});
         var report = new_report;
         report.deinit();
@@ -327,6 +344,9 @@ fn refreshCycleCheck(s: *FlowDocState) void {
     };
 
     if (s.cycle_report) |*old| old.deinit();
+    // Free the previous snapshot before replacing it — without this the
+    // child allocator would accumulate one dead snapshot per re-check.
+    if (s.cycle_refs_snapshot.len > 0) child.free(s.cycle_refs_snapshot);
     s.cycle_report = new_report;
     s.cycle_refs_snapshot = new_snapshot;
 }

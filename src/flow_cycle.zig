@@ -626,6 +626,95 @@ test "detectCycle: diamond reference graph is clean and walked once" {
     try std.testing.expect(status == .clean);
 }
 
+test "detectCycle: cycle reachable only through a node first seen on a clean branch" {
+    // Regression for the classic DFS three-state mistake: the `visited`
+    // (done) set must mean "fully explored AND acyclic", never "seen".
+    //
+    //   entry → x → c        (c first encountered down a clean-looking
+    //   entry → b → c → b     branch via x; the cycle is b → c → b)
+    //
+    // `x` is walked before `b`. While walking `x → c`, `c → b` is
+    // explored — `b` is not yet on the path, so the walk descends into
+    // `b → c`, finds `c` *is* on the path, and reports the cycle. `c`
+    // must therefore never enter the `done` set, and the later
+    // `entry → b` branch must still see the cycle. A walk that marked
+    // `c` "done" on first sight would wrongly return `.clean`.
+    var a_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a_state.deinit();
+    const a = a_state.allocator();
+
+    var m: MapResolver = .{ .map = .empty };
+    try m.map.put(a, "entry", &.{ "x", "b" });
+    try m.map.put(a, "x", &.{"c"});
+    try m.map.put(a, "b", &.{"c"});
+    try m.map.put(a, "c", &.{"b"});
+
+    const status = try detectCycle(a, "entry", m.resolver());
+    try std.testing.expect(status == .cycle);
+    // The offending chain is the b ↔ c loop. The walk descends
+    // entry → x → c → b → c, so the back edge closes at `c`: the chain
+    // is c → b → c, opening and closing on the same name.
+    try std.testing.expectEqual(@as(usize, 3), status.cycle.names.len);
+    try std.testing.expectEqualStrings("c", status.cycle.names[0]);
+    try std.testing.expectEqualStrings("b", status.cycle.names[1]);
+    try std.testing.expectEqualStrings(
+        status.cycle.names[0],
+        status.cycle.names[status.cycle.names.len - 1],
+    );
+}
+
+test "detectCycle: cycle behind a node reached via two clean-prefix paths" {
+    // A node (`c`) reachable via two paths, one of which closes a cycle.
+    //
+    //   entry → d           d's children are walked in order:
+    //   d → c               (1) c → leaf, a genuinely clean subtree
+    //   c → leaf            (2) e → d  closes the cycle d → e → d
+    //   d → e
+    //   e → d
+    //
+    // Child (1) leaves `c` (and `leaf`) in the `done` set. Child (2)
+    // then finds the back edge to `d`. The earlier `done` marking of the
+    // sibling subtree must not suppress the cycle on the later branch.
+    var a_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a_state.deinit();
+    const a = a_state.allocator();
+
+    var m: MapResolver = .{ .map = .empty };
+    try m.map.put(a, "entry", &.{"d"});
+    try m.map.put(a, "d", &.{ "c", "e" });
+    try m.map.put(a, "c", &.{"leaf"});
+    try m.map.put(a, "leaf", &.{});
+    try m.map.put(a, "e", &.{"d"});
+
+    const status = try detectCycle(a, "entry", m.resolver());
+    try std.testing.expect(status == .cycle);
+    try std.testing.expectEqualStrings("d", status.cycle.names[0]);
+    try std.testing.expectEqualStrings(
+        "d",
+        status.cycle.names[status.cycle.names.len - 1],
+    );
+}
+
+test "detectCycle: a node reached via two clean paths is not a false cycle" {
+    // Counterpart to the regression above: a node (`c`) reached twice,
+    // both paths genuinely acyclic, must stay `.clean`. The `done` set
+    // is what makes the second visit a cheap skip — and that skip must
+    // not be mistaken for, nor mistakenly upgraded to, a cycle.
+    var a_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a_state.deinit();
+    const a = a_state.allocator();
+
+    var m: MapResolver = .{ .map = .empty };
+    try m.map.put(a, "a", &.{ "x", "y" });
+    try m.map.put(a, "x", &.{"c"});
+    try m.map.put(a, "y", &.{"c"});
+    try m.map.put(a, "c", &.{"leaf"});
+    try m.map.put(a, "leaf", &.{});
+
+    const status = try detectCycle(a, "a", m.resolver());
+    try std.testing.expect(status == .clean);
+}
+
 test "detectCycle: empty entry with no refs is clean" {
     var a_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer a_state.deinit();
