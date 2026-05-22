@@ -73,6 +73,34 @@ pub const FileStamp = struct {
     size: ?u64,
 };
 
+/// A `.flow.jsonc` path a reference *expected* but the analysis could
+/// not successfully read — either it does not exist (`unresolved`) or it
+/// exists but failed to parse (`parse_failed`). `refreshCycleCheck`
+/// keeps this set alongside `read_files`: a previously-missing target
+/// that later *appears* on disk (or a parse-failed one whose content
+/// changes) can newly resolve a reference — possibly introducing a
+/// cycle — so its appearance must re-trigger the check even though
+/// `read_files` never tracked it.
+pub const MissingStamp = struct {
+    /// The absolute `.flow.jsonc` path the resolver expected for the
+    /// reference — `<flows_dir>/<flow_ref>.flow.jsonc` for a missing
+    /// target (the filename-basename fallback, RFC §5), or the broken
+    /// file's own path for a `parse_failed` one. Owned by the report
+    /// arena.
+    path: []const u8,
+    /// `true` when a file exists at `path` but failed to parse
+    /// (`parse_failed`); `false` when nothing exists there
+    /// (`unresolved`). For a parse-failed target a *content change*
+    /// re-triggers the check (the file may now parse); for a missing one
+    /// the file *appearing at all* re-triggers it.
+    parse_failed: bool,
+    /// `mtime`/`size` observed at analysis time. For a missing target
+    /// these are `null` (nothing to stat); for a parse-failed one they
+    /// stamp the broken file so a later content edit is noticed.
+    mtime_ns: ?i96 = null,
+    size: ?u64 = null,
+};
+
 /// An ordered list of flow names describing an offending reference
 /// path. Owned by the allocator passed to the analysis call.
 pub const Chain = struct {
@@ -104,6 +132,16 @@ pub const Report = struct {
     /// cycle the open flow's own reference set never reveals. Owned by
     /// `arena`.
     read_files: []const FileStamp = &.{},
+    /// Every reference target the analysis could *not* successfully read
+    /// — a missing flow file (`unresolved`) or one that exists but
+    /// failed to parse (`parse_failed`) — with the `.flow.jsonc` path the
+    /// resolver expected for it. `refreshCycleCheck` keeps this so it can
+    /// detect a previously-missing target *appearing* on disk (or a
+    /// parse-failed one changing): either can newly resolve a reference
+    /// and so must re-trigger the check. `read_files` never tracks these
+    /// (it only stamps files that were successfully read). Owned by
+    /// `arena`.
+    unresolved_targets: []const MissingStamp = &.{},
 
     pub fn deinit(self: *Report) void {
         const child = self.arena.child_allocator;
@@ -276,6 +314,13 @@ const ProjectResolver = struct {
     /// the `mtime`/`size` observed then. Surfaced on the `Report` so a
     /// later check can tell whether any referenced file changed.
     seen_files: std.ArrayListUnmanaged(FileStamp) = .empty,
+    /// Every reference target that did *not* resolve to a readable flow
+    /// — keyed by the `.flow.jsonc` path the resolver expected — with a
+    /// `MissingStamp` recording whether a (broken) file exists there.
+    /// Keyed by path (not by `flow_ref`) so a diamond of references that
+    /// all miss the same file records the target once. Surfaced on the
+    /// `Report` so a later check can notice the target appearing.
+    missing_targets: std.StringHashMapUnmanaged(MissingStamp) = .empty,
 
     fn refs(ctx: *anyopaque, name: []const u8) anyerror!RefResult {
         const self: *ProjectResolver = @ptrCast(@alignCast(ctx));
@@ -286,6 +331,40 @@ const ProjectResolver = struct {
         const result = self.loadRefs(name) catch RefResult.missing;
         try self.cache.put(self.arena, try self.arena.dupe(u8, name), result);
         return result;
+    }
+
+    /// Record the `.flow.jsonc` path a non-resolving reference expected,
+    /// so a later check can notice that target appearing (or, for a
+    /// broken file, changing) on disk. `expected` for a `.missing`
+    /// target is the filename-basename fallback path
+    /// `<flows_dir>/<name>.flow.jsonc`; for a `.parse_failed` one it is
+    /// the broken file's own path. Stamps the path so a parse-failed
+    /// file's later content edit is also caught.
+    fn recordMissing(
+        self: *ProjectResolver,
+        expected: []const u8,
+        parse_failed: bool,
+    ) !void {
+        if (self.missing_targets.contains(expected)) return;
+        const io = io_global.io();
+        var stamp: MissingStamp = .{ .path = expected, .parse_failed = parse_failed };
+        if (std.Io.Dir.cwd().statFile(io, expected, .{})) |st| {
+            stamp.mtime_ns = st.mtime.nanoseconds;
+            stamp.size = st.size;
+        } else |_| {}
+        try self.missing_targets.put(self.arena, expected, stamp);
+    }
+
+    /// The `.flow.jsonc` path the filename-basename fallback (RFC §5)
+    /// would place a flow named `name` at — `<flows_dir>/<name>.flow.jsonc`.
+    /// This is the path a *missing* reference expected, so a check can
+    /// stat it later to notice the target appearing.
+    fn expectedPath(self: *ProjectResolver, name: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(
+            self.arena,
+            "{s}{c}{s}{s}",
+            .{ self.flows_dir, std.fs.path.sep, name, flow_io.extension },
+        );
     }
 
     /// Scan `flows_dir` once and index every flow file by its effective
@@ -380,14 +459,24 @@ const ProjectResolver = struct {
             // Not a resolvable registry name. If a *broken* file's
             // basename matches, the reference points at a present but
             // unparseable flow — surface that distinctly.
-            if (self.broken.contains(name)) return .parse_failed;
+            if (self.broken.get(name)) |broken_path| {
+                try self.recordMissing(broken_path, true);
+                return .parse_failed;
+            }
+            // No file resolves this name. Record the path the
+            // basename-fallback rule would expect, so a later check
+            // notices the target appearing on disk.
+            try self.recordMissing(try self.expectedPath(name), false);
             return .missing;
         };
 
         // The file parsed during the scan; a failure here means it
         // changed (or a transient IO error) between scan and re-read —
         // treat it as broken rather than missing.
-        var doc = flow_io.loadFromFile(self.arena, full) catch return .parse_failed;
+        var doc = flow_io.loadFromFile(self.arena, full) catch {
+            try self.recordMissing(full, true);
+            return .parse_failed;
+        };
         defer doc.deinit();
 
         var out: std.ArrayList([]const u8) = .empty;
@@ -482,11 +571,23 @@ pub fn analyze(
     // arena, so they outlive this call and `deinit` reclaims them.
     const read_files = try resolver_ctx.seen_files.toOwnedSlice(a);
 
+    // Also hand over the targets that did *not* resolve, each with the
+    // `.flow.jsonc` path the resolver expected. A later check stats
+    // these so a previously-missing target appearing on disk re-triggers
+    // the analysis (`read_files` can never cover them — they were never
+    // read). All paths/stamps live on the report arena.
+    var missing_targets: std.ArrayList(MissingStamp) = .empty;
+    {
+        var it = resolver_ctx.missing_targets.valueIterator();
+        while (it.next()) |stamp| try missing_targets.append(a, stamp.*);
+    }
+
     return .{
         .arena = arena,
         .status = status,
         .chain_text = chain_text,
         .read_files = read_files,
+        .unresolved_targets = try missing_targets.toOwnedSlice(a),
     };
 }
 

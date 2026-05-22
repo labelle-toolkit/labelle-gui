@@ -243,9 +243,17 @@ fn effectiveName(s: *const FlowDocState) []const u8 {
 /// document's own `Subflow` reference set never reveals, so the banner
 /// must not trust a cached "clean" once any referenced file moves.
 ///
-/// Cheap: one `statFile` per referenced file. A flow graph references a
-/// handful of files at most, so this stays well within an immediate-mode
-/// frame budget.
+/// Also re-triggers when a reference target the last check could *not*
+/// read becomes readable: a previously-missing `.flow.jsonc` appearing
+/// on disk, or a parse-failed one whose content changed. `read_files`
+/// can never catch these — it only stamps files that were successfully
+/// read — so `unresolved_targets` is checked alongside it. A target
+/// appearing can newly resolve a reference (and even introduce a
+/// cycle), so the stale "unresolved" banner must not survive it.
+///
+/// Cheap: one `statFile` per tracked path (read files plus unresolved
+/// targets). A flow graph references a handful of files at most, so this
+/// stays well within an immediate-mode frame budget.
 pub fn referencedFilesChanged(report: *const flow_cycle.Report) bool {
     const io = io_global.io();
     for (report.read_files) |f| {
@@ -260,6 +268,21 @@ pub fn referencedFilesChanged(report: *const flow_cycle.Report) bool {
         if (f.mtime_ns == null or f.size == null) return true;
         if (f.mtime_ns.? != st.mtime.nanoseconds) return true;
         if (f.size.? != st.size) return true;
+    }
+    // A target the check could not read may now be readable.
+    for (report.unresolved_targets) |t| {
+        const st = std.Io.Dir.cwd().statFile(io, t.path, .{}) catch {
+            // Still not stat-able. Stale only if a (broken) file *was*
+            // present there at check time and has since vanished.
+            if (t.mtime_ns != null or t.size != null) return true;
+            continue;
+        };
+        // A previously-missing target now exists, or a parse-failed
+        // one's mtime/size moved (its content may now parse) — either
+        // way a reference that didn't resolve might now resolve.
+        if (t.mtime_ns == null or t.size == null) return true;
+        if (t.mtime_ns.? != st.mtime.nanoseconds) return true;
+        if (t.size.? != st.size) return true;
     }
     return false;
 }

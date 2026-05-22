@@ -5910,4 +5910,65 @@ pub const FlowCycleTests = struct {
         try expect.toBeTrue(fresh.status == .cycle);
         try expect.toBeFalse(flow_doc.referencedFilesChanged(&fresh));
     }
+
+    test "referencedFilesChanged re-triggers when a previously-missing referenced file is created" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // The open doc "a" references "b", but b.flow.jsonc does not
+        // exist yet — the check reports `unresolved`. `read_files` only
+        // stamps files that were successfully read (here just none, or
+        // whatever the directory scan saw), so it can never notice "b"
+        // appearing; `unresolved_targets` must carry the expected path.
+        var report = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .unresolved);
+        // The missing target is recorded with its expected `.flow.jsonc`
+        // path so a later check can stat it.
+        try expect.toBeTrue(report.unresolved_targets.len == 1);
+        try expect.toBeFalse(report.unresolved_targets[0].parse_failed);
+        // Nothing has appeared on disk yet — no re-trigger.
+        try expect.toBeFalse(flow_doc.referencedFilesChanged(&report));
+
+        // Create the previously-missing referenced flow. It even closes
+        // a cycle (b → a). The open flow's own Subflow refs ({"b"}) are
+        // unchanged, so only the appearance of the missing target can
+        // reveal the staleness.
+        try writeFlow(allocator, flows_dir, "b", &.{"a"});
+        try expect.toBeTrue(flow_doc.referencedFilesChanged(&report));
+
+        // Re-running the check now resolves "b" and sees the cycle the
+        // stale "unresolved" report could not.
+        var fresh = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        defer fresh.deinit();
+        try expect.toBeTrue(fresh.status == .cycle);
+        try expect.toBeFalse(flow_doc.referencedFilesChanged(&fresh));
+    }
+
+    test "referencedFilesChanged re-triggers when a parse-failed referenced file is fixed" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // "a" references "b"; b.flow.jsonc exists but does not parse —
+        // the check reports `parse_failed` and stamps the broken file.
+        try writeBrokenFlow(allocator, flows_dir, "b");
+
+        var report = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .parse_failed);
+        try expect.toBeTrue(report.unresolved_targets.len == 1);
+        try expect.toBeTrue(report.unresolved_targets[0].parse_failed);
+        try expect.toBeFalse(flow_doc.referencedFilesChanged(&report));
+
+        // Rewrite the broken file with valid, acyclic content.
+        try writeFlow(allocator, flows_dir, "b", &.{});
+        try expect.toBeTrue(flow_doc.referencedFilesChanged(&report));
+
+        var fresh = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        defer fresh.deinit();
+        try expect.toBeTrue(fresh.status == .clean);
+        try expect.toBeFalse(flow_doc.referencedFilesChanged(&fresh));
+    }
 };
