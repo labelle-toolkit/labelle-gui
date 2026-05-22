@@ -19,12 +19,15 @@
 //!      whatever app owns `.zig`, and most of those can't be told a
 //!      line from the command line.
 //!
-//! Every command this module spawns is a hand-off launcher — the OS
-//! file handler or a GUI editor's CLI front-end. They fork the real
-//! editor window and exit immediately, so `reveal` waits on (and thus
-//! reaps) the launcher without blocking the gui in practice. The
-//! editor window itself outlives the gui. `reveal` is best-effort —
-//! a failure to launch is reported to the caller, not retried.
+//! `reveal` spawns the launcher on the calling (UI) thread — `spawn`
+//! returns the instant the child is forked/exec'd, so the gui never
+//! stalls there, and a spawn failure surfaces synchronously to the
+//! caller. Reaping the child (the blocking `wait`) is then handed to a
+//! short-lived detached background thread: a terminal editor or a
+//! `code --wait`-style `$EDITOR` can keep the launcher alive for the
+//! whole editing session, and we must not freeze the gui waiting on
+//! it. `reveal` is best-effort — a failure to launch is reported to
+//! the caller, not retried.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -69,8 +72,10 @@ const known_editors = [_]KnownEditor{
 /// Result of resolving a reveal request into an argv. `Plan` borrows
 /// every string it carries — `file` from the caller, env-derived
 /// strings from `env`, and the formatted `file:line` (when used) from
-/// `scratch`. Nothing here is owned; the caller spawns from it
-/// immediately and lets it drop.
+/// `scratch`. Nothing here is owned; it stays valid only as long as
+/// the `argv_buf` / `scratch` / `editor` passed to `planReveal` do, so
+/// it must be spawned from before any of those drop. It never escapes
+/// `reveal` — `reveal` returns the value-only `RevealResult` instead.
 pub const Plan = struct {
     /// The argv to spawn. Always at least one element.
     argv: []const []const u8,
@@ -80,12 +85,30 @@ pub const Plan = struct {
     has_line: bool,
 };
 
+/// What `reveal` reports back to the caller. A plain value — it owns
+/// nothing and borrows nothing, so it is safe to return and outlive
+/// the call (unlike `Plan`, whose slices point into `reveal`'s stack).
+pub const RevealResult = struct {
+    /// True when the spawned command carried a line number, so the
+    /// editor's cursor lands on `line` rather than the file's top.
+    has_line: bool,
+};
+
 /// Lowercased basename of a command, with a trailing `.exe` / `.cmd`
 /// / `.bat` stripped (Windows). `$EDITOR` is often an absolute path
 /// or carries flags; we only ever match on the program name.
+///
+/// `$EDITOR` is split on whitespace — the universal shell convention
+/// for these variables (`"code --wait"` → program `code`, flag
+/// `--wait`). A program *path* that itself contains spaces is the
+/// known exception: it would tokenize wrong, exactly as it would in a
+/// bare shell. Such a path must be quoted by the user's environment;
+/// we deliberately don't reimplement shell quote parsing here, and
+/// `$LABELLE_FLOW_EDITOR` lets a user point flows at a quote-free
+/// command if their `$EDITOR` is awkward.
 fn programBasename(cmd: []const u8) []const u8 {
-    // `$EDITOR` may be `"code --wait"` — take the first whitespace-
-    // delimited token as the program.
+    // Take the first whitespace-delimited token as the program; see
+    // the doc comment for the spaced-path caveat.
     var tok = std.mem.tokenizeAny(u8, cmd, " \t");
     const first = tok.next() orelse cmd;
     const base = std.fs.path.basename(first);
@@ -113,7 +136,8 @@ fn classifyEditor(cmd: []const u8) ?KnownEditor.Kind {
 /// the argv slices; the returned slice points into it.
 ///
 /// `editor` is the raw command — it may include flags (`code --wait`).
-/// We split on whitespace so a flag-carrying `$EDITOR` still works.
+/// We split on whitespace so a flag-carrying `$EDITOR` still works;
+/// see `programBasename` for the (deliberate) spaced-path caveat.
 fn composeEditorArgv(
     argv_buf: [][]const u8,
     scratch: []u8,
@@ -238,16 +262,33 @@ fn editorFromEnv(allocator: std.mem.Allocator) ?[]u8 {
     return null;
 }
 
+/// Block on `child` until it exits, reaping it, then free `child`
+/// itself. Runs on a detached background thread (see `reveal`) so the
+/// blocking `wait` never touches the UI thread. `child` is heap-owned
+/// by this thread; `io` is the process-wide handle (valid for the
+/// program's lifetime).
+fn reapChild(allocator: std.mem.Allocator, io: std.Io, child: *std.process.Child) void {
+    // The launcher's exit status is irrelevant — `reveal` is
+    // best-effort and already returned. We only `wait` to reap the
+    // process so it doesn't linger as a zombie. A terminal editor
+    // (or `code --wait`) keeps the child alive for the whole editing
+    // session; that is exactly why this runs off the UI thread.
+    _ = child.wait(io) catch {};
+    allocator.destroy(child);
+}
+
 /// Open `file` at `line` in the user's editor (or the OS file
-/// handler). Fire-and-forget: the spawned process is detached and the
-/// gui never waits on it. Returns the `Plan` that was used so the
-/// caller can report what happened; spawn failure surfaces as an
-/// error.
+/// handler). The launcher is spawned on the calling thread — `spawn`
+/// returns as soon as the child is forked, so the gui does not stall —
+/// and is then reaped on a detached background thread so a long-lived
+/// editor process never freezes the gui. Returns a value-only
+/// `RevealResult`; a spawn failure surfaces synchronously as an error.
 ///
-/// `allocator` is used only transiently — for the env-derived editor
-/// command, which is freed before `reveal` returns. Nothing in the
-/// returned `Plan` outlives the call.
-pub fn reveal(allocator: std.mem.Allocator, file: []const u8, line: u32) !Plan {
+/// `allocator` backs the env-derived editor string (freed before
+/// `reveal` returns) and a small heap `Child` handed to the reaper
+/// thread (freed by that thread). Nothing borrowed by `reveal`
+/// outlives the call.
+pub fn reveal(allocator: std.mem.Allocator, file: []const u8, line: u32) !RevealResult {
     var argv_buf: [8][]const u8 = undefined;
     // `file:line` is the longest scratch consumer — path + ':' + a
     // 10-digit u32 + slack.
@@ -255,10 +296,14 @@ pub fn reveal(allocator: std.mem.Allocator, file: []const u8, line: u32) !Plan {
 
     const editor = editorFromEnv(allocator);
     defer if (editor) |e| allocator.free(e);
+    // `plan` borrows `argv_buf` / `scratch_buf` / `editor` — all valid
+    // here. `spawn` forks/exec's before it returns, so the argv only
+    // needs to live across the `spawn` call; nothing about `plan`
+    // escapes this function.
     const plan = planReveal(&argv_buf, &scratch_buf, editor, file, line);
 
     const io = io_global.io();
-    var child = std.process.spawn(io, .{
+    var stack_child = std.process.spawn(io, .{
         .argv = plan.argv,
         .stdin = .ignore,
         // The launched process shouldn't inherit our std handles — a
@@ -267,16 +312,33 @@ pub fn reveal(allocator: std.mem.Allocator, file: []const u8, line: u32) !Plan {
         .stderr = .ignore,
     }) catch |err| return err;
 
-    // Reap the launcher. Every command `planReveal` produces is a
-    // hand-off launcher — `open` / `xdg-open` / `cmd /c start`, and
-    // GUI editors (`code`, `cursor`, `zed`) all fork the real editor
-    // window and exit immediately. Waiting reaps the short-lived
-    // process so it doesn't linger as a zombie; the editor it spawned
-    // outlives the gui regardless. (A bare terminal editor set as
-    // `$EDITOR` is the documented exception — `$LABELLE_FLOW_EDITOR`
-    // lets a user point flows at a GUI editor without disturbing it.)
-    _ = child.wait(io) catch {};
-    return plan;
+    // Hand reaping to a detached background thread. `wait` blocks
+    // until the launcher exits — for a GUI editor's CLI front-end
+    // (`code`, `cursor`, `zed`) or an OS handler (`open` / `xdg-open`
+    // / `cmd /c start`) that is immediate, but a terminal editor or a
+    // `code --wait`-style `$EDITOR` stays alive for the whole editing
+    // session. Doing this on the UI thread would freeze the gui for
+    // exactly that long. The `Child` is heap-copied so it outlives
+    // this stack frame; the reaper thread owns and frees it.
+    const child = allocator.create(std.process.Child) catch {
+        // Out of memory for the 100-odd-byte handle — fall back to
+        // reaping inline. The child is a launcher in the common case,
+        // so this rarely blocks; under genuine OOM the gui has bigger
+        // problems anyway.
+        _ = stack_child.wait(io) catch {};
+        return .{ .has_line = plan.has_line };
+    };
+    child.* = stack_child;
+    const thread = std.Thread.spawn(.{}, reapChild, .{ allocator, io, child }) catch {
+        // Could not spawn the reaper thread — reap inline rather than
+        // leak the handle or the process.
+        defer allocator.destroy(child);
+        _ = child.wait(io) catch {};
+        return .{ .has_line = plan.has_line };
+    };
+    thread.detach();
+
+    return .{ .has_line = plan.has_line };
 }
 
 // Tests for `planReveal` / `programBasename` live in `src/tests.zig`

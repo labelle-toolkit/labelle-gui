@@ -376,12 +376,12 @@ fn renderSelectedInspector(s: *FlowState, app: *App) void {
 /// bar rather than propagated — a missing `$EDITOR` / `xdg-open`
 /// shouldn't take the gui down. See `src/flows/reveal.zig`.
 fn revealSelected(s: *FlowState, app: *App, line: u32) void {
-    const plan = reveal.reveal(app.allocator, s.path, line) catch |err| {
+    const result = reveal.reveal(app.allocator, s.path, line) catch |err| {
         std.log.warn("flow {s}: open-in-editor failed: {s}", .{ s.path, @errorName(err) });
         app.setStatus("Could not open the source file in an editor.");
         return;
     };
-    if (plan.has_line) {
+    if (result.has_line) {
         app.setStatus("Opened source at the selected line.");
     } else {
         // The OS file handler can't be told a line — say so, so the
