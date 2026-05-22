@@ -14,6 +14,7 @@
 const std = @import("std");
 const buf = @import("buf.zig");
 const io_global = @import("io_global.zig");
+const prefab_index_mod = @import("prefab_index.zig");
 
 /// Thin adapter that lets the per-component `emit*` helpers keep their
 /// existing `writer.writeAll(...) / writer.print(...) / writer.writeByte(...)`
@@ -267,6 +268,56 @@ pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !LoadedScene
     const raw = try std.Io.Dir.cwd().readFileAlloc(io_global.io(), path, allocator, .limited(16 * 1024 * 1024));
     defer allocator.free(raw);
     return parseScene(allocator, raw);
+}
+
+/// Append a child `Entity` to a `LoadedPrefab`'s `children` array,
+/// growing `children_extras` with an empty extras slot in lockstep.
+/// Mirrors `insertEntity` for prefabs — used by the prefab editor's
+/// component-drop handler that needs a bare new child before
+/// attaching its component as an unmodeled extra (#143).
+pub fn insertChild(loaded: *LoadedPrefab, child: Entity) !void {
+    const a = loaded.arena.allocator();
+    const old_children = loaded.children;
+    const new_children = try a.alloc(Entity, old_children.len + 1);
+    @memcpy(new_children[0..old_children.len], old_children);
+    new_children[old_children.len] = child;
+    loaded.children = new_children;
+
+    // Bring `children_extras` fully into lockstep with `children`.
+    // Older prefab files may carry an extras slice shorter than the
+    // children slice; sizing the new slice to `new_children.len`
+    // (rather than `old_extras.len + 1`) pads every missing slot with
+    // an empty extras entry so the two arrays end up the same length
+    // regardless of the starting mismatch.
+    const old_extras = loaded.children_extras;
+    const new_extras = try a.alloc([]const ComponentExtra, new_children.len);
+    const copy_len = @min(old_extras.len, new_extras.len);
+    @memcpy(new_extras[0..copy_len], old_extras[0..copy_len]);
+    for (new_extras[copy_len..]) |*slot| slot.* = &.{};
+    loaded.children_extras = new_extras;
+}
+
+/// Look up `component_name` in the prefab cache and return a fresh
+/// arena-owned copy of its body's Sprite, if any. The flying-platform-
+/// labelle convention pairs many components with same-named prefabs
+/// (`components/bed.zig` ↔ `prefabs/furniture/bed.jsonc`), so a
+/// dropped component can render with the matching prefab's actual
+/// atlas key instead of a placeholder (#143). Returns null when no
+/// matching prefab exists, or when the matching prefab has no body
+/// Sprite — caller falls through to "no visual," and the editor
+/// renders the entity as a marker on the canvas until the user adds
+/// a Sprite manually.
+pub fn copySpriteFromMatchingPrefab(
+    arena_allocator: std.mem.Allocator,
+    component_name: []const u8,
+    idx: ?*const prefab_index_mod.Index,
+) ?*Sprite {
+    const i = idx orelse return null;
+    const pfx = i.find(component_name) orelse return null;
+    const body_sprite = pfx.entity.sprite orelse return null;
+    const p = arena_allocator.create(Sprite) catch return null;
+    p.* = body_sprite.*;
+    return p;
 }
 
 // ─── Prefabs ───────────────────────────────────────────────────────────

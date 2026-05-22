@@ -21,6 +21,8 @@ const prefab_contents = @import("modules/inspector/prefab_contents.zig");
 const io_global = @import("io_global.zig");
 const game_view = @import("game_view.zig");
 const test_fixtures = @import("test_fixtures.zig");
+const dnd = @import("modules/dnd.zig");
+const prefab_index = @import("prefab_index.zig");
 const splitter = @import("modules/splitter.zig");
 
 /// Wall-clock seconds since the Unix epoch; replacement for the
@@ -4127,6 +4129,78 @@ pub const GameViewLatencyTests = struct {
         // Slots [1..120) are zero-initialized; only slot 0 counts.
         gv.latency_count = 1;
         try expect.equal(gv.meanLatencyNs(), @as(u64, 5_000_000));
+    }
+};
+
+pub const ComponentDndTests = struct {
+    // pack/unpack are the contract between the project tree (drag
+    // source) and the prefab canvas (drop target). No ImGui context
+    // needed — these are pure data helpers.
+
+    test "packComponent round-trips a short stem" {
+        const stem = "bed";
+        const p = dnd.packComponent(stem);
+        try expect.equal(@as(usize, p.name_len), stem.len);
+        try expect.equal(std.mem.eql(u8, dnd.unpackComponent(&p), stem), true);
+    }
+
+    test "packComponent round-trips a snake_case stem" {
+        // Component files often have underscores (e.g.
+        // bandit_combat.zig). Pack must preserve them verbatim.
+        const stem = "bandit_combat";
+        const p = dnd.packComponent(stem);
+        try expect.equal(@as(usize, p.name_len), stem.len);
+        try expect.equal(std.mem.eql(u8, dnd.unpackComponent(&p), stem), true);
+    }
+
+    test "packComponent truncates a stem longer than PAYLOAD_NAME_CAP" {
+        var oversize: [dnd.PAYLOAD_NAME_CAP + 1]u8 = undefined;
+        @memset(&oversize, 'x');
+        const p = dnd.packComponent(&oversize);
+        try expect.equal(@as(usize, p.name_len), dnd.PAYLOAD_NAME_CAP);
+    }
+
+    test "packComponent zero-pads the unused tail" {
+        const p = dnd.packComponent("bed");
+        // Bytes past `name_len` must be zero — the struct is memcpy'd
+        // into ImGui's buffer wholesale, and we don't want stale
+        // stack noise riding along.
+        try expect.equal(p.name[3], @as(u8, 0));
+        try expect.equal(p.name[p.name.len - 1], @as(u8, 0));
+    }
+};
+
+pub const MatchingPrefabSpriteTests = struct {
+    // Helper covers the "drop component → find same-named prefab →
+    // copy its body Sprite" pairing. Full happy path needs a real
+    // LoadedPrefab (which carries an arena and a parsed body),
+    // exercised end-to-end via the editor's visual test. Here we
+    // pin the cheap null-cases.
+
+    test "copySpriteFromMatchingPrefab returns null on null index" {
+        const result = scene_io.copySpriteFromMatchingPrefab(
+            std.testing.allocator,
+            "bed",
+            null,
+        );
+        try expect.toBeTrue(result == null);
+    }
+
+    test "copySpriteFromMatchingPrefab returns null when prefab not found" {
+        // Empty index — nothing resolves. Tests the orelse-null
+        // arm in the helper.
+        var idx: prefab_index.Index = .{
+            .allocator = std.testing.allocator,
+            .generation = 1,
+        };
+        defer idx.entries.deinit(std.testing.allocator);
+
+        const result = scene_io.copySpriteFromMatchingPrefab(
+            std.testing.allocator,
+            "bed",
+            &idx,
+        );
+        try expect.toBeTrue(result == null);
     }
 };
 
