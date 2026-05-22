@@ -107,9 +107,9 @@ fn render(app: *App) void {
 }
 
 /// Render a row of sprite-frame thumbnails for the atlas whose
-/// `resources[].name` equals `res_name`. Uses `atlas_ui.spriteButton`,
+/// `resources[].name` equals `res_name`. Uses `atlas_ui.spriteButtonFrame`,
 /// which draws the real atlas frame and falls back to a text button
-/// when the index is null or a frame can't be resolved.
+/// when the frame can't be resolved.
 ///
 /// Thumbnails are interactive `imageButton`s: clicking one copies the
 /// sprite name onto the status bar — a contained first use that the
@@ -136,21 +136,32 @@ fn renderThumbnails(app: *App, res_name: []const u8) void {
         avail_w / (thumb_size + style_spacing),
     )));
 
-    var shown: usize = 0;
-    var it = a.frames.iterator();
-    while (it.next()) |kv| : (shown += 1) {
-        const sprite_name = kv.key_ptr.*;
-        // Unique str_id per button: atlas name + sprite name. Without a
-        // distinct id imgui merges click/hover state across buttons.
-        var id_buf: [256:0]u8 = undefined;
-        const str_id = std.fmt.bufPrintZ(
-            &id_buf,
-            "##atlas_sprite_{s}_{s}",
-            .{ res_name, sprite_name },
-        ) catch continue;
+    // Collect + sort the sprite names so thumbnails render in a
+    // stable order — `StringHashMap` iteration order is not
+    // deterministic, which would otherwise reshuffle the grid on
+    // every atlas reload.
+    var names = std.ArrayList([]const u8).initCapacity(app.allocator, a.frames.count()) catch return;
+    defer names.deinit(app.allocator);
+    var kit = a.frames.keyIterator();
+    while (kit.next()) |k| names.appendAssumeCapacity(k.*);
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lessThan(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lessThan);
+
+    for (names.items, 0..) |sprite_name, shown| {
+        const frame = a.frames.get(sprite_name) orelse continue;
+        // Scope each thumbnail's imgui ID by sprite name — the row is
+        // already inside its own `pushStrIdZ` scope, so this is unique
+        // and avoids formatting a fresh string id every frame.
+        zgui.pushStrId(sprite_name);
+        defer zgui.popId();
 
         if (shown % per_row != 0) zgui.sameLine(.{});
-        if (atlas_ui.spriteButton(str_id, idx, sprite_name, thumb_size, thumb_size)) {
+        // Resolve against this row's atlas directly: a sprite name
+        // shared with another atlas must draw *this* atlas's frame.
+        if (atlas_ui.spriteButtonFrame("##thumb", a, sprite_name, frame, thumb_size, thumb_size)) {
             var status_buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrint(
                 &status_buf,

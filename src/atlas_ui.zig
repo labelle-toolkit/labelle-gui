@@ -35,29 +35,40 @@ pub fn resolve(index: ?*const atlas.Index, sprite_name: []const u8) ?Resolved {
     const idx = index orelse return null;
     if (sprite_name.len == 0) return null;
     const ref = idx.find(sprite_name) orelse return null;
+    if (ref.atlas >= idx.atlases.items.len) return null;
+    return resolveFrame(&idx.atlases.items[ref.atlas], ref.frame);
+}
 
-    const tex_id = idx.textureFor(ref);
-    if (tex_id == 0) return null;
-    const size = idx.atlasSize(ref);
-
+/// Resolve one `frame` against the atlas that owns it. Use this when
+/// the owning atlas is already known — e.g. a per-atlas thumbnail row
+/// — so a sprite name duplicated across atlases still draws the
+/// correct texture. `resolve` goes through the global `Index.find`,
+/// which keeps only the first atlas for a duplicated name
+/// (`Index.build` — first-atlas-wins on collisions).
+pub fn resolveFrame(a: *const atlas.Atlas, frame: atlas.Frame) ?Resolved {
+    if (a.texture_id == 0) return null;
+    const size: [2]f32 = .{
+        @floatFromInt(a.width),
+        @floatFromInt(a.height),
+    };
     const uv0: [2]f32 = .{
-        @as(f32, @floatFromInt(ref.frame.x)) / size[0],
-        @as(f32, @floatFromInt(ref.frame.y)) / size[1],
+        @as(f32, @floatFromInt(frame.x)) / size[0],
+        @as(f32, @floatFromInt(frame.y)) / size[1],
     };
     const uv1: [2]f32 = .{
-        @as(f32, @floatFromInt(ref.frame.x + ref.frame.w)) / size[0],
-        @as(f32, @floatFromInt(ref.frame.y + ref.frame.h)) / size[1],
+        @as(f32, @floatFromInt(frame.x + frame.w)) / size[0],
+        @as(f32, @floatFromInt(frame.y + frame.h)) / size[1],
     };
 
     // ImGui 1.92+ TextureRef: a null `tex_data` tells the opengl3
     // backend to read the raw handle in `tex_id` directly — exactly
     // what we want for atlas textures we manage ourselves.
     return .{
-        .tex_ref = .{ .tex_data = null, .tex_id = @enumFromInt(@as(u64, tex_id)) },
+        .tex_ref = .{ .tex_data = null, .tex_id = @enumFromInt(@as(u64, a.texture_id)) },
         .uv0 = uv0,
         .uv1 = uv1,
-        .frame_w = ref.frame.w,
-        .frame_h = ref.frame.h,
+        .frame_w = frame.w,
+        .frame_h = frame.h,
     };
 }
 
@@ -87,13 +98,43 @@ pub fn spriteButton(
     return textFallbackButton(str_id, sprite_name, w, h);
 }
 
-/// Text-button fallback shared by `spriteButton`. The visible label is
-/// the sprite name (or `"(sprite)"` when empty); the imgui ID is forced
-/// to `str_id` via the `label##id` suffix so callers keep a stable,
-/// unique ID regardless of the (possibly duplicated) sprite name.
+/// `spriteButton` for a frame whose owning atlas is already known —
+/// see `resolveFrame`. Unlike `spriteButton` it never goes through
+/// the global index, so a sprite name shared across atlases still
+/// draws this atlas's texture. Falls back to a text button.
+pub fn spriteButtonFrame(
+    str_id: [:0]const u8,
+    a: *const atlas.Atlas,
+    sprite_name: []const u8,
+    frame: atlas.Frame,
+    w: f32,
+    h: f32,
+) bool {
+    if (resolveFrame(a, frame)) |r| {
+        return zgui.imageButton(str_id, r.tex_ref, .{
+            .w = w,
+            .h = h,
+            .uv0 = r.uv0,
+            .uv1 = r.uv1,
+        });
+    }
+    return textFallbackButton(str_id, sprite_name, w, h);
+}
+
+/// Text-button fallback shared by `spriteButton` / `spriteButtonFrame`.
+/// The visible label is the sprite name (or `"(sprite)"` when empty);
+/// the imgui ID is forced to `str_id` via the `label##id` suffix so
+/// callers keep a stable, unique ID regardless of the (possibly
+/// duplicated) sprite name.
 fn textFallbackButton(str_id: [:0]const u8, sprite_name: []const u8, w: f32, h: f32) bool {
-    var label_buf: [192]u8 = undefined;
+    // Sized to comfortably hold a sprite name plus the caller's id
+    // (the resources panel formats ids into a 256-byte buffer). On the
+    // off chance the joined label still overflows, fall back to the
+    // bare visible name — never to `str_id`, which begins with `##`
+    // and would render a button with no visible text.
+    var label_buf: [512]u8 = undefined;
     const visible = if (sprite_name.len == 0) "(sprite)" else sprite_name;
-    const label = std.fmt.bufPrintZ(&label_buf, "{s}##{s}", .{ visible, str_id }) catch str_id;
+    const label = std.fmt.bufPrintZ(&label_buf, "{s}##{s}", .{ visible, str_id }) catch
+        std.fmt.bufPrintZ(&label_buf, "{s}", .{visible}) catch "(sprite)";
     return zgui.button(label, .{ .w = w, .h = h });
 }
