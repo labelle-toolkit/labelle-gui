@@ -35,6 +35,7 @@ const ne = zgui.node_editor;
 const App = @import("../app.zig").App;
 const flow_io = @import("../flow_io.zig");
 const io_global = @import("../io_global.zig");
+const flow_cycle = @import("../flow_cycle.zig");
 
 const inspector_w: f32 = 340;
 const split_gap: f32 = 8;
@@ -151,6 +152,15 @@ pub const FlowDocState = struct {
     /// same referenced flow is stat'd at most once per frame regardless of
     /// how many `Subflow` nodes point at it.
     frame_seq: u64 = 0,
+    /// Result of the most recent `Subflow` reference-cycle check
+    /// (issue #159). Null until the first check runs. A `clean` status
+    /// is kept (rather than null) so the UI can tell "checked, fine"
+    /// apart from "not yet checked". Owns its own arena.
+    cycle_report: ?flow_cycle.Report = null,
+    /// Snapshot of the `Subflow` `flow_ref` set the last cycle check
+    /// ran against, joined by `\n`. When the live set diverges from
+    /// this the check is re-run. Owned by `arena`.
+    cycle_refs_snapshot: []const u8 = "",
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !FlowDocState {
         const arena = try allocator.create(std.heap.ArenaAllocator);
@@ -185,11 +195,80 @@ pub const FlowDocState = struct {
         for (self.resolved.items) |*r| r.deinit();
         self.resolved.deinit(allocator);
         self.editor.destroy();
+        if (self.cycle_report) |*r| r.deinit();
         self.doc.deinit();
         self.arena.deinit();
         allocator.destroy(self.arena);
     }
 };
+
+/// Build the bare-name `Subflow` reference list of the open document
+/// (its live, possibly-unsaved state). Empty refs are skipped here so
+/// the snapshot and the analysis input agree. Owned by `a`.
+fn liveSubflowRefs(a: std.mem.Allocator, doc: flow_io.FlowDoc) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (doc.nodes) |n| {
+        if (n.kind != .subflow) continue;
+        if (n.flow_ref.len == 0) continue;
+        try out.append(a, n.flow_ref);
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// The flow document's effective name — the explicit top-level `name`
+/// or, failing that, the filename basename (RFC §5, mirrored by
+/// `flow_io.displayNameFromPath`).
+fn effectiveName(s: *const FlowDocState) []const u8 {
+    return s.doc.name orelse s.display_name;
+}
+
+/// Re-run the `Subflow` reference-cycle check if the live reference set
+/// has changed since the last run (or no check has run yet). Resolves
+/// referenced flows from the open document's own `scripts/flows/`
+/// directory — derived from the document path's parent.
+///
+/// Cheap to call every frame: when the reference set is unchanged this
+/// only builds and compares a short joined string and returns.
+fn refreshCycleCheck(s: *FlowDocState) void {
+    const a = s.arena.allocator();
+
+    // Build a `\n`-joined snapshot of the current Subflow refs.
+    var snap: std.ArrayList(u8) = .empty;
+    defer snap.deinit(a);
+    for (s.doc.nodes) |n| {
+        if (n.kind != .subflow or n.flow_ref.len == 0) continue;
+        snap.appendSlice(a, n.flow_ref) catch return;
+        snap.append(a, '\n') catch return;
+    }
+
+    if (s.cycle_report != null and
+        std.mem.eql(u8, snap.items, s.cycle_refs_snapshot)) return;
+
+    // Reference set changed (or first run) — re-analyze.
+    const child = s.arena.child_allocator;
+
+    var refs_arena = std.heap.ArenaAllocator.init(child);
+    defer refs_arena.deinit();
+    const refs = liveSubflowRefs(refs_arena.allocator(), s.doc) catch return;
+
+    // The flow file lives at `<flows_dir>/<name>.flow.jsonc`; the
+    // referenced flows resolve from the same directory.
+    const flows_dir = std.fs.path.dirname(s.path) orelse ".";
+
+    const new_report = flow_cycle.analyze(
+        child,
+        effectiveName(s),
+        refs,
+        flows_dir,
+    ) catch |err| {
+        std.log.err("flow: cycle check failed: {s}", .{@errorName(err)});
+        return;
+    };
+
+    if (s.cycle_report) |*old| old.deinit();
+    s.cycle_report = new_report;
+    s.cycle_refs_snapshot = a.dupe(u8, snap.items) catch "";
+}
 
 /// Public entry point — `OpenTab.render` dispatches here.
 pub fn render(s: *FlowDocState, app: *App) void {
@@ -206,6 +285,12 @@ pub fn render(s: *FlowDocState, app: *App) void {
     if (zgui.button("Save", .{})) saveFlowDoc(s, app);
     zgui.sameLine(.{});
     zgui.textDisabled("(.flow.jsonc — flat graph editor)", .{});
+
+    // Re-run the Subflow reference-cycle check whenever the live set of
+    // `Subflow` references changes (issue #159). Cheap when unchanged.
+    refreshCycleCheck(s);
+    renderCycleBanner(s);
+
     zgui.separator();
 
     const total_w = zgui.getContentRegionAvail()[0];
@@ -224,6 +309,51 @@ pub fn render(s: *FlowDocState, app: *App) void {
         renderInspector(s);
     }
     zgui.endChild();
+}
+
+/// Draw a warning banner when the most recent `Subflow` reference
+/// check found a cycle or an unresolved reference. A clean (or
+/// not-yet-run) check draws nothing — the editor stays quiet when the
+/// flow graph is fine (issue #159).
+fn renderCycleBanner(s: *FlowDocState) void {
+    const report = &(if (s.cycle_report) |*r| r else return).*;
+    switch (report.status) {
+        .clean => return,
+        .cycle => |chain| {
+            const text = chainText(s, chain) orelse "?";
+            zgui.textColored(
+                .{ 1.0, 0.35, 0.35, 1.0 },
+                "Subflow reference cycle: {s}",
+                .{text},
+            );
+            zgui.textDisabled(
+                "A cyclic flow graph is rejected by codegen at build time.",
+                .{},
+            );
+        },
+        .unresolved => |chain| {
+            const text = chainText(s, chain) orelse "?";
+            zgui.textColored(
+                .{ 1.0, 0.65, 0.2, 1.0 },
+                "Unresolved Subflow reference: {s}",
+                .{text},
+            );
+            zgui.textDisabled(
+                "The last flow in the chain has no scripts/flows/<name>.flow.jsonc file.",
+                .{},
+            );
+        },
+    }
+}
+
+/// Render a `flow_cycle.Chain` to an `a → b → c` string on the tab's
+/// arena. Returns null only on an allocation failure (then the caller
+/// shows a placeholder rather than crashing).
+fn chainText(s: *FlowDocState, chain: flow_cycle.Chain) ?[]const u8 {
+    const a = s.arena.allocator();
+    var out: std.ArrayList(u8) = .empty;
+    chain.format(&out, a) catch return null;
+    return out.toOwnedSlice(a) catch null;
 }
 
 // ─── Canvas ─────────────────────────────────────────────────────────────

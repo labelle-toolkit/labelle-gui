@@ -14,6 +14,7 @@ const atlas = @import("atlas.zig");
 const gizmo_io = @import("gizmo_io.zig");
 const flow_io = @import("flow_io.zig");
 const flow_doc = @import("modules/flow_doc.zig");
+const flow_cycle = @import("flow_cycle.zig");
 const gizmos = @import("gizmos.zig");
 const preview = @import("preview.zig");
 const flow_projector = @import("flows/projector.zig");
@@ -5376,5 +5377,221 @@ pub const FlowDocSubflowTests = struct {
             null,
             null,
         ));
+    }
+};
+
+// ─── flow_cycle: Subflow reference-cycle check (issue #159) ──────────────
+
+/// Covers `flow_cycle.detectCycle` (the pure DFS walk over the
+/// `Subflow` reference graph) and `flow_cycle.analyze` (the on-disk,
+/// project-backed resolver). The pure walk is exercised with an
+/// in-memory reference map; `analyze` is exercised against real
+/// `.flow.jsonc` files in a temp `scripts/flows/` directory.
+pub const FlowCycleTests = struct {
+    /// In-memory `flow_cycle.Resolver` backing — a flow name → refs
+    /// map. A name absent from the map resolves to `null` (unresolved).
+    const MapResolver = struct {
+        map: std.StringHashMapUnmanaged([]const []const u8),
+
+        fn refs(ctx: *anyopaque, name: []const u8) anyerror!?[]const []const u8 {
+            const self: *MapResolver = @ptrCast(@alignCast(ctx));
+            return self.map.get(name);
+        }
+
+        fn resolver(self: *MapResolver) flow_cycle.Resolver {
+            return .{ .ctx = self, .refsFn = MapResolver.refs };
+        }
+    };
+
+    test "detectCycle reports a clean linear chain" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var m: MapResolver = .{ .map = .empty };
+        try m.map.put(a, "a", &.{"b"});
+        try m.map.put(a, "b", &.{"c"});
+        try m.map.put(a, "c", &.{});
+
+        const status = try flow_cycle.detectCycle(a, "a", m.resolver());
+        try expect.toBeTrue(status == .clean);
+    }
+
+    test "detectCycle flags a direct self-reference" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var m: MapResolver = .{ .map = .empty };
+        try m.map.put(a, "a", &.{"a"});
+
+        const status = try flow_cycle.detectCycle(a, "a", m.resolver());
+        try expect.toBeTrue(status == .cycle);
+        try expect.equal(status.cycle.names.len, @as(usize, 2));
+    }
+
+    test "detectCycle reports the offending chain for an indirect cycle" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var m: MapResolver = .{ .map = .empty };
+        try m.map.put(a, "a", &.{"b"});
+        try m.map.put(a, "b", &.{"c"});
+        try m.map.put(a, "c", &.{"a"});
+
+        const status = try flow_cycle.detectCycle(a, "a", m.resolver());
+        try expect.toBeTrue(status == .cycle);
+        // a → b → c → a
+        try expect.equal(status.cycle.names.len, @as(usize, 4));
+        try expect.toBeTrue(std.mem.eql(u8, status.cycle.names[0], "a"));
+        try expect.toBeTrue(std.mem.eql(u8, status.cycle.names[3], "a"));
+    }
+
+    test "detectCycle finds a cycle that does not include the entry flow" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var m: MapResolver = .{ .map = .empty };
+        try m.map.put(a, "entry", &.{"b"});
+        try m.map.put(a, "b", &.{"c"});
+        try m.map.put(a, "c", &.{"b"});
+
+        const status = try flow_cycle.detectCycle(a, "entry", m.resolver());
+        try expect.toBeTrue(status == .cycle);
+    }
+
+    test "detectCycle reports an unresolved reference" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var m: MapResolver = .{ .map = .empty };
+        try m.map.put(a, "a", &.{"b"});
+        try m.map.put(a, "b", &.{"missing"});
+
+        const status = try flow_cycle.detectCycle(a, "a", m.resolver());
+        try expect.toBeTrue(status == .unresolved);
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            status.unresolved.names[status.unresolved.names.len - 1],
+            "missing",
+        ));
+    }
+
+    test "detectCycle treats a diamond reference graph as clean" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var m: MapResolver = .{ .map = .empty };
+        try m.map.put(a, "a", &.{ "b", "c" });
+        try m.map.put(a, "b", &.{"d"});
+        try m.map.put(a, "c", &.{"d"});
+        try m.map.put(a, "d", &.{});
+
+        const status = try flow_cycle.detectCycle(a, "a", m.resolver());
+        try expect.toBeTrue(status == .clean);
+    }
+
+    fn createTempDir(allocator: std.mem.Allocator) ![]const u8 {
+        const ts = timestampSeconds();
+        const dir_name = try std.fmt.allocPrint(
+            allocator,
+            "/tmp/labelle_flowcycle_{d}",
+            .{ts},
+        );
+        try std.Io.Dir.cwd().createDir(io_global.io(), dir_name, .default_dir);
+        return dir_name;
+    }
+
+    fn deleteTempDir(allocator: std.mem.Allocator, dir_path: []const u8) void {
+        std.Io.Dir.cwd().deleteTree(io_global.io(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+
+    /// Write `<flows_dir>/<name>.flow.jsonc` with a `Subflow` node per
+    /// entry in `refs`.
+    fn writeFlow(
+        allocator: std.mem.Allocator,
+        flows_dir: []const u8,
+        name: []const u8,
+        refs: []const []const u8,
+    ) !void {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(allocator);
+        try buf.appendSlice(allocator, "{ \"event\": { \"type\": \"OnCall\" }, \"nodes\": [");
+        for (refs, 0..) |r, i| {
+            if (i > 0) try buf.append(allocator, ',');
+            try buf.print(allocator,
+                " {{ \"id\": {d}, \"type\": \"Subflow\", \"flow\": \"{s}\", \"pos\": [0, 0] }}",
+                .{ i + 1, r });
+        }
+        try buf.appendSlice(allocator, " ], \"edges\": [] }\n");
+
+        const path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}{s}",
+            .{ flows_dir, name, flow_io.extension },
+        );
+        defer allocator.free(path);
+        try std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = path,
+            .data = buf.items,
+        });
+    }
+
+    test "analyze reads referenced flows from disk and reports a cycle" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // a → b → a, written as real .flow.jsonc files.
+        try writeFlow(allocator, flows_dir, "b", &.{"a"});
+
+        var report = try flow_cycle.analyze(
+            allocator,
+            "a",
+            &.{"b"}, // live (unsaved) Subflow refs of the open doc "a"
+            flows_dir,
+        );
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .cycle);
+    }
+
+    test "analyze reports an unresolved reference for a missing file" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // "a" references "ghost" — no ghost.flow.jsonc on disk.
+        var report = try flow_cycle.analyze(
+            allocator,
+            "a",
+            &.{"ghost"},
+            flows_dir,
+        );
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .unresolved);
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            report.status.unresolved.names[report.status.unresolved.names.len - 1],
+            "ghost",
+        ));
+    }
+
+    test "analyze reports clean for an acyclic on-disk reference graph" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // a → b → c, all real files, no cycle.
+        try writeFlow(allocator, flows_dir, "b", &.{"c"});
+        try writeFlow(allocator, flows_dir, "c", &.{});
+
+        var report = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .clean);
     }
 };
