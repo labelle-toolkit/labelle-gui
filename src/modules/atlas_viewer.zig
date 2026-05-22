@@ -26,6 +26,10 @@ pub const AtlasViewer = struct {
     loaded: std.ArrayListUnmanaged(atlas.Atlas) = .empty,
     /// Index into the combined list: project atlases, then `loaded`.
     selected: usize = 0,
+    /// `ProjectManager.generation` the `selected` index was last valid
+    /// against. When the project changes, the index points into a
+    /// different atlas set, so we reset selection + sprite.
+    last_generation: ?u64 = null,
     /// Selected sprite — a frame key in the current atlas.
     sprite_buf: [512]u8 = undefined,
     sprite_len: usize = 0,
@@ -53,6 +57,9 @@ pub const AtlasViewer = struct {
         const s = std.fmt.bufPrint(&self.status_buf, fmt, args) catch self.status_buf[0..0];
         self.status_len = s.len;
         self.status_ok = ok;
+    }
+    fn clearSprite(self: *AtlasViewer) void {
+        self.sprite_len = 0;
     }
 };
 
@@ -83,6 +90,17 @@ fn render(app: *App) void {
 
     const v = &app.atlas_viewer;
 
+    // Project transitions re-key `App.atlas_index`; the `selected`
+    // index then points into a different atlas set (or a now-shorter
+    // list). Reset selection + sprite when the generation changes so
+    // the viewer never shows an unintended atlas/sprite.
+    const generation = app.project_manager.generation;
+    if (v.last_generation != generation) {
+        v.last_generation = generation;
+        v.selected = 0;
+        v.clearSprite();
+    }
+
     // ── Toolbar ──────────────────────────────────────────────────
     if (zgui.button("Pack folder...", .{})) packFolder(app);
     if (v.status_len > 0) {
@@ -99,14 +117,25 @@ fn render(app: *App) void {
         zgui.textDisabled("No atlases. Open a project with atlas resources, or pack a folder.", .{});
         return;
     }
-    if (v.selected >= total) v.selected = 0;
-    const cur = atlasAt(project_atlases, v.loaded.items, v.selected);
+    if (v.selected >= total) {
+        v.selected = 0;
+        v.clearSprite();
+    }
 
     // ── Atlas picker + zoom ──────────────────────────────────────
-    if (zgui.button("<", .{})) v.selected = (v.selected + total - 1) % total;
+    // Resolve `cur` *after* the picker buttons so the header name,
+    // index, dimensions and sprite list all reflect the same atlas.
+    if (zgui.button("<", .{})) {
+        v.selected = (v.selected + total - 1) % total;
+        v.clearSprite();
+    }
     zgui.sameLine(.{});
-    if (zgui.button(">", .{})) v.selected = (v.selected + 1) % total;
+    if (zgui.button(">", .{})) {
+        v.selected = (v.selected + 1) % total;
+        v.clearSprite();
+    }
     zgui.sameLine(.{});
+    const cur = atlasAt(project_atlases, v.loaded.items, v.selected);
     const origin_tag: []const u8 = if (v.selected < project_atlases.len) "project" else "packed";
     zgui.text("{s}  ({d}/{d}, {s})", .{ cur.name, v.selected + 1, total, origin_tag });
 
@@ -275,9 +304,26 @@ fn packFolder(app: *App) void {
         return;
     }
 
-    const json_path = std.fmt.allocPrint(app.allocator, "{s}/{s}.atlas.json", .{ folder, name }) catch return;
+    const json_name = std.fmt.allocPrint(app.allocator, "{s}.atlas.json", .{name}) catch {
+        v.setStatus(false, "packed ok, but out of memory building the atlas path", .{});
+        return;
+    };
+    defer app.allocator.free(json_name);
+    const json_path = std.fs.path.join(app.allocator, &.{ folder, json_name }) catch {
+        v.setStatus(false, "packed ok, but out of memory building the atlas path", .{});
+        return;
+    };
     defer app.allocator.free(json_path);
-    const png_path = std.fmt.allocPrint(app.allocator, "{s}/{s}.atlas.png", .{ folder, name }) catch return;
+
+    const png_name = std.fmt.allocPrint(app.allocator, "{s}.atlas.png", .{name}) catch {
+        v.setStatus(false, "packed ok, but out of memory building the atlas path", .{});
+        return;
+    };
+    defer app.allocator.free(png_name);
+    const png_path = std.fs.path.join(app.allocator, &.{ folder, png_name }) catch {
+        v.setStatus(false, "packed ok, but out of memory building the atlas path", .{});
+        return;
+    };
     defer app.allocator.free(png_path);
 
     var loaded = atlas.loadFromPaths(app.allocator, name, json_path, png_path) catch |err| {
@@ -285,14 +331,36 @@ fn packFolder(app: *App) void {
         return;
     };
     const sprite_count = loaded.frames.count();
-    v.loaded.append(app.allocator, loaded) catch {
-        loaded.deinit(app.allocator);
-        v.setStatus(false, "out of memory", .{});
-        return;
-    };
 
+    // Re-packing the same folder must not accumulate duplicate atlases
+    // (and leak their GL textures). Replace any prior `loaded` entry
+    // with the same name in place.
+    var replaced = false;
+    for (v.loaded.items) |*existing| {
+        if (std.mem.eql(u8, existing.name, name)) {
+            existing.deinit(app.allocator);
+            existing.* = loaded;
+            replaced = true;
+            break;
+        }
+    }
+    if (!replaced) {
+        v.loaded.append(app.allocator, loaded) catch {
+            loaded.deinit(app.allocator);
+            v.setStatus(false, "out of memory", .{});
+            return;
+        };
+    }
+
+    // Select the freshly packed atlas. After a replace its slot is
+    // unchanged; locate it so the index is correct either way.
     const project_count = if (app.atlas_index) |*idx| idx.atlases.items.len else 0;
-    v.selected = project_count + v.loaded.items.len - 1;
-    v.sprite_len = 0;
+    for (v.loaded.items, 0..) |*a, i| {
+        if (std.mem.eql(u8, a.name, name)) {
+            v.selected = project_count + i;
+            break;
+        }
+    }
+    v.clearSprite();
     v.setStatus(true, "packed '{s}' — {d} sprites", .{ name, sprite_count });
 }
