@@ -15,6 +15,11 @@
 //!     effective registry name (RFC §5: the flow's top-level `name`,
 //!     else its filename basename) matches no `.flow.jsonc` file under
 //!     `scripts/flows/`. flow-codegen raises `UnknownFlowRef`.
+//!   - **A broken referenced file** — a `Subflow` resolves to a file
+//!     that exists on disk but fails to load/parse (a JSON or schema
+//!     error). flow-codegen can't read it either; the editor surfaces
+//!     this distinctly from a plain missing file so the author knows to
+//!     fix the file rather than create one.
 //!
 //! The pure walk (`detectCycle`) is decoupled from the filesystem via
 //! a `Resolver` callback so it can be unit-tested with an in-memory
@@ -39,10 +44,33 @@ pub const Status = union(enum) {
     /// flow names, starting and ending with the same name
     /// (e.g. `a → b → a`).
     cycle: Chain,
-    /// A `Subflow` referenced a flow that couldn't be resolved.
-    /// `chain` is the path of flow names from the entry flow down to
-    /// (and including) the unresolved name.
+    /// A `Subflow` referenced a flow whose effective registry name
+    /// matches no `.flow.jsonc` file on disk. `chain` is the path of
+    /// flow names from the entry flow down to (and including) the
+    /// missing name.
     unresolved: Chain,
+    /// A `Subflow` referenced a flow whose file exists on disk but
+    /// failed to load or parse (a JSON / schema error). `chain` is the
+    /// path of flow names from the entry flow down to (and including)
+    /// the broken flow's name. Distinct from `unresolved` so the editor
+    /// can tell "fix this file" apart from "create this file".
+    parse_failed: Chain,
+};
+
+/// A snapshot of one `.flow.jsonc` file the analysis read while
+/// resolving references — its path plus the `mtime`/`size` observed at
+/// read time. `refreshCycleCheck` keeps this set so it can cheaply tell
+/// whether any referenced file changed on disk since the last check
+/// (which can create or break a *transitive* cycle the open flow's own
+/// reference set never reveals).
+pub const FileStamp = struct {
+    /// Absolute path of the file, owned by the report arena.
+    path: []const u8,
+    /// Last-modification time in nanoseconds (`Io.Timestamp`), or
+    /// `null` when the file could not be stat'd (e.g. it is missing).
+    mtime_ns: ?i96,
+    /// File size in bytes, or `null` when the file could not be stat'd.
+    size: ?u64,
 };
 
 /// An ordered list of flow names describing an offending reference
@@ -69,6 +97,13 @@ pub const Report = struct {
     /// re-runs). Empty for a `clean` status. Owned by `arena`, so the
     /// UI can display it every frame without re-allocating.
     chain_text: []const u8 = "",
+    /// Every `.flow.jsonc` file the analysis stat'd while resolving
+    /// referenced flows, with the `mtime`/`size` observed at read time.
+    /// `refreshCycleCheck` keeps this so it can detect an on-disk edit
+    /// to a *referenced* flow — which can create or break a transitive
+    /// cycle the open flow's own reference set never reveals. Owned by
+    /// `arena`.
+    read_files: []const FileStamp = &.{},
 
     pub fn deinit(self: *Report) void {
         const child = self.arena.child_allocator;
@@ -81,18 +116,32 @@ pub const Report = struct {
     }
 };
 
+/// Result of resolving one flow name to its outgoing `Subflow`
+/// references — the value the `Resolver` callback returns.
+pub const RefResult = union(enum) {
+    /// The flow resolved; `.refs` is its (possibly empty) list of
+    /// referenced flow names. The slice and its strings must outlive
+    /// the `detectCycle` call.
+    ok: []const []const u8,
+    /// No flow with this effective name exists on disk.
+    missing,
+    /// A flow file with this name exists but failed to load or parse
+    /// (a JSON / schema error). Distinct from `missing` so the editor
+    /// can surface "fix this file" rather than "create this file".
+    parse_failed,
+};
+
 /// Abstract source of a flow's outgoing `Subflow` references. The pure
 /// `detectCycle` walk only needs this — it never touches the
-/// filesystem. `refs` returns:
-///   - the (possibly empty) list of flow names this flow references,
-///   - or `null` when the named flow cannot be resolved at all.
+/// filesystem. `refs` returns a `RefResult` classifying the named flow
+/// as resolved (with its references), missing, or present-but-broken.
 /// The returned slice and its strings must outlive the `detectCycle`
 /// call (the project resolver allocates them on the report arena).
 pub const Resolver = struct {
     ctx: *anyopaque,
-    refsFn: *const fn (ctx: *anyopaque, name: []const u8) anyerror!?[]const []const u8,
+    refsFn: *const fn (ctx: *anyopaque, name: []const u8) anyerror!RefResult,
 
-    fn refs(self: Resolver, name: []const u8) anyerror!?[]const []const u8 {
+    fn refs(self: Resolver, name: []const u8) anyerror!RefResult {
         return self.refsFn(self.ctx, name);
     }
 };
@@ -144,15 +193,19 @@ fn walk(
     // Already proven clean on an earlier branch — skip.
     if (visited.contains(name)) return .clean;
 
-    const child_refs = (try resolver.refs(name)) orelse {
-        // `name` itself couldn't be resolved. Report the path that led
+    const child_refs = switch (try resolver.refs(name)) {
+        .ok => |refs| refs,
+        // `name` names no flow file on disk. Report the path that led
         // here, including `name`.
-        var chain: std.ArrayList([]const u8) = .empty;
-        for (path.items) |n| {
-            try chain.append(arena, try arena.dupe(u8, n));
-        }
-        try chain.append(arena, try arena.dupe(u8, name));
-        return .{ .unresolved = .{ .names = try chain.toOwnedSlice(arena) } };
+        .missing => return .{
+            .unresolved = .{ .names = try chainTo(arena, path, name) },
+        },
+        // `name`'s flow file exists but is broken. Same chain shape as
+        // `unresolved`, but a distinct status so the banner can say
+        // "fix this file" rather than "create this file".
+        .parse_failed => return .{
+            .parse_failed = .{ .names = try chainTo(arena, path, name) },
+        },
     };
 
     try path.append(arena, name);
@@ -167,6 +220,23 @@ fn walk(
     // arena-owned copy so the key outlives any borrowed slice.
     try visited.put(arena, try arena.dupe(u8, name), {});
     return .clean;
+}
+
+/// Build the offending chain for a non-resolving flow: every name on
+/// the current DFS path, then `tail` (the offending name itself).
+/// Strings are duped onto `arena` so the chain outlives the walk's
+/// borrowed `path`.
+fn chainTo(
+    arena: std.mem.Allocator,
+    path: *std.ArrayList([]const u8),
+    tail: []const u8,
+) ![][]const u8 {
+    var chain: std.ArrayList([]const u8) = .empty;
+    for (path.items) |n| {
+        try chain.append(arena, try arena.dupe(u8, n));
+    }
+    try chain.append(arena, try arena.dupe(u8, tail));
+    return chain.toOwnedSlice(arena);
 }
 
 // ─── Project-backed resolver ────────────────────────────────────────────
@@ -188,25 +258,42 @@ const ProjectResolver = struct {
     arena: std.mem.Allocator,
     /// Absolute path of the project's `scripts/flows/` directory.
     flows_dir: []const u8,
-    /// flow name → its outgoing Subflow refs (`null` cached for a name
-    /// whose flow is missing or unparseable).
-    cache: std.StringHashMapUnmanaged(?[]const []const u8) = .empty,
+    /// flow name → the cached `RefResult` for it (resolved refs,
+    /// missing, or present-but-broken).
+    cache: std.StringHashMapUnmanaged(RefResult) = .empty,
     /// effective registry name → absolute file path. Built once by
     /// `ensureIndex`. `null` until the first `refs` call scans the dir.
     index: ?std.StringHashMapUnmanaged([]const u8) = null,
+    /// filename basename (without `.flow.jsonc`) → absolute path, for
+    /// every flow file that *failed to parse* during the directory
+    /// scan. A flow whose file is broken can't contribute a registry
+    /// `name`, so a reference to it only resolves when the `flow_ref`
+    /// equals the broken file's basename — the same fallback rule
+    /// `displayNameFromPath` applies to a nameless flow. Built by
+    /// `ensureIndex` alongside `index`.
+    broken: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// Every `.flow.jsonc` file seen during the directory scan, with
+    /// the `mtime`/`size` observed then. Surfaced on the `Report` so a
+    /// later check can tell whether any referenced file changed.
+    seen_files: std.ArrayListUnmanaged(FileStamp) = .empty,
 
-    fn refs(ctx: *anyopaque, name: []const u8) anyerror!?[]const []const u8 {
+    fn refs(ctx: *anyopaque, name: []const u8) anyerror!RefResult {
         const self: *ProjectResolver = @ptrCast(@alignCast(ctx));
         if (self.cache.get(name)) |cached| return cached;
 
-        const result = self.loadRefs(name) catch null;
+        // A filesystem error while resolving is treated as `missing` —
+        // the editor can't prove the flow is fine, so it flags it.
+        const result = self.loadRefs(name) catch RefResult.missing;
         try self.cache.put(self.arena, try self.arena.dupe(u8, name), result);
         return result;
     }
 
     /// Scan `flows_dir` once and index every flow file by its effective
     /// registry name. A directory that can't be opened yields an empty
-    /// index (every reference then resolves to `unresolved`).
+    /// index (every reference then resolves to `unresolved`). Files that
+    /// fail to parse are recorded in `broken` (keyed by basename) rather
+    /// than dropped, so a reference to a broken file is reported as
+    /// `parse_failed`, not `missing`.
     fn ensureIndex(self: *ProjectResolver) !*std.StringHashMapUnmanaged([]const u8) {
         if (self.index) |*idx| return idx;
         self.index = .empty;
@@ -229,12 +316,30 @@ const ProjectResolver = struct {
                 self.arena,
                 &.{ self.flows_dir, entry.name },
             );
+            // Record the file's stamp before parsing — a referenced
+            // file changing on disk (even one that now parses cleanly)
+            // must invalidate a cached check.
+            try self.recordStamp(full);
+
+            const base = flow_io.displayNameFromPath(entry.name);
             // Effective name = top-level `name`, else filename basename.
-            var doc = flow_io.loadFromFile(self.arena, full) catch continue;
+            var doc = flow_io.loadFromFile(self.arena, full) catch {
+                // The file exists but is broken. Index it by basename in
+                // `broken` so a `flow_ref` matching that basename
+                // resolves to `parse_failed` rather than `missing`.
+                if (!self.broken.contains(base)) {
+                    try self.broken.put(
+                        self.arena,
+                        try self.arena.dupe(u8, base),
+                        full,
+                    );
+                }
+                continue;
+            };
             const eff = if (doc.name) |n|
                 try self.arena.dupe(u8, n)
             else
-                try self.arena.dupe(u8, flow_io.displayNameFromPath(entry.name));
+                try self.arena.dupe(u8, base);
             doc.deinit();
 
             // First file wins on a duplicate name — deterministic and
@@ -244,14 +349,45 @@ const ProjectResolver = struct {
         return idx;
     }
 
+    /// `stat` `full` and append a `FileStamp` for it to `seen_files`. A
+    /// stat failure still records the path (with null mtime/size) so the
+    /// file is part of the "changed?" comparison set.
+    fn recordStamp(self: *ProjectResolver, full: []const u8) !void {
+        const io = io_global.io();
+        const st = std.Io.Dir.cwd().statFile(io, full, .{}) catch {
+            try self.seen_files.append(self.arena, .{
+                .path = full,
+                .mtime_ns = null,
+                .size = null,
+            });
+            return;
+        };
+        try self.seen_files.append(self.arena, .{
+            .path = full,
+            .mtime_ns = st.mtime.nanoseconds,
+            .size = st.size,
+        });
+    }
+
     /// Resolve `name` to its flow file via the registry-name index,
     /// parse it, and return the distinct non-empty `Subflow` `flow_ref`
-    /// values it contains. `null` when no flow has that effective name.
-    fn loadRefs(self: *ProjectResolver, name: []const u8) !?[]const []const u8 {
+    /// values it contains. Returns `.missing` when no flow has that
+    /// effective name and no broken file's basename matches, and
+    /// `.parse_failed` when a file exists for it but failed to parse.
+    fn loadRefs(self: *ProjectResolver, name: []const u8) !RefResult {
         const idx = try self.ensureIndex();
-        const full = idx.get(name) orelse return null;
+        const full = idx.get(name) orelse {
+            // Not a resolvable registry name. If a *broken* file's
+            // basename matches, the reference points at a present but
+            // unparseable flow — surface that distinctly.
+            if (self.broken.contains(name)) return .parse_failed;
+            return .missing;
+        };
 
-        var doc = flow_io.loadFromFile(self.arena, full) catch return null;
+        // The file parsed during the scan; a failure here means it
+        // changed (or a transient IO error) between scan and re-read —
+        // treat it as broken rather than missing.
+        var doc = flow_io.loadFromFile(self.arena, full) catch return .parse_failed;
         defer doc.deinit();
 
         var out: std.ArrayList([]const u8) = .empty;
@@ -265,7 +401,7 @@ const ProjectResolver = struct {
             try seen.put(self.arena, ref, {});
             try out.append(self.arena, ref);
         }
-        return try out.toOwnedSlice(self.arena);
+        return .{ .ok = try out.toOwnedSlice(self.arena) };
     }
 };
 
@@ -314,7 +450,7 @@ pub fn analyze(
         try resolver_ctx.cache.put(
             a,
             try a.dupe(u8, entry_name),
-            try refs_copy.toOwnedSlice(a),
+            .{ .ok = try refs_copy.toOwnedSlice(a) },
         );
     }
 
@@ -333,6 +469,7 @@ pub fn analyze(
         .clean => null,
         .cycle => |c| c,
         .unresolved => |c| c,
+        .parse_failed => |c| c,
     };
     if (chain) |c| {
         var out: std.ArrayList(u8) = .empty;
@@ -340,19 +477,33 @@ pub fn analyze(
         chain_text = try out.toOwnedSlice(a);
     }
 
-    return .{ .arena = arena, .status = status, .chain_text = chain_text };
+    // Hand the caller the set of files the resolver stat'd — the
+    // resolver allocated the `FileStamp`s and their paths on the report
+    // arena, so they outlive this call and `deinit` reclaims them.
+    const read_files = try resolver_ctx.seen_files.toOwnedSlice(a);
+
+    return .{
+        .arena = arena,
+        .status = status,
+        .chain_text = chain_text,
+        .read_files = read_files,
+    };
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────
 
 /// In-memory resolver for tests — a flow name → refs map. A name absent
-/// from the map resolves to `null` (unresolved).
+/// from the map resolves to `.missing`; a name present in `broken`
+/// resolves to `.parse_failed`.
 const MapResolver = struct {
     map: std.StringHashMapUnmanaged([]const []const u8),
+    broken: std.StringHashMapUnmanaged(void) = .empty,
 
-    fn refs(ctx: *anyopaque, name: []const u8) anyerror!?[]const []const u8 {
+    fn refs(ctx: *anyopaque, name: []const u8) anyerror!RefResult {
         const self: *MapResolver = @ptrCast(@alignCast(ctx));
-        return self.map.get(name);
+        if (self.map.get(name)) |r| return .{ .ok = r };
+        if (self.broken.contains(name)) return .parse_failed;
+        return .missing;
     }
 
     fn resolver(self: *MapResolver) Resolver {
@@ -440,6 +591,23 @@ test "detectCycle: unresolved reference is reported" {
     try std.testing.expect(status == .unresolved);
     try std.testing.expectEqual(@as(usize, 3), status.unresolved.names.len);
     try std.testing.expectEqualStrings("missing", status.unresolved.names[2]);
+}
+
+test "detectCycle: a broken referenced flow reports parse_failed" {
+    var a_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a_state.deinit();
+    const a = a_state.allocator();
+
+    var m: MapResolver = .{ .map = .empty };
+    try m.map.put(a, "a", &.{"b"});
+    try m.map.put(a, "b", &.{"broken"});
+    // "broken" exists but won't parse — distinct from a missing file.
+    try m.broken.put(a, "broken", {});
+
+    const status = try detectCycle(a, "a", m.resolver());
+    try std.testing.expect(status == .parse_failed);
+    try std.testing.expectEqual(@as(usize, 3), status.parse_failed.names.len);
+    try std.testing.expectEqualStrings("broken", status.parse_failed.names[2]);
 }
 
 test "detectCycle: diamond reference graph is clean and walked once" {

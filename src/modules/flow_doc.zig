@@ -36,6 +36,7 @@ const App = @import("../app.zig").App;
 const flow_io = @import("../flow_io.zig");
 const io_global = @import("../io_global.zig");
 const flow_cycle = @import("../flow_cycle.zig");
+const io_global = @import("../io_global.zig");
 
 const inspector_w: f32 = 340;
 const split_gap: f32 = 8;
@@ -155,7 +156,9 @@ pub const FlowDocState = struct {
     /// Result of the most recent `Subflow` reference-cycle check
     /// (issue #159). Null until the first check runs. A `clean` status
     /// is kept (rather than null) so the UI can tell "checked, fine"
-    /// apart from "not yet checked". Owns its own arena.
+    /// apart from "not yet checked". Owns its own arena. The report's
+    /// `read_files` field carries the on-disk stamps the check ran
+    /// against — `refreshCycleCheck` re-runs when any of them changes.
     cycle_report: ?flow_cycle.Report = null,
     /// Snapshot of the `Subflow` `flow_ref` set the last cycle check
     /// ran against, joined by `\n`. When the live set diverges from
@@ -222,13 +225,42 @@ fn effectiveName(s: *const FlowDocState) []const u8 {
     return s.doc.name orelse s.display_name;
 }
 
-/// Re-run the `Subflow` reference-cycle check if the live reference set
-/// has changed since the last run (or no check has run yet). Resolves
-/// referenced flows from the open document's own `scripts/flows/`
-/// directory — derived from the document path's parent.
+/// True when any `.flow.jsonc` file the last check read has changed on
+/// disk since — a different `mtime`, a different `size`, or a file that
+/// is now stat-able when it wasn't (or vice versa). An on-disk edit to
+/// a *referenced* flow can create or break a transitive cycle the open
+/// document's own `Subflow` reference set never reveals, so the banner
+/// must not trust a cached "clean" once any referenced file moves.
 ///
-/// Cheap to call every frame: when the reference set is unchanged this
-/// only builds and compares a short joined string and returns.
+/// Cheap: one `statFile` per referenced file. A flow graph references a
+/// handful of files at most, so this stays well within an immediate-mode
+/// frame budget.
+pub fn referencedFilesChanged(report: *const flow_cycle.Report) bool {
+    const io = io_global.io();
+    for (report.read_files) |f| {
+        const st = std.Io.Dir.cwd().statFile(io, f.path, .{}) catch {
+            // The file is no longer stat-able. Stale only if it *was*
+            // stat-able at check time.
+            if (f.mtime_ns != null or f.size != null) return true;
+            continue;
+        };
+        // The file became stat-able since the check, or its mtime/size
+        // moved — either way the cached result may be stale.
+        if (f.mtime_ns == null or f.size == null) return true;
+        if (f.mtime_ns.? != st.mtime.nanoseconds) return true;
+        if (f.size.? != st.size) return true;
+    }
+    return false;
+}
+
+/// Re-run the `Subflow` reference-cycle check if the live reference set
+/// has changed since the last run, if any referenced flow file changed
+/// on disk, or if no check has run yet. Resolves referenced flows from
+/// the open document's own `scripts/flows/` directory — derived from the
+/// document path's parent.
+///
+/// Cheap to call every frame: when nothing changed this only builds and
+/// compares a short joined string and stats a handful of files.
 fn refreshCycleCheck(s: *FlowDocState) void {
     // The tab arena (`ArenaAllocator.free` is a no-op) is never used
     // for per-frame scratch — the snapshot and refs are built on the
@@ -246,10 +278,17 @@ fn refreshCycleCheck(s: *FlowDocState) void {
         snap.append(child, '\n') catch return;
     }
 
-    if (s.cycle_report != null and
-        std.mem.eql(u8, snap.items, s.cycle_refs_snapshot)) return;
+    // Skip the re-analysis only when a check has run, the open flow's
+    // own reference set is unchanged, *and* none of the referenced
+    // files moved on disk. The disk-stamp check guards against a stale
+    // "clean" banner when a transitively-referenced flow is edited.
+    if (s.cycle_report) |*report| {
+        if (std.mem.eql(u8, snap.items, s.cycle_refs_snapshot) and
+            !referencedFilesChanged(report)) return;
+    }
 
-    // Reference set changed (or first run) — re-analyze.
+    // Reference set changed, a referenced file changed, or first run —
+    // re-analyze.
     var refs_arena = std.heap.ArenaAllocator.init(child);
     defer refs_arena.deinit();
     const refs = liveSubflowRefs(refs_arena.allocator(), s.doc) catch return;
@@ -365,6 +404,17 @@ fn renderCycleBanner(s: *FlowDocState) void {
             );
             zgui.textDisabled(
                 "The last flow in the chain has no scripts/flows/<name>.flow.jsonc file.",
+                .{},
+            );
+        },
+        .parse_failed => {
+            zgui.textColored(
+                .{ 1.0, 0.65, 0.2, 1.0 },
+                "Broken Subflow reference: {s}",
+                .{text},
+            );
+            zgui.textDisabled(
+                "The last flow in the chain has a .flow.jsonc file that failed to parse — fix that file.",
                 .{},
             );
         },

@@ -15,6 +15,7 @@ const gizmo_io = @import("gizmo_io.zig");
 const flow_io = @import("flow_io.zig");
 const flow_doc = @import("modules/flow_doc.zig");
 const flow_cycle = @import("flow_cycle.zig");
+const flow_doc = @import("modules/flow_doc.zig");
 const gizmos = @import("gizmos.zig");
 const preview = @import("preview.zig");
 const flow_projector = @import("flows/projector.zig");
@@ -5389,13 +5390,17 @@ pub const FlowDocSubflowTests = struct {
 /// `.flow.jsonc` files in a temp `scripts/flows/` directory.
 pub const FlowCycleTests = struct {
     /// In-memory `flow_cycle.Resolver` backing — a flow name → refs
-    /// map. A name absent from the map resolves to `null` (unresolved).
+    /// map. A name absent from the map resolves to `.missing`; a name
+    /// in `broken` resolves to `.parse_failed`.
     const MapResolver = struct {
         map: std.StringHashMapUnmanaged([]const []const u8),
+        broken: std.StringHashMapUnmanaged(void) = .empty,
 
-        fn refs(ctx: *anyopaque, name: []const u8) anyerror!?[]const []const u8 {
+        fn refs(ctx: *anyopaque, name: []const u8) anyerror!flow_cycle.RefResult {
             const self: *MapResolver = @ptrCast(@alignCast(ctx));
-            return self.map.get(name);
+            if (self.map.get(name)) |r| return .{ .ok = r };
+            if (self.broken.contains(name)) return .parse_failed;
+            return .missing;
         }
 
         fn resolver(self: *MapResolver) flow_cycle.Resolver {
@@ -5731,5 +5736,102 @@ pub const FlowCycleTests = struct {
             report.chain_text,
             "a \u{2192} b \u{2192} a",
         ));
+    }
+
+    /// Write `<flows_dir>/<name>.flow.jsonc` with deliberately broken
+    /// content — valid as a file on disk, but not parseable as a flow
+    /// (here: a top-level array, not an object).
+    fn writeBrokenFlow(
+        allocator: std.mem.Allocator,
+        flows_dir: []const u8,
+        name: []const u8,
+    ) !void {
+        const path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}{s}",
+            .{ flows_dir, name, flow_io.extension },
+        );
+        defer allocator.free(path);
+        try std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = path,
+            .data = "[ this is not valid flow json ]\n",
+        });
+    }
+
+    test "analyze flags a referenced file that exists but fails to parse" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // "a" references "b"; b.flow.jsonc exists on disk but its
+        // content is not parseable. This must be reported distinctly
+        // from a plain missing file — `parse_failed`, not `unresolved`.
+        try writeBrokenFlow(allocator, flows_dir, "b");
+
+        var report = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .parse_failed);
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            report.status.parse_failed.names[
+                report.status.parse_failed.names.len - 1
+            ],
+            "b",
+        ));
+        // A genuinely missing file is still `unresolved`, not
+        // `parse_failed` — the two stay distinct.
+        var missing = try flow_cycle.analyze(allocator, "a", &.{"ghost"}, flows_dir);
+        defer missing.deinit();
+        try expect.toBeTrue(missing.status == .unresolved);
+    }
+
+    test "analyze records the referenced files it read on the report" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        try writeFlow(allocator, flows_dir, "b", &.{"c"});
+        try writeFlow(allocator, flows_dir, "c", &.{});
+
+        var report = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        defer report.deinit();
+        // The resolver scans every `.flow.jsonc` in `flows_dir` to build
+        // its registry-name index, so both files are recorded with a
+        // stat-able mtime.
+        try expect.toBeTrue(report.read_files.len == 2);
+        for (report.read_files) |f| {
+            try expect.toBeTrue(f.mtime_ns != null);
+            try expect.toBeTrue(f.size != null);
+        }
+    }
+
+    test "referencedFilesChanged re-triggers when a referenced file changes on disk" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // Initial graph: a → b → c, acyclic and clean.
+        try writeFlow(allocator, flows_dir, "b", &.{"c"});
+        try writeFlow(allocator, flows_dir, "c", &.{});
+
+        var report = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .clean);
+        // Nothing has changed on disk yet — no re-trigger.
+        try expect.toBeFalse(flow_doc.referencedFilesChanged(&report));
+
+        // Edit a *transitively*-referenced flow so it now closes a cycle
+        // (c → a). The open flow's own Subflow refs ({"b"}) are
+        // unchanged, so only the on-disk stamp reveals the staleness.
+        // `writeFlow` truncates and rewrites `c.flow.jsonc`.
+        try writeFlow(allocator, flows_dir, "c", &.{"a"});
+        try expect.toBeTrue(flow_doc.referencedFilesChanged(&report));
+
+        // Re-running the check now sees the cycle the stale report
+        // missed.
+        var fresh = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        defer fresh.deinit();
+        try expect.toBeTrue(fresh.status == .cycle);
+        try expect.toBeFalse(flow_doc.referencedFilesChanged(&fresh));
     }
 };
