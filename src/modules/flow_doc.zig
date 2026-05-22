@@ -817,34 +817,45 @@ fn renderOtherField(s: *FlowDocState, n: *flow_io.Node, spec: flow_io.OtherField
             // doc arena here would leak for as long as the node stays
             // selected.
             var decode_buf: IdentBuf = undefined;
-            const decoded = flow_io.decodeStringValueBuf(&decode_buf, current);
-            // A missing or invalid stored `op` is treated as *no
-            // selection* (blank preview) rather than silently previewing
-            // the first choice. Otherwise picking the displayed default
-            // (`add`) wouldn't register as a change and could never be
-            // committed — the combo would show `add` without it ever
-            // being written to the node.
-            var sel: ?usize = null;
-            for (flow_io.bin_ops, 0..) |op, i| {
-                if (std.mem.eql(u8, op, decoded)) sel = i;
-            }
-            var preview_z: IdentBuf = undefined;
-            seedBuf(&preview_z, if (sel) |i| flow_io.bin_ops[i] else "");
-            if (zgui.beginCombo("##other_op", .{ .preview_value = &preview_z })) {
+            const decoded = flow_io.decodeStringValueBufChecked(&decode_buf, current);
+            if (decoded.truncated) {
+                // A stored `op` longer than the identifier buffer can't
+                // be matched against the choice list without loss — the
+                // combo would show a blank selection, and picking any
+                // operator would silently overwrite the full stored
+                // value on save. Treat it like the `.text` too-long case:
+                // show a read-only view and write nothing, so the
+                // original `op` round-trips verbatim.
+                renderTooLongField(current);
+            } else {
+                // A missing or invalid stored `op` is treated as *no
+                // selection* (blank preview) rather than silently
+                // previewing the first choice. Otherwise picking the
+                // displayed default (`add`) wouldn't register as a change
+                // and could never be committed — the combo would show
+                // `add` without it ever being written to the node.
+                var sel: ?usize = null;
                 for (flow_io.bin_ops, 0..) |op, i| {
-                    var op_z: IdentBuf = undefined;
-                    seedBuf(&op_z, op);
-                    if (zgui.selectable(&op_z, .{ .selected = sel == i })) {
-                        // `selectable` fires on every click — commit even
-                        // when the picked op equals the previewed one, so
-                        // selecting `add` on a node with no valid `op`
-                        // still writes and marks the doc dirty.
-                        const encoded = flow_io.encodeStringValue(a, op) catch return;
-                        flow_io.setExtraValue(a, n, spec.key, encoded) catch return;
-                        s.is_dirty = true;
-                    }
+                    if (std.mem.eql(u8, op, decoded.text)) sel = i;
                 }
-                zgui.endCombo();
+                var preview_z: IdentBuf = undefined;
+                seedBuf(&preview_z, if (sel) |i| flow_io.bin_ops[i] else "");
+                if (zgui.beginCombo("##other_op", .{ .preview_value = &preview_z })) {
+                    for (flow_io.bin_ops, 0..) |op, i| {
+                        var op_z: IdentBuf = undefined;
+                        seedBuf(&op_z, op);
+                        if (zgui.selectable(&op_z, .{ .selected = sel == i })) {
+                            // `selectable` fires on every click — commit
+                            // even when the picked op equals the previewed
+                            // one, so selecting `add` on a node with no
+                            // valid `op` still writes and marks dirty.
+                            const encoded = flow_io.encodeStringValue(a, op) catch return;
+                            flow_io.setExtraValue(a, n, spec.key, encoded) catch return;
+                            s.is_dirty = true;
+                        }
+                    }
+                    zgui.endCombo();
+                }
             }
         },
         .text => {

@@ -279,11 +279,21 @@ pub fn decodeStringValue(a: std.mem.Allocator, value_text: []const u8) ![]const 
 /// When the stored value isn't a JSON string, or the decoded text would
 /// not fit in `buf`, the canonical text is copied verbatim (truncated to
 /// `buf` if necessary) — the same fall-through `decodeStringValue` uses.
+///
+/// `buf` is written as a valid NUL-terminated edit buffer: one byte is
+/// reserved for the `0` sentinel, so the copied text is at most
+/// `buf.len - 1` bytes and a `0` is always written immediately after it.
+/// This lets a widget consume `buf` directly via `inputText` / `sliceTo`
+/// without trailing garbage past the value.
 pub fn decodeStringValueBuf(buf: []u8, value_text: []const u8) []const u8 {
+    std.debug.assert(buf.len > 0);
+    // One byte is reserved for the editor's NUL sentinel.
+    const cap = buf.len - 1;
     const trimmed = std.mem.trim(u8, value_text, " \t\r\n");
     const verbatim = blk: {
-        const n = @min(buf.len, trimmed.len);
+        const n = @min(cap, trimmed.len);
         @memcpy(buf[0..n], trimmed[0..n]);
+        buf[n] = 0;
         break :blk buf[0..n];
     };
     if (trimmed.len < 2 or trimmed[0] != '"') return verbatim;
@@ -303,8 +313,9 @@ pub fn decodeStringValueBuf(buf: []u8, value_text: []const u8) []const u8 {
     defer parsed.deinit();
     if (parsed.value != .string) return verbatim;
     const inner = parsed.value.string;
-    if (inner.len > buf.len) return verbatim;
+    if (inner.len > cap) return verbatim;
     @memcpy(buf[0..inner.len], inner);
+    buf[inner.len] = 0;
     return buf[0..inner.len];
 }
 
@@ -332,6 +343,12 @@ pub const DecodedValue = struct {
 /// `buf` (which always reserves one byte for the input-widget
 /// sentinel). When false the returned `text` is the exact, complete
 /// value and is safe to edit.
+///
+/// The returned text is always written as a valid NUL-terminated edit
+/// buffer: a `0` sentinel is placed immediately after the copied text
+/// (within the byte reserved for it), so a caller may hand `buf`
+/// straight to `inputText` / `sliceTo` without trailing garbage past
+/// the value.
 pub fn decodeStringValueBufChecked(buf: []u8, value_text: []const u8) DecodedValue {
     std.debug.assert(buf.len > 0);
     // One byte is reserved for the editor's NUL sentinel, so a value of
@@ -339,12 +356,21 @@ pub fn decodeStringValueBufChecked(buf: []u8, value_text: []const u8) DecodedVal
     const cap = buf.len - 1;
     const trimmed = std.mem.trim(u8, value_text, " \t\r\n");
 
+    // Copy at most `cap` bytes of `text` into `buf`, write the `0`
+    // sentinel after it, and return the result as a `DecodedValue`.
+    const verbatim = struct {
+        fn fill(b: []u8, c: usize, text: []const u8, lossy: bool) DecodedValue {
+            const n = @min(c, text.len);
+            @memcpy(b[0..n], text[0..n]);
+            b[n] = 0;
+            return .{ .text = b[0..n], .truncated = lossy };
+        }
+    }.fill;
+
     // Non-string canonical values (numbers, bools, null) are edited
     // verbatim; they fit only when shorter than the editable capacity.
     if (trimmed.len < 2 or trimmed[0] != '"') {
-        const n = @min(cap, trimmed.len);
-        @memcpy(buf[0..n], trimmed[0..n]);
-        return .{ .text = buf[0..n], .truncated = trimmed.len > cap };
+        return verbatim(buf, cap, trimmed, trimmed.len > cap);
     }
 
     var scratch: [1024]u8 = undefined;
@@ -356,25 +382,20 @@ pub fn decodeStringValueBufChecked(buf: []u8, value_text: []const u8) DecodedVal
         .{},
     ) catch {
         // Unparseable — fall through to the verbatim canonical text.
-        const n = @min(cap, trimmed.len);
-        @memcpy(buf[0..n], trimmed[0..n]);
-        return .{ .text = buf[0..n], .truncated = trimmed.len > cap };
+        return verbatim(buf, cap, trimmed, trimmed.len > cap);
     };
     defer parsed.deinit();
     if (parsed.value != .string) {
-        const n = @min(cap, trimmed.len);
-        @memcpy(buf[0..n], trimmed[0..n]);
-        return .{ .text = buf[0..n], .truncated = trimmed.len > cap };
+        return verbatim(buf, cap, trimmed, trimmed.len > cap);
     }
     const inner = parsed.value.string;
     if (inner.len > cap) {
         // The decoded text won't fit; surface a truncated verbatim view
         // and mark it lossy so the editor stays read-only.
-        const n = @min(cap, trimmed.len);
-        @memcpy(buf[0..n], trimmed[0..n]);
-        return .{ .text = buf[0..n], .truncated = true };
+        return verbatim(buf, cap, trimmed, true);
     }
     @memcpy(buf[0..inner.len], inner);
+    buf[inner.len] = 0;
     return .{ .text = buf[0..inner.len], .truncated = false };
 }
 
