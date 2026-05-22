@@ -13,6 +13,7 @@ const viewport = @import("modules/viewport.zig");
 const atlas = @import("atlas.zig");
 const gizmo_io = @import("gizmo_io.zig");
 const flow_io = @import("flow_io.zig");
+const flow_doc = @import("modules/flow_doc.zig");
 const gizmos = @import("gizmos.zig");
 const preview = @import("preview.zig");
 const flow_projector = @import("flows/projector.zig");
@@ -5214,5 +5215,166 @@ pub const AtomicWriteTests = struct {
         defer allocator.free(got);
         try expect.toBeTrue(std.mem.indexOf(u8, got, "\"main\"") != null);
         try expect.equal(try countTempFiles(tmp), 0);
+    }
+};
+
+// ─── flow_doc: Subflow reference resolution (issue #161) ────────────────
+
+/// Covers `flow_doc.referencedFlowPath` — the helper that maps a
+/// `Subflow` node's referenced-flow *name* to the on-disk path of the
+/// `.flow.jsonc` file (a sibling in the same `scripts/flows/` dir).
+pub const FlowDocSubflowTests = struct {
+    test "referencedFlowPath resolves a sibling .flow.jsonc" {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const got = flow_doc.referencedFlowPath(
+            &buf,
+            "/proj/scripts/flows/enemy_tick.flow.jsonc",
+            "combat_subgraph",
+        );
+        try expect.toBeTrue(got != null);
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            got.?,
+            "/proj/scripts/flows/combat_subgraph.flow.jsonc",
+        ));
+    }
+
+    test "referencedFlowPath returns null when the path has no directory" {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        try expect.toBeTrue(flow_doc.referencedFlowPath(&buf, "bare.flow.jsonc", "x") == null);
+    }
+
+    test "sameFileOnDisk detects identical path strings" {
+        try expect.toBeTrue(flow_doc.sameFileOnDisk(
+            "/proj/scripts/flows/a.flow.jsonc",
+            "/proj/scripts/flows/a.flow.jsonc",
+        ));
+    }
+
+    test "sameFileOnDisk catches a self-reference reached via a non-canonical path" {
+        // A `flow_ref` that resolves to the *same file on disk* through
+        // `.`/`..` segments must still be flagged: a raw byte compare
+        // would miss it and the Subflow node would mis-show the current
+        // flow's own pins.
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const dir = try std.fs.path.join(std.testing.allocator, &.{
+            ".zig-cache", "tmp", &tmp.sub_path,
+        });
+        defer std.testing.allocator.free(dir);
+
+        const canonical = try std.fs.path.join(std.testing.allocator, &.{
+            dir, "self.flow.jsonc",
+        });
+        defer std.testing.allocator.free(canonical);
+        std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = canonical,
+            .data = "{ \"event\": \"on_tick\", \"nodes\": [], \"edges\": [] }",
+        }) catch unreachable;
+
+        // Same file, reached through a `.` segment in the directory.
+        const non_canonical = try std.fs.path.join(std.testing.allocator, &.{
+            dir, ".", "self.flow.jsonc",
+        });
+        defer std.testing.allocator.free(non_canonical);
+
+        try expect.toBeTrue(flow_doc.sameFileOnDisk(canonical, non_canonical));
+    }
+
+    test "sameFileOnDisk distinguishes two different existing files" {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const dir = try std.fs.path.join(std.testing.allocator, &.{
+            ".zig-cache", "tmp", &tmp.sub_path,
+        });
+        defer std.testing.allocator.free(dir);
+
+        const a = try std.fs.path.join(std.testing.allocator, &.{ dir, "a.flow.jsonc" });
+        defer std.testing.allocator.free(a);
+        const b = try std.fs.path.join(std.testing.allocator, &.{ dir, "b.flow.jsonc" });
+        defer std.testing.allocator.free(b);
+        const body = "{ \"event\": \"on_tick\", \"nodes\": [], \"edges\": [] }";
+        std.Io.Dir.cwd().writeFile(io_global.io(), .{ .sub_path = a, .data = body }) catch unreachable;
+        std.Io.Dir.cwd().writeFile(io_global.io(), .{ .sub_path = b, .data = body }) catch unreachable;
+
+        try expect.toBeTrue(!flow_doc.sameFileOnDisk(a, b));
+    }
+
+    test "sameFileOnDisk falls back to raw compare when a path is missing" {
+        // Neither file exists — canonicalization is impossible, so the
+        // helper falls back to a raw byte compare. Distinct strings are
+        // (conservatively) reported as different files.
+        try expect.toBeTrue(!flow_doc.sameFileOnDisk(
+            "/no/such/dir/a.flow.jsonc",
+            "/no/such/dir/b.flow.jsonc",
+        ));
+    }
+
+    // ── ResolvedFlow cache-freshness (issue #161 follow-up) ─────────────
+    //
+    // `resolveSubflow` itself touches `FlowDocState`, which transitively
+    // pulls in the imgui/zgui stack the `zig build test` target
+    // deliberately excludes (build.zig issue #94 note). The staleness
+    // decision is therefore factored into the pure `resolvedFlowIsFresh`
+    // helper, which these tests exercise directly.
+
+    test "resolvedFlowIsFresh: a successful load with matching mtime + size is fresh" {
+        try expect.toBeTrue(flow_doc.resolvedFlowIsFresh(
+            true, // loaded_ok
+            123, // cached mtime
+            456, // cached size
+            123, // current mtime
+            456, // current size
+        ));
+    }
+
+    test "resolvedFlowIsFresh: same mtime but a changed size is stale" {
+        // The same-tick / mtime-preserving rewrite case: the referenced
+        // file's contents changed (size moved) without its mtime
+        // advancing. mtime alone would wrongly report the cache fresh;
+        // pairing it with size catches the rewrite and forces a
+        // re-resolve so the Subflow node's pins stay current.
+        try expect.toBeTrue(!flow_doc.resolvedFlowIsFresh(
+            true,
+            123,
+            456,
+            123, // mtime unchanged
+            512, // size grew
+        ));
+    }
+
+    test "resolvedFlowIsFresh: a changed mtime is stale even when size matches" {
+        try expect.toBeTrue(!flow_doc.resolvedFlowIsFresh(
+            true,
+            123,
+            456,
+            999, // mtime moved
+            456, // size unchanged
+        ));
+    }
+
+    test "resolvedFlowIsFresh: a previously failed load is never fresh" {
+        // `loaded_ok = false` must always re-attempt — a fixed-contents
+        // file has to recover even if mtime + size are unchanged.
+        try expect.toBeTrue(!flow_doc.resolvedFlowIsFresh(
+            false,
+            123,
+            456,
+            123,
+            456,
+        ));
+    }
+
+    test "resolvedFlowIsFresh: a failed stat (null mtime + size) is never fresh" {
+        // A missing/unstattable file leaves both observations null.
+        // Even against a cache entry that also has nulls, treat it as
+        // stale so the next frame re-attempts the load.
+        try expect.toBeTrue(!flow_doc.resolvedFlowIsFresh(
+            true,
+            null,
+            null,
+            null,
+            null,
+        ));
     }
 };
