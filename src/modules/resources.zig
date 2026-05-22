@@ -19,6 +19,12 @@ const App = @import("../app.zig").App;
 const module = @import("../module.zig");
 const project = @import("../project.zig");
 const buf = @import("../buf.zig");
+const atlas = @import("../atlas.zig");
+const atlas_ui = @import("../atlas_ui.zig");
+
+/// Edge length (px) of the per-sprite thumbnail buttons rendered under
+/// each resource row.
+const thumb_size: f32 = 40;
 
 const max_slots = 32;
 const name_cap = 64;
@@ -85,6 +91,7 @@ fn render(app: *App) void {
         _ = zgui.inputText("name", .{ .buf = &ed.slots[i].name });
         _ = zgui.inputText("json", .{ .buf = &ed.slots[i].json });
         _ = zgui.inputText("texture", .{ .buf = &ed.slots[i].texture });
+        renderThumbnails(app, bufStr(&ed.slots[i].name));
         if (zgui.button("Remove", .{ .w = 80 })) remove_idx = i;
     }
     if (remove_idx) |idx| removeAt(ed, idx);
@@ -96,6 +103,78 @@ fn render(app: *App) void {
     zgui.sameLine(.{});
     if (zgui.button("Revert", .{ .w = 80 })) {
         ed.last_generation = null; // resync next frame
+    }
+}
+
+/// Render a row of sprite-frame thumbnails for the atlas whose
+/// `resources[].name` equals `res_name`. Uses `atlas_ui.spriteButtonFrame`,
+/// which draws the real atlas frame and falls back to a text button
+/// when the frame can't be resolved.
+///
+/// Thumbnails are interactive `imageButton`s: clicking one copies the
+/// sprite name onto the status bar — a contained first use that the
+/// inspector's sprite-picker follow-up can build on. No-ops silently
+/// when no atlas index is built yet or the row's name matches no
+/// loaded atlas (e.g. an unsaved row, or a JSON that failed to load).
+fn renderThumbnails(app: *App, res_name: []const u8) void {
+    if (res_name.len == 0) return;
+    const idx = if (app.atlas_index) |*p| p else return;
+
+    // Locate the atlas this row's name refers to.
+    const a: *const atlas.Atlas = blk: {
+        for (idx.atlases.items) |*at| {
+            if (std.mem.eql(u8, at.name, res_name)) break :blk at;
+        }
+        return; // not loaded (unsaved row, or failed JSON)
+    };
+    if (a.frames.count() == 0) return;
+
+    // Wrap thumbnails to the panel width. Spacing comes from the live
+    // ImGui style so the grid tracks theme / HiDPI changes.
+    const avail_w = zgui.getContentRegionAvail()[0];
+    const style_spacing = zgui.getStyle().item_spacing[0];
+    const per_row: usize = @max(1, @as(usize, @intFromFloat(
+        avail_w / (thumb_size + style_spacing),
+    )));
+
+    // Collect + sort the sprite names so thumbnails render in a
+    // stable order — `StringHashMap` iteration order is not
+    // deterministic, which would otherwise reshuffle the grid on
+    // every atlas reload.
+    var names = std.ArrayList([]const u8).initCapacity(app.allocator, a.frames.count()) catch return;
+    defer names.deinit(app.allocator);
+    var kit = a.frames.keyIterator();
+    while (kit.next()) |k| names.appendAssumeCapacity(k.*);
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lessThan(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lessThan);
+
+    for (names.items, 0..) |sprite_name, shown| {
+        const frame = a.frames.get(sprite_name) orelse continue;
+        // Scope each thumbnail's imgui ID by sprite name — the row is
+        // already inside its own `pushStrIdZ` scope, so this is unique
+        // and avoids formatting a fresh string id every frame.
+        zgui.pushStrId(sprite_name);
+        defer zgui.popId();
+
+        if (shown % per_row != 0) zgui.sameLine(.{});
+        // Resolve against this row's atlas directly: a sprite name
+        // shared with another atlas must draw *this* atlas's frame.
+        if (atlas_ui.spriteButtonFrame("##thumb", a, sprite_name, frame, thumb_size, thumb_size)) {
+            var status_buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(
+                &status_buf,
+                "Sprite: {s}",
+                .{sprite_name},
+            ) catch sprite_name;
+            app.setStatus(msg);
+        }
+        if (zgui.isItemHovered(.{}) and zgui.beginTooltip()) {
+            zgui.text("{s}", .{sprite_name});
+            zgui.endTooltip();
+        }
     }
 }
 

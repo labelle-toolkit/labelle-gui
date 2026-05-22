@@ -13,6 +13,7 @@ const zgui = @import("zgui");
 
 const scene_io = @import("../scene_io.zig");
 const atlas = @import("../atlas.zig");
+const atlas_ui = @import("../atlas_ui.zig");
 const gizmos = @import("../gizmos.zig");
 const prefab_index_mod = @import("../prefab_index.zig");
 const dnd = @import("dnd.zig");
@@ -497,17 +498,15 @@ fn drawSpriteValueAt(
     idx: *const atlas.Index,
 ) bool {
     const name = std.mem.sliceTo(&sprite.sprite_name, 0);
-    if (name.len == 0) return false;
-    const ref = idx.find(name) orelse return false;
-
-    const tex_id = idx.textureFor(ref);
-    if (tex_id == 0) return false;
-    const atlas_size = idx.atlasSize(ref);
+    // Resolve the sprite name → TextureRef + UV rect via the shared
+    // atlas_ui helper (the same resolve the resources panel's sprite
+    // thumbnails use).
+    const r = atlas_ui.resolve(idx, name) orelse return false;
 
     // World-space size of one screen pixel of the sprite. No DPI
     // factor — the canvas itself is screen-space.
-    const w = @as(f32, @floatFromInt(ref.frame.w)) * zoom;
-    const h = @as(f32, @floatFromInt(ref.frame.h)) * zoom;
+    const w = @as(f32, @floatFromInt(r.frame_w)) * zoom;
+    const h = @as(f32, @floatFromInt(r.frame_h)) * zoom;
 
     const pivot_name = std.mem.sliceTo(&sprite.pivot, 0);
     const pivot = pivotOffset(pivot_name);
@@ -519,29 +518,11 @@ fn drawSpriteValueAt(
     const x1 = x0 + w;
     const y1 = y0 + h;
 
-    const uv0: [2]f32 = .{
-        @as(f32, @floatFromInt(ref.frame.x)) / atlas_size[0],
-        @as(f32, @floatFromInt(ref.frame.y)) / atlas_size[1],
-    };
-    const uv1: [2]f32 = .{
-        @as(f32, @floatFromInt(ref.frame.x + ref.frame.w)) / atlas_size[0],
-        @as(f32, @floatFromInt(ref.frame.y + ref.frame.h)) / atlas_size[1],
-    };
-
-    // ImGui 1.92+ TextureRef carries either a managed TextureData
-    // pointer (new dynamic-texture API) or a raw backend handle in
-    // `tex_id`. The opengl3 backend reads `tex_id` directly when
-    // `tex_data` is null, which is exactly what we want for atlas
-    // textures we manage ourselves.
-    const tex_ref: zgui.TextureRef = .{
-        .tex_data = null,
-        .tex_id = @enumFromInt(@as(u64, tex_id)),
-    };
-    dl.addImage(tex_ref, .{
+    dl.addImage(r.tex_ref, .{
         .pmin = .{ x0, y0 },
         .pmax = .{ x1, y1 },
-        .uvmin = uv0,
-        .uvmax = uv1,
+        .uvmin = r.uv0,
+        .uvmax = r.uv1,
     });
     return true;
 }
