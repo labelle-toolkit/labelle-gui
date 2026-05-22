@@ -982,6 +982,117 @@ test "normalizeValueText keeps valid JSON, quotes anything else" {
     }
 }
 
+test "huge flow file saves and round-trips at scale" {
+    const a = std.testing.allocator;
+
+    // Build a large `.flow.jsonc` source programmatically — ~2000 nodes
+    // and ~2000 edges chaining them. Node ids are deliberately sparse
+    // (id = (i + 1) * 3) so `max_node_id` and id sampling are non-trivial.
+    // Node types cycle through several kinds so the parser exercises both
+    // structurally-modeled nodes and `.other` capture. We accumulate the
+    // string with the same ArrayList/Writer idiom `render` uses.
+    const node_count: usize = 2000;
+    const types = [_][]const u8{ "GetComponent", "BinOp", "Literal", "SetComponent" };
+
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(a);
+    try src.appendSlice(a, "{\n  \"name\": \"huge_flow\",\n");
+    try src.appendSlice(a, "  \"event\": { \"type\": \"OnCreate\" },\n");
+    try src.appendSlice(a, "  \"nodes\": [\n");
+    for (0..node_count) |i| {
+        const id: u32 = @intCast((i + 1) * 3);
+        const tname = types[i % types.len];
+        // pos: x integral, y fractional — both must survive the trip.
+        const px: i64 = @intCast(i * 40);
+        const py = @as(f32, @floatFromInt(i)) * 1.5;
+        try src.print(a, "    {{ \"id\": {d}, \"type\": \"{s}\", \"pos\": [{d}, {d}], \"slot\": {d} }}", .{ id, tname, px, py, i });
+        if (i + 1 < node_count) try src.append(a, ',');
+        try src.append(a, '\n');
+    }
+    try src.appendSlice(a, "  ],\n  \"edges\": [\n");
+    // Chain each node to the next: ~node_count-1 edges.
+    const edge_count = node_count - 1;
+    for (0..edge_count) |i| {
+        const from_id: u32 = @intCast((i + 1) * 3);
+        const to_id: u32 = @intCast((i + 2) * 3);
+        try src.print(a, "    {{ \"from\": {{ \"node\": {d}, \"pin\": \"out\" }}, \"to\": {{ \"node\": {d}, \"pin\": \"in\" }} }}", .{ from_id, to_id });
+        if (i + 1 < edge_count) try src.append(a, ',');
+        try src.append(a, '\n');
+    }
+    try src.appendSlice(a, "  ]\n}\n");
+
+    // ── 1. Parse the huge source ──
+    var doc = try parse(a, src.items);
+    defer doc.deinit();
+
+    try std.testing.expectEqualStrings("huge_flow", doc.name.?);
+    try std.testing.expectEqual(node_count, doc.nodes.len);
+    try std.testing.expectEqual(edge_count, doc.edges.len);
+    // Highest id = (node_count) * 3.
+    try std.testing.expectEqual(@as(u32, @intCast(node_count * 3)), doc.max_node_id);
+
+    // Sample a spread of node ids / positions / types.
+    const sample_idx = [_]usize{ 0, 1, 777, 1000, node_count - 1 };
+    for (sample_idx) |idx| {
+        try std.testing.expectEqual(@as(u32, @intCast((idx + 1) * 3)), doc.nodes[idx].id);
+        try std.testing.expectEqual(@as(f32, @floatFromInt(idx * 40)), doc.nodes[idx].pos[0]);
+        try std.testing.expectEqual(@as(f32, @floatFromInt(idx)) * 1.5, doc.nodes[idx].pos[1]);
+        try std.testing.expectEqualStrings(types[idx % types.len], doc.nodes[idx].type_name);
+    }
+    // Sample an edge endpoint.
+    try std.testing.expectEqual(@as(u32, 3), doc.edges[0].from_node);
+    try std.testing.expectEqual(@as(u32, 6), doc.edges[0].to_node);
+    try std.testing.expectEqual(@as(u32, @intCast(node_count * 3)), doc.edges[edge_count - 1].to_node);
+
+    // ── 2. Render — this is the editor's Save serialization. ──
+    const text1 = try render(a, doc);
+    defer a.free(text1);
+    // The output must be genuinely large and non-trivial.
+    try std.testing.expect(text1.len > 100 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, text1, "\"huge_flow\"") != null);
+
+    // ── 3. Parse the rendered text — full integrity must survive. ──
+    var doc2 = try parse(a, text1);
+    defer doc2.deinit();
+    try std.testing.expectEqualStrings("huge_flow", doc2.name.?);
+    try std.testing.expectEqual(node_count, doc2.nodes.len);
+    try std.testing.expectEqual(edge_count, doc2.edges.len);
+    try std.testing.expectEqual(doc.max_node_id, doc2.max_node_id);
+    for (sample_idx) |idx| {
+        try std.testing.expectEqual(doc.nodes[idx].id, doc2.nodes[idx].id);
+        try std.testing.expectEqual(doc.nodes[idx].pos[0], doc2.nodes[idx].pos[0]);
+        try std.testing.expectEqual(doc.nodes[idx].pos[1], doc2.nodes[idx].pos[1]);
+        try std.testing.expectEqualStrings(doc.nodes[idx].type_name, doc2.nodes[idx].type_name);
+    }
+    for ([_]usize{ 0, 999, edge_count - 1 }) |idx| {
+        try std.testing.expectEqual(doc.edges[idx].from_node, doc2.edges[idx].from_node);
+        try std.testing.expectEqual(doc.edges[idx].to_node, doc2.edges[idx].to_node);
+    }
+
+    // ── 4. A second render must be byte-identical at scale. ──
+    const text2 = try render(a, doc2);
+    defer a.free(text2);
+    try std.testing.expectEqualStrings(text1, text2);
+
+    // ── 5. Real on-disk path: saveToFile → loadFromFile. ──
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fs.path.join(a, &.{
+        ".zig-cache", "tmp", &tmp.sub_path, "huge.flow.jsonc",
+    });
+    defer a.free(path);
+
+    try saveToFile(a, path, doc);
+    var disk_doc = try loadFromFile(a, path);
+    defer disk_doc.deinit();
+    try std.testing.expectEqual(node_count, disk_doc.nodes.len);
+    try std.testing.expectEqual(edge_count, disk_doc.edges.len);
+    try std.testing.expectEqual(doc.max_node_id, disk_doc.max_node_id);
+    const disk_text = try render(a, disk_doc);
+    defer a.free(disk_text);
+    try std.testing.expectEqualStrings(text1, disk_text);
+}
+
 test "binding order is deterministic after an edit reorders the slice" {
     const src =
         \\{
