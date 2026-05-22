@@ -4723,6 +4723,82 @@ pub const FlowIoTests = struct {
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"value\"") != null);
     }
 
+    test "otherFieldSpec maps field-editable node types to one extras key" {
+        try expect.toBeTrue(flow_io.otherFieldSpec("BinOp").?.widget == .op_combo);
+        try expect.toBeTrue(std.mem.eql(u8, flow_io.otherFieldSpec("BinOp").?.key, "op"));
+        try expect.toBeTrue(std.mem.eql(u8, flow_io.otherFieldSpec("GetComponent").?.key, "component"));
+        try expect.toBeTrue(std.mem.eql(u8, flow_io.otherFieldSpec("SetField").?.key, "target"));
+        try expect.toBeTrue(flow_io.otherFieldSpec("Literal").?.widget == .literal);
+        try expect.toBeTrue(std.mem.eql(u8, flow_io.otherFieldSpec("Identifier").?.key, "name"));
+        try expect.toBeTrue(std.mem.eql(u8, flow_io.otherFieldSpec("Call").?.key, "callee"));
+        // A genuinely-unknown node type has no spec → verbatim fallback.
+        try expect.toBeTrue(flow_io.otherFieldSpec("MysteryNode") == null);
+    }
+
+    test "editing an .other field via setExtraValue stays deterministic" {
+        const a = std.testing.allocator;
+        const src =
+            \\{
+            \\  "event": { "type": "OnCreate" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "BinOp", "op": "add", "pos": [0, 0] },
+            \\    { "id": 2, "type": "GetComponent", "pos": [10, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+        const da = doc.allocator();
+
+        // Edit BinOp.op (existing key) and GetComponent.component (new key).
+        try flow_io.setExtraValue(da, &doc.nodes[0], "op", "\"mul\"");
+        try flow_io.setExtraValue(da, &doc.nodes[1], "component", "\"Position\"");
+
+        const text1 = try flow_io.render(a, doc);
+        defer a.free(text1);
+        var doc2 = try flow_io.parse(a, text1);
+        defer doc2.deinit();
+        const text2 = try flow_io.render(a, doc2);
+        defer a.free(text2);
+
+        // Re-save is byte-identical and the edits are present.
+        try expect.toBeTrue(std.mem.eql(u8, text1, text2));
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"op\": \"mul\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"component\": \"Position\"") != null);
+    }
+
+    test "editing an .other field keeps unrelated extras keys verbatim" {
+        const a = std.testing.allocator;
+        const src =
+            \\{ "event": { "type": "OnCall" },
+            \\  "nodes": [ { "id": 1, "type": "Literal", "value": 1, "note": "keep me", "pos": [0, 0] } ],
+            \\  "edges": [] }
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+        const da = doc.allocator();
+
+        try flow_io.setExtraValue(da, &doc.nodes[0], "value", "2.5");
+        const text = try flow_io.render(a, doc);
+        defer a.free(text);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"value\": 2.5") != null);
+        // The unknown `note` key is untouched.
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"note\": \"keep me\"") != null);
+    }
+
+    test "string value text decodes and re-encodes round-trip" {
+        const a = std.testing.allocator;
+        const decoded = try flow_io.decodeStringValue(a, "\"Position\"");
+        defer a.free(decoded);
+        try expect.toBeTrue(std.mem.eql(u8, decoded, "Position"));
+
+        const encoded = try flow_io.encodeStringValue(a, "Velocity");
+        defer a.free(encoded);
+        try expect.toBeTrue(std.mem.eql(u8, encoded, "\"Velocity\""));
+    }
+
     test "displayNameFromPath strips the .flow.jsonc extension" {
         try expect.toBeTrue(std.mem.eql(
             u8,

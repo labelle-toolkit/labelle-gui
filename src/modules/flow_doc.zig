@@ -17,13 +17,16 @@
 //!     node palette (add `Subflow` / `Param` / `Output` / a custom
 //!     typed node) and the selected node's editable fields.
 //!
-//! Scope (v1): structural editing — add/remove nodes, edit the typed
-//! fields of the three composition node types, edit `params`, edit the
-//! event type, move nodes on the canvas. Edge creation by dragging
-//! pins and a load-time cycle check across `Subflow` references are
-//! deferred — see the PR notes. Unknown node types (`BinOp`, …) and
-//! their fields round-trip verbatim through `flow_io` but aren't
-//! field-editable here.
+//! Scope: structural editing — add/remove nodes, edit the typed fields
+//! of the three composition node types, edit `params`, edit the event
+//! type, move nodes on the canvas. The inspector also field-edits a set
+//! of recognised non-composition node types (`BinOp`, `GetComponent`,
+//! `SetField`, `Literal`, `Identifier`, `Call`) via the
+//! `flow_io.other_field_specs` table — each exposes one widget over its
+//! `extras` value, so the deterministic writer emits it unchanged.
+//! Genuinely-unknown node types still fall back to the verbatim view.
+//! Edge creation by dragging pins and a load-time cycle check across
+//! `Subflow` references are deferred — see the PR notes.
 
 const std = @import("std");
 const zgui = @import("zgui");
@@ -715,10 +718,16 @@ fn renderSelectedNode(s: *FlowDocState) void {
             }
         },
         .other => {
-            zgui.textDisabled("This node type is not field-editable in v1.", .{});
-            zgui.textDisabled("Its fields round-trip verbatim:", .{});
-            for (n.extras) |kv| {
-                zgui.bulletText("{s}: {s}", .{ kv.key, kv.value_text });
+            if (flow_io.otherFieldSpec(n.type_name)) |spec| {
+                renderOtherField(s, n, spec);
+            } else {
+                // A genuinely-unknown node type: no widget, just the
+                // verbatim round-tripped fields.
+                zgui.textDisabled("This node type is not field-editable.", .{});
+                zgui.textDisabled("Its fields round-trip verbatim:", .{});
+                for (n.extras) |kv| {
+                    zgui.bulletText("{s}: {s}", .{ kv.key, kv.value_text });
+                }
             }
         },
     }
@@ -785,6 +794,86 @@ fn renderBindingsEditor(s: *FlowDocState, n: *flow_io.Node) void {
             s.is_dirty = true;
         } else |err| {
             std.log.err("flow: remove binding failed: {s}", .{@errorName(err)});
+        }
+    }
+}
+
+/// Inspector editing for a recognised `.other` node type (`BinOp`,
+/// `GetComponent`, `SetField`, `Literal`, `Identifier`, `Call`). The
+/// value lives in `n.extras` under `spec.key`; the widget writes the
+/// canonical JSON text back there via `flow_io.setExtraValue`, so the
+/// deterministic writer emits it unchanged and any other (genuinely
+/// unknown) key on the node still round-trips verbatim.
+fn renderOtherField(s: *FlowDocState, n: *flow_io.Node, spec: flow_io.OtherFieldSpec) void {
+    const a = s.doc.allocator();
+    const current = flow_io.extraValue(n.*, spec.key) orelse "";
+
+    zgui.text("{s}", .{spec.label});
+    switch (spec.widget) {
+        .op_combo => {
+            // `op` is stored as a JSON string (`"add"`); decode to the
+            // bare word to match against the choice list.
+            const decoded = flow_io.decodeStringValue(a, current) catch current;
+            var sel: usize = 0;
+            for (flow_io.bin_ops, 0..) |op, i| {
+                if (std.mem.eql(u8, op, decoded)) sel = i;
+            }
+            var preview_z: IdentBuf = undefined;
+            seedBuf(&preview_z, flow_io.bin_ops[sel]);
+            if (zgui.beginCombo("##other_op", .{ .preview_value = &preview_z })) {
+                for (flow_io.bin_ops, 0..) |op, i| {
+                    var op_z: IdentBuf = undefined;
+                    seedBuf(&op_z, op);
+                    if (zgui.selectable(&op_z, .{ .selected = i == sel })) {
+                        const encoded = flow_io.encodeStringValue(a, op) catch return;
+                        flow_io.setExtraValue(a, n, spec.key, encoded) catch return;
+                        s.is_dirty = true;
+                    }
+                }
+                zgui.endCombo();
+            }
+        },
+        .text => {
+            // Identifier-like fields are stored as JSON strings; the
+            // widget edits the bare inner text.
+            const decoded = flow_io.decodeStringValue(a, current) catch current;
+            var buf: IdentBuf = undefined;
+            seedBuf(&buf, decoded);
+            if (zgui.inputText("##other_text", .{ .buf = &buf })) {
+                const raw = std.mem.sliceTo(&buf, 0);
+                const encoded = flow_io.encodeStringValue(a, raw) catch return;
+                flow_io.setExtraValue(a, n, spec.key, encoded) catch return;
+                s.is_dirty = true;
+            }
+        },
+        .literal => {
+            // `Literal.value` is any JSON type — edit the canonical text
+            // directly and normalise so a save can't emit invalid JSON.
+            var buf: ValueBuf = undefined;
+            seedBuf(&buf, current);
+            if (zgui.inputText("##other_literal", .{ .buf = &buf })) {
+                const raw = std.mem.sliceTo(&buf, 0);
+                const norm = flow_io.normalizeValueText(a, raw) catch return;
+                flow_io.setExtraValue(a, n, spec.key, norm) catch return;
+                s.is_dirty = true;
+            }
+            zgui.textDisabled("(JSON literal — e.g. 25, 1.5, \"txt\", true)", .{});
+        },
+    }
+
+    // Any other keys on the node (beyond the one editable field) still
+    // round-trip; surface them so the user sees nothing is hidden.
+    var has_other = false;
+    for (n.extras) |kv| {
+        if (std.mem.eql(u8, kv.key, spec.key)) continue;
+        has_other = true;
+    }
+    if (has_other) {
+        zgui.spacing();
+        zgui.textDisabled("Other fields (round-trip verbatim):", .{});
+        for (n.extras) |kv| {
+            if (std.mem.eql(u8, kv.key, spec.key)) continue;
+            zgui.bulletText("{s}: {s}", .{ kv.key, kv.value_text });
         }
     }
 }
