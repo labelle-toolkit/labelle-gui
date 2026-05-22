@@ -73,6 +73,13 @@ const PinEntry = struct {
 /// its `.zig` source. `doc` is null when the referenced file is
 /// missing or unparseable — the renderer then falls back to the
 /// binding-derived input pins and shows an "unresolved" hint.
+///
+/// Within a single frame the resolution (stat + reuse-or-parse) for a
+/// given name runs at most once: the first `resolveSubflow` for a name
+/// stamps `frame_seq` with the current frame counter, and subsequent
+/// nodes that reference the same flow that frame skip the `stat`
+/// syscall entirely and reuse the entry. So N nodes referencing one
+/// flow cost one stat per frame, not N.
 const ResolvedFlow = struct {
     /// The referenced flow's name (the `flow` field of the Subflow
     /// node). Owned by the enclosing `FlowDocState.arena`.
@@ -84,12 +91,23 @@ const ResolvedFlow = struct {
     /// or parsed. Owns its own arena — freed + replaced on re-resolve
     /// and on tab close.
     doc: ?flow_io.FlowDoc = null,
+    /// True when `doc` is the result of a *successful* load. Only then
+    /// is `mtime` authoritative: a failed load leaves this false so the
+    /// next frame re-attempts the load instead of trusting a stale
+    /// mtime (a fixed-contents file must recover even if its mtime
+    /// hasn't moved).
+    loaded_ok: bool = false,
+    /// The `FlowDocState.frame_seq` value at which this entry was last
+    /// resolved. Used to collapse repeated resolutions of the same flow
+    /// within one frame to a single `stat`.
+    last_frame: u64 = 0,
 
     fn deinit(self: *ResolvedFlow) void {
         if (self.doc) |*d| {
             d.deinit();
             self.doc = null;
         }
+        self.loaded_ok = false;
     }
 };
 
@@ -119,6 +137,11 @@ pub const FlowDocState = struct {
     /// `deinit` frees every one. Small — one entry per distinct
     /// referenced flow name across all the tab's Subflow nodes.
     resolved: std.ArrayList(ResolvedFlow) = .empty,
+    /// Monotonic frame counter, bumped once per `render`. `resolveSubflow`
+    /// stamps each cache entry with the frame it last resolved at, so the
+    /// same referenced flow is stat'd at most once per frame regardless of
+    /// how many `Subflow` nodes point at it.
+    frame_seq: u64 = 0,
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !FlowDocState {
         const arena = try allocator.create(std.heap.ArenaAllocator);
@@ -161,6 +184,10 @@ pub const FlowDocState = struct {
 
 /// Public entry point — `OpenTab.render` dispatches here.
 pub fn render(s: *FlowDocState, app: *App) void {
+    // Advance the per-frame counter so `resolveSubflow` stats each
+    // distinct referenced flow at most once this frame.
+    s.frame_seq +%= 1;
+
     zgui.text("Flow: {s}", .{s.display_name});
     if (s.is_dirty) {
         zgui.sameLine(.{});
@@ -626,12 +653,39 @@ fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Nod
 /// (mirroring `flow.zig`'s mtime-keyed re-derivation). The returned
 /// pointer borrows the cache entry's arena — valid until the next call
 /// that re-resolves the same name or the tab closes.
+///
+/// Two cost-control properties:
+///   - Within one frame, each distinct `flow_ref` is stat'd at most
+///     once. The first call for a name this frame stamps the entry's
+///     `last_frame`; later nodes referencing the same flow reuse the
+///     stamped entry and skip the `stat` syscall.
+///   - A failed load is *not* pinned to the file's current mtime. The
+///     entry stays `loaded_ok = false`, so the next frame re-attempts
+///     the load — a referenced file fixed in place (contents changed,
+///     mtime unchanged) recovers instead of staying unresolved.
 fn resolveSubflow(
     s: *FlowDocState,
     allocator: std.mem.Allocator,
     flow_ref: []const u8,
 ) ?*const flow_io.FlowDoc {
     if (flow_ref.len == 0) return null;
+
+    // Find an existing cache entry for this name.
+    var entry: ?*ResolvedFlow = null;
+    for (s.resolved.items) |*r| {
+        if (std.mem.eql(u8, r.name, flow_ref)) {
+            entry = r;
+            break;
+        }
+    }
+
+    // Already resolved this frame — reuse without a second `stat`. This
+    // is the common case when many `Subflow` nodes share one flow.
+    if (entry) |e| {
+        if (e.last_frame == s.frame_seq) {
+            return if (e.doc) |*d| d else null;
+        }
+    }
 
     // Referenced flows live alongside this flow in `scripts/flows/`;
     // the path is `<dir of this flow>/<name>.flow.jsonc`.
@@ -652,24 +706,25 @@ fn resolveSubflow(
         break :blk st.mtime.nanoseconds;
     };
 
-    // Find an existing cache entry for this name.
-    var entry: ?*ResolvedFlow = null;
-    for (s.resolved.items) |*r| {
-        if (std.mem.eql(u8, r.name, flow_ref)) {
-            entry = r;
-            break;
-        }
-    }
-
     if (entry) |e| {
-        // Cache hit — reuse unless the file changed on disk.
-        if (e.mtime == cur_mtime) {
+        // Cache hit (first time this frame). Reuse the existing parse
+        // only when the previous load *succeeded* and the file hasn't
+        // changed on disk. A previously failed load (`loaded_ok` false)
+        // always re-attempts — a fixed file must recover even if its
+        // mtime didn't move.
+        if (e.loaded_ok and e.mtime == cur_mtime) {
+            e.last_frame = s.frame_seq;
             return if (e.doc) |*d| d else null;
         }
-        // Stale: drop the old parse before re-resolving.
+        // Stale or previously failed: drop any old parse and re-resolve.
         e.deinit();
-        e.mtime = cur_mtime;
         e.doc = loadReferencedFlow(allocator, ref_path);
+        e.loaded_ok = e.doc != null;
+        // Only pin the mtime when the load succeeded; on failure leave
+        // it untouched so the next frame's `cur_mtime` comparison can't
+        // short-circuit the retry.
+        if (e.loaded_ok) e.mtime = cur_mtime;
+        e.last_frame = s.frame_seq;
         return if (e.doc) |*d| d else null;
     }
 
@@ -677,8 +732,13 @@ fn resolveSubflow(
     // so it outlives `flow_ref` (which points into the editable doc and
     // can be reallocated by an edit).
     const name_dup = s.doc.allocator().dupe(u8, flow_ref) catch return null;
-    var new_entry: ResolvedFlow = .{ .name = name_dup, .mtime = cur_mtime };
+    var new_entry: ResolvedFlow = .{ .name = name_dup, .last_frame = s.frame_seq };
     new_entry.doc = loadReferencedFlow(allocator, ref_path);
+    new_entry.loaded_ok = new_entry.doc != null;
+    // Only treat the mtime as authoritative on a successful load (see
+    // above) — a failed first load keeps `mtime` null and `loaded_ok`
+    // false so the next frame retries.
+    if (new_entry.loaded_ok) new_entry.mtime = cur_mtime;
     s.resolved.append(allocator, new_entry) catch {
         // Append failed — free the parse we just did rather than leak.
         var tmp = new_entry;
