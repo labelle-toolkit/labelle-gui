@@ -6062,4 +6062,121 @@ pub const FlowCycleTests = struct {
         try expect.toBeTrue(fresh.status == .clean);
         try expect.toBeFalse(flow_doc.referencedFilesChanged(&fresh));
     }
+
+    test "analyze flags two on-disk flows sharing one effective registry name" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // Two distinct files, `one.flow.jsonc` and `two.flow.jsonc`,
+        // both carry the explicit top-level name "shared" — so they
+        // resolve to the *same* effective registry name. flow-codegen's
+        // FlowRegistry rejects this as DuplicateFlowName; the editor's
+        // first-file-wins index would otherwise silently shadow `two`,
+        // potentially hiding a cycle in its `Subflow` refs.
+        try writeNamedFlow(allocator, flows_dir, "one", "shared", &.{});
+        try writeNamedFlow(allocator, flows_dir, "two", "shared", &.{});
+
+        var report = try flow_cycle.analyze(allocator, "entry", &.{}, flows_dir);
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .duplicate_name);
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            report.status.duplicate_name.name,
+            "shared",
+        ));
+        // Both offending files are reported, by their on-disk paths.
+        try expect.toBeTrue(std.mem.endsWith(
+            u8,
+            report.status.duplicate_name.path_a,
+            flow_io.extension,
+        ));
+        try expect.toBeTrue(std.mem.endsWith(
+            u8,
+            report.status.duplicate_name.path_b,
+            flow_io.extension,
+        ));
+        try expect.toBeFalse(std.mem.eql(
+            u8,
+            report.status.duplicate_name.path_a,
+            report.status.duplicate_name.path_b,
+        ));
+    }
+
+    test "analyze surfaces a duplicate name ahead of a cycle hidden in the shadowed file" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // `first.flow.jsonc` (name "dup") is clean; `second.flow.jsonc`
+        // (also name "dup") Subflow-references "entry", which would close
+        // a cycle entry → dup → entry. The first-file-wins index keeps
+        // `first`, so the cycle in `second` is never walked — exactly the
+        // hazard the duplicate-name check exists to surface. The report
+        // must call out the duplicate rather than a misleading clean.
+        try writeNamedFlow(allocator, flows_dir, "first", "dup", &.{});
+        try writeNamedFlow(allocator, flows_dir, "second", "dup", &.{"entry"});
+
+        var report = try flow_cycle.analyze(
+            allocator,
+            "entry",
+            &.{"dup"},
+            flows_dir,
+        );
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .duplicate_name);
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            report.status.duplicate_name.name,
+            "dup",
+        ));
+    }
+
+    test "analyze flags the open flow's name colliding with an on-disk file" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // The open (possibly unsaved) tab is being edited as "tick". An
+        // on-disk `other.flow.jsonc` already claims the registry name
+        // "tick" via its top-level `name`. That is the same
+        // DuplicateFlowName fault and must be reported even though the
+        // open tab itself has no entry in the on-disk index.
+        try writeNamedFlow(allocator, flows_dir, "other", "tick", &.{});
+
+        var report = try flow_cycle.analyze(allocator, "tick", &.{}, flows_dir);
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .duplicate_name);
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            report.status.duplicate_name.name,
+            "tick",
+        ));
+        // The open tab has no on-disk path here — it is reported via the
+        // `<open flow>` marker, with the conflicting file as `path_b`.
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            report.status.duplicate_name.path_a,
+            flow_cycle.open_flow_marker,
+        ));
+        try expect.toBeTrue(std.mem.endsWith(
+            u8,
+            report.status.duplicate_name.path_b,
+            flow_io.extension,
+        ));
+    }
+
+    test "analyze stays clean when every flow has a distinct registry name" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // Distinct names — no duplicate, no entry-name collision.
+        try writeNamedFlow(allocator, flows_dir, "one", "alpha", &.{});
+        try writeNamedFlow(allocator, flows_dir, "two", "beta", &.{});
+
+        var report = try flow_cycle.analyze(allocator, "entry", &.{}, flows_dir);
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .clean);
+    }
 };

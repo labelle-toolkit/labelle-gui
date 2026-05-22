@@ -490,6 +490,20 @@ fn renderCycleBanner(s: *FlowDocState) void {
                 .{},
             );
         },
+        .duplicate_name => |dup| {
+            zgui.textColored(
+                .{ 1.0, 0.35, 0.35, 1.0 },
+                "Duplicate flow name: two flows share the name '{s}' — rename one.",
+                .{dup.name},
+            );
+            zgui.textDisabled("  {s}", .{dup.path_a});
+            zgui.textDisabled("  {s}", .{dup.path_b});
+            zgui.textDisabled(
+                "A flow's registry name is its top-level `name`, else its filename. " ++
+                    "codegen rejects two flows resolving to the same name.",
+                .{},
+            );
+        },
     }
 }
 

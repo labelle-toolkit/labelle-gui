@@ -36,6 +36,12 @@ const std = @import("std");
 const io_global = @import("io_global.zig");
 const flow_io = @import("flow_io.zig");
 
+/// Placeholder used as `DuplicateName.path_a` when the open flow tab
+/// itself collides with an on-disk file. The open tab may be unsaved, so
+/// it has no path to report — this marker tells the banner the conflict
+/// involves the flow the user is editing.
+pub const open_flow_marker = "<open flow>";
+
 /// Outcome of a cycle check.
 pub const Status = union(enum) {
     /// No cycle, every transitively-referenced flow resolved.
@@ -55,6 +61,29 @@ pub const Status = union(enum) {
     /// the broken flow's name. Distinct from `unresolved` so the editor
     /// can tell "fix this file" apart from "create this file".
     parse_failed: Chain,
+    /// Two `.flow.jsonc` files under `scripts/flows/` resolve to the
+    /// *same* effective registry name (RFC §5). flow-codegen's
+    /// `FlowRegistry` rejects this as `DuplicateFlowName` — the project
+    /// is invalid. The editor surfaces it because the silent
+    /// first-file-wins index would otherwise let a cycle hide in the
+    /// shadowed file (its `Subflow` refs are never consulted). The open
+    /// tab's own `entry_name` colliding with an on-disk file is the same
+    /// fault and is reported here too.
+    duplicate_name: DuplicateName,
+};
+
+/// The two `.flow.jsonc` files that share one effective registry name.
+/// All three strings are owned by the report arena.
+pub const DuplicateName = struct {
+    /// The effective registry name both files claim.
+    name: []const u8,
+    /// Absolute path of the file indexed first for `name`. For an
+    /// `entry_name` collision this is the entry's own marker
+    /// `"<open flow>"` (the open tab has no on-disk path here — it may
+    /// be unsaved), with `path_b` the conflicting on-disk file.
+    path_a: []const u8,
+    /// Absolute path of the second file claiming `name`.
+    path_b: []const u8,
 };
 
 /// A snapshot of one `.flow.jsonc` file the analysis read while
@@ -296,9 +325,23 @@ const ProjectResolver = struct {
     arena: std.mem.Allocator,
     /// Absolute path of the project's `scripts/flows/` directory.
     flows_dir: []const u8,
+    /// Effective registry name of the open flow being analyzed. The
+    /// directory scan checks every on-disk flow's effective name against
+    /// this: a collision is the same `DuplicateFlowName` fault as two
+    /// on-disk files clashing, and must be surfaced even though the open
+    /// tab may be unsaved (so it has no entry in the on-disk index).
+    entry_name: []const u8 = "",
     /// flow name → the cached `RefResult` for it (resolved refs,
     /// missing, or present-but-broken).
     cache: std.StringHashMapUnmanaged(RefResult) = .empty,
+    /// First duplicate effective registry name found during the
+    /// directory scan, if any. `ensureIndex` sets this when two
+    /// `.flow.jsonc` files (or one file and the open tab) resolve to the
+    /// same effective name. `analyze` reports it ahead of any cycle
+    /// result — a duplicate name makes the registry itself invalid, and
+    /// the silent first-file-wins index can hide a cycle in the
+    /// shadowed file. All three strings are arena-owned.
+    duplicate: ?DuplicateName = null,
     /// effective registry name → absolute file path. Built once by
     /// `ensureIndex`. `null` until the first `refs` call scans the dir.
     index: ?std.StringHashMapUnmanaged([]const u8) = null,
@@ -421,9 +464,37 @@ const ProjectResolver = struct {
                 try self.arena.dupe(u8, base);
             doc.deinit();
 
-            // First file wins on a duplicate name — deterministic and
-            // matches flow-codegen's "ambiguous registry key" handling.
-            if (!idx.contains(eff)) try idx.put(self.arena, eff, full);
+            // Two `.flow.jsonc` files claiming the same effective
+            // registry name is `DuplicateFlowName` — flow-codegen
+            // rejects the project. Silently keeping the first file would
+            // let a cycle hide in the shadowed one (its `Subflow` refs
+            // are never resolved), so record the clash; `analyze` reports
+            // it ahead of any cycle result. Keep the first one found.
+            if (idx.get(eff)) |first_path| {
+                if (self.duplicate == null) {
+                    self.duplicate = .{
+                        .name = eff,
+                        .path_a = first_path,
+                        .path_b = full,
+                    };
+                }
+                continue;
+            }
+            // The open tab's effective name colliding with an on-disk
+            // file is the same fault — and the open tab may be unsaved,
+            // so it never appears in `idx`. Flag it before indexing the
+            // file so the entry's `<open flow>` marker is `path_a`.
+            if (self.entry_name.len > 0 and
+                std.mem.eql(u8, eff, self.entry_name) and
+                self.duplicate == null)
+            {
+                self.duplicate = .{
+                    .name = eff,
+                    .path_a = try self.arena.dupe(u8, open_flow_marker),
+                    .path_b = full,
+                };
+            }
+            try idx.put(self.arena, eff, full);
         }
         return idx;
     }
@@ -521,6 +592,10 @@ pub fn analyze(
     resolver_ctx.* = .{
         .arena = a,
         .flows_dir = try a.dupe(u8, flows_dir),
+        // The scan checks every on-disk flow's effective name against
+        // the open tab's name — a collision there is `DuplicateFlowName`
+        // too, and the unsaved open tab is otherwise invisible to it.
+        .entry_name = try a.dupe(u8, entry_name),
     };
 
     // Pre-seed the cache with the live (possibly unsaved) entry flow so
@@ -548,7 +623,22 @@ pub fn analyze(
         .refsFn = ProjectResolver.refs,
     };
 
-    const status = try detectCycle(a, entry_name, resolver);
+    const walk_status = try detectCycle(a, entry_name, resolver);
+
+    // The cycle walk only scans the flows directory when it actually
+    // resolves a referenced flow — an entry with no `Subflow` refs never
+    // triggers `ensureIndex`. Force the scan so a duplicate registry
+    // name (or an entry-name collision) is detected regardless.
+    _ = try resolver_ctx.ensureIndex();
+
+    // A duplicate effective registry name makes the whole flow registry
+    // invalid (flow-codegen rejects it) and the silent first-file-wins
+    // index can hide a cycle in the shadowed file — report it ahead of
+    // any cycle/unresolved/parse-failed result the walk produced.
+    const status: Status = if (resolver_ctx.duplicate) |dup|
+        .{ .duplicate_name = dup }
+    else
+        walk_status;
 
     // Render the offending chain once, here, while the report is
     // generated — the chain only changes when the analysis re-runs, so
@@ -559,6 +649,7 @@ pub fn analyze(
         .cycle => |c| c,
         .unresolved => |c| c,
         .parse_failed => |c| c,
+        .duplicate_name => null,
     };
     if (chain) |c| {
         var out: std.ArrayList(u8) = .empty;
