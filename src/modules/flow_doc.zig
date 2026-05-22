@@ -44,6 +44,19 @@ const IdentBuf = [ident_buf_len:0]u8;
 const value_buf_len: usize = 256;
 const ValueBuf = [value_buf_len:0]u8;
 
+/// One rendered pin on the canvas. The node editor only knows pins by
+/// their opaque `u64` id; `pinId` is a one-way hash, so to map an
+/// accepted/deleted link back to a `flow_io.Edge` we record every pin
+/// we draw this frame and look the endpoint ids up here.
+const PinEntry = struct {
+    /// Editor pin id — what `pinId(...)` produced for this pin.
+    id: u64,
+    node_id: u32,
+    /// Pin name. Borrowed from `doc` — only valid for the current frame.
+    name: []const u8,
+    dir: PinDir,
+};
+
 /// Per-tab state for an open `.flow.jsonc` file.
 pub const FlowDocState = struct {
     arena: *std.heap.ArenaAllocator,
@@ -59,6 +72,12 @@ pub const FlowDocState = struct {
     /// (the editor's node store starts empty; we seed it from
     /// `doc.nodes[].pos` once).
     needs_layout: bool = true,
+    /// Every pin drawn on the canvas this frame, rebuilt at the top of
+    /// `renderCanvas`. Used to resolve a node-editor pin id back to its
+    /// `(node_id, name, dir)` when authoring or deleting edges. Backed
+    /// by the doc arena; entries borrow `doc` node/pin strings so they
+    /// are only valid within the frame that filled the list.
+    pins: std.ArrayList(PinEntry) = .empty,
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !FlowDocState {
         const arena = try allocator.create(std.heap.ArenaAllocator);
@@ -153,6 +172,10 @@ fn renderCanvas(s: *FlowDocState) void {
         }
     }
 
+    // Reset the per-frame pin registry; `renderNodeBody` (via
+    // `recordPin`) refills it as it draws each node's pins.
+    s.pins.clearRetainingCapacity();
+
     // Pin ids must be globally unique and stable. We derive them from
     // (node_id, pin_index, direction) — packed into the high bits so
     // they never collide with node ids or edge ids.
@@ -169,6 +192,122 @@ fn renderCanvas(s: *FlowDocState) void {
         const from_pin = pinId(e.from_node, e.from_pin, .output);
         const to_pin = pinId(e.to_node, e.to_pin, .input);
         _ = ne.link(linkId(e), from_pin, to_pin, .{ 0.4, 0.8, 1.0, 1.0 }, 1.5);
+    }
+
+    // Edge authoring (issue #158) — turn a pin drag into a new
+    // `flow_io.Edge`, and a delete gesture into an edge removal. Both
+    // gestures are inspected *after* nodes and links are emitted so the
+    // editor has the full pin set for this frame.
+    handleLinkCreate(s);
+    handleLinkDelete(s);
+}
+
+/// Record a pin in the per-frame registry so a later `queryNewLink` /
+/// `queryDeletedLink` id can be resolved back to `(node, name, dir)`.
+/// Call once per `ne.beginPin` with the same id and direction.
+fn recordPin(s: *FlowDocState, node_id: u32, name: []const u8, dir: PinDir) void {
+    s.pins.append(s.doc.allocator(), .{
+        .id = pinId(node_id, name, dir),
+        .node_id = node_id,
+        .name = name,
+        .dir = dir,
+    }) catch {};
+}
+
+/// Look an editor pin id up in the per-frame registry.
+fn findPin(s: *FlowDocState, id: u64) ?PinEntry {
+    for (s.pins.items) |p| {
+        if (p.id == id) return p;
+    }
+    return null;
+}
+
+/// Whether an edge already wires this exact (output) → (input) pair.
+fn edgeExists(s: *FlowDocState, from: PinEntry, to: PinEntry) bool {
+    for (s.doc.edges) |e| {
+        if (e.from_node == from.node_id and
+            e.to_node == to.node_id and
+            std.mem.eql(u8, e.from_pin, from.name) and
+            std.mem.eql(u8, e.to_pin, to.name)) return true;
+    }
+    return false;
+}
+
+/// Drive the node-editor create-link query. On a valid accepted drag
+/// (one output pin → one input pin on two different nodes) a fresh
+/// `flow_io.Edge` is appended and the tab marked dirty.
+fn handleLinkCreate(s: *FlowDocState) void {
+    if (!ne.beginCreate()) {
+        ne.endCreate();
+        return;
+    }
+    defer ne.endCreate();
+
+    var start_id: ?u64 = null;
+    var end_id: ?u64 = null;
+    if (!ne.queryNewLink(&start_id, &end_id)) return;
+    // Both endpoints land only once the user releases over a pin.
+    const sid = start_id orelse return;
+    const eid = end_id orelse return;
+
+    const sp = findPin(s, sid);
+    const ep = findPin(s, eid);
+    // An unknown pin id (a pin not drawn this frame) — reject.
+    if (sp == null or ep == null) {
+        _ = ne.rejectNewItem(.{ 1.0, 0.3, 0.3, 1.0 }, 2.0);
+        return;
+    }
+    const a_pin = sp.?;
+    const b_pin = ep.?;
+
+    // Validate: exactly one input and one output, on two distinct
+    // nodes, and not a duplicate of an existing edge. The drag may
+    // start from either end, so figure out which is the output.
+    const valid = a_pin.dir != b_pin.dir and
+        a_pin.node_id != b_pin.node_id;
+    if (!valid) {
+        _ = ne.rejectNewItem(.{ 1.0, 0.3, 0.3, 1.0 }, 2.0);
+        return;
+    }
+    const out_pin = if (a_pin.dir == .output) a_pin else b_pin;
+    const in_pin = if (a_pin.dir == .output) b_pin else a_pin;
+    if (edgeExists(s, out_pin, in_pin)) {
+        _ = ne.rejectNewItem(.{ 1.0, 0.6, 0.2, 1.0 }, 2.0);
+        return;
+    }
+
+    // `acceptNewItem` returns true on the frame the user releases the
+    // drag — only then do we commit the edge.
+    if (ne.acceptNewItem(.{ 0.3, 1.0, 0.4, 1.0 }, 2.0)) {
+        appendEdge(s, out_pin, in_pin) catch |err| {
+            std.log.err("flow: add edge failed: {s}", .{@errorName(err)});
+        };
+    }
+}
+
+/// Drive the node-editor delete query — removes any edge the user
+/// selected and deleted on the canvas.
+fn handleLinkDelete(s: *FlowDocState) void {
+    if (!ne.beginDelete()) {
+        ne.endDelete();
+        return;
+    }
+    defer ne.endDelete();
+
+    var del_id: u64 = 0;
+    while (ne.queryDeletedLink(&del_id, null, null)) {
+        if (ne.acceptDeletedItem(true)) {
+            deleteEdgeByLinkId(s, del_id) catch |err| {
+                std.log.err("flow: delete edge failed: {s}", .{@errorName(err)});
+            };
+        }
+    }
+    // Node deletion is handled by the inspector's "Delete node" button;
+    // reject node-delete gestures here so a stray selection doesn't
+    // silently drop a node behind the inspector's back.
+    var del_node: u64 = 0;
+    while (ne.queryDeletedNode(&del_node)) {
+        ne.rejectDeletedItem();
     }
 }
 
@@ -207,7 +346,6 @@ fn pinId(node: u32, name: []const u8, dir: PinDir) u64 {
 }
 
 fn renderNodeBody(s: *FlowDocState, n: flow_io.Node) void {
-    _ = s;
     zgui.text("[{d}] {s}", .{ n.id, n.type_name });
     switch (n.kind) {
         .subflow => {
@@ -218,6 +356,7 @@ fn renderNodeBody(s: *FlowDocState, n: flow_io.Node) void {
                 ne.beginPin(pinId(n.id, b.name, .input), .input);
                 zgui.text("> {s}", .{b.name});
                 ne.endPin();
+                recordPin(s, n.id, b.name, .input);
             }
         },
         .param => {
@@ -225,12 +364,14 @@ fn renderNodeBody(s: *FlowDocState, n: flow_io.Node) void {
             ne.beginPin(pinId(n.id, "value", .output), .output);
             zgui.text("value >", .{});
             ne.endPin();
+            recordPin(s, n.id, "value", .output);
         },
         .output => {
             zgui.textDisabled("output: {s}", .{n.output_name});
             ne.beginPin(pinId(n.id, "value", .input), .input);
             zgui.text("> value", .{});
             ne.endPin();
+            recordPin(s, n.id, "value", .input);
         },
         .other => {
             // Show extras as a compact hint so the user can tell nodes
@@ -558,10 +699,48 @@ fn deleteNode(s: *FlowDocState, id: u32) !void {
     s.is_dirty = true;
 }
 
+/// Append a `flow_io.Edge` from an output pin to an input pin. The
+/// caller (`handleLinkCreate`) has already validated direction, node
+/// distinctness and duplication; this only allocates and grows.
+fn appendEdge(s: *FlowDocState, out_pin: PinEntry, in_pin: PinEntry) !void {
+    const a = s.doc.allocator();
+    const edge: flow_io.Edge = .{
+        .from_node = out_pin.node_id,
+        .from_pin = try a.dupe(u8, out_pin.name),
+        .to_node = in_pin.node_id,
+        .to_pin = try a.dupe(u8, in_pin.name),
+    };
+    s.doc.edges = try growEdges(a, s.doc.edges, edge);
+    s.is_dirty = true;
+}
+
+/// Remove the edge whose `linkId` matches `id`. No-op when nothing
+/// matches (the editor may report a delete for a link we don't own).
+fn deleteEdgeByLinkId(s: *FlowDocState, id: u64) !void {
+    const a = s.doc.allocator();
+    var idx: ?usize = null;
+    for (s.doc.edges, 0..) |e, i| {
+        if (linkId(e) == id) {
+            idx = i;
+            break;
+        }
+    }
+    const i = idx orelse return;
+    s.doc.edges = try removeAt(flow_io.Edge, a, s.doc.edges, i);
+    s.is_dirty = true;
+}
+
 // ─── Slice helpers ──────────────────────────────────────────────────────
 
 fn growNodes(a: std.mem.Allocator, src: []flow_io.Node, add: flow_io.Node) ![]flow_io.Node {
     const out = try a.alloc(flow_io.Node, src.len + 1);
+    @memcpy(out[0..src.len], src);
+    out[src.len] = add;
+    return out;
+}
+
+fn growEdges(a: std.mem.Allocator, src: []flow_io.Edge, add: flow_io.Edge) ![]flow_io.Edge {
+    const out = try a.alloc(flow_io.Edge, src.len + 1);
     @memcpy(out[0..src.len], src);
     out[src.len] = add;
     return out;
