@@ -24,6 +24,7 @@ const preview_mod = @import("modules/preview.zig");
 const scene_mod = @import("modules/scene.zig");
 const prefab_mod = @import("modules/prefab.zig");
 const flow_mod = @import("modules/flow.zig");
+const flow_doc_mod = @import("modules/flow_doc.zig");
 const gizmo_mod = @import("modules/gizmo.zig");
 const entity_inspector_mod = @import("modules/entity_inspector.zig");
 const game_view_mod = @import("modules/game_view.zig");
@@ -52,10 +53,13 @@ const SCENE_NAME_BUF_LEN = 128;
 pub const OpenTab = union(enum) {
     scene: scene_mod.SceneState,
     prefab: prefab_mod.PrefabState,
-    /// Visual-scripting "flow graph" editor — spike for issue #45.
-    /// `save`/`isDirty` are no-ops until Phase 1 lands the
-    /// `.flow.zon` schema.
+    /// Read-only Flow *viewer* — a `.zig` script projected into a
+    /// node graph via `std.zig.Ast` (issues #48/#49). `save`/`isDirty`
+    /// are no-ops.
     flow: flow_mod.FlowState,
+    /// `.flow.jsonc` flow-graph *editor* (RFC: Flows as `.flow.jsonc`,
+    /// issue #153). Authors the flat `nodes`+`edges` content format.
+    flow_doc: flow_doc_mod.FlowDocState,
     gizmo: gizmo_mod.GizmoState,
     /// Live game view (#128). Routing marker only — the consumer +
     /// GL texture state live on `App.game_view`. No per-tab struct
@@ -69,6 +73,7 @@ pub const OpenTab = union(enum) {
             .scene => |*s| s.deinit(allocator),
             .prefab => |*p| p.deinit(allocator),
             .flow => |*f| f.deinit(allocator),
+            .flow_doc => |*f| f.deinit(allocator),
             .gizmo => |*g| g.deinit(allocator),
             .game_view => {},
         }
@@ -79,6 +84,7 @@ pub const OpenTab = union(enum) {
             .scene => |*s| scene_mod.render(s, app),
             .prefab => |*p| prefab_mod.render(p, app),
             .flow => |*f| flow_mod.render(f, app),
+            .flow_doc => |*f| flow_doc_mod.render(f, app),
             .gizmo => |*g| gizmo_mod.render(g, app),
             .game_view => game_view_mod.renderTab(app),
         }
@@ -89,6 +95,7 @@ pub const OpenTab = union(enum) {
             .scene => |*s| scene_mod.saveScene(s, app),
             .prefab => |*p| prefab_mod.savePrefab(p, app),
             .flow => |*f| flow_mod.saveFlow(f, app),
+            .flow_doc => |*f| flow_doc_mod.saveFlowDoc(f, app),
             .gizmo => |*g| gizmo_mod.saveGizmo(g, app),
             .game_view => {},
         }
@@ -99,6 +106,7 @@ pub const OpenTab = union(enum) {
             .scene => |s| s.display_name,
             .prefab => |p| p.display_name,
             .flow => |f| f.display_name,
+            .flow_doc => |f| f.display_name,
             .gizmo => |g| g.display_name,
             .game_view => "▶ Game View",
         };
@@ -109,6 +117,7 @@ pub const OpenTab = union(enum) {
             .scene => |s| s.path,
             .prefab => |p| p.path,
             .flow => |f| f.path,
+            .flow_doc => |f| f.path,
             .gizmo => |g| g.path,
             .game_view => "<runtime>",
         };
@@ -119,6 +128,7 @@ pub const OpenTab = union(enum) {
             .scene => |s| s.is_dirty,
             .prefab => |p| p.is_dirty,
             .flow => |f| f.is_dirty,
+            .flow_doc => |f| f.is_dirty,
             .gizmo => |g| g.is_dirty,
             .game_view => false,
         };
@@ -634,6 +644,27 @@ pub const App = struct {
         var state = try flow_mod.FlowState.open(self.allocator, path);
         errdefer state.deinit(self.allocator);
         try self.open_tabs.append(self.allocator, .{ .flow = state });
+        const new_idx = self.open_tabs.items.len - 1;
+        self.active_tab_idx = new_idx;
+        self.focus_tab_idx = new_idx;
+    }
+
+    /// Open a `.flow.jsonc` file (under `<project>/scripts/flows/`) as
+    /// the flow-graph *editor* tab — the authoring counterpart to
+    /// `openFlow`. The file is parsed by `src/flow_io.zig` into the
+    /// flat `nodes`+`edges` model and edited in `modules/flow_doc.zig`.
+    /// See the Flows-as-`.flow.jsonc` RFC and issue #153.
+    pub fn openFlowDoc(self: *Self, path: []const u8) !void {
+        for (self.open_tabs.items, 0..) |t, i| {
+            if (std.mem.eql(u8, t.path(), path)) {
+                self.focus_tab_idx = i;
+                return;
+            }
+        }
+
+        var state = try flow_doc_mod.FlowDocState.open(self.allocator, path);
+        errdefer state.deinit(self.allocator);
+        try self.open_tabs.append(self.allocator, .{ .flow_doc = state });
         const new_idx = self.open_tabs.items.len - 1;
         self.active_tab_idx = new_idx;
         self.focus_tab_idx = new_idx;
