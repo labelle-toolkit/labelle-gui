@@ -35,6 +35,7 @@ const ne = zgui.node_editor;
 const App = @import("../app.zig").App;
 const flow_io = @import("../flow_io.zig");
 const io_global = @import("../io_global.zig");
+const flow_cycle = @import("../flow_cycle.zig");
 
 const inspector_w: f32 = 340;
 const split_gap: f32 = 8;
@@ -151,6 +152,24 @@ pub const FlowDocState = struct {
     /// same referenced flow is stat'd at most once per frame regardless of
     /// how many `Subflow` nodes point at it.
     frame_seq: u64 = 0,
+    /// Result of the most recent `Subflow` reference-cycle check
+    /// (issue #159). Null until the first check runs. A `clean` status
+    /// is kept (rather than null) so the UI can tell "checked, fine"
+    /// apart from "not yet checked". Owns its own arena. The report's
+    /// `read_files` field carries the on-disk stamps the check ran
+    /// against — `refreshCycleCheck` re-runs when any of them changes.
+    cycle_report: ?flow_cycle.Report = null,
+    /// Snapshot of the `Subflow` `flow_ref` set the last cycle check
+    /// ran against, encoded by `buildRefsFingerprint` (each ref
+    /// length-prefixed so the encoding is unambiguous for any ref
+    /// content). When the live set diverges from this the check is
+    /// re-run. Owned by the child/GPA allocator
+    /// (`arena.child_allocator`), *not* the tab arena: it is replaced on
+    /// every actual re-check, and arena `free` is a no-op, so persisting
+    /// it on the arena would leak the prior snapshot on each
+    /// invalidation. `refreshCycleCheck` frees the previous snapshot
+    /// before storing a new one; `deinit` frees the last one.
+    cycle_refs_snapshot: []const u8 = "",
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !FlowDocState {
         const arena = try allocator.create(std.heap.ArenaAllocator);
@@ -185,11 +204,203 @@ pub const FlowDocState = struct {
         for (self.resolved.items) |*r| r.deinit();
         self.resolved.deinit(allocator);
         self.editor.destroy();
+        if (self.cycle_report) |*r| r.deinit();
+        // The snapshot lives on the child/GPA allocator (see the field
+        // doc), so it must be freed explicitly — the arena does not own
+        // it. Freeing an empty `""` slice is a safe no-op.
+        if (self.cycle_refs_snapshot.len > 0) {
+            self.arena.child_allocator.free(self.cycle_refs_snapshot);
+        }
         self.doc.deinit();
         self.arena.deinit();
         allocator.destroy(self.arena);
     }
 };
+
+/// Build the bare-name `Subflow` reference list of the open document
+/// (its live, possibly-unsaved state). Empty refs are skipped here so
+/// the snapshot and the analysis input agree. Owned by `a`.
+fn liveSubflowRefs(a: std.mem.Allocator, doc: flow_io.FlowDoc) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (doc.nodes) |n| {
+        if (n.kind != .subflow) continue;
+        if (n.flow_ref.len == 0) continue;
+        try out.append(a, n.flow_ref);
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// The flow document's effective name — the explicit top-level `name`
+/// or, failing that, the filename basename (RFC §5, mirrored by
+/// `flow_io.displayNameFromPath`).
+fn effectiveName(s: *const FlowDocState) []const u8 {
+    return s.doc.name orelse s.display_name;
+}
+
+/// True when any `.flow.jsonc` file the last check read has changed on
+/// disk since — a different `mtime`, a different `size`, or a file that
+/// is now stat-able when it wasn't (or vice versa). An on-disk edit to
+/// a *referenced* flow can create or break a transitive cycle the open
+/// document's own `Subflow` reference set never reveals, so the banner
+/// must not trust a cached "clean" once any referenced file moves.
+///
+/// Also re-triggers when a reference target the last check could *not*
+/// read becomes readable: a previously-missing `.flow.jsonc` appearing
+/// on disk, or a parse-failed one whose content changed. `read_files`
+/// can never catch these — it only stamps files that were successfully
+/// read — so `unresolved_targets` is checked alongside it. A target
+/// appearing can newly resolve a reference (and even introduce a
+/// cycle), so the stale "unresolved" banner must not survive it.
+///
+/// Cheap: one `statFile` per tracked path (read files plus unresolved
+/// targets). A flow graph references a handful of files at most, so this
+/// stays well within an immediate-mode frame budget.
+pub fn referencedFilesChanged(report: *const flow_cycle.Report) bool {
+    const io = io_global.io();
+    for (report.read_files) |f| {
+        const st = std.Io.Dir.cwd().statFile(io, f.path, .{}) catch {
+            // The file is no longer stat-able. Stale only if it *was*
+            // stat-able at check time.
+            if (f.mtime_ns != null or f.size != null) return true;
+            continue;
+        };
+        // The file became stat-able since the check, or its mtime/size
+        // moved — either way the cached result may be stale.
+        if (f.mtime_ns == null or f.size == null) return true;
+        if (f.mtime_ns.? != st.mtime.nanoseconds) return true;
+        if (f.size.? != st.size) return true;
+    }
+    // A target the check could not read may now be readable.
+    for (report.unresolved_targets) |t| {
+        const st = std.Io.Dir.cwd().statFile(io, t.path, .{}) catch {
+            // Still not stat-able. Stale only if a (broken) file *was*
+            // present there at check time and has since vanished.
+            if (t.mtime_ns != null or t.size != null) return true;
+            continue;
+        };
+        // A previously-missing target now exists, or a parse-failed
+        // one's mtime/size moved (its content may now parse) — either
+        // way a reference that didn't resolve might now resolve.
+        if (t.mtime_ns == null or t.size == null) return true;
+        if (t.mtime_ns.? != st.mtime.nanoseconds) return true;
+        if (t.size.? != st.size) return true;
+    }
+    return false;
+}
+
+/// Build the invalidation fingerprint of the open document's live
+/// `Subflow` `flow_ref` set. `refreshCycleCheck` compares this against
+/// the stored `cycle_refs_snapshot` to decide whether the reference set
+/// changed since the last check.
+///
+/// Each ref is **length-prefixed** — its byte length as a fixed-width
+/// little-endian `u64`, then the raw bytes — so the encoding is
+/// unambiguous for any `flow_ref` content. A plain separator (newline,
+/// NUL, …) is not enough: a `flow_ref` is a JSON string and may contain
+/// that separator byte itself, so one ref `"a\nb"` would otherwise
+/// encode the exact same bytes as two refs `"a"`, `"b"` and the check
+/// would wrongly skip re-analysis. With the length prefix no
+/// concatenation of one ref set can collide with a different set.
+///
+/// Empty refs are skipped — same filter as `liveSubflowRefs`, so the
+/// fingerprint and the analysis input agree. Owned by `a`.
+pub fn buildRefsFingerprint(a: std.mem.Allocator, doc: flow_io.FlowDoc) !std.ArrayList(u8) {
+    var snap: std.ArrayList(u8) = .empty;
+    errdefer snap.deinit(a);
+    for (doc.nodes) |n| {
+        if (n.kind != .subflow or n.flow_ref.len == 0) continue;
+        var len_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &len_buf, n.flow_ref.len, .little);
+        try snap.appendSlice(a, &len_buf);
+        try snap.appendSlice(a, n.flow_ref);
+    }
+    return snap;
+}
+
+/// Re-run the `Subflow` reference-cycle check if the live reference set
+/// has changed since the last run, if any referenced flow file changed
+/// on disk, or if no check has run yet. Resolves referenced flows from
+/// the open document's own `scripts/flows/` directory — derived from the
+/// document path's parent.
+///
+/// Cheap to call every frame: when nothing changed this only builds and
+/// compares a short length-prefixed fingerprint and stats a handful of
+/// files.
+fn refreshCycleCheck(s: *FlowDocState) void {
+    // The tab arena (`ArenaAllocator.free` is a no-op) is never used
+    // for the cycle-check scratch *or* the persisted snapshot — both
+    // live on the child/GPA allocator. Per-frame scratch is freed
+    // before this returns; the single stored snapshot is freed and
+    // replaced on each actual re-check (and on `deinit`). Keeping it
+    // off the arena means an editing session does not accumulate one
+    // dead snapshot per invalidation.
+    const child = s.arena.child_allocator;
+
+    // Build a length-prefixed fingerprint of the current Subflow refs
+    // on the child allocator so it is reclaimed every frame. The
+    // length prefix keeps the encoding unambiguous for any ref content
+    // (see `buildRefsFingerprint`).
+    var snap = buildRefsFingerprint(child, s.doc) catch return;
+    defer snap.deinit(child);
+
+    // Skip the re-analysis only when a check has run, the open flow's
+    // own reference set is unchanged, *and* none of the referenced
+    // files moved on disk. The disk-stamp check guards against a stale
+    // "clean" banner when a transitively-referenced flow is edited.
+    if (s.cycle_report) |*report| {
+        if (std.mem.eql(u8, snap.items, s.cycle_refs_snapshot) and
+            !referencedFilesChanged(report)) return;
+    }
+
+    // Reference set changed, a referenced file changed, or first run —
+    // re-analyze.
+    var refs_arena = std.heap.ArenaAllocator.init(child);
+    defer refs_arena.deinit();
+    const refs = liveSubflowRefs(refs_arena.allocator(), s.doc) catch return;
+
+    // The flow file lives at `<flows_dir>/<name>.flow.jsonc`; the
+    // referenced flows resolve from the same directory.
+    const flows_dir = std.fs.path.dirname(s.path) orelse ".";
+
+    const new_report = flow_cycle.analyze(
+        child,
+        effectiveName(s),
+        refs,
+        flows_dir,
+    ) catch |err| {
+        // The check failed (e.g. OOM, a filesystem error). Drop the
+        // stale report so the banner reflects "not checked" rather than
+        // a now-incorrect cycle/unresolved status, and clear the
+        // snapshot so the next frame retries instead of trusting a
+        // result that was never produced.
+        std.log.err("flow: cycle check failed: {s}", .{@errorName(err)});
+        if (s.cycle_report) |*old| old.deinit();
+        s.cycle_report = null;
+        if (s.cycle_refs_snapshot.len > 0) child.free(s.cycle_refs_snapshot);
+        s.cycle_refs_snapshot = "";
+        return;
+    };
+
+    // Duplicate the snapshot onto the child/GPA allocator *before*
+    // committing the new report — if the dup fails we keep the old
+    // report/snapshot pair consistent (rather than leaving an empty
+    // snapshot that would re-run the disk-backed analysis every
+    // subsequent frame). The snapshot stays off the tab arena so the
+    // prior one can actually be reclaimed below.
+    const new_snapshot = child.dupe(u8, snap.items) catch {
+        std.log.err("flow: cycle snapshot alloc failed; keeping prior result", .{});
+        var report = new_report;
+        report.deinit();
+        return;
+    };
+
+    if (s.cycle_report) |*old| old.deinit();
+    // Free the previous snapshot before replacing it — without this the
+    // child allocator would accumulate one dead snapshot per re-check.
+    if (s.cycle_refs_snapshot.len > 0) child.free(s.cycle_refs_snapshot);
+    s.cycle_report = new_report;
+    s.cycle_refs_snapshot = new_snapshot;
+}
 
 /// Public entry point — `OpenTab.render` dispatches here.
 pub fn render(s: *FlowDocState, app: *App) void {
@@ -206,6 +417,12 @@ pub fn render(s: *FlowDocState, app: *App) void {
     if (zgui.button("Save", .{})) saveFlowDoc(s, app);
     zgui.sameLine(.{});
     zgui.textDisabled("(.flow.jsonc — flat graph editor)", .{});
+
+    // Re-run the Subflow reference-cycle check whenever the live set of
+    // `Subflow` references changes (issue #159). Cheap when unchanged.
+    refreshCycleCheck(s);
+    renderCycleBanner(s);
+
     zgui.separator();
 
     const total_w = zgui.getContentRegionAvail()[0];
@@ -224,6 +441,69 @@ pub fn render(s: *FlowDocState, app: *App) void {
         renderInspector(s);
     }
     zgui.endChild();
+}
+
+/// Draw a warning banner when the most recent `Subflow` reference
+/// check found a cycle or an unresolved reference. A clean (or
+/// not-yet-run) check draws nothing — the editor stays quiet when the
+/// flow graph is fine (issue #159).
+fn renderCycleBanner(s: *FlowDocState) void {
+    const report = &(if (s.cycle_report) |*r| r else return).*;
+    // `chain_text` was rendered once when the report was generated
+    // (`flow_cycle.analyze`) — the banner just displays it, so the tab
+    // arena doesn't grow per frame. A blank string only happens on a
+    // formatting-alloc failure inside `analyze`; show a placeholder.
+    const text = if (report.chain_text.len > 0) report.chain_text else "?";
+    switch (report.status) {
+        .clean => return,
+        .cycle => {
+            zgui.textColored(
+                .{ 1.0, 0.35, 0.35, 1.0 },
+                "Subflow reference cycle: {s}",
+                .{text},
+            );
+            zgui.textDisabled(
+                "A cyclic flow graph is rejected by codegen at build time.",
+                .{},
+            );
+        },
+        .unresolved => {
+            zgui.textColored(
+                .{ 1.0, 0.65, 0.2, 1.0 },
+                "Unresolved Subflow reference: {s}",
+                .{text},
+            );
+            zgui.textDisabled(
+                "The last flow in the chain has no scripts/flows/<name>.flow.jsonc file.",
+                .{},
+            );
+        },
+        .parse_failed => {
+            zgui.textColored(
+                .{ 1.0, 0.65, 0.2, 1.0 },
+                "Broken Subflow reference: {s}",
+                .{text},
+            );
+            zgui.textDisabled(
+                "The last flow in the chain has a .flow.jsonc file that failed to parse — fix that file.",
+                .{},
+            );
+        },
+        .duplicate_name => |dup| {
+            zgui.textColored(
+                .{ 1.0, 0.35, 0.35, 1.0 },
+                "Duplicate flow name: two flows share the name '{s}' — rename one.",
+                .{dup.name},
+            );
+            zgui.textDisabled("  {s}", .{dup.path_a});
+            zgui.textDisabled("  {s}", .{dup.path_b});
+            zgui.textDisabled(
+                "A flow's registry name is its top-level `name`, else its filename. " ++
+                    "codegen rejects two flows resolving to the same name.",
+                .{},
+            );
+        },
+    }
 }
 
 // ─── Canvas ─────────────────────────────────────────────────────────────

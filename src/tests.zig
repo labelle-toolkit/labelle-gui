@@ -14,6 +14,7 @@ const atlas = @import("atlas.zig");
 const gizmo_io = @import("gizmo_io.zig");
 const flow_io = @import("flow_io.zig");
 const flow_doc = @import("modules/flow_doc.zig");
+const flow_cycle = @import("flow_cycle.zig");
 const gizmos = @import("gizmos.zig");
 const preview = @import("preview.zig");
 const flow_projector = @import("flows/projector.zig");
@@ -5376,5 +5377,805 @@ pub const FlowDocSubflowTests = struct {
             null,
             null,
         ));
+    }
+};
+
+// ─── flow_cycle: Subflow reference-cycle check (issue #159) ──────────────
+
+/// Covers `flow_cycle.detectCycle` (the pure DFS walk over the
+/// `Subflow` reference graph) and `flow_cycle.analyze` (the on-disk,
+/// project-backed resolver). The pure walk is exercised with an
+/// in-memory reference map; `analyze` is exercised against real
+/// `.flow.jsonc` files in a temp `scripts/flows/` directory.
+pub const FlowCycleTests = struct {
+    /// In-memory `flow_cycle.Resolver` backing — a flow name → refs
+    /// map. A name absent from the map resolves to `.missing`; a name
+    /// in `broken` resolves to `.parse_failed`.
+    const MapResolver = struct {
+        map: std.StringHashMapUnmanaged([]const []const u8),
+        broken: std.StringHashMapUnmanaged(void) = .empty,
+
+        fn refs(ctx: *anyopaque, name: []const u8) anyerror!flow_cycle.RefResult {
+            const self: *MapResolver = @ptrCast(@alignCast(ctx));
+            if (self.map.get(name)) |r| return .{ .ok = r };
+            if (self.broken.contains(name)) return .parse_failed;
+            return .missing;
+        }
+
+        fn resolver(self: *MapResolver) flow_cycle.Resolver {
+            return .{ .ctx = self, .refsFn = MapResolver.refs };
+        }
+    };
+
+    test "detectCycle reports a clean linear chain" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var m: MapResolver = .{ .map = .empty };
+        try m.map.put(a, "a", &.{"b"});
+        try m.map.put(a, "b", &.{"c"});
+        try m.map.put(a, "c", &.{});
+
+        const status = try flow_cycle.detectCycle(a, "a", m.resolver());
+        try expect.toBeTrue(status == .clean);
+    }
+
+    test "detectCycle flags a direct self-reference" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var m: MapResolver = .{ .map = .empty };
+        try m.map.put(a, "a", &.{"a"});
+
+        const status = try flow_cycle.detectCycle(a, "a", m.resolver());
+        try expect.toBeTrue(status == .cycle);
+        try expect.equal(status.cycle.names.len, @as(usize, 2));
+    }
+
+    test "detectCycle reports the offending chain for an indirect cycle" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var m: MapResolver = .{ .map = .empty };
+        try m.map.put(a, "a", &.{"b"});
+        try m.map.put(a, "b", &.{"c"});
+        try m.map.put(a, "c", &.{"a"});
+
+        const status = try flow_cycle.detectCycle(a, "a", m.resolver());
+        try expect.toBeTrue(status == .cycle);
+        // a → b → c → a
+        try expect.equal(status.cycle.names.len, @as(usize, 4));
+        try expect.toBeTrue(std.mem.eql(u8, status.cycle.names[0], "a"));
+        try expect.toBeTrue(std.mem.eql(u8, status.cycle.names[3], "a"));
+    }
+
+    test "detectCycle finds a cycle that does not include the entry flow" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var m: MapResolver = .{ .map = .empty };
+        try m.map.put(a, "entry", &.{"b"});
+        try m.map.put(a, "b", &.{"c"});
+        try m.map.put(a, "c", &.{"b"});
+
+        const status = try flow_cycle.detectCycle(a, "entry", m.resolver());
+        try expect.toBeTrue(status == .cycle);
+    }
+
+    test "detectCycle reports an unresolved reference" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var m: MapResolver = .{ .map = .empty };
+        try m.map.put(a, "a", &.{"b"});
+        try m.map.put(a, "b", &.{"missing"});
+
+        const status = try flow_cycle.detectCycle(a, "a", m.resolver());
+        try expect.toBeTrue(status == .unresolved);
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            status.unresolved.names[status.unresolved.names.len - 1],
+            "missing",
+        ));
+    }
+
+    test "detectCycle treats a diamond reference graph as clean" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var m: MapResolver = .{ .map = .empty };
+        try m.map.put(a, "a", &.{ "b", "c" });
+        try m.map.put(a, "b", &.{"d"});
+        try m.map.put(a, "c", &.{"d"});
+        try m.map.put(a, "d", &.{});
+
+        const status = try flow_cycle.detectCycle(a, "a", m.resolver());
+        try expect.toBeTrue(status == .clean);
+    }
+
+    test "detectCycle catches a cycle reachable only through a node first seen on a clean branch" {
+        // Regression for the classic three-state DFS mistake: the
+        // "done" set must mean "fully explored AND acyclic", never just
+        // "seen". `c` is first reached down the clean-looking `entry →
+        // x → c` branch; the real cycle is `b → c → b`. A walk that
+        // marked `c` done on first sight would skip `c` on the later
+        // `entry → b` branch and wrongly report `.clean`.
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var m: MapResolver = .{ .map = .empty };
+        try m.map.put(a, "entry", &.{ "x", "b" });
+        try m.map.put(a, "x", &.{"c"});
+        try m.map.put(a, "b", &.{"c"});
+        try m.map.put(a, "c", &.{"b"});
+
+        const status = try flow_cycle.detectCycle(a, "entry", m.resolver());
+        try expect.toBeTrue(status == .cycle);
+        // Walk descends entry → x → c → b → c; the back edge closes at
+        // `c`, so the offending chain is c → b → c.
+        try expect.equal(status.cycle.names.len, @as(usize, 3));
+        try expect.toBeTrue(std.mem.eql(u8, status.cycle.names[0], "c"));
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            status.cycle.names[status.cycle.names.len - 1],
+            "c",
+        ));
+    }
+
+    test "detectCycle catches a cycle behind a node reached via two clean-prefix paths" {
+        // `d`'s children are walked in order: (1) `c → leaf` is a
+        // genuinely clean subtree that leaves `c`/`leaf` in the done
+        // set; (2) `e → d` then closes the `d → e → d` cycle. The
+        // earlier done-marking of the sibling subtree must not suppress
+        // the cycle on the later branch.
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var m: MapResolver = .{ .map = .empty };
+        try m.map.put(a, "entry", &.{"d"});
+        try m.map.put(a, "d", &.{ "c", "e" });
+        try m.map.put(a, "c", &.{"leaf"});
+        try m.map.put(a, "leaf", &.{});
+        try m.map.put(a, "e", &.{"d"});
+
+        const status = try flow_cycle.detectCycle(a, "entry", m.resolver());
+        try expect.toBeTrue(status == .cycle);
+        try expect.toBeTrue(std.mem.eql(u8, status.cycle.names[0], "d"));
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            status.cycle.names[status.cycle.names.len - 1],
+            "d",
+        ));
+    }
+
+    test "detectCycle treats a node reached via two genuinely clean paths as clean" {
+        // Counterpart false-positive guard: `c` is reached twice, both
+        // paths acyclic. The done-set skip on the second visit must not
+        // be mistaken for a cycle.
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var m: MapResolver = .{ .map = .empty };
+        try m.map.put(a, "a", &.{ "x", "y" });
+        try m.map.put(a, "x", &.{"c"});
+        try m.map.put(a, "y", &.{"c"});
+        try m.map.put(a, "c", &.{"leaf"});
+        try m.map.put(a, "leaf", &.{});
+
+        const status = try flow_cycle.detectCycle(a, "a", m.resolver());
+        try expect.toBeTrue(status == .clean);
+    }
+
+    /// Build a `flow_io.FlowDoc` carrying one `Subflow` node per entry
+    /// in `flow_refs`. Only `nodes` is populated — `buildRefsFingerprint`
+    /// reads nothing else. Caller owns `nodes` (allocated on `a`).
+    fn docWithSubflowRefs(
+        a: std.mem.Allocator,
+        flow_refs: []const []const u8,
+    ) !flow_io.FlowDoc {
+        const nodes = try a.alloc(flow_io.Node, flow_refs.len);
+        for (flow_refs, 0..) |r, i| {
+            nodes[i] = .{
+                .id = @intCast(i + 1),
+                .type_name = "Subflow",
+                .kind = .subflow,
+                .flow_ref = r,
+            };
+        }
+        return .{ .arena = undefined, .nodes = nodes };
+    }
+
+    test "buildRefsFingerprint distinguishes ref sets that collide under newline-joining" {
+        // A `flow_ref` is a JSON string and may contain a newline.
+        // Joining refs with `\n` is ambiguous: one ref "a\nb" produces
+        // the exact same bytes as two refs "a", "b". The fingerprint
+        // must keep these distinct so a changed reference set is never
+        // mistaken for "unchanged" and the cycle check re-runs.
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        const doc_one = try docWithSubflowRefs(a, &.{"a\nb"});
+        const doc_two = try docWithSubflowRefs(a, &.{ "a", "b" });
+
+        var fp_one = try flow_doc.buildRefsFingerprint(a, doc_one);
+        defer fp_one.deinit(a);
+        var fp_two = try flow_doc.buildRefsFingerprint(a, doc_two);
+        defer fp_two.deinit(a);
+
+        try expect.toBeTrue(!std.mem.eql(u8, fp_one.items, fp_two.items));
+    }
+
+    test "buildRefsFingerprint is stable for an identical ref set" {
+        // Same refs in the same order must produce identical bytes —
+        // otherwise the check would re-run every frame.
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        const doc_a = try docWithSubflowRefs(a, &.{ "alpha", "beta\ngamma" });
+        const doc_b = try docWithSubflowRefs(a, &.{ "alpha", "beta\ngamma" });
+
+        var fp_a = try flow_doc.buildRefsFingerprint(a, doc_a);
+        defer fp_a.deinit(a);
+        var fp_b = try flow_doc.buildRefsFingerprint(a, doc_b);
+        defer fp_b.deinit(a);
+
+        try expect.toBeTrue(std.mem.eql(u8, fp_a.items, fp_b.items));
+    }
+
+    test "buildRefsFingerprint encoding cannot be reproduced by a different ref split" {
+        // Length-prefixing must defeat *every* re-split, not just the
+        // newline case. A plain NUL separator is also insufficient — a
+        // `flow_ref` may contain a NUL — so ["x\x00y"] and ["x", "y"]
+        // must differ too, as must order-only changes.
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        const sets = [_][]const []const u8{
+            &.{"xy"},
+            &.{ "x", "y" },
+            &.{ "y", "x" },
+            &.{"x\x00y"},
+            &.{ "x\ny", "z" },
+            &.{ "x", "y\nz" },
+        };
+        var seen: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (seen.items) |s| a.free(s);
+            seen.deinit(a);
+        }
+        for (sets) |set| {
+            const doc = try docWithSubflowRefs(a, set);
+            var fp = try flow_doc.buildRefsFingerprint(a, doc);
+            defer fp.deinit(a);
+            for (seen.items) |prev| {
+                try expect.toBeTrue(!std.mem.eql(u8, prev, fp.items));
+            }
+            try seen.append(a, try a.dupe(u8, fp.items));
+        }
+    }
+
+    fn createTempDir(allocator: std.mem.Allocator) ![]const u8 {
+        const ts = timestampSeconds();
+        const dir_name = try std.fmt.allocPrint(
+            allocator,
+            "/tmp/labelle_flowcycle_{d}",
+            .{ts},
+        );
+        try std.Io.Dir.cwd().createDir(io_global.io(), dir_name, .default_dir);
+        return dir_name;
+    }
+
+    fn deleteTempDir(allocator: std.mem.Allocator, dir_path: []const u8) void {
+        std.Io.Dir.cwd().deleteTree(io_global.io(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+
+    /// Write `<flows_dir>/<name>.flow.jsonc` with a `Subflow` node per
+    /// entry in `refs`.
+    fn writeFlow(
+        allocator: std.mem.Allocator,
+        flows_dir: []const u8,
+        name: []const u8,
+        refs: []const []const u8,
+    ) !void {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(allocator);
+        try buf.appendSlice(allocator, "{ \"event\": { \"type\": \"OnCall\" }, \"nodes\": [");
+        for (refs, 0..) |r, i| {
+            if (i > 0) try buf.append(allocator, ',');
+            try buf.print(allocator,
+                " {{ \"id\": {d}, \"type\": \"Subflow\", \"flow\": \"{s}\", \"pos\": [0, 0] }}",
+                .{ i + 1, r });
+        }
+        try buf.appendSlice(allocator, " ], \"edges\": [] }\n");
+
+        const path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}{s}",
+            .{ flows_dir, name, flow_io.extension },
+        );
+        defer allocator.free(path);
+        try std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = path,
+            .data = buf.items,
+        });
+    }
+
+    test "analyze reads referenced flows from disk and reports a cycle" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // a → b → a, written as real .flow.jsonc files.
+        try writeFlow(allocator, flows_dir, "b", &.{"a"});
+
+        var report = try flow_cycle.analyze(
+            allocator,
+            "a",
+            &.{"b"}, // live (unsaved) Subflow refs of the open doc "a"
+            flows_dir,
+        );
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .cycle);
+    }
+
+    test "analyze reports an unresolved reference for a missing file" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // "a" references "ghost" — no ghost.flow.jsonc on disk.
+        var report = try flow_cycle.analyze(
+            allocator,
+            "a",
+            &.{"ghost"},
+            flows_dir,
+        );
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .unresolved);
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            report.status.unresolved.names[report.status.unresolved.names.len - 1],
+            "ghost",
+        ));
+    }
+
+    test "analyze reports clean for an acyclic on-disk reference graph" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // a → b → c, all real files, no cycle.
+        try writeFlow(allocator, flows_dir, "b", &.{"c"});
+        try writeFlow(allocator, flows_dir, "c", &.{});
+
+        var report = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .clean);
+    }
+
+    /// Write `<flows_dir>/<file>.flow.jsonc` carrying an explicit
+    /// top-level `name` (its effective registry name) that differs from
+    /// the filename, with a `Subflow` node per entry in `refs`.
+    fn writeNamedFlow(
+        allocator: std.mem.Allocator,
+        flows_dir: []const u8,
+        file: []const u8,
+        reg_name: []const u8,
+        refs: []const []const u8,
+    ) !void {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(allocator);
+        try buf.print(allocator,
+            "{{ \"name\": \"{s}\", \"event\": {{ \"type\": \"OnCall\" }}, \"nodes\": [",
+            .{reg_name});
+        for (refs, 0..) |r, i| {
+            if (i > 0) try buf.append(allocator, ',');
+            try buf.print(allocator,
+                " {{ \"id\": {d}, \"type\": \"Subflow\", \"flow\": \"{s}\", \"pos\": [0, 0] }}",
+                .{ i + 1, r });
+        }
+        try buf.appendSlice(allocator, " ], \"edges\": [] }\n");
+
+        const path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}{s}",
+            .{ flows_dir, file, flow_io.extension },
+        );
+        defer allocator.free(path);
+        try std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = path,
+            .data = buf.items,
+        });
+    }
+
+    test "analyze resolves a reference by registry name, not filename" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // The open doc "a" references "tick_logic" — a registry name.
+        // On disk that flow lives in `b_file.flow.jsonc`, whose
+        // top-level `name` is "tick_logic". Keying on the filename
+        // would mis-report this as unresolved.
+        try writeNamedFlow(allocator, flows_dir, "b_file", "tick_logic", &.{});
+
+        var report = try flow_cycle.analyze(
+            allocator,
+            "a",
+            &.{"tick_logic"},
+            flows_dir,
+        );
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .clean);
+    }
+
+    test "analyze detects a cycle through registry-name resolution" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // a → reg_b → a, where reg_b's flow file is `b_file.flow.jsonc`
+        // (filename ≠ registry name) and it Subflow-references "a".
+        try writeNamedFlow(allocator, flows_dir, "b_file", "reg_b", &.{"a"});
+
+        var report = try flow_cycle.analyze(
+            allocator,
+            "a",
+            &.{"reg_b"},
+            flows_dir,
+        );
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .cycle);
+    }
+
+    test "analyze flags a reference that matches a filename but not a registry name" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // `b_file.flow.jsonc` has registry name "reg_b". A Subflow that
+        // references the *filename* "b_file" must NOT resolve — only the
+        // effective registry name "reg_b" is a valid target.
+        try writeNamedFlow(allocator, flows_dir, "b_file", "reg_b", &.{});
+
+        var report = try flow_cycle.analyze(
+            allocator,
+            "a",
+            &.{"b_file"},
+            flows_dir,
+        );
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .unresolved);
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            report.status.unresolved.names[report.status.unresolved.names.len - 1],
+            "b_file",
+        ));
+    }
+
+    test "analyze still resolves a flow with no name by its filename" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // `plain.flow.jsonc` has no top-level `name`; its effective
+        // registry name falls back to the filename basename "plain".
+        try writeFlow(allocator, flows_dir, "plain", &.{});
+
+        var report = try flow_cycle.analyze(
+            allocator,
+            "a",
+            &.{"plain"},
+            flows_dir,
+        );
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .clean);
+    }
+
+    test "analyze populates chain_text once for a cycle" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        try writeFlow(allocator, flows_dir, "b", &.{"a"});
+
+        var report = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .cycle);
+        // chain_text is rendered at analysis time: a → b → a.
+        try expect.toBeTrue(report.chain_text.len > 0);
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            report.chain_text,
+            "a \u{2192} b \u{2192} a",
+        ));
+    }
+
+    /// Write `<flows_dir>/<name>.flow.jsonc` with deliberately broken
+    /// content — valid as a file on disk, but not parseable as a flow
+    /// (here: a top-level array, not an object).
+    fn writeBrokenFlow(
+        allocator: std.mem.Allocator,
+        flows_dir: []const u8,
+        name: []const u8,
+    ) !void {
+        const path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}{s}",
+            .{ flows_dir, name, flow_io.extension },
+        );
+        defer allocator.free(path);
+        try std.Io.Dir.cwd().writeFile(io_global.io(), .{
+            .sub_path = path,
+            .data = "[ this is not valid flow json ]\n",
+        });
+    }
+
+    test "analyze flags a referenced file that exists but fails to parse" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // "a" references "b"; b.flow.jsonc exists on disk but its
+        // content is not parseable. This must be reported distinctly
+        // from a plain missing file — `parse_failed`, not `unresolved`.
+        try writeBrokenFlow(allocator, flows_dir, "b");
+
+        var report = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .parse_failed);
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            report.status.parse_failed.names[
+                report.status.parse_failed.names.len - 1
+            ],
+            "b",
+        ));
+        // A genuinely missing file is still `unresolved`, not
+        // `parse_failed` — the two stay distinct.
+        var missing = try flow_cycle.analyze(allocator, "a", &.{"ghost"}, flows_dir);
+        defer missing.deinit();
+        try expect.toBeTrue(missing.status == .unresolved);
+    }
+
+    test "analyze records the referenced files it read on the report" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        try writeFlow(allocator, flows_dir, "b", &.{"c"});
+        try writeFlow(allocator, flows_dir, "c", &.{});
+
+        var report = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        defer report.deinit();
+        // The resolver scans every `.flow.jsonc` in `flows_dir` to build
+        // its registry-name index, so both files are recorded with a
+        // stat-able mtime.
+        try expect.toBeTrue(report.read_files.len == 2);
+        for (report.read_files) |f| {
+            try expect.toBeTrue(f.mtime_ns != null);
+            try expect.toBeTrue(f.size != null);
+        }
+    }
+
+    test "referencedFilesChanged re-triggers when a referenced file changes on disk" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // Initial graph: a → b → c, acyclic and clean.
+        try writeFlow(allocator, flows_dir, "b", &.{"c"});
+        try writeFlow(allocator, flows_dir, "c", &.{});
+
+        var report = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .clean);
+        // Nothing has changed on disk yet — no re-trigger.
+        try expect.toBeFalse(flow_doc.referencedFilesChanged(&report));
+
+        // Edit a *transitively*-referenced flow so it now closes a cycle
+        // (c → a). The open flow's own Subflow refs ({"b"}) are
+        // unchanged, so only the on-disk stamp reveals the staleness.
+        // `writeFlow` truncates and rewrites `c.flow.jsonc`.
+        try writeFlow(allocator, flows_dir, "c", &.{"a"});
+        try expect.toBeTrue(flow_doc.referencedFilesChanged(&report));
+
+        // Re-running the check now sees the cycle the stale report
+        // missed.
+        var fresh = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        defer fresh.deinit();
+        try expect.toBeTrue(fresh.status == .cycle);
+        try expect.toBeFalse(flow_doc.referencedFilesChanged(&fresh));
+    }
+
+    test "referencedFilesChanged re-triggers when a previously-missing referenced file is created" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // The open doc "a" references "b", but b.flow.jsonc does not
+        // exist yet — the check reports `unresolved`. `read_files` only
+        // stamps files that were successfully read (here just none, or
+        // whatever the directory scan saw), so it can never notice "b"
+        // appearing; `unresolved_targets` must carry the expected path.
+        var report = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .unresolved);
+        // The missing target is recorded with its expected `.flow.jsonc`
+        // path so a later check can stat it.
+        try expect.toBeTrue(report.unresolved_targets.len == 1);
+        try expect.toBeFalse(report.unresolved_targets[0].parse_failed);
+        // Nothing has appeared on disk yet — no re-trigger.
+        try expect.toBeFalse(flow_doc.referencedFilesChanged(&report));
+
+        // Create the previously-missing referenced flow. It even closes
+        // a cycle (b → a). The open flow's own Subflow refs ({"b"}) are
+        // unchanged, so only the appearance of the missing target can
+        // reveal the staleness.
+        try writeFlow(allocator, flows_dir, "b", &.{"a"});
+        try expect.toBeTrue(flow_doc.referencedFilesChanged(&report));
+
+        // Re-running the check now resolves "b" and sees the cycle the
+        // stale "unresolved" report could not.
+        var fresh = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        defer fresh.deinit();
+        try expect.toBeTrue(fresh.status == .cycle);
+        try expect.toBeFalse(flow_doc.referencedFilesChanged(&fresh));
+    }
+
+    test "referencedFilesChanged re-triggers when a parse-failed referenced file is fixed" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // "a" references "b"; b.flow.jsonc exists but does not parse —
+        // the check reports `parse_failed` and stamps the broken file.
+        try writeBrokenFlow(allocator, flows_dir, "b");
+
+        var report = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .parse_failed);
+        try expect.toBeTrue(report.unresolved_targets.len == 1);
+        try expect.toBeTrue(report.unresolved_targets[0].parse_failed);
+        try expect.toBeFalse(flow_doc.referencedFilesChanged(&report));
+
+        // Rewrite the broken file with valid, acyclic content.
+        try writeFlow(allocator, flows_dir, "b", &.{});
+        try expect.toBeTrue(flow_doc.referencedFilesChanged(&report));
+
+        var fresh = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        defer fresh.deinit();
+        try expect.toBeTrue(fresh.status == .clean);
+        try expect.toBeFalse(flow_doc.referencedFilesChanged(&fresh));
+    }
+
+    test "analyze flags two on-disk flows sharing one effective registry name" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // Two distinct files, `one.flow.jsonc` and `two.flow.jsonc`,
+        // both carry the explicit top-level name "shared" — so they
+        // resolve to the *same* effective registry name. flow-codegen's
+        // FlowRegistry rejects this as DuplicateFlowName; the editor's
+        // first-file-wins index would otherwise silently shadow `two`,
+        // potentially hiding a cycle in its `Subflow` refs.
+        try writeNamedFlow(allocator, flows_dir, "one", "shared", &.{});
+        try writeNamedFlow(allocator, flows_dir, "two", "shared", &.{});
+
+        var report = try flow_cycle.analyze(allocator, "entry", &.{}, flows_dir);
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .duplicate_name);
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            report.status.duplicate_name.name,
+            "shared",
+        ));
+        // Both offending files are reported, by their on-disk paths.
+        try expect.toBeTrue(std.mem.endsWith(
+            u8,
+            report.status.duplicate_name.path_a,
+            flow_io.extension,
+        ));
+        try expect.toBeTrue(std.mem.endsWith(
+            u8,
+            report.status.duplicate_name.path_b,
+            flow_io.extension,
+        ));
+        try expect.toBeFalse(std.mem.eql(
+            u8,
+            report.status.duplicate_name.path_a,
+            report.status.duplicate_name.path_b,
+        ));
+    }
+
+    test "analyze surfaces a duplicate name ahead of a cycle hidden in the shadowed file" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // `first.flow.jsonc` (name "dup") is clean; `second.flow.jsonc`
+        // (also name "dup") Subflow-references "entry", which would close
+        // a cycle entry → dup → entry. The first-file-wins index keeps
+        // `first`, so the cycle in `second` is never walked — exactly the
+        // hazard the duplicate-name check exists to surface. The report
+        // must call out the duplicate rather than a misleading clean.
+        try writeNamedFlow(allocator, flows_dir, "first", "dup", &.{});
+        try writeNamedFlow(allocator, flows_dir, "second", "dup", &.{"entry"});
+
+        var report = try flow_cycle.analyze(
+            allocator,
+            "entry",
+            &.{"dup"},
+            flows_dir,
+        );
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .duplicate_name);
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            report.status.duplicate_name.name,
+            "dup",
+        ));
+    }
+
+    test "analyze flags the open flow's name colliding with an on-disk file" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // The open (possibly unsaved) tab is being edited as "tick". An
+        // on-disk `other.flow.jsonc` already claims the registry name
+        // "tick" via its top-level `name`. That is the same
+        // DuplicateFlowName fault and must be reported even though the
+        // open tab itself has no entry in the on-disk index.
+        try writeNamedFlow(allocator, flows_dir, "other", "tick", &.{});
+
+        var report = try flow_cycle.analyze(allocator, "tick", &.{}, flows_dir);
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .duplicate_name);
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            report.status.duplicate_name.name,
+            "tick",
+        ));
+        // The open tab has no on-disk path here — it is reported via the
+        // `<open flow>` marker, with the conflicting file as `path_b`.
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            report.status.duplicate_name.path_a,
+            flow_cycle.open_flow_marker,
+        ));
+        try expect.toBeTrue(std.mem.endsWith(
+            u8,
+            report.status.duplicate_name.path_b,
+            flow_io.extension,
+        ));
+    }
+
+    test "analyze stays clean when every flow has a distinct registry name" {
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // Distinct names — no duplicate, no entry-name collision.
+        try writeNamedFlow(allocator, flows_dir, "one", "alpha", &.{});
+        try writeNamedFlow(allocator, flows_dir, "two", "beta", &.{});
+
+        var report = try flow_cycle.analyze(allocator, "entry", &.{}, flows_dir);
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .clean);
     }
 };
