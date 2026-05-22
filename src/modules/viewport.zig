@@ -26,7 +26,7 @@ pub const min_h: f32 = 240;
 /// copied into a fixed buffer so the receiver doesn't depend on
 /// ImGui's payload buffer staying alive past the accept callback.
 pub const ComponentDrop = struct {
-    name_buf: [128]u8 = [_]u8{0} ** 128,
+    name_buf: [dnd.PAYLOAD_NAME_CAP]u8 = [_]u8{0} ** dnd.PAYLOAD_NAME_CAP,
     name_len: u8 = 0,
 
     pub fn name(self: *const ComponentDrop) []const u8 {

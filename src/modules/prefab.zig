@@ -164,7 +164,17 @@ pub fn render(s: *PrefabState, app: *App) void {
         };
         const new_idx = s.loaded.children.len - 1;
         appendChildExtra(s, new_idx, drop.name()) catch |err| {
+            // Roll back the just-inserted child so we don't leave a
+            // dropped entity with no component attached. `insertChild`
+            // always appends at the end, so trimming the last slot of
+            // both arrays restores the pre-drop state.
             std.log.err("appendChildExtra failed during component drop: {s}", .{@errorName(err)});
+            s.loaded.children = s.loaded.children[0..new_idx];
+            if (s.loaded.children_extras.len > new_idx) {
+                s.loaded.children_extras = s.loaded.children_extras[0..new_idx];
+            }
+            app.setStatus("Component drop failed");
+            return;
         };
         s.selected_child_idx = new_idx;
         s.is_dirty = true;

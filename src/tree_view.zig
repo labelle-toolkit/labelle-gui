@@ -399,5 +399,13 @@ pub const TreeView = struct {
 fn isComponentFile(full_path: []const u8, file_name: []const u8, components_prefix: []const u8) bool {
     if (components_prefix.len == 0) return false;
     if (!std.mem.endsWith(u8, file_name, ".zig")) return false;
-    return std.mem.startsWith(u8, full_path, components_prefix);
+    if (!std.mem.startsWith(u8, full_path, components_prefix)) return false;
+    // Non-recursive: the bytes after the `components/` prefix must be
+    // the file's basename alone — no further separator means the file
+    // is an immediate child of `components/`. `components_prefix` ends
+    // with a trailing '/', so the remainder is the path relative to
+    // the components folder; a nested `components/sub/foo.zig` would
+    // still carry a '/' here and is rejected.
+    const remainder = full_path[components_prefix.len..];
+    return std.mem.indexOfScalar(u8, remainder, '/') == null;
 }

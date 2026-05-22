@@ -283,10 +283,17 @@ pub fn insertChild(loaded: *LoadedPrefab, child: Entity) !void {
     new_children[old_children.len] = child;
     loaded.children = new_children;
 
+    // Bring `children_extras` fully into lockstep with `children`.
+    // Older prefab files may carry an extras slice shorter than the
+    // children slice; sizing the new slice to `new_children.len`
+    // (rather than `old_extras.len + 1`) pads every missing slot with
+    // an empty extras entry so the two arrays end up the same length
+    // regardless of the starting mismatch.
     const old_extras = loaded.children_extras;
-    const new_extras = try a.alloc([]const ComponentExtra, old_extras.len + 1);
-    @memcpy(new_extras[0..old_extras.len], old_extras);
-    new_extras[old_extras.len] = &.{};
+    const new_extras = try a.alloc([]const ComponentExtra, new_children.len);
+    const copy_len = @min(old_extras.len, new_extras.len);
+    @memcpy(new_extras[0..copy_len], old_extras[0..copy_len]);
+    for (new_extras[copy_len..]) |*slot| slot.* = &.{};
     loaded.children_extras = new_extras;
 }
 
