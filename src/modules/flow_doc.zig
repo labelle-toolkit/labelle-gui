@@ -34,6 +34,7 @@ const ne = zgui.node_editor;
 
 const App = @import("../app.zig").App;
 const flow_io = @import("../flow_io.zig");
+const io_global = @import("../io_global.zig");
 
 const inspector_w: f32 = 340;
 const split_gap: f32 = 8;
@@ -60,6 +61,38 @@ const PinEntry = struct {
     dir: PinDir,
 };
 
+/// One cached resolution of a `Subflow` node's referenced flow (issue
+/// #161). A `Subflow` node only stores the *name* of the flow it
+/// references; to draw the node's true pin interface — one input pin
+/// per declared `param`, one output pin per `Output` node — the editor
+/// must load and parse the referenced `.flow.jsonc` file.
+///
+/// Resolution is keyed by `(name, mtime)`: the parse is reused across
+/// frames and only redone when the referenced file changes on disk,
+/// mirroring the mtime-keyed re-derivation pattern `flow.zig` uses for
+/// its `.zig` source. `doc` is null when the referenced file is
+/// missing or unparseable — the renderer then falls back to the
+/// binding-derived input pins and shows an "unresolved" hint.
+const ResolvedFlow = struct {
+    /// The referenced flow's name (the `flow` field of the Subflow
+    /// node). Owned by the enclosing `FlowDocState.arena`.
+    name: []const u8,
+    /// Last-observed mtime of the referenced file (nanoseconds since
+    /// the unix epoch). Null when the file could not be stat'd.
+    mtime: ?i96 = null,
+    /// The parsed referenced flow, or null when it could not be loaded
+    /// or parsed. Owns its own arena — freed + replaced on re-resolve
+    /// and on tab close.
+    doc: ?flow_io.FlowDoc = null,
+
+    fn deinit(self: *ResolvedFlow) void {
+        if (self.doc) |*d| {
+            d.deinit();
+            self.doc = null;
+        }
+    }
+};
+
 /// Per-tab state for an open `.flow.jsonc` file.
 pub const FlowDocState = struct {
     arena: *std.heap.ArenaAllocator,
@@ -81,6 +114,11 @@ pub const FlowDocState = struct {
     /// by the doc arena; entries borrow `doc` node/pin strings so they
     /// are only valid within the frame that filled the list.
     pins: std.ArrayList(PinEntry) = .empty,
+    /// Cache of referenced flows resolved for `Subflow` nodes (issue
+    /// #161), keyed by name. Each entry owns a `flow_io.FlowDoc` arena;
+    /// `deinit` frees every one. Small — one entry per distinct
+    /// referenced flow name across all the tab's Subflow nodes.
+    resolved: std.ArrayList(ResolvedFlow) = .empty,
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !FlowDocState {
         const arena = try allocator.create(std.heap.ArenaAllocator);
@@ -109,6 +147,11 @@ pub const FlowDocState = struct {
     }
 
     pub fn deinit(self: *FlowDocState, allocator: std.mem.Allocator) void {
+        // Free every resolved-flow arena before the state's own arena
+        // goes away (the `ResolvedFlow` list lives off `allocator`, its
+        // `name` strings off `arena`).
+        for (self.resolved.items) |*r| r.deinit();
+        self.resolved.deinit(allocator);
         self.editor.destroy();
         self.doc.deinit();
         self.arena.deinit();
@@ -133,7 +176,7 @@ pub fn render(s: *FlowDocState, app: *App) void {
     const canvas_w = @max(160.0, total_w - inspector_w - split_gap);
 
     if (zgui.beginChild("##flowdoc_canvas", .{ .w = canvas_w, .h = 0 })) {
-        renderCanvas(s);
+        renderCanvas(s, app.allocator);
     }
     zgui.endChild();
     zgui.sameLine(.{});
@@ -149,7 +192,7 @@ pub fn render(s: *FlowDocState, app: *App) void {
 
 // ─── Canvas ─────────────────────────────────────────────────────────────
 
-fn renderCanvas(s: *FlowDocState) void {
+fn renderCanvas(s: *FlowDocState, allocator: std.mem.Allocator) void {
     ne.setCurrentEditor(s.editor);
     defer ne.setCurrentEditor(null);
 
@@ -184,7 +227,7 @@ fn renderCanvas(s: *FlowDocState) void {
     // they never collide with node ids or edge ids.
     for (s.doc.nodes) |n| {
         ne.beginNode(@intCast(n.id));
-        renderNodeBody(s, n);
+        renderNodeBody(s, allocator, n);
         ne.endNode();
     }
 
@@ -503,18 +546,47 @@ fn pinId(node: u32, name: []const u8, dir: PinDir) u64 {
     return if (dir == .output) base | (@as(u64, 1) << 62) else base;
 }
 
-fn renderNodeBody(s: *FlowDocState, n: flow_io.Node) void {
+fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Node) void {
     zgui.text("[{d}] {s}", .{ n.id, n.type_name });
     switch (n.kind) {
         .subflow => {
             zgui.textDisabled("flow: {s}", .{n.flow_ref});
-            // One input pin per binding; output pins are unknown to the
-            // editor without resolving the referenced flow (deferred).
-            for (n.bindings) |b| {
-                ne.beginPin(pinId(n.id, b.name, .input), .input);
-                zgui.text("> {s}", .{b.name});
-                ne.endPin();
-                recordPin(s, n.id, b.name, .input);
+            // Resolve the referenced flow (issue #161) so the node
+            // shows its *true* pin interface — one input pin per
+            // declared `param`, one output pin per `Output` node —
+            // rather than only the input pins implied by its existing
+            // `bindings`. Every pin drawn is also recorded (issue #158)
+            // so edge authoring can map a pin id back to its node.
+            const resolved = resolveSubflow(s, allocator, n.flow_ref);
+            if (resolved) |ref_doc| {
+                // Inputs: one pin per declared parameter of the
+                // referenced flow.
+                for (ref_doc.params) |p| {
+                    ne.beginPin(pinId(n.id, p.name, .input), .input);
+                    zgui.text("> {s}", .{p.name});
+                    ne.endPin();
+                    recordPin(s, n.id, p.name, .input);
+                }
+                // Outputs: one pin per `Output` node of the referenced
+                // flow, named by the Output node's result-pin name.
+                for (ref_doc.nodes) |rn| {
+                    if (rn.kind != .output) continue;
+                    ne.beginPin(pinId(n.id, rn.output_name, .output), .output);
+                    zgui.text("{s} >", .{rn.output_name});
+                    ne.endPin();
+                    recordPin(s, n.id, rn.output_name, .output);
+                }
+            } else {
+                // Unresolved — referenced file missing or unparseable.
+                // Fall back to the binding-derived input pins so the
+                // node still wires, and show a subtle hint.
+                zgui.textDisabled("(unresolved — pins from bindings)", .{});
+                for (n.bindings) |b| {
+                    ne.beginPin(pinId(n.id, b.name, .input), .input);
+                    zgui.text("> {s}", .{b.name});
+                    ne.endPin();
+                    recordPin(s, n.id, b.name, .input);
+                }
             }
         },
         .param => {
@@ -539,6 +611,101 @@ fn renderNodeBody(s: *FlowDocState, n: flow_io.Node) void {
             }
         },
     }
+}
+
+// ─── Subflow reference resolution ───────────────────────────────────────
+
+/// Resolve a `Subflow` node's referenced-flow name to a parsed
+/// `flow_io.FlowDoc` (issue #161). Returns null when the name is empty
+/// or the referenced file is missing / unparseable — the caller then
+/// falls back to the binding-derived pins.
+///
+/// The result is cached on `FlowDocState.resolved`, keyed by name plus
+/// the referenced file's mtime: the file is parsed once and the parse
+/// reused across frames, re-done only when the file changes on disk
+/// (mirroring `flow.zig`'s mtime-keyed re-derivation). The returned
+/// pointer borrows the cache entry's arena — valid until the next call
+/// that re-resolves the same name or the tab closes.
+fn resolveSubflow(
+    s: *FlowDocState,
+    allocator: std.mem.Allocator,
+    flow_ref: []const u8,
+) ?*const flow_io.FlowDoc {
+    if (flow_ref.len == 0) return null;
+
+    // Referenced flows live alongside this flow in `scripts/flows/`;
+    // the path is `<dir of this flow>/<name>.flow.jsonc`.
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const ref_path = referencedFlowPath(&path_buf, s.path, flow_ref) orelse return null;
+
+    // A flow may not reference itself — that would recurse and is a
+    // malformed graph anyway. Treat it as unresolved.
+    if (std.mem.eql(u8, ref_path, s.path)) return null;
+
+    // Stat the referenced file for its mtime. A failed stat (missing
+    // file) leaves `cur_mtime` null — still cacheable as "unresolved".
+    const cur_mtime: ?i96 = blk: {
+        const io = io_global.io();
+        const file = std.Io.Dir.cwd().openFile(io, ref_path, .{}) catch break :blk null;
+        defer file.close(io);
+        const st = file.stat(io) catch break :blk null;
+        break :blk st.mtime.nanoseconds;
+    };
+
+    // Find an existing cache entry for this name.
+    var entry: ?*ResolvedFlow = null;
+    for (s.resolved.items) |*r| {
+        if (std.mem.eql(u8, r.name, flow_ref)) {
+            entry = r;
+            break;
+        }
+    }
+
+    if (entry) |e| {
+        // Cache hit — reuse unless the file changed on disk.
+        if (e.mtime == cur_mtime) {
+            return if (e.doc) |*d| d else null;
+        }
+        // Stale: drop the old parse before re-resolving.
+        e.deinit();
+        e.mtime = cur_mtime;
+        e.doc = loadReferencedFlow(allocator, ref_path);
+        return if (e.doc) |*d| d else null;
+    }
+
+    // Cache miss — add a new entry. `name` is duped onto the tab arena
+    // so it outlives `flow_ref` (which points into the editable doc and
+    // can be reallocated by an edit).
+    const name_dup = s.doc.allocator().dupe(u8, flow_ref) catch return null;
+    var new_entry: ResolvedFlow = .{ .name = name_dup, .mtime = cur_mtime };
+    new_entry.doc = loadReferencedFlow(allocator, ref_path);
+    s.resolved.append(allocator, new_entry) catch {
+        // Append failed — free the parse we just did rather than leak.
+        var tmp = new_entry;
+        tmp.deinit();
+        return null;
+    };
+    const stored = &s.resolved.items[s.resolved.items.len - 1];
+    return if (stored.doc) |*d| d else null;
+}
+
+/// Load + parse the referenced flow file. Returns null on any failure
+/// (missing file, unparseable JSON, malformed schema) — resolution is
+/// best-effort and a bad reference must never crash the editor.
+fn loadReferencedFlow(allocator: std.mem.Allocator, ref_path: []const u8) ?flow_io.FlowDoc {
+    return flow_io.loadFromFile(allocator, ref_path) catch |err| {
+        std.log.warn("flow: subflow reference {s} unresolved: {s}", .{ ref_path, @errorName(err) });
+        return null;
+    };
+}
+
+/// Build the on-disk path of a referenced flow: the directory holding
+/// the current flow file, plus `<name>.flow.jsonc`. Returns null when
+/// the current path has no directory component or the result would
+/// overflow `buf`. Public for unit testing.
+pub fn referencedFlowPath(buf: []u8, current_path: []const u8, flow_ref: []const u8) ?[]const u8 {
+    const dir = std.fs.path.dirname(current_path) orelse return null;
+    return std.fmt.bufPrint(buf, "{s}/{s}{s}", .{ dir, flow_ref, flow_io.extension }) catch null;
 }
 
 // ─── Inspector ──────────────────────────────────────────────────────────

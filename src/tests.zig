@@ -13,6 +13,7 @@ const viewport = @import("modules/viewport.zig");
 const atlas = @import("atlas.zig");
 const gizmo_io = @import("gizmo_io.zig");
 const flow_io = @import("flow_io.zig");
+const flow_doc = @import("modules/flow_doc.zig");
 const gizmos = @import("gizmos.zig");
 const preview = @import("preview.zig");
 const flow_projector = @import("flows/projector.zig");
@@ -5214,5 +5215,32 @@ pub const AtomicWriteTests = struct {
         defer allocator.free(got);
         try expect.toBeTrue(std.mem.indexOf(u8, got, "\"main\"") != null);
         try expect.equal(try countTempFiles(tmp), 0);
+    }
+};
+
+// ─── flow_doc: Subflow reference resolution (issue #161) ────────────────
+
+/// Covers `flow_doc.referencedFlowPath` — the helper that maps a
+/// `Subflow` node's referenced-flow *name* to the on-disk path of the
+/// `.flow.jsonc` file (a sibling in the same `scripts/flows/` dir).
+pub const FlowDocSubflowTests = struct {
+    test "referencedFlowPath resolves a sibling .flow.jsonc" {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const got = flow_doc.referencedFlowPath(
+            &buf,
+            "/proj/scripts/flows/enemy_tick.flow.jsonc",
+            "combat_subgraph",
+        );
+        try expect.toBeTrue(got != null);
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            got.?,
+            "/proj/scripts/flows/combat_subgraph.flow.jsonc",
+        ));
+    }
+
+    test "referencedFlowPath returns null when the path has no directory" {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        try expect.toBeTrue(flow_doc.referencedFlowPath(&buf, "bare.flow.jsonc", "x") == null);
     }
 };
