@@ -421,16 +421,20 @@ pub const App = struct {
     /// zero-copy path. Anything else falls back to SHM.
     pub fn attachGameView(self: *Self, shm_name: []const u8, format: []const u8) !void {
         try self.game_view.attach(shm_name, format);
-        // Backwards-compat: the floating "Game View" panel registered
-        // via the Module Registry is still available for users who
-        // want a docked-elsewhere layout. The tab below is the
-        // default surface; both share `renderViewportContent` so
-        // they stay in lockstep.
-        self.show_game_view = true;
-        // #128: also open the Game View as a tab in the main content
-        // area so users see the live frame inline with the editor
-        // tabs they were working in. Logged + swallowed because an
-        // OOM here shouldn't fail the attach — the panel still works.
+        // #145: the docked tab is the default auto-open surface after
+        // a preview attach. The floating "Game View" panel registered
+        // via the Module Registry remains available as a manual
+        // opt-in via the View menu (users who want a docked-elsewhere
+        // layout). Both surfaces share `renderViewportContent` so
+        // whichever is toggled on stays in lockstep with the live
+        // attachment. We intentionally do NOT flip `show_game_view`
+        // here — doing so opened both surfaces simultaneously and
+        // rendered the same live frame twice (#145).
+        // #128: open the Game View as a tab in the main content area
+        // so users see the live frame inline with the editor tabs
+        // they were working in. Logged + swallowed because an OOM
+        // here shouldn't fail the attach — the floating panel still
+        // works as a fallback if the user opens it from the menu.
         self.openGameViewTab() catch |err| {
             std.log.warn("attachGameView: openGameViewTab failed: {s}", .{@errorName(err)});
         };
@@ -546,6 +550,10 @@ pub const App = struct {
 
         var state = try scene_mod.SceneState.open(self.allocator, path);
         errdefer state.deinit(self.allocator);
+        // Seed inspector width from prefs so the user's preferred
+        // split carries across sessions (#140). In-tab drags update
+        // both this field and prefs.
+        state.inspector_width = self.prefs.inspector_width;
         try self.open_tabs.append(self.allocator, .{ .scene = state });
         const new_idx = self.open_tabs.items.len - 1;
         self.active_tab_idx = new_idx;
@@ -562,6 +570,7 @@ pub const App = struct {
 
         var state = try prefab_mod.PrefabState.open(self.allocator, path);
         errdefer state.deinit(self.allocator);
+        state.inspector_width = self.prefs.inspector_width;
         try self.open_tabs.append(self.allocator, .{ .prefab = state });
         const new_idx = self.open_tabs.items.len - 1;
         self.active_tab_idx = new_idx;
@@ -700,6 +709,19 @@ pub const App = struct {
         const n = @min(message.len, self.status_message.len - 1);
         @memcpy(self.status_message[0..n], message[0..n]);
         self.status_timer = config.ui.status_message_duration;
+    }
+
+    /// Sync a new inspector-splitter width back to `self.prefs` and
+    /// persist. Called by the scene + prefab editors on drag-release
+    /// so the splitter widget itself can stay prefs-free. The equality
+    /// guard avoids churning the file when a click ends without an
+    /// actual drag.
+    pub fn saveInspectorWidth(self: *Self, width: f32) void {
+        if (self.prefs.inspector_width == width) return;
+        self.prefs.inspector_width = width;
+        prefs_mod.save(self.allocator, self.prefs) catch |err| {
+            std.log.warn("prefs: could not persist inspector_width: {s}", .{@errorName(err)});
+        };
     }
 
     /// One UI frame. `dt_seconds` is the wall-clock time since the last

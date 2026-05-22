@@ -1,6 +1,6 @@
 .{
     .name = .labelle_gui,
-    .version = "0.4.0",
+    .version = "0.5.0",
     .fingerprint = 0x3fd05a33857eec15,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
@@ -35,12 +35,17 @@
             .url = "git+https://github.com/zig-gamedev/zstbi?ref=main#3813f5f113b26f644cfa01a30155cc76b3526e91",
             .hash = "zstbi-0.11.0-dev-L0Ea_3GWBwAh7m54XX055vwLKPTPij5hyqyeq92MXPE2",
         },
+        // The `.flow.zon` parser + Zig-source codegen. Extracted from
+        // this repo's former `flow-codegen/` sub-package into its own
+        // repo so `labelle-assembler` can pin it by URL (a `.path`
+        // sub-package can't be resolved when its parent is fetched as
+        // a dependency). labelle-gui now consumes it by URL too.
         .flow_codegen = .{
-            .path = "flow-codegen",
+            .url = "https://github.com/labelle-toolkit/flow-codegen/archive/refs/tags/v0.1.0.tar.gz",
+            .hash = "flow_codegen-0.1.0-PFKUp5g7AQArc7JihUzx3JXAZbYv4KXaW7I9ugZ20ooW",
         },
-        // labelle-engine via sibling-path dep — same pattern
-        // labelle-assembler uses for `../labelle-gui/flow-codegen`.
-        // Dev-time and CI both check out the engine as a sibling
+        // labelle-engine via sibling-path dep — dev-time and CI both
+        // check out the engine as a sibling
         // (see `.github/workflows/ci.yml`). Release builds swap in
         // a `git+https://...?ref=vX.Y.Z#<hash>` pin at build time;
         // the path here is the dev-time default, not the source of
@@ -53,6 +58,5 @@
         "build.zig",
         "build.zig.zon",
         "src",
-        "flow-codegen",
     },
 }

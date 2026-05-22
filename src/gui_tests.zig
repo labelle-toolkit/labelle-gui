@@ -696,14 +696,17 @@ pub fn main() !void {
             ctx.yield(2);
 
             // Equivalent of TE window introspection: attachGameView
-            // toggles `show_game_view` on AND the consumer's
-            // isAttached() flips true. The Game View module's
-            // `render` is gated on `is_open.*` from
-            // Registry.renderAllPanels, so these two flags together
-            // are the editor-side proof that the panel rendered for
-            // this frame.
+            // pushes a `.game_view` tab AND the consumer's
+            // isAttached() flips true. The tab body is gated on the
+            // `.game_view` variant in `open_tabs` (rendered via
+            // `OpenTab.render`), so these two together are the
+            // editor-side proof that the live frame surfaces this
+            // frame. The floating Module-Registry panel is NOT
+            // auto-opened (#145) — it's the manual View-menu opt-in
+            // surface, so `show_game_view` stays false here.
             _ = zgui.te.check(@src(), .{}, a.game_view.isAttached(), "consumer attached after producer detected");
-            _ = zgui.te.check(@src(), .{}, a.show_game_view, "Game View panel auto-opens on attach");
+            _ = zgui.te.check(@src(), .{}, !a.show_game_view, "floating Game View panel stays closed (#145 — tab is the default surface)");
+            _ = zgui.te.check(@src(), .{}, countGameViewTabs(a) >= 1, "Game View tab auto-opened on attach");
 
             // Let the deferred detach land before the next test
             // observes a stale attachment.
@@ -791,7 +794,13 @@ pub fn main() !void {
             // window-text introspection so a literal substring
             // match isn't reachable from here — the underlying
             // state mirror is the next best thing.
-            _ = zgui.te.check(@src(), .{}, a.show_game_view, "Stats window's parent Game View panel is open");
+            // #145: floating panel doesn't auto-open; the tab is the
+            // default surface, and `renderViewportContent` (shared
+            // with the panel) is what populates `last_latency_ns`
+            // via `game_view.poll()`. The tab body renders through
+            // the same path as the panel, so the live-numbers proof
+            // is the latency stat, not which surface is on screen.
+            _ = zgui.te.check(@src(), .{}, countGameViewTabs(a) >= 1, "Game View tab open so Stats area shows live numbers");
             _ = zgui.te.check(@src(), .{}, a.game_view.isAttached(), "consumer attached so Stats window shows live numbers");
             _ = zgui.te.check(@src(), .{}, a.game_view.last_latency_ns > 0, "last_latency_ns populated from a real frame");
 
@@ -899,7 +908,9 @@ pub fn main() !void {
             ctx.yield(2); // service the deferred attach (GL work).
 
             _ = zgui.te.check(@src(), .{}, a.game_view.isAttached(), "iosurface consumer attached");
-            _ = zgui.te.check(@src(), .{}, a.show_game_view, "Game View panel opened on iosurface attach");
+            // #145: tab is the auto-open surface; floating panel stays closed.
+            _ = zgui.te.check(@src(), .{}, countGameViewTabs(a) >= 1, "Game View tab opened on iosurface attach");
+            _ = zgui.te.check(@src(), .{}, !a.show_game_view, "floating panel not auto-opened on iosurface attach (#145)");
             // Rectangle textures + draw FBO only exist in iosurface
             // mode — they're the smoking gun that we took the right
             // dispatch branch.
@@ -1050,7 +1061,7 @@ pub fn main() !void {
             ctx.yield(2);
 
             _ = zgui.te.check(@src(), .{}, !a.game_view.isAttached(), "consumer detached on tab close");
-            _ = zgui.te.check(@src(), .{}, !a.show_game_view, "panel toggle reset on tab close");
+            _ = zgui.te.check(@src(), .{}, !a.show_game_view, "floating panel stays closed across tab close (#145)");
             _ = zgui.te.check(@src(), .{}, !a.preview.isActive(), "preview reports inactive after stop()");
 
             // No .game_view tab remains. Other test-leftover tabs
