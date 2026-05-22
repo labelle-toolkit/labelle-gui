@@ -59,10 +59,13 @@ fn renderStatus(p: *const preview.PreviewSession) void {
         .connecting => zgui.textColored(.{ 1.0, 1.0, 0.0, 1.0 }, "Connecting — engine connected, waiting for hello...", .{}),
         .running => {
             const pid = p.engine_pid orelse 0;
-            // std.time.milliTimestamp was removed in 0.16; preview is
-            // a stub during the migration so the actual ms-ago value
-            // isn't surfaced. Shows 0 until preview is restored.
-            const ago: i64 = if (p.last_heartbeat_ms) |hb| -hb else 0;
+            // Age of the last inbound frame, measured against the
+            // editor's local monotonic clock (#79). `last_rx_ms` is
+            // refreshed by any engine traffic, so this is a true
+            // "engine last heard from Xms ago" — it climbs visibly
+            // when the engine wedges, right up to the heartbeat
+            // watchdog firing at `heartbeat_timeout_ms`.
+            const ago: i64 = p.heartbeatAgeMs() orelse 0;
             zgui.textColored(.{ 0.0, 1.0, 0.0, 1.0 }, "Preview running (engine PID {d}, last heartbeat {d}ms ago)", .{ pid, ago });
             if (p.engine_version) |v| zgui.text("Engine version: {s}", .{v});
         },

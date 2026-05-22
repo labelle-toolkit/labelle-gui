@@ -3567,6 +3567,86 @@ pub const PreviewTransportTests = struct {
         _ = close(fd);
         try waitUntilState(&sess, .crashed, 500);
     }
+
+    // ── #79: heartbeat watchdog ───────────────────────────────────
+    // A `.running` session whose engine goes silent (socket still
+    // open, no traffic) must land in `.crashed` once the watchdog
+    // window elapses — without this the editor sat in a stale
+    // `.running` forever showing a frozen "last heartbeat".
+
+    test "heartbeat watchdog fires when a connected engine goes silent" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        try sess.bindListener();
+
+        const fd = try dialEditor(sess.port.?);
+        try waitUntilState(&sess, .connecting, 500);
+        try sendJsonLine(fd, "{\"kind\":\"hello\",\"engine_version\":\"\",\"pid\":7,\"protocol_version\":1}\n");
+        try waitUntilState(&sess, .running, 500);
+
+        // Engine never writes again, but the socket stays open — the
+        // wedged-but-connected case. The watchdog should trip after
+        // `heartbeat_timeout_ms`. Poll well past the window.
+        const deadline: u64 = @intCast(preview.heartbeat_timeout_ms + 2_000);
+        try waitUntilState(&sess, .crashed, deadline);
+        const reason = sess.bye_reason orelse "";
+        try expect.toBeTrue(std.mem.indexOf(u8, reason, "heartbeat") != null);
+
+        _ = close(fd);
+    }
+
+    test "heartbeat traffic keeps a session in .running past the watchdog window" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        try sess.bindListener();
+
+        const fd = try dialEditor(sess.port.?);
+        try waitUntilState(&sess, .connecting, 500);
+        try sendJsonLine(fd, "{\"kind\":\"hello\",\"engine_version\":\"\",\"pid\":7,\"protocol_version\":1}\n");
+        try waitUntilState(&sess, .running, 500);
+
+        // Drip heartbeats for longer than `heartbeat_timeout_ms`,
+        // spaced well inside the window. The session must NOT trip
+        // the watchdog — a live engine should never see a false
+        // `.crashed`.
+        const span: i64 = preview.heartbeat_timeout_ms + 1_000;
+        var elapsed: i64 = 0;
+        const step: i64 = @divTrunc(preview.heartbeat_timeout_ms, 4);
+        while (elapsed < span) : (elapsed += step) {
+            try sendJsonLine(fd, "{\"kind\":\"heartbeat\",\"t\":1}\n");
+            var s: i64 = 0;
+            while (s < step) : (s += 10) {
+                sess.poll();
+                sleepMs(10);
+            }
+            try expect.equal(sess.state, preview.State.running);
+        }
+
+        try sendJsonLine(fd, "{\"kind\":\"bye\",\"reason\":\"normal\"}\n");
+        try waitUntilState(&sess, .stopped, 500);
+
+        _ = close(fd);
+    }
+
+    test "heartbeatAgeMs is null before hello and bounded after" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        try sess.bindListener();
+        // No engine yet — no receive clock.
+        try expect.toBeTrue(sess.heartbeatAgeMs() == null);
+
+        const fd = try dialEditor(sess.port.?);
+        try waitUntilState(&sess, .connecting, 500);
+        try sendJsonLine(fd, "{\"kind\":\"hello\",\"engine_version\":\"\",\"pid\":7,\"protocol_version\":1}\n");
+        try waitUntilState(&sess, .running, 500);
+
+        // After the handshake the age is a real, small value.
+        const age = sess.heartbeatAgeMs() orelse return error.AgeMissing;
+        try expect.toBeTrue(age >= 0);
+        try expect.toBeTrue(age < preview.heartbeat_timeout_ms);
+
+        _ = close(fd);
+    }
 };
 
 pub const PreviewLiveStderrTests = struct {
@@ -3755,6 +3835,43 @@ pub const PreviewLiveStderrTests = struct {
         // the early-detection branch fired.
         const reason = sess.bye_reason orelse "";
         try expect.toBeTrue(std.mem.indexOf(u8, reason, "labelle exited") != null);
+    }
+
+    // #79: a clean (code 0) child exit while the session is `.running`
+    // is the engine shutting itself down — the user closed the game
+    // window. It must land in `.stopped`, NOT `.crashed`, even when no
+    // `bye` frame ever arrives. `/usr/bin/true` exits 0 immediately.
+    test "clean child exit while running lands in .stopped not .crashed" {
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        try sess.bindListener();
+
+        // Force the session into `.running` without a real engine:
+        // the child-exit logic keys off `state`. `last_rx_ms` stays
+        // `null` so the heartbeat watchdog is inert — this test
+        // isolates the clean-exit path in `tryWaitChild`.
+        sess.state = .running;
+
+        const argv = &[_][]const u8{"/usr/bin/true"};
+        const child = std.process.spawn(io_global.io(), .{
+            .argv = argv,
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .pipe,
+        }) catch |err| {
+            std.debug.print("skip: /usr/bin/true unavailable ({s})\n", .{@errorName(err)});
+            return error.SkipZigTest;
+        };
+        sess.child = child;
+
+        var slept: u64 = 0;
+        while (slept < 2000) {
+            sess.poll();
+            if (sess.state != .running) break;
+            sleepMs(5);
+            slept += 5;
+        }
+        try expect.equal(sess.state, preview.State.stopped);
     }
 };
 
