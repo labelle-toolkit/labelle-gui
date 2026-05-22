@@ -19,6 +19,12 @@ const App = @import("../app.zig").App;
 const module = @import("../module.zig");
 const project = @import("../project.zig");
 const buf = @import("../buf.zig");
+const atlas = @import("../atlas.zig");
+const atlas_ui = @import("../atlas_ui.zig");
+
+/// Edge length (px) of the per-sprite thumbnail buttons rendered under
+/// each resource row.
+const thumb_size: f32 = 40;
 
 const max_slots = 32;
 const name_cap = 64;
@@ -85,6 +91,7 @@ fn render(app: *App) void {
         _ = zgui.inputText("name", .{ .buf = &ed.slots[i].name });
         _ = zgui.inputText("json", .{ .buf = &ed.slots[i].json });
         _ = zgui.inputText("texture", .{ .buf = &ed.slots[i].texture });
+        renderThumbnails(app, bufStr(&ed.slots[i].name));
         if (zgui.button("Remove", .{ .w = 80 })) remove_idx = i;
     }
     if (remove_idx) |idx| removeAt(ed, idx);
@@ -96,6 +103,66 @@ fn render(app: *App) void {
     zgui.sameLine(.{});
     if (zgui.button("Revert", .{ .w = 80 })) {
         ed.last_generation = null; // resync next frame
+    }
+}
+
+/// Render a row of sprite-frame thumbnails for the atlas whose
+/// `resources[].name` equals `res_name`. Uses `atlas_ui.spriteButton`,
+/// which draws the real atlas frame and falls back to a text button
+/// when the index is null or a frame can't be resolved.
+///
+/// Thumbnails are interactive `imageButton`s: clicking one copies the
+/// sprite name onto the status bar — a contained first use that the
+/// inspector's sprite-picker follow-up can build on. No-ops silently
+/// when no atlas index is built yet or the row's name matches no
+/// loaded atlas (e.g. an unsaved row, or a JSON that failed to load).
+fn renderThumbnails(app: *App, res_name: []const u8) void {
+    if (res_name.len == 0) return;
+    const idx = if (app.atlas_index) |*p| p else return;
+
+    // Locate the atlas this row's name refers to.
+    const a: *const atlas.Atlas = blk: {
+        for (idx.atlases.items) |*at| {
+            if (std.mem.eql(u8, at.name, res_name)) break :blk at;
+        }
+        return; // not loaded (unsaved row, or failed JSON)
+    };
+    if (a.frames.count() == 0) return;
+
+    // Wrap thumbnails to the panel width.
+    const avail_w = zgui.getContentRegionAvail()[0];
+    const style_spacing = 6.0;
+    const per_row: usize = @max(1, @as(usize, @intFromFloat(
+        avail_w / (thumb_size + style_spacing),
+    )));
+
+    var shown: usize = 0;
+    var it = a.frames.iterator();
+    while (it.next()) |kv| : (shown += 1) {
+        const sprite_name = kv.key_ptr.*;
+        // Unique str_id per button: atlas name + sprite name. Without a
+        // distinct id imgui merges click/hover state across buttons.
+        var id_buf: [256:0]u8 = undefined;
+        const str_id = std.fmt.bufPrintZ(
+            &id_buf,
+            "##atlas_sprite_{s}_{s}",
+            .{ res_name, sprite_name },
+        ) catch continue;
+
+        if (shown % per_row != 0) zgui.sameLine(.{});
+        if (atlas_ui.spriteButton(str_id, idx, sprite_name, thumb_size, thumb_size)) {
+            var status_buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(
+                &status_buf,
+                "Sprite: {s}",
+                .{sprite_name},
+            ) catch sprite_name;
+            app.setStatus(msg);
+        }
+        if (zgui.isItemHovered(.{}) and zgui.beginTooltip()) {
+            zgui.text("{s}", .{sprite_name});
+            zgui.endTooltip();
+        }
     }
 }
 
