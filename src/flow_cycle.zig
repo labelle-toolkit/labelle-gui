@@ -331,6 +331,13 @@ const ProjectResolver = struct {
     /// on-disk files clashing, and must be surfaced even though the open
     /// tab may be unsaved (so it has no entry in the on-disk index).
     entry_name: []const u8 = "",
+    /// Absolute path of the open flow's on-disk file, when the tab is
+    /// backed by a saved file. The directory scan's `entry_name`
+    /// collision check skips this exact path so a saved tab doesn't
+    /// flag a duplicate against its own on-disk copy. Empty when the
+    /// open tab is unsaved — the scan never finds a matching path, so
+    /// the collision logic stays untouched for that case.
+    entry_path: []const u8 = "",
     /// flow name → the cached `RefResult` for it (resolved refs,
     /// missing, or present-but-broken).
     cache: std.StringHashMapUnmanaged(RefResult) = .empty,
@@ -484,7 +491,16 @@ const ProjectResolver = struct {
             // file is the same fault — and the open tab may be unsaved,
             // so it never appears in `idx`. Flag it before indexing the
             // file so the entry's `<open flow>` marker is `path_a`.
+            //
+            // Skip when `full` IS the open tab's own on-disk path: a
+            // saved tab matches itself in the scan, and the "duplicate"
+            // is just the same file seen twice (once as the live tab,
+            // once on disk). Without this guard, every saved flow tab
+            // would flag a spurious duplicate against itself.
+            const same_as_entry_file =
+                self.entry_path.len > 0 and std.mem.eql(u8, self.entry_path, full);
             if (self.entry_name.len > 0 and
+                !same_as_entry_file and
                 std.mem.eql(u8, eff, self.entry_name) and
                 self.duplicate == null)
             {
@@ -581,6 +597,13 @@ pub fn analyze(
     entry_name: []const u8,
     entry_refs: []const []const u8,
     flows_dir: []const u8,
+    /// Absolute path of the open tab's on-disk file. Pass `""` for an
+    /// unsaved tab so the entry-name collision check still fires on any
+    /// on-disk file claiming the same registry name. For a saved tab,
+    /// passing its path lets the resolver skip self-matches in the
+    /// directory scan (else the tab flags a duplicate against its own
+    /// on-disk copy — flow-codegen#issue, this gui fix).
+    entry_path: []const u8,
 ) !Report {
     const arena = try child_allocator.create(std.heap.ArenaAllocator);
     errdefer child_allocator.destroy(arena);
@@ -596,6 +619,7 @@ pub fn analyze(
         // the open tab's name — a collision there is `DuplicateFlowName`
         // too, and the unsaved open tab is otherwise invisible to it.
         .entry_name = try a.dupe(u8, entry_name),
+        .entry_path = try a.dupe(u8, entry_path),
     };
 
     // Pre-seed the cache with the live (possibly unsaved) entry flow so

@@ -384,6 +384,7 @@ fn refreshCycleCheck(s: *FlowDocState) void {
         effectiveName(s),
         refs,
         flows_dir,
+        s.path,
     ) catch |err| {
         // The check failed (e.g. OOM, a filesystem error). Drop the
         // stale report so the banner reflects "not checked" rather than

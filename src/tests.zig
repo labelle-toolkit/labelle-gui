@@ -6210,6 +6210,7 @@ pub const FlowCycleTests = struct {
             "a",
             &.{"b"}, // live (unsaved) Subflow refs of the open doc "a"
             flows_dir,
+            "",
         );
         defer report.deinit();
         try expect.toBeTrue(report.status == .cycle);
@@ -6226,6 +6227,7 @@ pub const FlowCycleTests = struct {
             "a",
             &.{"ghost"},
             flows_dir,
+            "",
         );
         defer report.deinit();
         try expect.toBeTrue(report.status == .unresolved);
@@ -6245,7 +6247,7 @@ pub const FlowCycleTests = struct {
         try writeFlow(allocator, flows_dir, "b", &.{"c"});
         try writeFlow(allocator, flows_dir, "c", &.{});
 
-        var report = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        var report = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir, "");
         defer report.deinit();
         try expect.toBeTrue(report.status == .clean);
     }
@@ -6301,6 +6303,7 @@ pub const FlowCycleTests = struct {
             "a",
             &.{"tick_logic"},
             flows_dir,
+            "",
         );
         defer report.deinit();
         try expect.toBeTrue(report.status == .clean);
@@ -6320,6 +6323,7 @@ pub const FlowCycleTests = struct {
             "a",
             &.{"reg_b"},
             flows_dir,
+            "",
         );
         defer report.deinit();
         try expect.toBeTrue(report.status == .cycle);
@@ -6340,6 +6344,7 @@ pub const FlowCycleTests = struct {
             "a",
             &.{"b_file"},
             flows_dir,
+            "",
         );
         defer report.deinit();
         try expect.toBeTrue(report.status == .unresolved);
@@ -6364,6 +6369,7 @@ pub const FlowCycleTests = struct {
             "a",
             &.{"plain"},
             flows_dir,
+            "",
         );
         defer report.deinit();
         try expect.toBeTrue(report.status == .clean);
@@ -6376,7 +6382,7 @@ pub const FlowCycleTests = struct {
 
         try writeFlow(allocator, flows_dir, "b", &.{"a"});
 
-        var report = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        var report = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir, "");
         defer report.deinit();
         try expect.toBeTrue(report.status == .cycle);
         // chain_text is rendered at analysis time: a → b → a.
@@ -6418,7 +6424,7 @@ pub const FlowCycleTests = struct {
         // from a plain missing file — `parse_failed`, not `unresolved`.
         try writeBrokenFlow(allocator, flows_dir, "b");
 
-        var report = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        var report = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir, "");
         defer report.deinit();
         try expect.toBeTrue(report.status == .parse_failed);
         try expect.toBeTrue(std.mem.eql(
@@ -6430,7 +6436,7 @@ pub const FlowCycleTests = struct {
         ));
         // A genuinely missing file is still `unresolved`, not
         // `parse_failed` — the two stay distinct.
-        var missing = try flow_cycle.analyze(allocator, "a", &.{"ghost"}, flows_dir);
+        var missing = try flow_cycle.analyze(allocator, "a", &.{"ghost"}, flows_dir, "");
         defer missing.deinit();
         try expect.toBeTrue(missing.status == .unresolved);
     }
@@ -6443,7 +6449,7 @@ pub const FlowCycleTests = struct {
         try writeFlow(allocator, flows_dir, "b", &.{"c"});
         try writeFlow(allocator, flows_dir, "c", &.{});
 
-        var report = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        var report = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir, "");
         defer report.deinit();
         // The resolver scans every `.flow.jsonc` in `flows_dir` to build
         // its registry-name index, so both files are recorded with a
@@ -6464,7 +6470,7 @@ pub const FlowCycleTests = struct {
         try writeFlow(allocator, flows_dir, "b", &.{"c"});
         try writeFlow(allocator, flows_dir, "c", &.{});
 
-        var report = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        var report = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir, "");
         defer report.deinit();
         try expect.toBeTrue(report.status == .clean);
         // Nothing has changed on disk yet — no re-trigger.
@@ -6479,7 +6485,7 @@ pub const FlowCycleTests = struct {
 
         // Re-running the check now sees the cycle the stale report
         // missed.
-        var fresh = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        var fresh = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir, "");
         defer fresh.deinit();
         try expect.toBeTrue(fresh.status == .cycle);
         try expect.toBeFalse(flow_doc.referencedFilesChanged(&fresh));
@@ -6495,7 +6501,7 @@ pub const FlowCycleTests = struct {
         // stamps files that were successfully read (here just none, or
         // whatever the directory scan saw), so it can never notice "b"
         // appearing; `unresolved_targets` must carry the expected path.
-        var report = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        var report = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir, "");
         defer report.deinit();
         try expect.toBeTrue(report.status == .unresolved);
         // The missing target is recorded with its expected `.flow.jsonc`
@@ -6514,7 +6520,7 @@ pub const FlowCycleTests = struct {
 
         // Re-running the check now resolves "b" and sees the cycle the
         // stale "unresolved" report could not.
-        var fresh = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        var fresh = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir, "");
         defer fresh.deinit();
         try expect.toBeTrue(fresh.status == .cycle);
         try expect.toBeFalse(flow_doc.referencedFilesChanged(&fresh));
@@ -6529,7 +6535,7 @@ pub const FlowCycleTests = struct {
         // the check reports `parse_failed` and stamps the broken file.
         try writeBrokenFlow(allocator, flows_dir, "b");
 
-        var report = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        var report = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir, "");
         defer report.deinit();
         try expect.toBeTrue(report.status == .parse_failed);
         try expect.toBeTrue(report.unresolved_targets.len == 1);
@@ -6540,7 +6546,7 @@ pub const FlowCycleTests = struct {
         try writeFlow(allocator, flows_dir, "b", &.{});
         try expect.toBeTrue(flow_doc.referencedFilesChanged(&report));
 
-        var fresh = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir);
+        var fresh = try flow_cycle.analyze(allocator, "a", &.{"b"}, flows_dir, "");
         defer fresh.deinit();
         try expect.toBeTrue(fresh.status == .clean);
         try expect.toBeFalse(flow_doc.referencedFilesChanged(&fresh));
@@ -6560,7 +6566,7 @@ pub const FlowCycleTests = struct {
         try writeNamedFlow(allocator, flows_dir, "one", "shared", &.{});
         try writeNamedFlow(allocator, flows_dir, "two", "shared", &.{});
 
-        var report = try flow_cycle.analyze(allocator, "entry", &.{}, flows_dir);
+        var report = try flow_cycle.analyze(allocator, "entry", &.{}, flows_dir, "");
         defer report.deinit();
         try expect.toBeTrue(report.status == .duplicate_name);
         try expect.toBeTrue(std.mem.eql(
@@ -6605,6 +6611,7 @@ pub const FlowCycleTests = struct {
             "entry",
             &.{"dup"},
             flows_dir,
+            "",
         );
         defer report.deinit();
         try expect.toBeTrue(report.status == .duplicate_name);
@@ -6627,7 +6634,7 @@ pub const FlowCycleTests = struct {
         // open tab itself has no entry in the on-disk index.
         try writeNamedFlow(allocator, flows_dir, "other", "tick", &.{});
 
-        var report = try flow_cycle.analyze(allocator, "tick", &.{}, flows_dir);
+        var report = try flow_cycle.analyze(allocator, "tick", &.{}, flows_dir, "");
         defer report.deinit();
         try expect.toBeTrue(report.status == .duplicate_name);
         try expect.toBeTrue(std.mem.eql(
@@ -6658,7 +6665,46 @@ pub const FlowCycleTests = struct {
         try writeNamedFlow(allocator, flows_dir, "one", "alpha", &.{});
         try writeNamedFlow(allocator, flows_dir, "two", "beta", &.{});
 
-        var report = try flow_cycle.analyze(allocator, "entry", &.{}, flows_dir);
+        var report = try flow_cycle.analyze(allocator, "entry", &.{}, flows_dir, "");
+        defer report.deinit();
+        try expect.toBeTrue(report.status == .clean);
+    }
+
+    test "analyze does not flag a saved tab as duplicate against its own on-disk file" {
+        // Regression: an open flow tab backed by a saved file on disk
+        // (e.g. `scripts/flows/hit_counter.flow.jsonc`) caused the
+        // editor's banner to fire `duplicate_name` against itself —
+        // `ensureIndex` walked the directory, found the tab's own file,
+        // and matched its effective name (`"hit_counter"`) against the
+        // entry name. The fix threads the tab's on-disk path through to
+        // the resolver so a same-path match is skipped. This pins the
+        // contract: when `entry_path` IS the on-disk file's path, the
+        // report status stays clean.
+        const allocator = std.testing.allocator;
+        const flows_dir = try createTempDir(allocator);
+        defer deleteTempDir(allocator, flows_dir);
+
+        // One on-disk file whose effective name is "hit_counter" —
+        // claimed via the top-level `name`, matching what the open tab
+        // would carry once loaded.
+        try writeNamedFlow(allocator, flows_dir, "hit_counter", "hit_counter", &.{});
+
+        // Reconstruct the path `ensureIndex` would join when iterating
+        // the directory — `<flows_dir>/<file>.flow.jsonc`. Pass it as
+        // `entry_path` so the resolver's same-path check fires.
+        const entry_path = try std.fs.path.join(
+            allocator,
+            &.{ flows_dir, "hit_counter" ++ flow_io.extension },
+        );
+        defer allocator.free(entry_path);
+
+        var report = try flow_cycle.analyze(
+            allocator,
+            "hit_counter",
+            &.{},
+            flows_dir,
+            entry_path,
+        );
         defer report.deinit();
         try expect.toBeTrue(report.status == .clean);
     }
