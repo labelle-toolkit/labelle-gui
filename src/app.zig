@@ -36,6 +36,7 @@ const close_scene_dialog = @import("dialogs/close_scene.zig");
 const atlas = @import("atlas.zig");
 const gizmos = @import("gizmos.zig");
 const prefab_index = @import("prefab_index.zig");
+const flow_node_catalog = @import("flow_node_catalog.zig");
 const new_scene_dialog = @import("dialogs/new_scene.zig");
 const dpi_warning_dialog = @import("dialogs/dpi_warning.zig");
 const preferences_dialog = @import("dialogs/preferences.zig");
@@ -553,6 +554,37 @@ pub const App = struct {
         );
     }
 
+    /// Load (or reload) the project's `flow_catalog.json` sidecar
+    /// (labelle-assembler#178). Replaces the static
+    /// `flow_node_catalog.entries` / `pin_styles` slices with the
+    /// project-specific catalog the assembler emitted alongside
+    /// `main.zig`. Projects that haven't been regenerated since the
+    /// sidecar feature landed (no `.labelle/<backend>/flow_catalog.json`
+    /// present) fall back silently to the static catalog — the editor
+    /// stays functional, the palette just mirrors box2d only.
+    ///
+    /// Called from `renderFrame` on every project transition (same
+    /// hook as `rebuildAtlasIndex`). Closing a project routes through
+    /// the no-project branch which clears the runtime catalog via
+    /// `setRuntime(null)` and the static fallback reappears.
+    pub fn reloadFlowNodeCatalog(self: *Self) void {
+        const proj = self.project_manager.current_project;
+        const dir = if (proj) |p| p.dir else null;
+        if (dir) |d| {
+            const cat = flow_node_catalog.loadFromSidecar(self.allocator, d) catch |err| {
+                std.log.warn("flow_node_catalog: load failed for project '{s}': {s} (falling back to static catalog)", .{ d, @errorName(err) });
+                flow_node_catalog.setRuntime(null);
+                return;
+            };
+            // `setRuntime` frees the previous runtime catalog (if any)
+            // before installing the new one; passing `null` here
+            // restores the static fallback when no sidecar is found.
+            flow_node_catalog.setRuntime(cat);
+        } else {
+            flow_node_catalog.setRuntime(null);
+        }
+    }
+
     // ─── Scene tabs ─────────────────────────────────────────────────────
 
     /// Open a `.jsonc` scene file (under `<project>/scenes/`) as a
@@ -794,6 +826,7 @@ pub const App = struct {
                 self.rebuildAtlasIndex();
                 self.rebuildGizmoIndex();
                 self.rebuildPrefabIndex();
+                self.reloadFlowNodeCatalog();
                 // The override borrowed a string from the previous
                 // project's arena, which is freed on the transition.
                 // Drop it so the next Run uses `initial_scene` until
@@ -804,6 +837,7 @@ pub const App = struct {
             self.rebuildAtlasIndex();
             self.rebuildGizmoIndex();
             self.rebuildPrefabIndex();
+            self.reloadFlowNodeCatalog();
         }
         self.last_project_generation = gen;
 

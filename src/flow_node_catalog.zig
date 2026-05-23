@@ -54,6 +54,7 @@
 //! available without importing labelle-core at editor build time.
 
 const std = @import("std");
+const io_global = @import("io_global.zig");
 
 /// Command (rectangular, has execution flow) vs reporter (rounded,
 /// data-only). Matches `core.flow.FlowNodeKind`.
@@ -403,12 +404,359 @@ const static_entries = [_]Entry{
     },
 };
 
+// ─── Runtime catalog (labelle-assembler#178 sidecar) ────────────────────
+//
+// `entries` and `pin_styles` start out as slice views pointing at the
+// static arrays above. When `App.openProject(dir)` finds a
+// `flow_catalog.json` sidecar, it calls `setRuntime(loaded)` and the
+// slices flip to the loaded catalog's owned arrays. Closing a project
+// (or opening one without a sidecar) calls `setRuntime(null)` which
+// restores the static view. `lookup` / `lookupStyle` / `isKnown` /
+// every caller in `flow_doc.zig` reads through these slices, so no
+// other call sites need to know whether the active catalog is static
+// or dynamic.
+//
+// Why slice-of-const rather than a tagged union or a separate Module:
+// the editor's API surface stays unchanged. `entries.len`,
+// `for (entries) |e|`, and `&entries[i]` all keep working — only the
+// underlying memory pointer moves. The `pub var` is process-global
+// because the editor only has one active project at a time, and
+// switching projects is a single-threaded `App.renderFrame` operation
+// that's already serialised against everything else.
+
+/// Owned heap-allocated catalog loaded from a project's
+/// `flow_catalog.json` sidecar. Owns every string and slice inside;
+/// the parent's `setRuntime` swaps it in and tears down the previous
+/// one via `freeRuntimeCatalog`.
+pub const RuntimeCatalog = struct {
+    entries: []Entry,
+    pin_styles: []PinStyleEntry,
+    arena: std.heap.ArenaAllocator,
+    /// Allocator the catalog's outer struct was created with (the
+    /// one `loadFromPath` calls `aa.create(RuntimeCatalog)` on).
+    /// `setRuntime` uses it to fully reclaim the heap box after the
+    /// arena teardown; without it the struct itself leaks.
+    box_allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *RuntimeCatalog) void {
+        // Arena owns every string + slice inside; one teardown drops them all.
+        self.arena.deinit();
+        self.entries = &.{};
+        self.pin_styles = &.{};
+    }
+};
+
+/// Slice view the editor reads. Defaults to the static fallback;
+/// flipped by `setRuntime` when a sidecar loads.
+pub var entries: []const Entry = &static_entries;
+
+/// Slice view the editor reads. Defaults to the static fallback;
+/// flipped by `setRuntime` when a sidecar loads.
+pub var pin_styles: []const PinStyleEntry = &static_pin_styles;
+
+/// The currently-active runtime catalog (when non-null). Held here so
+/// `setRuntime(null)` can free the prior one before installing a new
+/// one or reverting to the static view. The App holds the
+/// `RuntimeCatalog` itself; this pointer is just for ownership-aware
+/// teardown on the next swap.
+var current_runtime: ?*RuntimeCatalog = null;
+
+/// Install a runtime catalog. Pass `null` to revert to the static
+/// fallback (e.g. on project close). Frees the previously-active
+/// runtime catalog (if any) before installing the new one — the
+/// caller hands off ownership.
+///
+/// Safety: `cat`'s `entries` / `pin_styles` must outlive any pointer
+/// returned by `lookup` / `lookupStyle`. Because the editor calls
+/// `lookup` per-frame and `setRuntime` only fires on project
+/// transitions (already a "close all tabs" boundary), pointer
+/// invalidation is naturally bounded.
+pub fn setRuntime(cat: ?*RuntimeCatalog) void {
+    if (current_runtime) |old| {
+        // The arena inside `old.deinit` owns every string + slice it
+        // returned through the view; once we tear it down, the
+        // `entries` / `pin_styles` slices below MUST point at fresh
+        // memory before any caller reads them again. The outer
+        // struct's box is freed via the saved `box_allocator`.
+        const ba = old.box_allocator;
+        old.deinit();
+        ba.destroy(old);
+    }
+    if (cat) |c| {
+        entries = c.entries;
+        pin_styles = c.pin_styles;
+        current_runtime = c;
+    } else {
+        entries = &static_entries;
+        pin_styles = &static_pin_styles;
+        current_runtime = null;
+    }
+}
+
+/// Read `<project_dir>/.labelle/<backend>/flow_catalog.json` and build
+/// a `RuntimeCatalog` from it. Tries `raylib_desktop` first, then
+/// `null_desktop`, then any other `*_desktop` subdir under
+/// `.labelle/`. Returns `null` when no sidecar is found, leaving the
+/// editor on its static fallback.
+///
+/// Caller owns the returned pointer — the typical lifecycle is:
+/// `setRuntime(loadFromSidecar(allocator, dir) catch null)`.
+///
+/// Logging: on success, prints a single info line to stderr counting
+/// the loaded entries — the verification path the editor uses to
+/// confirm the sidecar loaded without needing visual inspection of
+/// the palette.
+pub fn loadFromSidecar(allocator: std.mem.Allocator, project_dir: []const u8) !?*RuntimeCatalog {
+    const path = (try findSidecarPath(allocator, project_dir)) orelse return null;
+    defer allocator.free(path);
+    return try loadFromPath(allocator, path);
+}
+
+/// Load a sidecar from an explicit path. Exposed primarily for tests —
+/// `loadFromSidecar` is the right entry point for production code.
+pub fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) !*RuntimeCatalog {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const aa = arena.allocator();
+
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io_global.io(), path, aa, .limited(16 * 1024 * 1024));
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, aa, bytes, .{});
+    defer parsed.deinit();
+
+    var entries_list: std.ArrayList(Entry) = .empty;
+    var styles_list: std.ArrayList(PinStyleEntry) = .empty;
+
+    const root = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidSidecar,
+    };
+    const plugins = if (root.get("plugins")) |p| switch (p) {
+        .array => |a| a,
+        else => return error.InvalidSidecar,
+    } else return error.InvalidSidecar;
+
+    for (plugins.items) |plugin_val| {
+        const plugin = switch (plugin_val) {
+            .object => |obj| obj,
+            else => continue,
+        };
+        if (plugin.get("flow_nodes")) |fns_val| {
+            if (fns_val == .array) {
+                for (fns_val.array.items) |node_val| {
+                    const entry = parseFlowNode(aa, node_val) catch continue;
+                    try entries_list.append(aa, entry);
+                }
+            }
+        }
+        if (plugin.get("pin_styles")) |ps_val| {
+            if (ps_val == .array) {
+                for (ps_val.array.items) |style_val| {
+                    const style = parsePinStyle(aa, style_val) catch continue;
+                    try styles_list.append(aa, style);
+                }
+            }
+        }
+    }
+
+    // Layer the loaded pin styles on top of the static defaults so a
+    // sidecar that only ships plugin-specific styles (e.g. just
+    // BodyId / RayResult) still gets primitives styled. Static entries
+    // come first; loaded entries come last so `lookupStyle`'s
+    // last-write-wins reverse walk picks them up first.
+    var merged_styles: std.ArrayList(PinStyleEntry) = .empty;
+    for (static_pin_styles) |s| try merged_styles.append(aa, s);
+    for (styles_list.items) |s| try merged_styles.append(aa, s);
+
+    const cat = try allocator.create(RuntimeCatalog);
+    cat.* = .{
+        .entries = try entries_list.toOwnedSlice(aa),
+        .pin_styles = try merged_styles.toOwnedSlice(aa),
+        .arena = arena,
+        .box_allocator = allocator,
+    };
+
+    std.log.info("flow_node_catalog: loaded {d} entries from {s}", .{ cat.entries.len, path });
+    return cat;
+}
+
+/// Walk `<project_dir>/.labelle/` for a `flow_catalog.json` and return
+/// the first one found, preferring `raylib_desktop` (the default
+/// editor target). Returns `null` when no sidecar exists — `App`
+/// treats that as "stay on the static fallback".
+fn findSidecarPath(allocator: std.mem.Allocator, project_dir: []const u8) !?[]u8 {
+    // Preferred backend subdirectories, in order. The first existing
+    // one wins; the file shape is identical across them so the
+    // selection only affects which target's discovery the editor
+    // mirrors (different backends would emit the same plugin set
+    // unless a plugin gates its FlowNodes per-backend, which the
+    // toolkit doesn't currently allow).
+    const preferred = [_][]const u8{
+        "raylib_desktop",
+        "null_desktop",
+        "sokol_desktop",
+        "sdl_desktop",
+        "bgfx_desktop",
+        "wgpu_desktop",
+        // Tests target the assembler also writes — useful for projects
+        // built only via `zig build test` paths.
+        "tests",
+    };
+    for (preferred) |sub| {
+        const candidate = try std.fs.path.join(allocator, &.{ project_dir, ".labelle", sub, "flow_catalog.json" });
+        std.Io.Dir.cwd().access(io_global.io(), candidate, .{}) catch {
+            allocator.free(candidate);
+            continue;
+        };
+        return candidate;
+    }
+    return null;
+}
+
+fn parseFlowNode(aa: std.mem.Allocator, val: std.json.Value) !Entry {
+    const obj = switch (val) {
+        .object => |o| o,
+        else => return error.InvalidEntry,
+    };
+    const qualified = (obj.get("qualified") orelse return error.InvalidEntry).string;
+    const display_name = (obj.get("display_name") orelse return error.InvalidEntry).string;
+    const category = (obj.get("category") orelse return error.InvalidEntry).string;
+    const docs = if (obj.get("docs")) |d| switch (d) {
+        .string => |s| s,
+        else => "",
+    } else "";
+    const kind_str = (obj.get("kind") orelse return error.InvalidEntry).string;
+    const kind: Kind = if (std.mem.eql(u8, kind_str, "reporter")) .reporter else .command;
+
+    var pins: std.ArrayList(Pin) = .empty;
+    if (obj.get("pins")) |pins_val| {
+        if (pins_val == .array) {
+            for (pins_val.array.items) |p_val| {
+                const p = switch (p_val) {
+                    .object => |o| o,
+                    else => continue,
+                };
+                const name = (p.get("name") orelse continue).string;
+                const label = (p.get("label") orelse continue).string;
+                const zig_type = (p.get("zig_type") orelse continue).string;
+                const dir_str = (p.get("dir") orelse continue).string;
+                const dir: PinDir = if (std.mem.eql(u8, dir_str, "output")) .output else .input;
+                try pins.append(aa, .{
+                    .name = try aa.dupe(u8, name),
+                    .label = try aa.dupe(u8, label),
+                    .type_name = try aa.dupe(u8, zig_type),
+                    .dir = dir,
+                });
+            }
+        }
+    }
+
+    // Pass through O5's `constructs` hint when present. The sidecar
+    // doesn't emit it yet (sibling agent's work) — when it does, we
+    // pick it up; until then, the field stays null and the palette
+    // suggestion code falls back to the static catalog's hand-coded
+    // values for box2d.
+    var constructs_val: ?[]const u8 = null;
+    if (obj.get("return_type")) |rt| {
+        // The current sidecar emits `return_type` but not `constructs`.
+        // For reporters whose return type is a nominal (non-primitive)
+        // type, we treat that return type AS the `constructs` value —
+        // it's the right semantic: the node returns a value of that
+        // type, which is what `constructs` means per RFC §1 / O5.
+        switch (rt) {
+            .string => |s| {
+                if (isLikelyStructName(s)) {
+                    constructs_val = try aa.dupe(u8, s);
+                }
+            },
+            else => {},
+        }
+    }
+    if (obj.get("constructs")) |c| {
+        switch (c) {
+            .string => |s| constructs_val = try aa.dupe(u8, s),
+            else => {},
+        }
+    }
+
+    return .{
+        .name = try aa.dupe(u8, qualified),
+        .category = try aa.dupe(u8, category),
+        .display_name = try aa.dupe(u8, display_name),
+        .docs = try aa.dupe(u8, docs),
+        .kind = kind,
+        .pins = try pins.toOwnedSlice(aa),
+        .constructs = constructs_val,
+    };
+}
+
+fn parsePinStyle(aa: std.mem.Allocator, val: std.json.Value) !PinStyleEntry {
+    const obj = switch (val) {
+        .object => |o| o,
+        else => return error.InvalidPinStyle,
+    };
+    const zig_type = (obj.get("zig_type") orelse return error.InvalidPinStyle).string;
+    const label = (obj.get("label") orelse return error.InvalidPinStyle).string;
+    const color_val = obj.get("color") orelse return error.InvalidPinStyle;
+    if (color_val != .array) return error.InvalidPinStyle;
+    if (color_val.array.items.len < 3) return error.InvalidPinStyle;
+    const r = parseU8FromJson(color_val.array.items[0]);
+    const g = parseU8FromJson(color_val.array.items[1]);
+    const b = parseU8FromJson(color_val.array.items[2]);
+    return .{
+        .type_name = try aa.dupe(u8, zig_type),
+        .style = .{
+            .label = try aa.dupe(u8, label),
+            .color = .{ r, g, b },
+        },
+    };
+}
+
+fn parseU8FromJson(v: std.json.Value) u8 {
+    return switch (v) {
+        .integer => |i| @intCast(@as(i64, @intCast(std.math.clamp(i, 0, 255)))),
+        .float => |f| @intFromFloat(std.math.clamp(f, 0, 255)),
+        else => 0,
+    };
+}
+
+/// Heuristic: a type name that doesn't look like a Zig primitive is
+/// likely a struct or nominal type that flows would constructor-node
+/// into. Used to infer `Entry.constructs` from `return_type` until the
+/// sibling agent's `.constructs` extraction lands in the sidecar.
+fn isLikelyStructName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    const c = name[0];
+    // Primitive families start with `i`/`u`/`f` + digits, or are one
+    // of `bool`/`void` literally.
+    if (std.mem.eql(u8, name, "bool")) return false;
+    if (std.mem.eql(u8, name, "void")) return false;
+    if (std.mem.eql(u8, name, "EntityId")) return false; // aliases u32
+    if (std.mem.eql(u8, name, "[]const u8")) return false;
+    if (c == 'i' or c == 'u' or c == 'f') {
+        // Check if the rest is all digits — `i32`, `u64`, `f32`.
+        const rest = name[1..];
+        if (rest.len == 0) return true; // bare 'i'/'u'/'f' — uncommon, treat as struct
+        var all_digits = true;
+        for (rest) |ch| {
+            if (ch < '0' or ch > '9') {
+                all_digits = false;
+                break;
+            }
+        }
+        if (all_digits) return false;
+    }
+    // Capitalised first letter → almost certainly a struct.
+    if (c >= 'A' and c <= 'Z') return true;
+    return true;
+}
+
 /// Lookup a catalog entry by its dotted name. Returns null when the
 /// name isn't a known FlowNode — the editor surfaces that as a hint;
 /// codegen rejects it at build time against the merged
 /// `PluginFlowNodes` registry.
 pub fn lookup(name: []const u8) ?*const Entry {
-    for (&entries) |*e| {
+    for (entries) |*e| {
         if (std.mem.eql(u8, e.name, name)) return e;
     }
     return null;
@@ -677,7 +1025,135 @@ test "every catalog entry's pins include at least one user-visible pin" {
     // A FlowNode with no params and no return value would be a strange
     // "fire-and-forget no-op" — guard against accidentally adding one
     // until reflection lands and proves the case is reachable.
-    for (&entries) |e| {
+    for (entries) |e| {
         try std.testing.expect(e.pins.len > 0);
     }
+}
+
+// ─── Sidecar loader tests ───────────────────────────────────────────────
+
+test "loadFromPath: parses a synthetic flow_catalog.json into the in-memory shape" {
+    const aa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const json =
+        \\{
+        \\  "generated_at": "2026-05-23T16:42:11Z",
+        \\  "plugins": [
+        \\    {
+        \\      "name": "synthetic",
+        \\      "flow_nodes": [
+        \\        {
+        \\          "qualified": "synthetic.do_thing",
+        \\          "display_name": "Do Thing",
+        \\          "category": "synthetic",
+        \\          "docs": "Sample command.",
+        \\          "kind": "command",
+        \\          "pins": [
+        \\            { "name": "entity", "label": "Entity", "zig_type": "u32", "dir": "input", "default": null },
+        \\            { "name": "value", "label": "Value", "zig_type": "f32", "dir": "input", "default": null }
+        \\          ],
+        \\          "return_type": null
+        \\        },
+        \\        {
+        \\          "qualified": "synthetic.read_thing",
+        \\          "display_name": "Read Thing",
+        \\          "category": "synthetic",
+        \\          "docs": "Sample reporter.",
+        \\          "kind": "reporter",
+        \\          "pins": [
+        \\            { "name": "entity", "label": "Entity", "zig_type": "u32", "dir": "input", "default": null },
+        \\            { "name": "result", "label": "Result", "zig_type": "MyStruct", "dir": "output", "default": null }
+        \\          ],
+        \\          "return_type": "MyStruct"
+        \\        }
+        \\      ],
+        \\      "pin_styles": [
+        \\        { "zig_type": "MyStruct", "label": "My Struct", "color": [123, 45, 67] }
+        \\      ]
+        \\    }
+        \\  ]
+        \\}
+        \\
+    ;
+    try tmp.dir.writeFile(io_global.io(), .{ .sub_path = "flow_catalog.json", .data = json });
+    const path = try tmp.dir.realPathFileAlloc(io_global.io(), "flow_catalog.json", aa);
+    defer aa.free(path);
+
+    const cat = try loadFromPath(aa, path);
+    defer {
+        const ba = cat.box_allocator;
+        cat.deinit();
+        ba.destroy(cat);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), cat.entries.len);
+    try std.testing.expectEqualStrings("synthetic.do_thing", cat.entries[0].name);
+    try std.testing.expectEqualStrings("Do Thing", cat.entries[0].display_name);
+    try std.testing.expectEqual(Kind.command, cat.entries[0].kind);
+    try std.testing.expectEqual(@as(usize, 2), cat.entries[0].pins.len);
+    try std.testing.expectEqualStrings("u32", cat.entries[0].pins[0].type_name);
+
+    try std.testing.expectEqual(Kind.reporter, cat.entries[1].kind);
+    // O5 inference: a non-primitive return_type seeds `constructs`.
+    try std.testing.expectEqualStrings("MyStruct", cat.entries[1].constructs.?);
+
+    // Pin styles: merged on top of the static defaults (static count + 1).
+    try std.testing.expectEqual(static_pin_styles.len + 1, cat.pin_styles.len);
+    // Last one is the loaded MyStruct style.
+    try std.testing.expectEqualStrings("MyStruct", cat.pin_styles[cat.pin_styles.len - 1].type_name);
+    try std.testing.expectEqual(@as(u8, 123), cat.pin_styles[cat.pin_styles.len - 1].style.color[0]);
+}
+
+test "setRuntime: swap to runtime, then revert to static" {
+    const aa = std.testing.allocator;
+
+    // Baseline — static slice in place.
+    const static_count = entries.len;
+    try std.testing.expectEqual(@as(usize, 14), static_count);
+
+    // Synthesize a minimal runtime catalog (1 entry) and install it.
+    var arena = std.heap.ArenaAllocator.init(aa);
+    const ag = arena.allocator();
+    var es: std.ArrayList(Entry) = .empty;
+    try es.append(ag, .{
+        .name = "x.y",
+        .category = "x",
+        .display_name = "Y",
+        .docs = "",
+        .kind = .command,
+        .pins = &[_]Pin{},
+    });
+    var ss: std.ArrayList(PinStyleEntry) = .empty;
+    const cat = try aa.create(RuntimeCatalog);
+    cat.* = .{
+        .entries = try es.toOwnedSlice(ag),
+        .pin_styles = try ss.toOwnedSlice(ag),
+        .arena = arena,
+        .box_allocator = aa,
+    };
+
+    setRuntime(cat);
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqualStrings("x.y", entries[0].name);
+
+    // Revert — static slice back in place. `setRuntime(null)` frees the
+    // previous runtime catalog (arena teardown drops every string +
+    // slice; the saved `box_allocator` reclaims the outer struct).
+    setRuntime(null);
+    try std.testing.expectEqual(static_count, entries.len);
+}
+
+test "loadFromSidecar: returns null when no .labelle/* subdir has the file" {
+    const aa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realPathFileAlloc(io_global.io(), ".", aa);
+    defer aa.free(dir_path);
+
+    // No .labelle/ created → loader returns null and the App stays on
+    // the static fallback.
+    const cat = try loadFromSidecar(aa, dir_path);
+    try std.testing.expect(cat == null);
 }
