@@ -15,6 +15,7 @@ const gizmo_io = @import("gizmo_io.zig");
 const flow_io = @import("flow_io.zig");
 const flow_doc = @import("modules/flow_doc.zig");
 const flow_cycle = @import("flow_cycle.zig");
+const event_catalog = @import("flow_event_catalog.zig");
 const gizmos = @import("gizmos.zig");
 const preview = @import("preview.zig");
 const flow_projector = @import("flows/projector.zig");
@@ -5075,6 +5076,199 @@ pub const FlowIoTests = struct {
         try expect.toBeTrue(project_tree.isFlowDocPath(dir, "/proj/scripts/flows/a.flow.jsonc"));
         try expect.toBeTrue(!project_tree.isFlowDocPath(dir, "/proj/scripts/flows/a.zig"));
         try expect.toBeTrue(!project_tree.isFlowDocPath(dir, "/proj/scenes/a.jsonc"));
+    }
+};
+
+// ─── RFC-PLUGIN-EVENTS (issue #169 — closes O6): flow editor event-name
+//     dropdown + new-form `OnEvent` + `Emit` node ───────────────────────
+
+/// Cover the editor-side surface for RFC-PLUGIN-EVENTS phase 5:
+///
+///   - `flow_io.zig` models `OnEvent`'s two forms (new `name`-form,
+///     legacy `module`+`callback`+`params`) as first-class fields and
+///     rejects malformed combinations.
+///   - `flow_io.zig` models the `Emit` node structurally; both shapes
+///     round-trip through `parse` → `render` byte-stably.
+///   - The static `flow_event_catalog` drives the editor's event-name
+///     dropdown until the assembler-derived sidecar lands.
+///   - `flow_io.legacy_onevent_to_name` migrates a legacy `OnEvent` to
+///     the new form (mirrors `flow-codegen`'s converter).
+pub const PluginEventsRfcTests = struct {
+    test "OnEvent new-form round-trips with name" {
+        const a = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "hit_counter",
+            \\  "event": { "type": "OnEvent", "name": "box2d.collision_begin" },
+            \\  "nodes": [],
+            \\  "edges": []
+            \\}
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+        try expect.toBeTrue(std.mem.eql(u8, doc.event.type_name, "OnEvent"));
+        try expect.toBeTrue(doc.event.name != null);
+        try expect.toBeTrue(std.mem.eql(u8, doc.event.name.?, "box2d.collision_begin"));
+        try expect.toBeTrue(doc.event.module == null);
+        try expect.toBeTrue(doc.event.callback == null);
+        try expect.equal(doc.event.params.len, @as(usize, 0));
+
+        // Re-render is byte-stable so a Save → reopen leaves no diff.
+        const text1 = try flow_io.render(a, doc);
+        defer a.free(text1);
+        var doc2 = try flow_io.parse(a, text1);
+        defer doc2.deinit();
+        const text2 = try flow_io.render(a, doc2);
+        defer a.free(text2);
+        try expect.toBeTrue(std.mem.eql(u8, text1, text2));
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"name\": \"box2d.collision_begin\"") != null);
+    }
+
+    test "OnEvent legacy form round-trips with module+callback+params" {
+        const a = std.testing.allocator;
+        const src =
+            \\{
+            \\  "event": {
+            \\    "type": "OnEvent",
+            \\    "module": "box2d",
+            \\    "callback": "on_collision_begin",
+            \\    "params": [
+            \\      { "name": "entity_a", "type": "u32" },
+            \\      { "name": "entity_b", "type": "u32" }
+            \\    ]
+            \\  },
+            \\  "nodes": [],
+            \\  "edges": []
+            \\}
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+        try expect.toBeTrue(doc.event.name == null);
+        try expect.toBeTrue(std.mem.eql(u8, doc.event.module.?, "box2d"));
+        try expect.toBeTrue(std.mem.eql(u8, doc.event.callback.?, "on_collision_begin"));
+        try expect.equal(doc.event.params.len, @as(usize, 2));
+
+        const text1 = try flow_io.render(a, doc);
+        defer a.free(text1);
+        var doc2 = try flow_io.parse(a, text1);
+        defer doc2.deinit();
+        const text2 = try flow_io.render(a, doc2);
+        defer a.free(text2);
+        try expect.toBeTrue(std.mem.eql(u8, text1, text2));
+    }
+
+    test "OnEvent rejects malformed two-form combinations" {
+        const a = std.testing.allocator;
+        // Both forms.
+        try expect.toReturnError(flow_io.parse(a,
+            \\{ "event": { "type": "OnEvent", "name": "box2d.collision_begin", "module": "box2d", "callback": "on_collision_begin" }, "nodes": [], "edges": [] }
+        ), error.MalformedFlow);
+        // Neither.
+        try expect.toReturnError(flow_io.parse(a,
+            \\{ "event": { "type": "OnEvent" }, "nodes": [], "edges": [] }
+        ), error.MalformedFlow);
+        // Partial legacy.
+        try expect.toReturnError(flow_io.parse(a,
+            \\{ "event": { "type": "OnEvent", "module": "box2d" }, "nodes": [], "edges": [] }
+        ), error.MalformedFlow);
+        try expect.toReturnError(flow_io.parse(a,
+            \\{ "event": { "type": "OnEvent", "callback": "on_collision_begin" }, "nodes": [], "edges": [] }
+        ), error.MalformedFlow);
+    }
+
+    test "Emit node parses, exposes event_ref, and round-trips" {
+        const a = std.testing.allocator;
+        const src =
+            \\{
+            \\  "event": { "type": "OnUpdate" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Emit", "event": "box2d.collision_begin", "pos": [400, 200] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+        try expect.toBeTrue(doc.nodes[0].kind == .emit);
+        try expect.toBeTrue(std.mem.eql(u8, doc.nodes[0].event_ref, "box2d.collision_begin"));
+
+        const text1 = try flow_io.render(a, doc);
+        defer a.free(text1);
+        var doc2 = try flow_io.parse(a, text1);
+        defer doc2.deinit();
+        const text2 = try flow_io.render(a, doc2);
+        defer a.free(text2);
+        try expect.toBeTrue(std.mem.eql(u8, text1, text2));
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"type\": \"Emit\"") != null);
+    }
+
+    test "legacy_onevent_to_name maps module + on_callback to dotted name" {
+        const a = std.testing.allocator;
+        const src =
+            \\{
+            \\  "event": { "type": "OnEvent", "module": "box2d", "callback": "on_collision_begin" },
+            \\  "nodes": [],
+            \\  "edges": []
+            \\}
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+        try flow_io.legacy_onevent_to_name(doc.allocator(), &doc.event);
+        try expect.toBeTrue(std.mem.eql(u8, doc.event.name.?, "box2d.collision_begin"));
+        try expect.toBeTrue(doc.event.module == null);
+        try expect.toBeTrue(doc.event.callback == null);
+        try expect.equal(doc.event.params.len, @as(usize, 0));
+    }
+
+    test "event_catalog covers shipped labelle-box2d events" {
+        // Every plugin event `labelle-box2d` ships in `pub const Events`
+        // (root.zig:93-125) must appear in the catalog — the editor's
+        // dropdown is the user-facing surface of phase 1's discovery
+        // until the assembler-emitted sidecar lands.
+        try expect.toBeTrue(event_catalog.isKnown("box2d.collision_begin"));
+        try expect.toBeTrue(event_catalog.isKnown("box2d.collision_end"));
+        try expect.toBeTrue(event_catalog.isKnown("box2d.collision_hit"));
+        try expect.toBeTrue(event_catalog.isKnown("box2d.sensor_enter"));
+        try expect.toBeTrue(event_catalog.isKnown("box2d.sensor_exit"));
+        try expect.toBeTrue(!event_catalog.isKnown("not_a_real.event"));
+    }
+
+    test "event_catalog reflects collision_hit's 7-field payload" {
+        const e = event_catalog.lookup("box2d.collision_hit").?;
+        try expect.equal(e.fields.len, @as(usize, 7));
+        try expect.toBeTrue(std.mem.eql(u8, e.fields[0].name, "entity_a"));
+        try expect.toBeTrue(std.mem.eql(u8, e.fields[6].name, "speed"));
+        try expect.toBeTrue(std.mem.eql(u8, e.fields[6].type_name, "f32"));
+    }
+
+    test "bouncing-ball hit_counter.flow.jsonc parses as new-form OnEvent" {
+        // Real-file ingestion test — phase 3 of `flow-codegen` (commit
+        // 1182a80) converted this in-tree example to the new form. The
+        // editor must load it without complaint and surface the `name`
+        // field, the box2d catalog entry, and the four-node Call→BinOp
+        // chain.
+        const a = std.testing.allocator;
+        const path = "../bouncing-ball/scripts/flows/hit_counter.flow.jsonc";
+
+        var doc = flow_io.loadFromFile(a, path) catch |err| switch (err) {
+            // Other repos in the toolkit may not be checked out alongside
+            // labelle-gui in every CI matrix slot. Skip — the test still
+            // executes in dev environments where the example exists.
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer doc.deinit();
+
+        try expect.toBeTrue(std.mem.eql(u8, doc.event.type_name, "OnEvent"));
+        try expect.toBeTrue(doc.event.name != null);
+        try expect.toBeTrue(std.mem.eql(u8, doc.event.name.?, "box2d.collision_begin"));
+        try expect.toBeTrue(doc.event.module == null);
+        try expect.toBeTrue(doc.event.callback == null);
+        try expect.toBeTrue(event_catalog.isKnown(doc.event.name.?));
+
+        // Sanity-check the node chain so the test catches any future
+        // schema drift (e.g. an `Emit` node accidentally injected).
+        try expect.equal(doc.nodes.len, @as(usize, 4));
     }
 };
 

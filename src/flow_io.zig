@@ -69,6 +69,12 @@ pub const NodeKind = enum {
     param,
     /// Names one of the subgraph's result pins.
     output,
+    /// Fires a custom event by dotted name (RFC-PLUGIN-EVENTS §8). The
+    /// node's input pins are the payload struct's fields — derived
+    /// editor-side by `event_catalog` from the resolved event name. The
+    /// codegen reflects the same fields from the assembler-built
+    /// `PluginEvents` / `GameEvents` union at build time.
+    emit,
     /// Any other node type — kind preserved as a string in `type_name`.
     other,
 
@@ -76,6 +82,7 @@ pub const NodeKind = enum {
         if (std.mem.eql(u8, name, "Subflow")) return .subflow;
         if (std.mem.eql(u8, name, "Param")) return .param;
         if (std.mem.eql(u8, name, "Output")) return .output;
+        if (std.mem.eql(u8, name, "Emit")) return .emit;
         return .other;
     }
 
@@ -86,6 +93,7 @@ pub const NodeKind = enum {
             .subflow => "Subflow",
             .param => "Param",
             .output => "Output",
+            .emit => "Emit",
             .other => null,
         };
     }
@@ -142,6 +150,11 @@ pub const Node = struct {
     // ── Output-specific ──
     /// The result-pin name this node names. Empty for non-Output.
     output_name: []const u8 = "",
+
+    // ── Emit-specific ──
+    /// Dotted event name (`"<plugin>.<event>"` or a bare game event name)
+    /// fired by this `Emit` node (RFC-PLUGIN-EVENTS §8). Empty for non-Emit.
+    event_ref: []const u8 = "",
 
     /// Verbatim key/value pairs not modeled above. Keys are emitted in
     /// sorted order so the writer is deterministic. Values are canonical
@@ -420,9 +433,43 @@ pub const Edge = struct {
 /// The flow's entry point. `type` is a lifecycle event name (e.g.
 /// `OnCreate`) or `OnCall` for a subgraph (RFC §3). `arg_entity` and any
 /// other event keys are captured in `extras` so they round-trip.
+///
+/// `OnEvent` has two forms (RFC-PLUGIN-EVENTS §7):
+///
+/// - **New form** — `name` set (`"<plugin>.<event>"`), legacy fields
+///   absent. Codegen resolves the name through the assembler's
+///   `PluginEvents` / `GameEvents` union and reflects the handler
+///   signature.
+/// - **Legacy form** — `module` + `callback` set, optional `params`
+///   listing the callback's signature. v1 behaviour: binds the flow to
+///   a plugin's `pub var ?*const fn` slot. Dropped in phase 6; for now
+///   the editor round-trips it and offers a "Convert to new form"
+///   button.
+///
+/// `module` / `callback` / `params` / `name` are *not* duped into
+/// `extras` — they ride in their own structurally-modeled fields so
+/// the editor can validate "exactly one form" and offer the dropdown
+/// without rummaging through arbitrary keys. Genuinely-unknown event
+/// keys (e.g. `arg_entity` on `OnCreate`) still round-trip via
+/// `extras` as before.
 pub const Event = struct {
     type_name: []const u8 = "OnCreate",
     extras: []KeyValue = &.{},
+
+    /// `OnEvent` new-form name (RFC-PLUGIN-EVENTS §7). Null for every
+    /// other event type or for a legacy-form `OnEvent`.
+    name: ?[]const u8 = null,
+    /// `OnEvent` legacy `module` field — the plugin's `@import` name
+    /// (e.g. `"box2d"`). Null for every other event type or for a
+    /// new-form `OnEvent`.
+    module: ?[]const u8 = null,
+    /// `OnEvent` legacy `callback` field — the `pub var` slot name
+    /// (e.g. `"on_collision_begin"`). Null for every other event type
+    /// or for a new-form `OnEvent`.
+    callback: ?[]const u8 = null,
+    /// `OnEvent` legacy `params` list — the callback's signature. Empty
+    /// for every other event type or for a new-form `OnEvent`.
+    params: []Param = &.{},
 };
 
 /// A fully parsed flow graph plus the arena that owns every slice and
@@ -470,6 +517,10 @@ pub const ParseError = error{
     /// rejects malformed schema rather than silently substituting a
     /// default — a silent default would mask data the author intended.
     BadSchema,
+    /// An `OnEvent` event has neither `name` nor `module`+`callback`, or
+    /// it has both, or only one of `module`/`callback` is set. The two
+    /// forms are mutually exclusive (RFC-PLUGIN-EVENTS §7).
+    MalformedFlow,
 } || std.json.ParseError(std.json.Scanner) || std.mem.Allocator.Error;
 
 /// Read and parse a `.flow.jsonc` file from disk.
@@ -543,14 +594,52 @@ pub fn parse(child_allocator: std.mem.Allocator, raw: []const u8) !FlowDoc {
 fn parseEvent(a: std.mem.Allocator, obj: std.json.ObjectMap) !Event {
     var ev: Event = .{};
     var extras: std.ArrayList(KeyValue) = .empty;
+
+    // First pass — pull `type` out so we can dispatch on it.
     var it = obj.iterator();
     while (it.next()) |entry| {
         const key = entry.key_ptr.*;
         if (std.mem.eql(u8, key, "type")) {
             if (entry.value_ptr.* != .string) return ParseError.BadSchema;
             ev.type_name = try a.dupe(u8, entry.value_ptr.string);
-            continue;
+            break;
         }
+    }
+    const is_on_event = std.mem.eql(u8, ev.type_name, "OnEvent");
+
+    // Second pass — model `OnEvent`'s structural fields
+    // (`name`/`module`/`callback`/`params`) separately from `extras` so
+    // the editor can validate the two-form rule and offer the dropdown.
+    // Every other event type (`OnCreate`/`OnUpdate`/`OnDestroy`/`OnCall`)
+    // keeps the pre-RFC behaviour: all non-`type` keys ride in `extras`.
+    it = obj.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (std.mem.eql(u8, key, "type")) continue;
+
+        if (is_on_event) {
+            if (std.mem.eql(u8, key, "name")) {
+                if (entry.value_ptr.* != .string) return ParseError.BadSchema;
+                ev.name = try a.dupe(u8, entry.value_ptr.string);
+                continue;
+            }
+            if (std.mem.eql(u8, key, "module")) {
+                if (entry.value_ptr.* != .string) return ParseError.BadSchema;
+                ev.module = try a.dupe(u8, entry.value_ptr.string);
+                continue;
+            }
+            if (std.mem.eql(u8, key, "callback")) {
+                if (entry.value_ptr.* != .string) return ParseError.BadSchema;
+                ev.callback = try a.dupe(u8, entry.value_ptr.string);
+                continue;
+            }
+            if (std.mem.eql(u8, key, "params")) {
+                if (entry.value_ptr.* != .array) return ParseError.BadSchema;
+                ev.params = try parseParams(a, entry.value_ptr.array);
+                continue;
+            }
+        }
+
         try extras.append(a, .{
             .key = try a.dupe(u8, key),
             .value_text = try jsonValueToText(a, entry.value_ptr.*),
@@ -558,6 +647,22 @@ fn parseEvent(a: std.mem.Allocator, obj: std.json.ObjectMap) !Event {
     }
     sortKeyValues(extras.items);
     ev.extras = try extras.toOwnedSlice(a);
+
+    // `OnEvent` two-form rule (RFC-PLUGIN-EVENTS §7): `name` XOR
+    // (`module` + `callback`). Both set, neither set, or only one of
+    // `module`/`callback` set is `MalformedFlow`. This is the same
+    // validation `flow-codegen`'s `buildEvent` enforces (`flow-codegen`
+    // `flow_io.zig:342-353`).
+    if (is_on_event) {
+        const has_new = ev.name != null;
+        const has_legacy_complete = ev.module != null and ev.callback != null;
+        const has_legacy_partial = (ev.module != null) != (ev.callback != null);
+        if (has_legacy_partial) return ParseError.MalformedFlow;
+        if (has_new and (ev.module != null or ev.callback != null))
+            return ParseError.MalformedFlow;
+        if (!has_new and !has_legacy_complete) return ParseError.MalformedFlow;
+    }
+
     return ev;
 }
 
@@ -651,6 +756,11 @@ fn parseNodes(a: std.mem.Allocator, arr: std.json.Array) !NodesResult {
             if (kind == .output and std.mem.eql(u8, key, "name")) {
                 if (entry.value_ptr.* != .string) return ParseError.BadSchema;
                 node.output_name = try a.dupe(u8, entry.value_ptr.string);
+                continue;
+            }
+            if (kind == .emit and std.mem.eql(u8, key, "event")) {
+                if (entry.value_ptr.* != .string) return ParseError.BadSchema;
+                node.event_ref = try a.dupe(u8, entry.value_ptr.string);
                 continue;
             }
 
@@ -892,10 +1002,43 @@ pub fn render(child_allocator: std.mem.Allocator, doc: FlowDoc) ![]u8 {
         try out.appendSlice(a, ",\n");
     }
 
-    // event
+    // event — `OnEvent`'s structural fields (`name` / `module` /
+    // `callback` / `params`) are emitted in a fixed order so a re-save
+    // is byte-stable regardless of edit history. Generic `extras` keys
+    // (alphabetical, e.g. `arg_entity` on `OnCreate`) follow. `parseEvent`
+    // already enforces the two-form rule for `OnEvent`, so the writer
+    // just renders what's set.
     try out.appendSlice(a, indent_unit);
     try out.appendSlice(a, "\"event\": { \"type\": ");
     try writeJsonString(a, &out, doc.event.type_name);
+    if (doc.event.name) |n| {
+        try out.appendSlice(a, ", \"name\": ");
+        try writeJsonString(a, &out, n);
+    }
+    if (doc.event.module) |m| {
+        try out.appendSlice(a, ", \"module\": ");
+        try writeJsonString(a, &out, m);
+    }
+    if (doc.event.callback) |c| {
+        try out.appendSlice(a, ", \"callback\": ");
+        try writeJsonString(a, &out, c);
+    }
+    if (doc.event.params.len > 0) {
+        try out.appendSlice(a, ", \"params\": [");
+        for (doc.event.params, 0..) |p, i| {
+            if (i > 0) try out.append(a, ',');
+            try out.appendSlice(a, " { \"name\": ");
+            try writeJsonString(a, &out, p.name);
+            try out.appendSlice(a, ", \"type\": ");
+            try writeJsonString(a, &out, p.type_name);
+            if (p.default_text) |d| {
+                try out.appendSlice(a, ", \"default\": ");
+                try out.appendSlice(a, d);
+            }
+            try out.appendSlice(a, " }");
+        }
+        try out.appendSlice(a, " ]");
+    }
     for (doc.event.extras) |kv| {
         try out.appendSlice(a, ", ");
         try writeJsonString(a, &out, kv.key);
@@ -1009,6 +1152,10 @@ fn renderNode(a: std.mem.Allocator, out: *std.ArrayList(u8), n: Node) !void {
             try out.appendSlice(a, ", \"name\": ");
             try writeJsonString(a, out, n.output_name);
         },
+        .emit => {
+            try out.appendSlice(a, ", \"event\": ");
+            try writeJsonString(a, out, n.event_ref);
+        },
         .other => {},
     }
 
@@ -1058,6 +1205,63 @@ pub fn displayNameFromPath(path: []const u8) []const u8 {
         return base[0 .. base.len - extension.len];
     }
     return base;
+}
+
+// ─── Legacy OnEvent converter ───────────────────────────────────────────
+
+pub const ConvertError = error{
+    /// The event is not `OnEvent`. Only `OnEvent` has the two-form
+    /// structure to convert away from.
+    NotOnEvent,
+    /// The event is already in new form (`name` set, legacy fields
+    /// absent). No conversion needed.
+    AlreadyNewForm,
+    /// The legacy `callback` is empty or equals `"on_"` — there is no
+    /// event stem to map. `flow-codegen` reports the same case.
+    MalformedCallback,
+};
+
+/// Rewrite an `OnEvent` event from the legacy `module`+`callback`
+/// (+`params`) form to the new-form `name` shape (RFC-PLUGIN-EVENTS §7).
+/// In-place on `ev`; strings are duped onto `a` so the result outlives
+/// the source extras for as long as `a` does.
+///
+/// **Name mapping** (mirrors `flow-codegen`'s `legacy_onevent_to_name`):
+/// the dotted name is `<module>.<event>` where `<event>` is `callback`
+/// with its `on_` prefix stripped — `on_collision_begin` →
+/// `collision_begin`. A `callback` that doesn't start with `on_` passes
+/// through verbatim; any mismatch surfaces at codegen against the
+/// `PluginEvents` union.
+///
+/// **Validation.** The editor runs without a `PluginEvents` handle, so
+/// it does not validate the rewritten name against the discovered event
+/// set — that is codegen's job. The converter rejects only the
+/// structural-error cases (`NotOnEvent`, `AlreadyNewForm`,
+/// `MalformedCallback`).
+pub fn legacy_onevent_to_name(a: std.mem.Allocator, ev: *Event) ConvertError!void {
+    if (!std.mem.eql(u8, ev.type_name, "OnEvent")) return ConvertError.NotOnEvent;
+    if (ev.name != null) return ConvertError.AlreadyNewForm;
+
+    // `parseEvent`'s two-form rule guarantees both `module` and `callback`
+    // are set on the legacy form. A bare `error.MalformedCallback` here
+    // would only fire on a hand-constructed `Event` value that bypassed
+    // the parser — guard anyway so misuse fails loudly.
+    const module = ev.module orelse return ConvertError.MalformedCallback;
+    const callback = ev.callback orelse return ConvertError.MalformedCallback;
+
+    const stem = if (std.mem.startsWith(u8, callback, "on_"))
+        callback[3..]
+    else
+        callback;
+    if (stem.len == 0) return ConvertError.MalformedCallback;
+
+    const dotted = std.fmt.allocPrint(a, "{s}.{s}", .{ module, stem }) catch
+        return ConvertError.MalformedCallback;
+
+    ev.name = dotted;
+    ev.module = null;
+    ev.callback = null;
+    ev.params = &.{};
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────
@@ -1420,6 +1624,175 @@ test "decodeStringValue / encodeStringValue round-trip" {
     const num = try decodeStringValue(a, "1.5");
     defer a.free(num);
     try std.testing.expectEqualStrings("1.5", num);
+}
+
+test "OnEvent new-form round-trips with name" {
+    const src =
+        \\{
+        \\  "name": "hit_counter",
+        \\  "event": { "type": "OnEvent", "name": "box2d.collision_begin" },
+        \\  "nodes": [],
+        \\  "edges": []
+        \\}
+    ;
+    var doc = try parse(std.testing.allocator, src);
+    defer doc.deinit();
+
+    try std.testing.expectEqualStrings("OnEvent", doc.event.type_name);
+    try std.testing.expectEqualStrings("box2d.collision_begin", doc.event.name.?);
+    try std.testing.expect(doc.event.module == null);
+    try std.testing.expect(doc.event.callback == null);
+    try std.testing.expectEqual(@as(usize, 0), doc.event.params.len);
+
+    // Idempotent re-render.
+    const text1 = try render(std.testing.allocator, doc);
+    defer std.testing.allocator.free(text1);
+    var doc2 = try parse(std.testing.allocator, text1);
+    defer doc2.deinit();
+    const text2 = try render(std.testing.allocator, doc2);
+    defer std.testing.allocator.free(text2);
+    try std.testing.expectEqualStrings(text1, text2);
+    try std.testing.expect(std.mem.indexOf(u8, text1, "\"name\": \"box2d.collision_begin\"") != null);
+}
+
+test "OnEvent legacy form round-trips with module+callback+params" {
+    const src =
+        \\{
+        \\  "event": {
+        \\    "type": "OnEvent",
+        \\    "module": "box2d",
+        \\    "callback": "on_collision_begin",
+        \\    "params": [
+        \\      { "name": "entity_a", "type": "u32" },
+        \\      { "name": "entity_b", "type": "u32" }
+        \\    ]
+        \\  },
+        \\  "nodes": [],
+        \\  "edges": []
+        \\}
+    ;
+    var doc = try parse(std.testing.allocator, src);
+    defer doc.deinit();
+
+    try std.testing.expect(doc.event.name == null);
+    try std.testing.expectEqualStrings("box2d", doc.event.module.?);
+    try std.testing.expectEqualStrings("on_collision_begin", doc.event.callback.?);
+    try std.testing.expectEqual(@as(usize, 2), doc.event.params.len);
+    try std.testing.expectEqualStrings("entity_a", doc.event.params[0].name);
+
+    // Idempotent re-render.
+    const text1 = try render(std.testing.allocator, doc);
+    defer std.testing.allocator.free(text1);
+    var doc2 = try parse(std.testing.allocator, text1);
+    defer doc2.deinit();
+    const text2 = try render(std.testing.allocator, doc2);
+    defer std.testing.allocator.free(text2);
+    try std.testing.expectEqualStrings(text1, text2);
+}
+
+test "OnEvent rejects malformed two-form combinations" {
+    // Both forms set.
+    try std.testing.expectError(ParseError.MalformedFlow, parse(std.testing.allocator,
+        \\{ "event": { "type": "OnEvent", "name": "box2d.collision_begin", "module": "box2d", "callback": "on_collision_begin" }, "nodes": [], "edges": [] }
+    ));
+    // Neither form set.
+    try std.testing.expectError(ParseError.MalformedFlow, parse(std.testing.allocator,
+        \\{ "event": { "type": "OnEvent" }, "nodes": [], "edges": [] }
+    ));
+    // Only module, no callback.
+    try std.testing.expectError(ParseError.MalformedFlow, parse(std.testing.allocator,
+        \\{ "event": { "type": "OnEvent", "module": "box2d" }, "nodes": [], "edges": [] }
+    ));
+    // Only callback, no module.
+    try std.testing.expectError(ParseError.MalformedFlow, parse(std.testing.allocator,
+        \\{ "event": { "type": "OnEvent", "callback": "on_collision_begin" }, "nodes": [], "edges": [] }
+    ));
+    // `name` plus a legacy field.
+    try std.testing.expectError(ParseError.MalformedFlow, parse(std.testing.allocator,
+        \\{ "event": { "type": "OnEvent", "name": "box2d.collision_begin", "module": "box2d" }, "nodes": [], "edges": [] }
+    ));
+}
+
+test "Emit node parses and round-trips" {
+    const src =
+        \\{
+        \\  "event": { "type": "OnUpdate" },
+        \\  "nodes": [
+        \\    { "id": 1, "type": "Emit", "event": "my_game.player_attacked", "pos": [400, 200] }
+        \\  ],
+        \\  "edges": []
+        \\}
+    ;
+    var doc = try parse(std.testing.allocator, src);
+    defer doc.deinit();
+    try std.testing.expectEqual(NodeKind.emit, doc.nodes[0].kind);
+    try std.testing.expectEqualStrings("my_game.player_attacked", doc.nodes[0].event_ref);
+
+    const text1 = try render(std.testing.allocator, doc);
+    defer std.testing.allocator.free(text1);
+    var doc2 = try parse(std.testing.allocator, text1);
+    defer doc2.deinit();
+    const text2 = try render(std.testing.allocator, doc2);
+    defer std.testing.allocator.free(text2);
+    try std.testing.expectEqualStrings(text1, text2);
+    try std.testing.expect(std.mem.indexOf(u8, text1, "\"type\": \"Emit\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text1, "\"event\": \"my_game.player_attacked\"") != null);
+}
+
+test "Emit rejects a non-string event field" {
+    try std.testing.expectError(ParseError.BadSchema, parse(std.testing.allocator,
+        \\{ "event": { "type": "OnUpdate" }, "nodes": [ { "id": 1, "type": "Emit", "event": 9 } ], "edges": [] }
+    ));
+}
+
+test "legacy_onevent_to_name converts the canonical mapping" {
+    const src =
+        \\{
+        \\  "event": { "type": "OnEvent", "module": "box2d", "callback": "on_collision_begin" },
+        \\  "nodes": [],
+        \\  "edges": []
+        \\}
+    ;
+    var doc = try parse(std.testing.allocator, src);
+    defer doc.deinit();
+    try legacy_onevent_to_name(doc.allocator(), &doc.event);
+    try std.testing.expectEqualStrings("box2d.collision_begin", doc.event.name.?);
+    try std.testing.expect(doc.event.module == null);
+    try std.testing.expect(doc.event.callback == null);
+    try std.testing.expectEqual(@as(usize, 0), doc.event.params.len);
+}
+
+test "legacy_onevent_to_name passes a non-on_-prefixed callback through" {
+    const src =
+        \\{
+        \\  "event": { "type": "OnEvent", "module": "physics", "callback": "explode" },
+        \\  "nodes": [],
+        \\  "edges": []
+        \\}
+    ;
+    var doc = try parse(std.testing.allocator, src);
+    defer doc.deinit();
+    try legacy_onevent_to_name(doc.allocator(), &doc.event);
+    try std.testing.expectEqualStrings("physics.explode", doc.event.name.?);
+}
+
+test "legacy_onevent_to_name rejects already-new and non-OnEvent" {
+    {
+        const src =
+            \\{ "event": { "type": "OnEvent", "name": "box2d.collision_begin" }, "nodes": [], "edges": [] }
+        ;
+        var doc = try parse(std.testing.allocator, src);
+        defer doc.deinit();
+        try std.testing.expectError(ConvertError.AlreadyNewForm, legacy_onevent_to_name(doc.allocator(), &doc.event));
+    }
+    {
+        const src =
+            \\{ "event": { "type": "OnCreate", "arg_entity": "entity" }, "nodes": [], "edges": [] }
+        ;
+        var doc = try parse(std.testing.allocator, src);
+        defer doc.deinit();
+        try std.testing.expectError(ConvertError.NotOnEvent, legacy_onevent_to_name(doc.allocator(), &doc.event));
+    }
 }
 
 test "binding order is deterministic after an edit reorders the slice" {

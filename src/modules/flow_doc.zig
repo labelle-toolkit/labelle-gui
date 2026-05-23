@@ -36,6 +36,7 @@ const App = @import("../app.zig").App;
 const flow_io = @import("../flow_io.zig");
 const io_global = @import("../io_global.zig");
 const flow_cycle = @import("../flow_cycle.zig");
+const event_catalog = @import("../flow_event_catalog.zig");
 
 const inspector_w: f32 = 340;
 const split_gap: f32 = 8;
@@ -951,6 +952,41 @@ fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Nod
             ne.endPin();
             recordPin(s, n.id, "value", .input);
         },
+        .emit => {
+            // `Emit` fires a custom event (RFC-PLUGIN-EVENTS §8). The
+            // node's input pins are the payload struct's fields, derived
+            // from the editor's static event catalog. An unresolved event
+            // name (the dropdown lets a user type a name that isn't yet
+            // in the catalog) renders no pins and surfaces a hint so the
+            // unwired Emit can still be saved and inspected.
+            if (n.event_ref.len == 0) {
+                zgui.textDisabled("(no event selected)", .{});
+                return;
+            }
+            zgui.textDisabled("event: {s}", .{n.event_ref});
+            const entry = event_catalog.lookup(n.event_ref) orelse {
+                zgui.textDisabled("(unknown event — no pins)", .{});
+                return;
+            };
+            // Payload fields are an `Emit` node's *inputs* — the flow
+            // author wires a value to every field, and codegen lowers
+            // the node to `game.emit(.{ .<tag> = .{ .<field> = ... } })`.
+            // De-duplicate by name (a same-name field appearing twice
+            // would collide on `pinId`) — the static catalog is
+            // hand-written, but a future scan-based catalog might admit
+            // a malformed payload struct and we want the editor to stay
+            // robust either way.
+            var seen = PinNameSet.init(allocator);
+            defer seen.deinit();
+            for (entry.fields) |f| {
+                const dup = (seen.fetchPut(f.name, {}) catch null) != null;
+                if (dup) continue;
+                ne.beginPin(pinId(n.id, f.name, .input), .input);
+                zgui.text("> {s}: {s}", .{ f.name, f.type_name });
+                ne.endPin();
+                recordPin(s, n.id, f.name, .input);
+            }
+        },
         .other => {
             // Show extras as a compact hint so the user can tell nodes
             // apart even though the editor can't field-edit them.
@@ -1197,6 +1233,159 @@ fn renderEventEditor(s: *FlowDocState) void {
     }
     zgui.sameLine(.{});
     zgui.textDisabled("type", .{});
+
+    // `OnEvent` carries two forms (RFC-PLUGIN-EVENTS §7): the new
+    // dotted-name form and the legacy `module`+`callback`+`params`
+    // form. The editor offers the dropdown when the event is — or is
+    // newly switched to — `OnEvent`; a legacy-form flow gets a banner
+    // explaining what it is plus a one-click converter.
+    if (std.mem.eql(u8, s.doc.event.type_name, "OnEvent")) {
+        renderOnEventEditor(s);
+    }
+}
+
+/// Editor surface specific to `OnEvent` (RFC-PLUGIN-EVENTS §7). Renders
+/// either the new-form name dropdown or the legacy-form fallback view
+/// depending on which form the doc currently holds. Migrating a doc to
+/// `OnEvent` for the first time (e.g. via the event-type text box above)
+/// leaves it in *neither* form — the editor seeds the new form on the
+/// next frame so the user only sees the dropdown.
+fn renderOnEventEditor(s: *FlowDocState) void {
+    const a = s.doc.allocator();
+    const ev = &s.doc.event;
+
+    // Seed the new form on a fresh switch to `OnEvent`. `parseEvent`
+    // would have rejected a malformed `OnEvent` at load time, so an
+    // in-memory `OnEvent` with neither form set only happens when the
+    // user just retyped the type. Allocate a tiny empty-name marker so
+    // a save is structurally valid (codegen will reject the empty name
+    // explicitly — better than a `MalformedFlow` save).
+    if (ev.name == null and ev.module == null and ev.callback == null) {
+        ev.name = a.dupe(u8, "") catch null;
+        s.is_dirty = true;
+    }
+
+    if (ev.module != null or ev.callback != null) {
+        // Legacy form. Show the raw fields read-only and a converter
+        // button — phase 6 will drop the legacy path entirely; for now
+        // the editor round-trips it untouched and helps the user
+        // migrate.
+        zgui.spacing();
+        zgui.textColored(
+            .{ 1.0, 0.65, 0.2, 1.0 },
+            "Legacy OnEvent form (module + callback)",
+            .{},
+        );
+        zgui.textDisabled(
+            "Phase 6 will drop this form. Use Convert to migrate.",
+            .{},
+        );
+        if (ev.module) |m| zgui.bulletText("module: {s}", .{m});
+        if (ev.callback) |c| zgui.bulletText("callback: {s}", .{c});
+        for (ev.params) |p| {
+            zgui.bulletText("param: {s}: {s}", .{ p.name, p.type_name });
+        }
+        if (zgui.button("Convert to new form", .{})) {
+            flow_io.legacy_onevent_to_name(a, ev) catch |err| {
+                std.log.err("flow: OnEvent convert failed: {s}", .{@errorName(err)});
+                return;
+            };
+            s.is_dirty = true;
+        }
+        return;
+    }
+
+    // New form — event-name dropdown sourced from the static catalog
+    // (`flow_event_catalog`). Picks resolve through the same combo
+    // helper an `Emit` node uses, so the two sites stay byte-identical
+    // in shape (RFC O6 — "the editor offers the discovered event names
+    // as a dropdown").
+    zgui.spacing();
+    zgui.text("Event name", .{});
+    // `renderEventNameCombo` takes a `*[]const u8` it can re-point on
+    // selection. `ev.name` is `?[]const u8`, so route through a local
+    // and write back. A `null` was already replaced with `""` above,
+    // so the `orelse` here just satisfies the compiler.
+    var name_buf: []const u8 = ev.name orelse "";
+    renderEventNameCombo(s, "##onevent_name", &name_buf);
+    ev.name = name_buf;
+    if (name_buf.len > 0 and !event_catalog.isKnown(name_buf)) {
+        zgui.textColored(
+            .{ 1.0, 0.65, 0.2, 1.0 },
+            "(unknown event — codegen will validate against PluginEvents)",
+            .{},
+        );
+    }
+    if (event_catalog.lookup(name_buf)) |entry| {
+        if (entry.description.len > 0) {
+            zgui.textDisabled("— {s}", .{entry.description});
+        }
+        zgui.textDisabled("Payload fields the flow can read via Param nodes:", .{});
+        for (entry.fields) |f| {
+            zgui.bulletText("{s}: {s}", .{ f.name, f.type_name });
+        }
+    }
+}
+
+/// Shared event-name dropdown — used by both `OnEvent`'s event editor
+/// and the `Emit` node inspector (RFC O6). `event_ref` is mutated in
+/// place to the new selection (a dup'd slice on the doc arena); the
+/// caller decides what to do on change. A free-text fallback covers
+/// names not yet in the catalog so a project-local game event isn't
+/// blocked on the catalog catching up.
+fn renderEventNameCombo(s: *FlowDocState, label: [:0]const u8, event_ref: *[]const u8) void {
+    const a = s.doc.allocator();
+    // Show the current selection — empty for a brand-new node/event.
+    var preview: IdentBuf = undefined;
+    seedBuf(&preview, event_ref.*);
+    if (zgui.beginCombo(label, .{ .preview_value = &preview })) {
+        // First row: blank "<choose>" so a node mid-authoring can clear
+        // its selection without a manual delete.
+        if (zgui.selectable("<choose>", .{ .selected = event_ref.*.len == 0 })) {
+            if (event_ref.*.len != 0) {
+                event_ref.* = a.dupe(u8, "") catch event_ref.*;
+                s.is_dirty = true;
+            }
+        }
+        for (&event_catalog.entries) |entry| {
+            var row: IdentBuf = undefined;
+            seedBuf(&row, entry.name);
+            const sel = std.mem.eql(u8, entry.name, event_ref.*);
+            if (zgui.selectable(&row, .{ .selected = sel })) {
+                if (!sel) {
+                    event_ref.* = a.dupe(u8, entry.name) catch event_ref.*;
+                    s.is_dirty = true;
+                }
+            }
+            if (entry.description.len > 0 and zgui.isItemHovered(.{})) {
+                if (zgui.beginTooltip()) {
+                    zgui.text("{s}", .{entry.description});
+                    zgui.endTooltip();
+                }
+            }
+        }
+        zgui.endCombo();
+    }
+    // Free-text fallback — pick a name not yet in the catalog (a
+    // project-local game event, or a plugin event the editor doesn't
+    // yet know about). Editing this writes through to the same
+    // `event_ref` so the dropdown and the text input stay in sync.
+    var custom: IdentBuf = undefined;
+    seedBuf(&custom, event_ref.*);
+    zgui.setNextItemWidth(220);
+    var name_id_buf: [48]u8 = undefined;
+    const custom_id = std.fmt.bufPrintZ(
+        &name_id_buf,
+        "{s}_custom",
+        .{label},
+    ) catch label;
+    if (zgui.inputText(custom_id, .{ .buf = &custom })) {
+        const raw = std.mem.sliceTo(&custom, 0);
+        event_ref.* = a.dupe(u8, raw) catch event_ref.*;
+        s.is_dirty = true;
+    }
+    zgui.sameLine(.{});
+    zgui.textDisabled("(or type a name)", .{});
 }
 
 fn renderParamsEditor(s: *FlowDocState) void {
@@ -1276,6 +1465,13 @@ fn renderNodePalette(s: *FlowDocState) void {
     if (zgui.button("+ Output", .{})) {
         addNode(s, .output) catch |err| nodeAddErr(err);
     }
+    zgui.sameLine(.{});
+    // `Emit` fires a custom event (RFC-PLUGIN-EVENTS §8). The new node's
+    // event_ref starts empty so the inspector dropdown can drive the
+    // first selection.
+    if (zgui.button("+ Emit", .{})) {
+        addNode(s, .emit) catch |err| nodeAddErr(err);
+    }
 }
 
 fn nodeAddErr(err: anyerror) void {
@@ -1342,6 +1538,34 @@ fn renderSelectedNode(s: *FlowDocState) void {
             if (zgui.inputText("##out_name", .{ .buf = &obuf })) {
                 n.output_name = dupZ(a, &obuf) catch n.output_name;
                 s.is_dirty = true;
+            }
+        },
+        .emit => {
+            zgui.text("Event", .{});
+            // Event-name dropdown — the same picker `renderEventEditor`
+            // uses for `OnEvent`. A free-text fallback covers events not
+            // yet in the catalog (a project-local event the static table
+            // doesn't know about); the editor stores whatever the user
+            // picks/types verbatim and codegen validates against the
+            // assembler-built union.
+            renderEventNameCombo(s, "##emit_event", &n.event_ref);
+            if (n.event_ref.len > 0 and !event_catalog.isKnown(n.event_ref)) {
+                zgui.textColored(
+                    .{ 1.0, 0.65, 0.2, 1.0 },
+                    "(unknown event — pins blank, codegen will validate)",
+                    .{},
+                );
+            }
+            if (event_catalog.lookup(n.event_ref)) |entry| {
+                zgui.spacing();
+                zgui.textDisabled("Payload fields (wire each input pin):", .{});
+                for (entry.fields) |f| {
+                    zgui.bulletText("{s}: {s}", .{ f.name, f.type_name });
+                }
+                if (entry.description.len > 0) {
+                    zgui.spacing();
+                    zgui.textDisabled("— {s}", .{entry.description});
+                }
             }
         },
         .other => {
@@ -1603,6 +1827,11 @@ fn addNode(s: *FlowDocState, kind: flow_io.NodeKind) !void {
         .subflow => node.flow_ref = try a.dupe(u8, ""),
         .param => node.param_ref = try a.dupe(u8, ""),
         .output => node.output_name = try a.dupe(u8, "result"),
+        // A fresh `Emit` starts with no event chosen — the inspector
+        // dropdown will let the user pick one from the catalog. Codegen
+        // would reject an unwired Emit at build time; the editor surfaces
+        // a "no event selected" hint on the canvas in the meantime.
+        .emit => node.event_ref = try a.dupe(u8, ""),
         .other => unreachable,
     }
     s.doc.nodes = try growNodes(a, s.doc.nodes, node);
