@@ -493,11 +493,14 @@ pub fn setRuntime(cat: ?*RuntimeCatalog) void {
     }
 }
 
-/// Read `<project_dir>/.labelle/<backend>/flow_catalog.json` and build
-/// a `RuntimeCatalog` from it. Tries `raylib_desktop` first, then
-/// `null_desktop`, then any other `*_desktop` subdir under
-/// `.labelle/`. Returns `null` when no sidecar is found, leaving the
-/// editor on its static fallback.
+/// Read `<project_dir>/.labelle/flow_catalog.json` and build a
+/// `RuntimeCatalog` from it. Returns `null` when no sidecar is found,
+/// leaving the editor on its static fallback.
+///
+/// The sidecar is **project-level** (one file per project, not one per
+/// render-target backend) because a flow's catalog — plugin verbs,
+/// events, pin types — is backend-independent. Every backend's
+/// generated build sees the same FlowNodes declarations.
 ///
 /// Caller owns the returned pointer — the typical lifecycle is:
 /// `setRuntime(loadFromSidecar(allocator, dir) catch null)`.
@@ -568,10 +571,26 @@ pub fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) !*RuntimeCat
     for (static_pin_styles) |s| try merged_styles.append(aa, s);
     for (styles_list.items) |s| try merged_styles.append(aa, s);
 
+    // Materialize the owned slices BEFORE allocating the outer struct
+    // so an OOM mid-finalize cleans up via the arena `errdefer` without
+    // ever leaving a heap-allocated `cat` box outstanding. The earlier
+    // ordering sat `try ...toOwnedSlice(aa)` inside the struct literal
+    // *after* `allocator.create(RuntimeCatalog)`, which would leak the
+    // freshly-created `RuntimeCatalog` if the slice call failed (the
+    // arena `errdefer` correctly freed the arena memory, but the
+    // outer box wasn't tracked). The arena's `remap` path means
+    // current `toOwnedSlice` calls don't trip a fresh allocation —
+    // they shrink in place — so the leak window is currently
+    // unreachable from the standard `loadFromPath` driver; this
+    // ordering keeps it unreachable even if the allocator (or
+    // ArrayList growth strategy) changes.
+    const owned_entries = try entries_list.toOwnedSlice(aa);
+    const owned_styles = try merged_styles.toOwnedSlice(aa);
+
     const cat = try allocator.create(RuntimeCatalog);
     cat.* = .{
-        .entries = try entries_list.toOwnedSlice(aa),
-        .pin_styles = try merged_styles.toOwnedSlice(aa),
+        .entries = owned_entries,
+        .pin_styles = owned_styles,
         .arena = arena,
         .box_allocator = allocator,
     };
@@ -580,37 +599,21 @@ pub fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) !*RuntimeCat
     return cat;
 }
 
-/// Walk `<project_dir>/.labelle/` for a `flow_catalog.json` and return
-/// the first one found, preferring `raylib_desktop` (the default
-/// editor target). Returns `null` when no sidecar exists — `App`
-/// treats that as "stay on the static fallback".
+/// Resolve `<project_dir>/.labelle/flow_catalog.json` if it exists.
+/// Returns `null` when no sidecar is present — `App` treats that as
+/// "stay on the static fallback."
+///
+/// The sidecar's project-level location is deliberate (was previously
+/// `<project>/.labelle/<backend>/flow_catalog.json`, which forced the
+/// editor to pick a backend it had no business knowing about — flows
+/// are backend-independent).
 fn findSidecarPath(allocator: std.mem.Allocator, project_dir: []const u8) !?[]u8 {
-    // Preferred backend subdirectories, in order. The first existing
-    // one wins; the file shape is identical across them so the
-    // selection only affects which target's discovery the editor
-    // mirrors (different backends would emit the same plugin set
-    // unless a plugin gates its FlowNodes per-backend, which the
-    // toolkit doesn't currently allow).
-    const preferred = [_][]const u8{
-        "raylib_desktop",
-        "null_desktop",
-        "sokol_desktop",
-        "sdl_desktop",
-        "bgfx_desktop",
-        "wgpu_desktop",
-        // Tests target the assembler also writes — useful for projects
-        // built only via `zig build test` paths.
-        "tests",
+    const candidate = try std.fs.path.join(allocator, &.{ project_dir, ".labelle", "flow_catalog.json" });
+    std.Io.Dir.cwd().access(io_global.io(), candidate, .{}) catch {
+        allocator.free(candidate);
+        return null;
     };
-    for (preferred) |sub| {
-        const candidate = try std.fs.path.join(allocator, &.{ project_dir, ".labelle", sub, "flow_catalog.json" });
-        std.Io.Dir.cwd().access(io_global.io(), candidate, .{}) catch {
-            allocator.free(candidate);
-            continue;
-        };
-        return candidate;
-    }
-    return null;
+    return candidate;
 }
 
 fn parseFlowNode(aa: std.mem.Allocator, val: std.json.Value) !Entry {
@@ -1156,4 +1159,67 @@ test "loadFromSidecar: returns null when no .labelle/* subdir has the file" {
     // the static fallback.
     const cat = try loadFromSidecar(aa, dir_path);
     try std.testing.expect(cat == null);
+}
+
+// ─── Allocator-failure leak regression ─────────────────────────────────
+//
+// Drives `loadFromPath` through every allocation point with
+// `std.testing.checkAllAllocationFailures` to catch any cleanup hole
+// introduced by future refactors. Today the leak window flagged by
+// Wave 4 review (labelle-gui#170 phase 4 follow-up) — `cat` allocated
+// before `try ...toOwnedSlice(aa)` in the struct literal — is
+// unreachable because the arena's `remap` path means `toOwnedSlice`
+// shrinks the existing arena buffer in place rather than allocating
+// fresh memory. The defensive ordering in `loadFromPath`
+// (materialize the slices *before* `allocator.create`) keeps the
+// leak window unreachable even if the arena is swapped for a
+// non-remap-capable allocator down the road. This test pins both
+// the ordering invariant and the broader allocator-cleanup
+// guarantee.
+
+fn loadFromPathOomCase(allocator: std.mem.Allocator) !void {
+    // Hermetic fixture: a minimal but realistic sidecar (one plugin,
+    // one FlowNode, one PinStyle) so every allocation point in
+    // `parseFlowNode` and `parsePinStyle` runs at least once.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const json =
+        \\{
+        \\  "generated_at": "2026-05-23T00:00:00Z",
+        \\  "plugins": [
+        \\    {
+        \\      "name": "synthetic",
+        \\      "flow_nodes": [
+        \\        {
+        \\          "qualified": "synthetic.do_thing",
+        \\          "display_name": "Do Thing",
+        \\          "category": "synthetic",
+        \\          "docs": "",
+        \\          "kind": "command",
+        \\          "pins": [
+        \\            { "name": "entity", "label": "Entity", "zig_type": "u32", "dir": "input", "default": null }
+        \\          ],
+        \\          "return_type": null
+        \\        }
+        \\      ],
+        \\      "pin_styles": [
+        \\        { "zig_type": "MyStruct", "label": "My Struct", "color": [12, 34, 56] }
+        \\      ]
+        \\    }
+        \\  ]
+        \\}
+        \\
+    ;
+    try tmp.dir.writeFile(io_global.io(), .{ .sub_path = "flow_catalog.json", .data = json });
+    const path = try tmp.dir.realPathFileAlloc(io_global.io(), "flow_catalog.json", allocator);
+    defer allocator.free(path);
+
+    const cat = try loadFromPath(allocator, path);
+    const ba = cat.box_allocator;
+    cat.deinit();
+    ba.destroy(cat);
+}
+
+test "loadFromPath: no leaks at every allocation-failure point" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, loadFromPathOomCase, .{});
 }
