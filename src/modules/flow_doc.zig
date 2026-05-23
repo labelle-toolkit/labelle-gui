@@ -664,12 +664,18 @@ fn edgeWithEndpoint(s: *FlowDocState, pin: PinEntry) EndpointEdge {
 /// Either way an invalid drop is rejected and leaves the document
 /// unchanged. The tab is only marked dirty once a mutation commits.
 fn handleLinkCreate(s: *FlowDocState) void {
-    // `endCreate` must only run when `beginCreate` returned true — that
-    // is the imgui-node-editor API contract. Pair them with a guard
-    // clause + `defer` so the editor's create-item state never ends
-    // without a matching begin.
-    if (!ne.beginCreate()) return;
+    // `endCreate` must pair with EVERY `beginCreate`, not just the ones
+    // that returned true. Looking at `imgui_node_editor.cpp:4736-4751`
+    // (`ed::CreateItemAction::Begin`), `m_InActive` is set to `true`
+    // *before* the `if (m_CurrentStage == None) return false;` — so
+    // `beginCreate()` leaves the action mid-Begin regardless of return
+    // value. Skipping `endCreate` then makes the next frame's
+    // `beginCreate` trip its `IM_ASSERT(false == m_InActive)` and
+    // SIGABRT the GUI. Defer `endCreate` first, then early-return on
+    // the create-not-active path.
+    const create_active = ne.beginCreate();
     defer ne.endCreate();
+    if (!create_active) return;
 
     var start_id: ?u64 = null;
     var end_id: ?u64 = null;
@@ -789,10 +795,15 @@ fn handleLinkReroute(s: *FlowDocState, from_pin: PinEntry, to_pin: PinEntry) voi
 /// Drive the node-editor delete query — removes any edge the user
 /// selected and deleted on the canvas.
 fn handleLinkDelete(s: *FlowDocState) void {
-    // `endDelete` must only run when `beginDelete` returned true — same
-    // imgui-node-editor API contract as the create scope above.
-    if (!ne.beginDelete()) return;
+    // Same asymmetry as `handleLinkCreate`: `beginDelete` leaves the
+    // delete-action mid-Begin regardless of its return value, so
+    // `endDelete` MUST run on every call. Defer first, then early-
+    // return on the delete-not-active path. (See the
+    // `imgui_node_editor.cpp` `Begin`/`End` assertions in any of the
+    // ItemAction classes.)
+    const delete_active = ne.beginDelete();
     defer ne.endDelete();
+    if (!delete_active) return;
 
     var del_id: u64 = 0;
     while (ne.queryDeletedLink(&del_id, null, null)) {
