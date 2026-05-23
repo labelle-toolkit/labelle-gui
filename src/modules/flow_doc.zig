@@ -138,6 +138,14 @@ pub const FlowDocState = struct {
     /// (the editor's node store starts empty; we seed it from
     /// `doc.nodes[].pos` once).
     needs_layout: bool = true,
+    /// Set on the same frame that seeds positions; consumed the frame
+    /// *after* so `navigateToContent` runs once node sizes are known
+    /// (sizes come from `beginNode`/`endNode`; the layout frame sets
+    /// positions only). Without this, opening a flow whose nodes sit
+    /// far from the editor's default view (e.g. positions near `0,0`
+    /// when the default view is far away, or vice-versa) renders an
+    /// apparently-empty canvas — the nodes are there, just off-screen.
+    needs_fit_to_content: bool = false,
     /// Every pin drawn on the canvas this frame, rebuilt at the top of
     /// `renderCanvas`. Used to resolve a node-editor pin id back to its
     /// `(node_id, name, dir)` when authoring or deleting edges. Backed
@@ -524,6 +532,13 @@ fn renderCanvas(s: *FlowDocState, allocator: std.mem.Allocator) void {
             ne.setNodePosition(@intCast(n.id), n.pos);
         }
         s.needs_layout = false;
+        // Defer the viewport fit to the next frame — `navigateToContent`
+        // needs node *sizes*, which the editor only learns once
+        // `beginNode`/`endNode` have run.
+        if (s.doc.nodes.len > 0) s.needs_fit_to_content = true;
+    } else if (s.needs_fit_to_content) {
+        ne.navigateToContent(0.0);
+        s.needs_fit_to_content = false;
     }
 
     // Pull live positions back into the document so a Save persists
