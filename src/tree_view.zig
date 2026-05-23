@@ -136,17 +136,15 @@ pub const TreeView = struct {
             self.needs_refresh = false;
         }
 
-        // Precompute absolute paths of every managed top-level folder. The
-        // recursive walker uses these to skip subdirectories that are
-        // ALREADY rendered as separate top-level entries — namely
-        // `scripts/flows`, which appears in `ProjectFolders.all` as a
-        // sibling of `scripts`. Without this, recursing into `scripts`
-        // would surface `flows/` a second time with the wrong icon.
-        var managed_storage: [project.ProjectFolders.all.len][path_buf_size]u8 = undefined;
-        var managed_paths: [project.ProjectFolders.all.len][]const u8 = undefined;
-        for (project.ProjectFolders.all, 0..) |fname, i| {
-            managed_paths[i] = std.fmt.bufPrint(&managed_storage[i], "{s}/{s}", .{ base_path, fname }) catch "";
-        }
+        // Nested entries in `ProjectFolders.all` (e.g. `scripts/flows`)
+        // render naturally as children of their parent via the recursive
+        // walker — they do NOT need a separate top-level row. Users
+        // expect the on-disk hierarchy: expanding `scripts/` should
+        // show `flows/` as a child, not have it living next to
+        // `scripts/` in a row labelled `"scripts/flows"`. The
+        // `managed_paths` array is therefore intentionally empty: there
+        // is nothing rendered twice, so nothing to dedup.
+        const managed_paths: []const []const u8 = &.{};
 
         // Absolute prefix for the components/ folder, used to decide
         // whether a `.zig` file leaf becomes a drag source for the
@@ -158,13 +156,18 @@ pub const TreeView = struct {
             .{ base_path, project.ProjectFolders.components },
         ) catch "";
 
-        // Render each project folder
+        // Render each top-level project folder. Entries that contain a
+        // path separator (`scripts/flows`) are skipped — they belong
+        // under their parent in the tree, and the recursive walker
+        // surfaces them naturally when the parent is expanded.
         for (project.ProjectFolders.all) |folder_name| {
+            if (std.mem.indexOfScalar(u8, folder_name, '/') != null) continue;
+
             // Build folder path on stack
             var folder_path_buf: [path_buf_size:0]u8 = undefined;
             const folder_path = std.fmt.bufPrintZ(&folder_path_buf, "{s}/{s}", .{ base_path, folder_name }) catch continue;
 
-            if (self.renderDirectoryRow(folder_path, folder_name, &managed_paths, components_prefix)) {
+            if (self.renderDirectoryRow(folder_path, folder_name, managed_paths, components_prefix)) {
                 file_selected = true;
             }
         }
