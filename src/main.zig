@@ -29,6 +29,65 @@ fn contentScaleCallback(_: *zglfw.Window, xscale: f32, _: f32) callconv(.c) void
     g_dpi_changed.store(true, .release);
 }
 
+/// Startup args parsed from argv. Both fields are optional; either or
+/// both may be absent. String slices live as long as the iterator's
+/// internal buffer — `StartupArgs.parse` duplicates each value into
+/// the caller-provided arena so the values outlive the iterator.
+const StartupArgs = struct {
+    project_dir: ?[]const u8 = null,
+    open_flow: ?[]const u8 = null,
+
+    /// `--project <dir>` — open the project at this folder right after
+    /// `App.init`, before the main loop starts. `--open-flow <path>` —
+    /// open this `.flow.jsonc` as a flow-editor tab after the project
+    /// loads. Anything else is rejected with a usage line, so a typo
+    /// surfaces loudly instead of silently launching the empty GUI.
+    ///
+    /// `args_vector` is `proc_init.args`; `arena` owns the duplicated
+    /// strings the caller will read after `parse` returns.
+    fn parse(args_vector: std.process.Args, arena: std.mem.Allocator) !StartupArgs {
+        var out: StartupArgs = .{};
+        var iter = try std.process.Args.Iterator.initAllocator(args_vector, arena);
+        defer iter.deinit();
+        _ = iter.skip(); // argv[0] is the binary path
+
+        while (iter.next()) |a| {
+            if (std.mem.eql(u8, a, "--project")) {
+                const v = iter.next() orelse return error.MissingValue;
+                out.project_dir = try arena.dupe(u8, v);
+            } else if (std.mem.eql(u8, a, "--open-flow")) {
+                const v = iter.next() orelse return error.MissingValue;
+                out.open_flow = try arena.dupe(u8, v);
+            } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+                printUsage();
+                return error.HelpRequested;
+            } else {
+                std.log.err("labelle-gui: unknown argument: {s}", .{a});
+                printUsage();
+                return error.UnknownArgument;
+            }
+        }
+        return out;
+    }
+};
+
+fn printUsage() void {
+    const msg =
+        \\labelle-gui — the labelle-toolkit project editor.
+        \\
+        \\Usage:
+        \\  labelle-gui [--project <dir>] [--open-flow <flow.flow.jsonc>]
+        \\
+        \\Options:
+        \\  --project <dir>             Open the project folder at startup (skips the picker).
+        \\  --open-flow <path>          Open a `.flow.jsonc` as a flow-editor tab at startup.
+        \\                              Pair with --project so the editor has palette context.
+        \\  -h, --help                  Print this and exit.
+        \\
+    ;
+    std.debug.print("{s}", .{msg});
+}
+
 pub fn main(proc_init: std.process.Init.Minimal) !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
@@ -38,6 +97,16 @@ pub fn main(proc_init: std.process.Init.Minimal) !void {
     // previously used std.fs.cwd() (removed in Zig 0.16).
     io_global.init(proc_init);
 
+    // Startup args (`--project <dir>`, `--open-flow <path>`) — parsed
+    // up front so a typo bails before we initialize GLFW + zgui. The
+    // slices live in `args_arena` and are read once after `App.init`
+    // returns, so the arena outlives the read but not the main loop.
+    var args_arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer args_arena_state.deinit();
+    const startup = StartupArgs.parse(proc_init.args, args_arena_state.allocator()) catch |err| switch (err) {
+        error.HelpRequested => return,
+        else => return err,
+    };
 
     zglfw.init() catch {
         std.log.err("Failed to initialize GLFW", .{});
@@ -115,6 +184,22 @@ pub fn main(proc_init: std.process.Init.Minimal) !void {
 
     const app = try App.init(allocator, window, user_prefs);
     defer app.deinit();
+
+    // Apply startup args after init. Failures log and continue —
+    // dropping into an empty editor is still useful, and surfacing the
+    // error in the terminal beats a silent abort. The flow tab is
+    // skipped if the project load failed, since the editor needs the
+    // project's palette context to render the graph meaningfully.
+    if (startup.project_dir) |dir| {
+        app.openProjectPath(dir) catch |err| {
+            std.log.err("--project: failed to load {s}: {}", .{ dir, err });
+        };
+    }
+    if (startup.open_flow) |flow_path| {
+        app.openFlowDoc(flow_path) catch |err| {
+            std.log.err("--open-flow: failed to open {s}: {}", .{ flow_path, err });
+        };
+    }
 
     std.log.info("Labelle started", .{});
 

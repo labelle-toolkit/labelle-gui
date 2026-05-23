@@ -947,6 +947,16 @@ pub const App = struct {
         self.tree_view.refresh();
     }
 
+    /// Open a project from an absolute path (no folder picker). Shared
+    /// between the menu's "Open Project…" flow and `main.zig`'s
+    /// `--project <dir>` startup flag. Callers that want UI status
+    /// feedback (`setStatus`) wrap the call — this helper just runs
+    /// the load + tree-refresh side-effects.
+    pub fn openProjectPath(self: *Self, path: []const u8) !void {
+        try self.project_manager.loadProject(path);
+        self.tree_view.refresh();
+    }
+
     fn pickFolderAndOpenProject(self: *Self) void {
         const maybe = nfd.openFolderDialog(null) catch {
             self.setStatus("Error opening folder dialog!");
@@ -955,13 +965,12 @@ pub const App = struct {
         const folder = maybe orelse return;
         defer nfd.freePath(folder);
 
-        self.project_manager.loadProject(folder) catch |err| {
+        self.openProjectPath(folder) catch |err| {
             std.log.err("Error loading project: {}", .{err});
             self.setStatus("Error loading project!");
             return;
         };
         self.setStatus("Project loaded!");
-        self.tree_view.refresh();
     }
 
     fn saveProject(self: *Self) void {
