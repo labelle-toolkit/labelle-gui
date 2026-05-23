@@ -37,6 +37,7 @@ const flow_io = @import("../flow_io.zig");
 const io_global = @import("../io_global.zig");
 const flow_cycle = @import("../flow_cycle.zig");
 const event_catalog = @import("../flow_event_catalog.zig");
+const node_catalog = @import("../flow_node_catalog.zig");
 
 const inspector_w: f32 = 340;
 const split_gap: f32 = 8;
@@ -542,7 +543,21 @@ fn renderCanvas(s: *FlowDocState, allocator: std.mem.Allocator) void {
     // Pin ids must be globally unique and stable. We derive them from
     // (node_id, pin_index, direction) — packed into the high bits so
     // they never collide with node ids or edge ids.
+    //
+    // Command vs reporter visual (RFC §6 — phase 4 item 6): commands
+    // are rectangular (small corner radius), reporters rounded (large
+    // corner radius). The Event node gets a third treatment — the same
+    // rectangular command shape with a warm border color to read as the
+    // trigger. The full execution-flow connector wiring on command nodes
+    // is follow-up; phase 4 ships the shape + color difference.
     for (s.doc.nodes) |n| {
+        const visual = nodeVisual(n);
+        ne.pushStyleVar1f(.node_rounding, visual.rounding);
+        ne.pushStyleColor(.node_border, visual.border);
+        defer {
+            ne.popStyleColor(1);
+            ne.popStyleVar(1);
+        }
         ne.beginNode(@intCast(n.id));
         renderNodeBody(s, allocator, n);
         ne.endNode();
@@ -715,6 +730,17 @@ fn handleLinkCreate(s: *FlowDocState) void {
         _ = ne.rejectNewItem(.{ 1.0, 0.6, 0.2, 1.0 }, 2.0);
         return;
     }
+    // Wire-fit type check (RFC §2 — phase 4 item 5). When both pins
+    // belong to nodes with known catalog entries, refuse a drop that
+    // would wire incompatible Zig types. Unknown-type pins (e.g.
+    // `Subflow`'s reflected params with no static type info) skip the
+    // check and fall back to the prior behaviour — the editor never
+    // blocks editing of a still-unfinished graph. The red flash on
+    // refusal is the visual feedback the RFC calls for.
+    if (pinsFitForWire(s, out_pin, in_pin) == .no) {
+        _ = ne.rejectNewItem(.{ 1.0, 0.3, 0.3, 1.0 }, 2.0);
+        return;
+    }
 
     // `acceptNewItem` returns true on the frame the user releases the
     // drag — only then is there an edge to commit. The node editor does
@@ -726,6 +752,65 @@ fn handleLinkCreate(s: *FlowDocState) void {
         appendEdge(s, out_pin, in_pin) catch |err| {
             std.log.err("flow: add edge failed: {s}", .{@errorName(err)});
         };
+    }
+}
+
+/// Three-valued wire-fit result so the caller can distinguish a known
+/// reject from "unknown — let it through". The editor is intentionally
+/// permissive: it only refuses when *both* pin types are known and the
+/// pair is incompatible. A pin whose type the static catalog doesn't
+/// know (e.g. a Subflow's reflected `param`) is treated as a wildcard
+/// so an in-progress graph stays editable.
+const WireFit = enum { yes, unknown, no };
+
+fn pinsFitForWire(s: *FlowDocState, out_pin: PinEntry, in_pin: PinEntry) WireFit {
+    const out_type = pinZigType(s, out_pin) orelse return .unknown;
+    const in_type = pinZigType(s, in_pin) orelse return .unknown;
+    return if (node_catalog.typesFit(out_type, in_type)) .yes else .no;
+}
+
+/// Best-effort resolution of a pin's Zig type from the document. Walks
+/// the per-kind sources the catalog uses to draw the pin (event payload
+/// fields for `Event` / `Emit`, the targeted variable's declared type
+/// for the variable ops, the CustomNode catalog entry's pin list).
+/// Returns null when no static source covers the pin — wire-fit then
+/// falls back to permissive behaviour.
+fn pinZigType(s: *FlowDocState, pin: PinEntry) ?[]const u8 {
+    var node: ?flow_io.Node = null;
+    for (s.doc.nodes) |n| {
+        if (n.id == pin.node_id) {
+            node = n;
+            break;
+        }
+    }
+    const n = node orelse return null;
+    switch (n.kind) {
+        .event => {
+            if (event_catalog.lookup(n.event_ref)) |entry| {
+                for (entry.fields) |f| if (std.mem.eql(u8, f.name, pin.name)) return f.type_name;
+            }
+            return null;
+        },
+        .emit => {
+            if (event_catalog.lookup(n.event_ref)) |entry| {
+                for (entry.fields) |f| if (std.mem.eql(u8, f.name, pin.name)) return f.type_name;
+            }
+            return null;
+        },
+        .get_variable, .set_variable, .change_variable, .has_value_variable => {
+            // The variable-op pins (`value` / `by`) are typed by the
+            // declared variable. `HasValueVariable.value` is always
+            // `bool` per RFC §4.
+            if (n.kind == .has_value_variable) return "bool";
+            return lookupVariableType(s, n.variable_ref);
+        },
+        .custom_node => {
+            if (node_catalog.lookup(n.custom_name)) |entry| {
+                for (entry.pins) |p| if (std.mem.eql(u8, p.name, pin.name)) return p.type_name;
+            }
+            return null;
+        },
+        else => return null,
     }
 }
 
@@ -998,6 +1083,106 @@ fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Nod
                 recordPin(s, n.id, f.name, .input);
             }
         },
+        .event => {
+            // RFC-FLOW-VOCABULARY §3 — graph-level trigger. Visual cue:
+            // a trigger glyph and the dotted event name. Output pins
+            // are the event's payload fields (same source the `Emit`
+            // node's inputs use).
+            if (n.event_ref.len == 0) {
+                zgui.textDisabled("(no event selected)", .{});
+                return;
+            }
+            zgui.textColored(.{ 1.0, 0.78, 0.2, 1.0 }, ">>> {s}", .{n.event_ref});
+            const entry = event_catalog.lookup(n.event_ref) orelse {
+                zgui.textDisabled("(unknown event — no pins)", .{});
+                return;
+            };
+            var seen = PinNameSet.init(allocator);
+            defer seen.deinit();
+            for (entry.fields) |f| {
+                const dup = (seen.fetchPut(f.name, {}) catch null) != null;
+                if (dup) continue;
+                ne.beginPin(pinId(n.id, f.name, .output), .output);
+                zgui.text("{s}: {s} >", .{ f.name, f.type_name });
+                ne.endPin();
+                recordPin(s, n.id, f.name, .output);
+            }
+        },
+        .get_variable => {
+            // Reporter — one output pin `value`, typed to the variable.
+            zgui.textDisabled("get: {s}", .{n.variable_ref});
+            ne.beginPin(pinId(n.id, "value", .output), .output);
+            const var_type = lookupVariableType(s, n.variable_ref) orelse "?";
+            zgui.text("value: {s} >", .{var_type});
+            ne.endPin();
+            recordPin(s, n.id, "value", .output);
+        },
+        .set_variable => {
+            // Command — one input pin `value`, typed to the variable.
+            zgui.textDisabled("set: {s}", .{n.variable_ref});
+            ne.beginPin(pinId(n.id, "value", .input), .input);
+            const var_type = lookupVariableType(s, n.variable_ref) orelse "?";
+            zgui.text("> value: {s}", .{var_type});
+            ne.endPin();
+            recordPin(s, n.id, "value", .input);
+        },
+        .change_variable => {
+            zgui.textDisabled("change: {s} by {s}", .{ n.variable_ref, n.by_text });
+            ne.beginPin(pinId(n.id, "by", .input), .input);
+            const var_type = lookupVariableType(s, n.variable_ref) orelse "?";
+            zgui.text("> by: {s}", .{var_type});
+            ne.endPin();
+            recordPin(s, n.id, "by", .input);
+        },
+        .clear_variable => {
+            zgui.textDisabled("clear: {s}", .{n.variable_ref});
+        },
+        .has_value_variable => {
+            zgui.textDisabled("has value: {s}", .{n.variable_ref});
+            ne.beginPin(pinId(n.id, "value", .output), .output);
+            zgui.text("value: bool >", .{});
+            ne.endPin();
+            recordPin(s, n.id, "value", .output);
+        },
+        .custom_node => {
+            // Plugin/script-contributed FlowNode (RFC §1, §6). Render
+            // the catalog-derived pins: inputs above, output below. An
+            // unknown name renders no pins and surfaces a hint so the
+            // node still saves but the user knows it's unresolved.
+            if (n.custom_name.len == 0) {
+                zgui.textDisabled("(no FlowNode chosen)", .{});
+                return;
+            }
+            const entry = node_catalog.lookup(n.custom_name) orelse {
+                zgui.textDisabled("custom: {s}", .{n.custom_name});
+                zgui.textDisabled("(unknown FlowNode — codegen will validate)", .{});
+                return;
+            };
+            zgui.text("{s}", .{entry.display_name});
+            zgui.textDisabled("{s}", .{entry.name});
+            var seen_in = PinNameSet.init(allocator);
+            defer seen_in.deinit();
+            var seen_out = PinNameSet.init(allocator);
+            defer seen_out.deinit();
+            for (entry.pins) |p| switch (p.dir) {
+                .input => {
+                    const dup = (seen_in.fetchPut(p.name, {}) catch null) != null;
+                    if (dup) continue;
+                    ne.beginPin(pinId(n.id, p.name, .input), .input);
+                    zgui.text("> {s}: {s}", .{ p.label, p.type_name });
+                    ne.endPin();
+                    recordPin(s, n.id, p.name, .input);
+                },
+                .output => {
+                    const dup = (seen_out.fetchPut(p.name, {}) catch null) != null;
+                    if (dup) continue;
+                    ne.beginPin(pinId(n.id, p.name, .output), .output);
+                    zgui.text("{s}: {s} >", .{ p.label, p.type_name });
+                    ne.endPin();
+                    recordPin(s, n.id, p.name, .output);
+                },
+            };
+        },
         .other => {
             // Show extras as a compact hint so the user can tell nodes
             // apart even though the editor can't field-edit them.
@@ -1006,6 +1191,71 @@ fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Nod
             }
         },
     }
+}
+
+/// Per-node visual style — corner radius + border color. Drives the
+/// command vs reporter visual difference (RFC §6, phase 4 item 6).
+const NodeVisual = struct {
+    rounding: f32,
+    border: [4]f32,
+};
+
+/// Map a node kind to its visual treatment. Commands are rectangular
+/// (rounding 4), reporters rounded (rounding 14), the `Event` trigger
+/// stays command-shaped but with a warm border color so the entry point
+/// reads at a glance. Unknown kinds get the neutral default.
+fn nodeVisual(n: flow_io.Node) NodeVisual {
+    const command_round: f32 = 4.0;
+    const reporter_round: f32 = 14.0;
+    const neutral_border: [4]f32 = .{ 0.4, 0.4, 0.45, 1.0 };
+    const reporter_border: [4]f32 = .{ 0.4, 0.65, 0.45, 1.0 };
+    const command_border: [4]f32 = .{ 0.4, 0.55, 0.85, 1.0 };
+    const trigger_border: [4]f32 = .{ 0.95, 0.74, 0.2, 1.0 };
+
+    switch (n.kind) {
+        // Reporter ops (RFC §6) — rounded, green-ish border.
+        .get_variable, .has_value_variable, .param => return .{
+            .rounding = reporter_round,
+            .border = reporter_border,
+        },
+        // Command ops — rectangular, blue-ish border.
+        .set_variable, .change_variable, .clear_variable, .emit, .subflow, .output => return .{
+            .rounding = command_round,
+            .border = command_border,
+        },
+        // Event trigger — command shape with the warm "trigger" border.
+        .event => return .{
+            .rounding = command_round,
+            .border = trigger_border,
+        },
+        // CustomNode shape follows the catalog entry's kind. An unknown
+        // entry falls through to neutral so the user can still place it.
+        .custom_node => {
+            const entry = node_catalog.lookup(n.custom_name) orelse return .{
+                .rounding = command_round,
+                .border = neutral_border,
+            };
+            return switch (entry.kind) {
+                .command => .{ .rounding = command_round, .border = command_border },
+                .reporter => .{ .rounding = reporter_round, .border = reporter_border },
+            };
+        },
+        else => return .{
+            .rounding = command_round,
+            .border = neutral_border,
+        },
+    }
+}
+
+/// Look up the declared Zig type of a flow-scope variable by name.
+/// Returns null when the variable isn't declared — the canvas displays
+/// the value pin with a `?` placeholder so the unresolved binding is
+/// visible at a glance.
+fn lookupVariableType(s: *FlowDocState, name: []const u8) ?[]const u8 {
+    for (s.doc.variables) |v| {
+        if (std.mem.eql(u8, v.name, name)) return v.type_name;
+    }
+    return null;
 }
 
 // ─── Subflow reference resolution ───────────────────────────────────────
@@ -1221,6 +1471,9 @@ fn renderInspector(s: *FlowDocState) void {
     renderEventEditor(s);
     zgui.spacing();
     zgui.separator();
+    renderVariablesSidebar(s);
+    zgui.spacing();
+    zgui.separator();
     renderParamsEditor(s);
     zgui.spacing();
     zgui.separator();
@@ -1233,6 +1486,45 @@ fn renderInspector(s: *FlowDocState) void {
 fn renderEventEditor(s: *FlowDocState) void {
     zgui.text("Event", .{});
     const a = s.doc.allocator();
+
+    // v2-form flows (RFC-FLOW-VOCABULARY §3) declare their trigger ON
+    // the canvas as one or more `Event` nodes — no file-level header.
+    // Show a hint surfacing the on-canvas trigger(s) and offer to opt
+    // back into the legacy header for projects that still need it.
+    if (!s.doc.event_present) {
+        var event_node_count: usize = 0;
+        var first_name: []const u8 = "";
+        for (s.doc.nodes) |n| if (n.kind == .event) {
+            if (event_node_count == 0) first_name = n.event_ref;
+            event_node_count += 1;
+        };
+        if (event_node_count == 0) {
+            zgui.textColored(
+                .{ 1.0, 0.65, 0.2, 1.0 },
+                "(no trigger — add an Event node or restore the legacy header)",
+                .{},
+            );
+        } else if (event_node_count == 1) {
+            zgui.textDisabled(
+                "Trigger on canvas: Event \"{s}\"",
+                .{first_name},
+            );
+        } else {
+            zgui.textDisabled(
+                "Multi-trigger flow ({d} Event nodes on canvas)",
+                .{event_node_count},
+            );
+        }
+        if (zgui.smallButton("+ Restore legacy event header")) {
+            s.doc.event = .{
+                .type_name = a.dupe(u8, "OnCreate") catch s.doc.event.type_name,
+            };
+            s.doc.event_present = true;
+            s.is_dirty = true;
+        }
+        return;
+    }
+
     // Static event buffer — re-seeded each frame from the doc so an
     // external reload (none in v1) wouldn't desync, and so the buffer
     // tracks the current value.
@@ -1252,6 +1544,108 @@ fn renderEventEditor(s: *FlowDocState) void {
     // explaining what it is plus a one-click converter.
     if (std.mem.eql(u8, s.doc.event.type_name, "OnEvent")) {
         renderOnEventEditor(s);
+    }
+}
+
+/// Variables sidebar (RFC-FLOW-VOCABULARY §4, item 3) — list the flow's
+/// declared `variables` grouped by Zig type, with `+ Get` / `+ Set` /
+/// `+ Change` (and `+ Clear` / `+ Has Value` for nullables) drop
+/// buttons that synthesize a variable-op node onto the canvas.
+fn renderVariablesSidebar(s: *FlowDocState) void {
+    zgui.text("Variables", .{});
+    zgui.textDisabled("Flow-scope persistent state (RFC §4).", .{});
+
+    const a = s.doc.allocator();
+    var remove_idx: ?usize = null;
+    var id_buf: [64]u8 = undefined;
+
+    if (s.doc.variables.len == 0) {
+        zgui.textDisabled("(none — add one below)", .{});
+    }
+
+    // Group by `type_name` so two `i32` vars sit under one heading. The
+    // assembler's discovery walk is unsorted; we list types in their
+    // first-appearance order for stable rendering. Backed by a stack
+    // buffer — a flow with >32 distinct variable types is implausible
+    // in practice, and the overflow falls through silently (the variable
+    // still renders, just under no type heading).
+    var type_buf: [32][]const u8 = undefined;
+    var type_count: usize = 0;
+    for (s.doc.variables) |v| {
+        var already = false;
+        for (type_buf[0..type_count]) |t| if (std.mem.eql(u8, t, v.type_name)) {
+            already = true;
+            break;
+        };
+        if (!already and type_count < type_buf.len) {
+            type_buf[type_count] = v.type_name;
+            type_count += 1;
+        }
+    }
+
+    for (type_buf[0..type_count]) |type_name| {
+        zgui.textColored(.{ 0.6, 0.85, 1.0, 1.0 }, "  {s}", .{type_name});
+        for (s.doc.variables, 0..) |*v, i| {
+            if (!std.mem.eql(u8, v.type_name, type_name)) continue;
+            zgui.pushIntId(@intCast(i));
+            defer zgui.popId();
+
+            // Name editor.
+            zgui.setNextItemWidth(120);
+            var name_buf: IdentBuf = undefined;
+            seedBuf(&name_buf, v.name);
+            const name_id = std.fmt.bufPrintZ(&id_buf, "##vname{d}", .{i}) catch "##vn";
+            if (zgui.inputText(name_id, .{ .buf = &name_buf })) {
+                v.name = dupZ(a, &name_buf) catch v.name;
+                s.is_dirty = true;
+            }
+            zgui.sameLine(.{});
+
+            // Default editor (canonical JSON text).
+            zgui.setNextItemWidth(90);
+            var def_buf: ValueBuf = undefined;
+            seedBuf(&def_buf, v.default_text);
+            const def_id = std.fmt.bufPrintZ(&id_buf, "##vdef{d}", .{i}) catch "##vd";
+            if (zgui.inputText(def_id, .{ .buf = &def_buf })) {
+                const txt = std.mem.sliceTo(&def_buf, 0);
+                v.default_text = flow_io.normalizeValueText(a, txt) catch v.default_text;
+                s.is_dirty = true;
+            }
+            zgui.sameLine(.{});
+            const x_id = std.fmt.bufPrintZ(&id_buf, "x##vx{d}", .{i}) catch "x";
+            if (zgui.smallButton(x_id)) remove_idx = i;
+
+            // `+ Get / + Set / + Change` (+ Clear / Has Value for nullables)
+            // synthesize one of the variable-op nodes (RFC §4) pre-named
+            // to this variable, so the author isn't retyping a name.
+            const get_id = std.fmt.bufPrintZ(&id_buf, "Get##g{d}", .{i}) catch "Get";
+            if (zgui.smallButton(get_id)) addVarOpNode(s, .get_variable, v.name) catch |err| nodeAddErr(err);
+            zgui.sameLine(.{});
+            const set_id = std.fmt.bufPrintZ(&id_buf, "Set##s{d}", .{i}) catch "Set";
+            if (zgui.smallButton(set_id)) addVarOpNode(s, .set_variable, v.name) catch |err| nodeAddErr(err);
+            zgui.sameLine(.{});
+            const chg_id = std.fmt.bufPrintZ(&id_buf, "Change##c{d}", .{i}) catch "Change";
+            if (zgui.smallButton(chg_id)) addVarOpNode(s, .change_variable, v.name) catch |err| nodeAddErr(err);
+            if (v.isNullable()) {
+                zgui.sameLine(.{});
+                const clr_id = std.fmt.bufPrintZ(&id_buf, "Clear##cl{d}", .{i}) catch "Clear";
+                if (zgui.smallButton(clr_id)) addVarOpNode(s, .clear_variable, v.name) catch |err| nodeAddErr(err);
+                zgui.sameLine(.{});
+                const hv_id = std.fmt.bufPrintZ(&id_buf, "HasValue##hv{d}", .{i}) catch "HasValue";
+                if (zgui.smallButton(hv_id)) addVarOpNode(s, .has_value_variable, v.name) catch |err| nodeAddErr(err);
+            }
+        }
+    }
+
+    if (zgui.button("+ Add variable", .{})) {
+        appendVariable(s) catch |err| {
+            std.log.err("flow: add variable failed: {s}", .{@errorName(err)});
+        };
+    }
+    if (remove_idx) |idx| {
+        removeVariable(s, idx) catch |err| {
+            std.log.err("flow: remove variable failed: {s}", .{@errorName(err)});
+        };
     }
 }
 
@@ -1464,24 +1858,155 @@ fn renderParamsEditor(s: *FlowDocState) void {
 }
 
 fn renderNodePalette(s: *FlowDocState) void {
-    zgui.text("Add node", .{});
-    if (zgui.button("+ Subflow", .{})) {
-        addNode(s, .subflow) catch |err| nodeAddErr(err);
+    zgui.text("Palette", .{});
+    zgui.textDisabled("Built-in node types.", .{});
+
+    // ── Built-in section ──
+    // Composition + control: Event (trigger), the variable ops, Subflow,
+    // Param, Output, Emit. The raw `Call` escape hatch lives under
+    // "Add raw call…" below, not on the default palette (RFC §7).
+    if (zgui.button("+ Event", .{})) {
+        addNode(s, .event) catch |err| nodeAddErr(err);
     }
     zgui.sameLine(.{});
-    if (zgui.button("+ Param", .{})) {
-        addNode(s, .param) catch |err| nodeAddErr(err);
+    if (zgui.button("+ Subflow", .{})) addNode(s, .subflow) catch |err| nodeAddErr(err);
+    zgui.sameLine(.{});
+    if (zgui.button("+ Param", .{})) addNode(s, .param) catch |err| nodeAddErr(err);
+    zgui.sameLine(.{});
+    if (zgui.button("+ Output", .{})) addNode(s, .output) catch |err| nodeAddErr(err);
+    if (zgui.button("+ Emit", .{})) addNode(s, .emit) catch |err| nodeAddErr(err);
+    zgui.sameLine(.{});
+    if (zgui.button("+ Get/Set/Change Variable", .{})) addNode(s, .get_variable) catch |err| nodeAddErr(err);
+
+    // Raw `Call` escape hatch (RFC §7) — surfaced separately so a user
+    // who finds it has knowingly opted into raw Zig source rather than
+    // mistaking it for a normal palette entry.
+    zgui.spacing();
+    if (zgui.button("+ Add raw call...", .{})) {
+        zgui.openPopup("##raw_call_dialog", .{});
     }
     zgui.sameLine(.{});
-    if (zgui.button("+ Output", .{})) {
-        addNode(s, .output) catch |err| nodeAddErr(err);
+    zgui.textDisabled("(escape hatch — drops Zig source)", .{});
+    renderRawCallDialog(s);
+
+    // ── Per-plugin sections (RFC §1, §6) ──
+    // For phase 4 MVP this walks the static `flow_node_catalog`.
+    // TODO(O1 follow-up): replace with an assembler-emitted sidecar so
+    // the palette tracks every plugin the project links —
+    // labelle-box2d, future plugins, and the game's own
+    // `scripts/<module>.zig` FlowNodes blocks.
+    zgui.spacing();
+    zgui.separator();
+    zgui.text("Plugins", .{});
+    renderPluginPaletteSections(s);
+}
+
+/// Render one collapsible header per discovered category (RFC §6 —
+/// palette grouped by plugin / category). Walks the static
+/// `flow_node_catalog.entries`.
+fn renderPluginPaletteSections(s: *FlowDocState) void {
+    // Walk categories in order of first appearance — same order the
+    // static catalog lists them, which is the assembler's discovery
+    // order in practice. Stack-buffered cap of 16 categories
+    // comfortably covers labelle-box2d + a future handful of plugins.
+    var cat_buf: [16][]const u8 = undefined;
+    var cat_count: usize = 0;
+    for (node_catalog.entries) |e| {
+        var already = false;
+        for (cat_buf[0..cat_count]) |c| if (std.mem.eql(u8, c, e.category)) {
+            already = true;
+            break;
+        };
+        if (!already and cat_count < cat_buf.len) {
+            cat_buf[cat_count] = e.category;
+            cat_count += 1;
+        }
     }
-    zgui.sameLine(.{});
-    // `Emit` fires a custom event (RFC-PLUGIN-EVENTS §8). The new node's
-    // event_ref starts empty so the inspector dropdown can drive the
-    // first selection.
-    if (zgui.button("+ Emit", .{})) {
-        addNode(s, .emit) catch |err| nodeAddErr(err);
+
+    var label_buf: [128:0]u8 = undefined;
+    for (cat_buf[0..cat_count]) |category| {
+        const label = std.fmt.bufPrintZ(&label_buf, "{s}##cat_{s}", .{ category, category }) catch continue;
+        if (zgui.collapsingHeader(label, .{ .default_open = true })) {
+            for (node_catalog.entries) |e| {
+                if (!std.mem.eql(u8, e.category, category)) continue;
+
+                // Color-code by command/reporter so a glance at the
+                // palette communicates the visual shape the canvas will
+                // give the dropped node (RFC §6).
+                const kind_color: [4]f32 = switch (e.kind) {
+                    .command => .{ 0.6, 0.85, 1.0, 1.0 },
+                    .reporter => .{ 0.7, 0.95, 0.7, 1.0 },
+                };
+                _ = kind_color;
+
+                // Button label includes the display name; the dotted
+                // form goes in the tooltip.
+                var btn_buf: [256:0]u8 = undefined;
+                const btn = std.fmt.bufPrintZ(
+                    &btn_buf,
+                    "+ {s}##plug_{s}",
+                    .{ e.display_name, e.name },
+                ) catch continue;
+                if (zgui.button(btn, .{})) {
+                    addCustomNode(s, e.name) catch |err| nodeAddErr(err);
+                }
+                if (zgui.isItemHovered(.{})) {
+                    if (zgui.beginTooltip()) {
+                        zgui.text("{s}", .{e.name});
+                        if (e.docs.len > 0) {
+                            zgui.spacing();
+                            zgui.text("{s}", .{e.docs});
+                        }
+                        zgui.spacing();
+                        zgui.textDisabled("{s}", .{@tagName(e.kind)});
+                        zgui.endTooltip();
+                    }
+                }
+            }
+        }
+    }
+    if (cat_count == 0) {
+        zgui.textDisabled("(no plugin FlowNodes discovered)", .{});
+    }
+}
+
+/// "Add raw call…" modal (RFC §7). Captures the Zig source text the
+/// `Call` node's `callee` field will hold. The raw Call node is *off*
+/// the default palette — surfaced here so a user has to knowingly opt
+/// in rather than misuse it as a generic node.
+fn renderRawCallDialog(s: *FlowDocState) void {
+    // One stable buffer per session — the modal is non-modal, so the
+    // user can type freely and we don't lose state on a missed click.
+    // Buffer is `static`-equivalent via a `struct {}` namespace.
+    const dlg = struct {
+        var text: [256:0]u8 = .{0} ** 256;
+    };
+
+    if (zgui.beginPopupModal("##raw_call_dialog", .{ .flags = .{ .always_auto_resize = true } })) {
+        zgui.text("Add raw Call node (RFC §7 escape hatch)", .{});
+        zgui.textDisabled("Drops a `Call` node carrying the Zig source text below.", .{});
+        zgui.textDisabled("Pin interface is unknown to the editor — codegen lowers it directly.", .{});
+        zgui.spacing();
+        zgui.setNextItemWidth(360);
+        _ = zgui.inputText("##raw_call_text", .{ .buf = &dlg.text });
+        zgui.sameLine(.{});
+        zgui.textDisabled("callee (Zig expression)", .{});
+        zgui.spacing();
+        if (zgui.button("Add", .{})) {
+            const txt = std.mem.sliceTo(&dlg.text, 0);
+            if (txt.len > 0) {
+                addRawCallNode(s, txt) catch |err| {
+                    std.log.err("flow: add raw call failed: {s}", .{@errorName(err)});
+                };
+                @memset(&dlg.text, 0);
+            }
+            zgui.closeCurrentPopup();
+        }
+        zgui.sameLine(.{});
+        if (zgui.button("Cancel", .{})) {
+            zgui.closeCurrentPopup();
+        }
+        zgui.endPopup();
     }
 }
 
@@ -1578,6 +2103,36 @@ fn renderSelectedNode(s: *FlowDocState) void {
                     zgui.textDisabled("— {s}", .{entry.description});
                 }
             }
+        },
+        .event => {
+            // RFC-FLOW-VOCABULARY §3 — graph-level trigger. Same picker
+            // as `Emit`, different role (output pins, not input).
+            zgui.text("Event name", .{});
+            renderEventNameCombo(s, "##event_node_name", &n.event_ref);
+            if (n.event_ref.len > 0 and !event_catalog.isKnown(n.event_ref)) {
+                zgui.textColored(
+                    .{ 1.0, 0.65, 0.2, 1.0 },
+                    "(unknown event — codegen will validate against PluginEvents)",
+                    .{},
+                );
+            }
+            if (event_catalog.lookup(n.event_ref)) |entry| {
+                zgui.spacing();
+                zgui.textDisabled("Payload (exposed as output pins):", .{});
+                for (entry.fields) |f| {
+                    zgui.bulletText("{s}: {s}", .{ f.name, f.type_name });
+                }
+                if (entry.description.len > 0) {
+                    zgui.spacing();
+                    zgui.textDisabled("— {s}", .{entry.description});
+                }
+            }
+        },
+        .get_variable, .set_variable, .change_variable, .clear_variable, .has_value_variable => {
+            renderVariableOpInspector(s, n);
+        },
+        .custom_node => {
+            renderCustomNodeInspector(s, n);
         },
         .other => {
             if (flow_io.otherFieldSpec(n.type_name)) |spec| {
@@ -1782,6 +2337,160 @@ fn renderOtherField(s: *FlowDocState, n: *flow_io.Node, spec: flow_io.OtherField
     }
 }
 
+/// Inspector for the variable-op nodes (RFC §4). Lets the user pick
+/// which declared variable to target (with a free-text fallback so a
+/// project-local variable not in `s.doc.variables` doesn't deadlock the
+/// editor) and edit the inline `by` literal on `ChangeVariable`. A
+/// `ClearVariable` / `HasValueVariable` on a non-nullable variable is
+/// flagged — codegen rejects it at build time per RFC §4.
+fn renderVariableOpInspector(s: *FlowDocState, n: *flow_io.Node) void {
+    const a = s.doc.allocator();
+    zgui.text("Variable", .{});
+    var preview: IdentBuf = undefined;
+    seedBuf(&preview, n.variable_ref);
+    if (zgui.beginCombo("##var_target", .{ .preview_value = &preview })) {
+        if (zgui.selectable("<choose>", .{ .selected = n.variable_ref.len == 0 })) {
+            n.variable_ref = a.dupe(u8, "") catch n.variable_ref;
+            s.is_dirty = true;
+        }
+        for (s.doc.variables) |v| {
+            var row: IdentBuf = undefined;
+            seedBuf(&row, v.name);
+            const sel = std.mem.eql(u8, v.name, n.variable_ref);
+            if (zgui.selectable(&row, .{ .selected = sel })) {
+                if (!sel) {
+                    n.variable_ref = a.dupe(u8, v.name) catch n.variable_ref;
+                    s.is_dirty = true;
+                }
+            }
+            if (zgui.isItemHovered(.{})) {
+                if (zgui.beginTooltip()) {
+                    zgui.text("{s}: {s}", .{ v.name, v.type_name });
+                    zgui.endTooltip();
+                }
+            }
+        }
+        zgui.endCombo();
+    }
+    // Free-text fallback so a variable declared in a referenced file (or
+    // not yet declared) doesn't block authoring.
+    var fb_buf: IdentBuf = undefined;
+    seedBuf(&fb_buf, n.variable_ref);
+    zgui.setNextItemWidth(160);
+    if (zgui.inputText("##var_target_text", .{ .buf = &fb_buf })) {
+        const raw = std.mem.sliceTo(&fb_buf, 0);
+        n.variable_ref = a.dupe(u8, raw) catch n.variable_ref;
+        s.is_dirty = true;
+    }
+    zgui.sameLine(.{});
+    zgui.textDisabled("(or type a name)", .{});
+
+    // Surface the variable's type when known so the inspector reads at
+    // a glance.
+    for (s.doc.variables) |v| {
+        if (std.mem.eql(u8, v.name, n.variable_ref)) {
+            zgui.textDisabled("type: {s}", .{v.type_name});
+            // Nullability gate for Clear/HasValue (RFC §4).
+            if ((n.kind == .clear_variable or n.kind == .has_value_variable) and !v.isNullable()) {
+                zgui.textColored(
+                    .{ 1.0, 0.4, 0.4, 1.0 },
+                    "(needs a nullable `?T` variable)",
+                    .{},
+                );
+            }
+            break;
+        }
+    } else {
+        if (n.variable_ref.len > 0) {
+            zgui.textColored(
+                .{ 1.0, 0.65, 0.2, 1.0 },
+                "(undeclared — declare it in the Variables panel)",
+                .{},
+            );
+        }
+    }
+
+    // `ChangeVariable.by` inline literal — Scratch-style "change X by [N]".
+    if (n.kind == .change_variable) {
+        zgui.spacing();
+        zgui.text("Inline `by` (JSON literal)", .{});
+        var by_buf: ValueBuf = undefined;
+        seedBuf(&by_buf, n.by_text);
+        if (zgui.inputText("##var_by", .{ .buf = &by_buf })) {
+            const txt = std.mem.sliceTo(&by_buf, 0);
+            n.by_text = if (txt.len == 0)
+                (a.dupe(u8, "1") catch n.by_text)
+            else
+                (flow_io.normalizeValueText(a, txt) catch n.by_text);
+            s.is_dirty = true;
+        }
+    }
+}
+
+/// Inspector for plugin/script-contributed FlowNode references
+/// (`CustomNode` — RFC §1, §6). Dropdown sourced from
+/// `flow_node_catalog`, free-text fallback for entries not yet in the
+/// static catalog.
+fn renderCustomNodeInspector(s: *FlowDocState, n: *flow_io.Node) void {
+    const a = s.doc.allocator();
+    zgui.text("FlowNode (dotted name)", .{});
+
+    var preview: IdentBuf = undefined;
+    seedBuf(&preview, n.custom_name);
+    if (zgui.beginCombo("##custom_target", .{ .preview_value = &preview })) {
+        if (zgui.selectable("<choose>", .{ .selected = n.custom_name.len == 0 })) {
+            n.custom_name = a.dupe(u8, "") catch n.custom_name;
+            s.is_dirty = true;
+        }
+        for (node_catalog.entries) |entry| {
+            var row: IdentBuf = undefined;
+            seedBuf(&row, entry.name);
+            const sel = std.mem.eql(u8, entry.name, n.custom_name);
+            if (zgui.selectable(&row, .{ .selected = sel })) {
+                if (!sel) {
+                    n.custom_name = a.dupe(u8, entry.name) catch n.custom_name;
+                    s.is_dirty = true;
+                }
+            }
+            if (entry.docs.len > 0 and zgui.isItemHovered(.{})) {
+                if (zgui.beginTooltip()) {
+                    zgui.text("{s}", .{entry.docs});
+                    zgui.endTooltip();
+                }
+            }
+        }
+        zgui.endCombo();
+    }
+    var fb_buf: IdentBuf = undefined;
+    seedBuf(&fb_buf, n.custom_name);
+    zgui.setNextItemWidth(200);
+    if (zgui.inputText("##custom_target_text", .{ .buf = &fb_buf })) {
+        const raw = std.mem.sliceTo(&fb_buf, 0);
+        n.custom_name = a.dupe(u8, raw) catch n.custom_name;
+        s.is_dirty = true;
+    }
+    zgui.sameLine(.{});
+    zgui.textDisabled("(or type a dotted name)", .{});
+
+    if (node_catalog.lookup(n.custom_name)) |entry| {
+        zgui.spacing();
+        zgui.textDisabled("Kind: {s}", .{@tagName(entry.kind)});
+        if (entry.docs.len > 0) zgui.textDisabled("— {s}", .{entry.docs});
+        zgui.spacing();
+        zgui.textDisabled("Pins:", .{});
+        for (entry.pins) |p| {
+            const arrow: []const u8 = if (p.dir == .input) "→" else "←";
+            zgui.bulletText("{s} {s}: {s}", .{ arrow, p.label, p.type_name });
+        }
+    } else if (n.custom_name.len > 0) {
+        zgui.textColored(
+            .{ 1.0, 0.65, 0.2, 1.0 },
+            "(unknown FlowNode — codegen will validate against PluginFlowNodes)",
+            .{},
+        );
+    }
+}
+
 /// Render a recognised field whose stored value is too long for the
 /// inline editor. The value is shown in a disabled (read-only) input so
 /// the user can see it in full-ish, with a hint explaining why it can't
@@ -1803,6 +2512,103 @@ fn renderTooLongField(value: []const u8) void {
 }
 
 // ─── Mutators ───────────────────────────────────────────────────────────
+
+fn appendVariable(s: *FlowDocState) !void {
+    const a = s.doc.allocator();
+    const out = try a.alloc(flow_io.Variable, s.doc.variables.len + 1);
+    @memcpy(out[0..s.doc.variables.len], s.doc.variables);
+    out[s.doc.variables.len] = .{
+        .name = try a.dupe(u8, "var"),
+        .type_name = try a.dupe(u8, "i32"),
+        .default_text = try a.dupe(u8, "0"),
+    };
+    s.doc.variables = out;
+    s.is_dirty = true;
+}
+
+fn removeVariable(s: *FlowDocState, idx: usize) !void {
+    const a = s.doc.allocator();
+    s.doc.variables = try removeAt(flow_io.Variable, a, s.doc.variables, idx);
+    s.is_dirty = true;
+}
+
+/// Synthesize a variable-op node (RFC §4) pre-named to `var_name`. The
+/// variables sidebar uses this so the user doesn't retype the variable
+/// name once it is already declared.
+fn addVarOpNode(s: *FlowDocState, kind: flow_io.NodeKind, var_name: []const u8) !void {
+    const a = s.doc.allocator();
+    const id = s.doc.nextNodeId();
+    const type_name = kind.typeName() orelse return error.UnsupportedKind;
+    const offset: f32 = @floatFromInt((s.doc.nodes.len % 8) * 30);
+    var node: flow_io.Node = .{
+        .id = id,
+        .type_name = try a.dupe(u8, type_name),
+        .kind = kind,
+        .pos = .{ 240 + offset, 40 + offset },
+        .variable_ref = try a.dupe(u8, var_name),
+    };
+    // `ChangeVariable` defaults to `by: 1` — codegen treats omitted `by`
+    // the same way, but materialize it on save so the file is
+    // self-describing (see the RFC-vocabulary "ChangeVariable defaults
+    // to by:1" round-trip test).
+    if (kind == .change_variable) node.by_text = try a.dupe(u8, "1");
+    s.doc.nodes = try growNodes(a, s.doc.nodes, node);
+    s.needs_layout = true;
+    s.is_dirty = true;
+}
+
+/// Synthesize a `CustomNode` for the named plugin FlowNode. The palette
+/// section per-plugin uses this when the user clicks an entry.
+fn addCustomNode(s: *FlowDocState, name: []const u8) !void {
+    const a = s.doc.allocator();
+    const id = s.doc.nextNodeId();
+    const offset: f32 = @floatFromInt((s.doc.nodes.len % 8) * 30);
+    const node: flow_io.Node = .{
+        .id = id,
+        .type_name = try a.dupe(u8, "CustomNode"),
+        .kind = .custom_node,
+        .pos = .{ 240 + offset, 60 + offset },
+        .custom_name = try a.dupe(u8, name),
+    };
+    s.doc.nodes = try growNodes(a, s.doc.nodes, node);
+    s.needs_layout = true;
+    s.is_dirty = true;
+}
+
+/// Synthesize a raw `Call` node (RFC §7 escape hatch). The `callee`
+/// text is whatever the dialog captured — Zig source, evaluated by the
+/// generated module's surrounding scope.
+fn addRawCallNode(s: *FlowDocState, callee: []const u8) !void {
+    const a = s.doc.allocator();
+    const id = s.doc.nextNodeId();
+    const offset: f32 = @floatFromInt((s.doc.nodes.len % 8) * 30);
+
+    // Encode the callee as a JSON-string extras value so the
+    // deterministic writer emits it verbatim. `Call` is registered as
+    // an `.other` kind with `callee` in `extras`.
+    var encoded_buf: std.ArrayList(u8) = .empty;
+    defer encoded_buf.deinit(a);
+    {
+        // Inline JSON-string-quote `callee` into `encoded_buf`. Keep
+        // the encoder in step with flow_io.encodeStringValue.
+        const encoded = try flow_io.encodeStringValue(a, callee);
+        defer a.free(encoded);
+        try encoded_buf.appendSlice(a, encoded);
+    }
+
+    var node: flow_io.Node = .{
+        .id = id,
+        .type_name = try a.dupe(u8, "Call"),
+        .kind = .other,
+        .pos = .{ 240 + offset, 60 + offset },
+    };
+    // Put the `callee` key in extras — `flow_io.other_field_specs` already
+    // declares "Call" as field-editable on `callee`.
+    try flow_io.setExtraValue(a, &node, "callee", encoded_buf.items);
+    s.doc.nodes = try growNodes(a, s.doc.nodes, node);
+    s.needs_layout = true;
+    s.is_dirty = true;
+}
 
 fn appendParam(s: *FlowDocState) !void {
     const a = s.doc.allocator();
@@ -1842,7 +2648,15 @@ fn addNode(s: *FlowDocState, kind: flow_io.NodeKind) !void {
         // dropdown will let the user pick one from the catalog. Codegen
         // would reject an unwired Emit at build time; the editor surfaces
         // a "no event selected" hint on the canvas in the meantime.
-        .emit => node.event_ref = try a.dupe(u8, ""),
+        .emit, .event => node.event_ref = try a.dupe(u8, ""),
+        .get_variable, .set_variable, .clear_variable, .has_value_variable => {
+            node.variable_ref = try a.dupe(u8, "");
+        },
+        .change_variable => {
+            node.variable_ref = try a.dupe(u8, "");
+            node.by_text = try a.dupe(u8, "1");
+        },
+        .custom_node => node.custom_name = try a.dupe(u8, ""),
         .other => unreachable,
     }
     s.doc.nodes = try growNodes(a, s.doc.nodes, node);

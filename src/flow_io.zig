@@ -75,6 +75,38 @@ pub const NodeKind = enum {
     /// codegen reflects the same fields from the assembler-built
     /// `PluginEvents` / `GameEvents` union at build time.
     emit,
+    /// Graph-level event trigger (RFC-FLOW-VOCABULARY §3). Replaces the
+    /// file-level `event:` header for new-form flows. Carries the dotted
+    /// event name in `event_ref`; payload fields are surfaced as output
+    /// pins reflected from the editor's event catalog (same source the
+    /// `Emit` node uses for its inputs).
+    event,
+    /// Read a declared `Variable` (RFC-FLOW-VOCABULARY §4). Reporter
+    /// node — one output pin `value` typed to the variable's declared
+    /// type. The targeted variable name lives in `variable_ref`.
+    get_variable,
+    /// Write a declared `Variable` (RFC-FLOW-VOCABULARY §4). Command
+    /// node — one input pin `value`. Targets `variable_ref`.
+    set_variable,
+    /// Increment/toggle a declared `Variable` (RFC-FLOW-VOCABULARY §4).
+    /// Command node. The increment is the wired `by` input pin or, when
+    /// no wire is attached, the inline `by_text` literal (the
+    /// Scratch-style "change X by [1]" knob). Defaults to `"1"`.
+    change_variable,
+    /// Clear a nullable `?T` `Variable` (RFC-FLOW-VOCABULARY §4 —
+    /// nullable variable operations). Command node, no extra pins.
+    clear_variable,
+    /// Reporter on a nullable `?T` `Variable` — `bool` output pin
+    /// `value` evaluating to `<var> != null`.
+    has_value_variable,
+    /// Plugin- or game-script-contributed `FlowNode` (RFC-FLOW-VOCABULARY
+    /// §1, §6). Names a `pub const` decl on some module's `FlowNodes`
+    /// block by its dotted form (`"box2d.apply_impulse"`) — codegen
+    /// resolves it through the assembler-emitted `PluginFlowNodes`
+    /// registry at build time. The editor uses a static catalog
+    /// (`flow_node_catalog`) to surface pin labels + command/reporter
+    /// kind until the assembler-emitted sidecar lands.
+    custom_node,
     /// Any other node type — kind preserved as a string in `type_name`.
     other,
 
@@ -83,6 +115,13 @@ pub const NodeKind = enum {
         if (std.mem.eql(u8, name, "Param")) return .param;
         if (std.mem.eql(u8, name, "Output")) return .output;
         if (std.mem.eql(u8, name, "Emit")) return .emit;
+        if (std.mem.eql(u8, name, "Event")) return .event;
+        if (std.mem.eql(u8, name, "GetVariable")) return .get_variable;
+        if (std.mem.eql(u8, name, "SetVariable")) return .set_variable;
+        if (std.mem.eql(u8, name, "ChangeVariable")) return .change_variable;
+        if (std.mem.eql(u8, name, "ClearVariable")) return .clear_variable;
+        if (std.mem.eql(u8, name, "HasValueVariable")) return .has_value_variable;
+        if (std.mem.eql(u8, name, "CustomNode")) return .custom_node;
         return .other;
     }
 
@@ -94,6 +133,13 @@ pub const NodeKind = enum {
             .param => "Param",
             .output => "Output",
             .emit => "Emit",
+            .event => "Event",
+            .get_variable => "GetVariable",
+            .set_variable => "SetVariable",
+            .change_variable => "ChangeVariable",
+            .clear_variable => "ClearVariable",
+            .has_value_variable => "HasValueVariable",
+            .custom_node => "CustomNode",
             .other => null,
         };
     }
@@ -151,10 +197,29 @@ pub const Node = struct {
     /// The result-pin name this node names. Empty for non-Output.
     output_name: []const u8 = "",
 
-    // ── Emit-specific ──
-    /// Dotted event name (`"<plugin>.<event>"` or a bare game event name)
-    /// fired by this `Emit` node (RFC-PLUGIN-EVENTS §8). Empty for non-Emit.
+    // ── Emit-specific / Event-specific ──
+    /// Dotted event name (`"<plugin>.<event>"` or a bare game event name).
+    /// Used by `Emit` (the event the node fires) and `Event` (the trigger
+    /// the flow handles, RFC-FLOW-VOCABULARY §3). Empty for other kinds.
     event_ref: []const u8 = "",
+
+    // ── Variable-op-specific ──
+    /// The declared variable this node reads or writes (RFC-FLOW-VOCABULARY
+    /// §4). Set on `GetVariable` / `SetVariable` / `ChangeVariable` /
+    /// `ClearVariable` / `HasValueVariable`. Empty otherwise.
+    variable_ref: []const u8 = "",
+    /// Inline increment literal for `ChangeVariable`. Canonical JSON value
+    /// text — defaults to `"1"` when the node is created without one,
+    /// matching codegen's default. An incoming wire on the `by` pin still
+    /// takes precedence at codegen time. Empty for other kinds.
+    by_text: []const u8 = "",
+
+    // ── CustomNode-specific ──
+    /// Dotted plugin-FlowNode name (`"box2d.apply_impulse"`) when this is
+    /// a `CustomNode`. The editor resolves it through `flow_node_catalog`
+    /// to draw pin labels; codegen resolves it through the assembler's
+    /// `PluginFlowNodes.resolve` at build time. Empty for other kinds.
+    custom_name: []const u8 = "",
 
     /// Verbatim key/value pairs not modeled above. Keys are emitted in
     /// sorted order so the writer is deterministic. Values are canonical
@@ -167,6 +232,34 @@ pub const Node = struct {
 pub const KeyValue = struct {
     key: []const u8,
     value_text: []const u8,
+};
+
+/// One declared flow-scope variable (RFC-FLOW-VOCABULARY §4 — top-level
+/// `variables` block). Lowers in codegen to a file-scope
+/// `var <name>: <type> = <default>;` in the generated `.zig` module —
+/// persistent across handler invocations, invisible to other flows.
+/// `GetVariable` / `SetVariable` / `ChangeVariable` / `ClearVariable` /
+/// `HasValueVariable` nodes read and write it.
+pub const Variable = struct {
+    /// Zig identifier — the variable's symbol in the generated module.
+    name: []const u8,
+    /// Zig type-name text — `"i32"`, `"f32"`, `"bool"`, `"?EntityId"`, …
+    /// Stored verbatim; codegen emits it unchanged. A leading `?` marks
+    /// a nullable variable (the only kind `ClearVariable` /
+    /// `HasValueVariable` accept).
+    type_name: []const u8,
+    /// Canonical JSON text of the variable's initial value (e.g. `0`,
+    /// `true`, `null`, `1.5`, `"idle"`). Same encoding as `Param.default`.
+    /// Required by codegen — every variable declares a default — so the
+    /// editor enforces a non-null `default_text` on save.
+    default_text: []const u8,
+
+    /// True when this variable's `type_name` starts with `?` — the only
+    /// shape `ClearVariable` and `HasValueVariable` accept. Pure helper
+    /// so callers don't sprinkle `startsWith(?)` checks across the UI.
+    pub fn isNullable(self: Variable) bool {
+        return self.type_name.len > 0 and self.type_name[0] == '?';
+    }
 };
 
 // ─── Typed editing of `.other` node fields ─────────────────────────────
@@ -480,7 +573,17 @@ pub const FlowDoc = struct {
     /// is the filename basename (RFC §5).
     name: ?[]const u8 = null,
     event: Event = .{},
+    /// True when the source file carried a `"event"` header — the
+    /// editor needs to track this separately so a flow that declares
+    /// its trigger via in-graph `Event` nodes (RFC-FLOW-VOCABULARY §3)
+    /// doesn't get an `OnCreate` header injected on save. The writer
+    /// emits the header only when `event_present` is true.
+    event_present: bool = false,
     params: []Param = &.{},
+    /// Top-level declared variables (RFC-FLOW-VOCABULARY §4). Empty for
+    /// flows that declare none — absence in the source file is
+    /// indistinguishable from `"variables": []`.
+    variables: []Variable = &.{},
     nodes: []Node = &.{},
     edges: []Edge = &.{},
     /// Highest node id seen — the editor allocates fresh ids above this.
@@ -566,12 +669,19 @@ pub fn parse(child_allocator: std.mem.Allocator, raw: []const u8) !FlowDoc {
     if (root.get("event")) |v| {
         if (v != .object) return ParseError.BadSchema;
         doc.event = try parseEvent(a, v.object);
+        doc.event_present = true;
     }
 
     // ── params ──
     if (root.get("params")) |v| {
         if (v != .array) return ParseError.BadSchema;
         doc.params = try parseParams(a, v.array);
+    }
+
+    // ── variables ── (RFC-FLOW-VOCABULARY §4)
+    if (root.get("variables")) |v| {
+        if (v != .array) return ParseError.BadSchema;
+        doc.variables = try parseVariables(a, v.array);
     }
 
     // ── nodes ──
@@ -664,6 +774,27 @@ fn parseEvent(a: std.mem.Allocator, obj: std.json.ObjectMap) !Event {
     }
 
     return ev;
+}
+
+fn parseVariables(a: std.mem.Allocator, arr: std.json.Array) ![]Variable {
+    var out: std.ArrayList(Variable) = .empty;
+    for (arr.items) |item| {
+        if (item != .object) return ParseError.BadSchema;
+        const o = item.object;
+        const name_v = o.get("name") orelse return ParseError.BadSchema;
+        const type_v = o.get("type") orelse return ParseError.BadSchema;
+        // codegen rejects a variable without a `default` — the same
+        // contract holds here so a save can't produce a flow codegen
+        // refuses (every variable must declare an initial value).
+        const default_v = o.get("default") orelse return ParseError.BadSchema;
+        if (name_v != .string or type_v != .string) return ParseError.BadSchema;
+        try out.append(a, .{
+            .name = try a.dupe(u8, name_v.string),
+            .type_name = try a.dupe(u8, type_v.string),
+            .default_text = try jsonValueToText(a, default_v),
+        });
+    }
+    return out.toOwnedSlice(a);
 }
 
 fn parseParams(a: std.mem.Allocator, arr: std.json.Array) ![]Param {
@@ -761,6 +892,37 @@ fn parseNodes(a: std.mem.Allocator, arr: std.json.Array) !NodesResult {
             if (kind == .emit and std.mem.eql(u8, key, "event")) {
                 if (entry.value_ptr.* != .string) return ParseError.BadSchema;
                 node.event_ref = try a.dupe(u8, entry.value_ptr.string);
+                continue;
+            }
+            // `Event` (RFC-FLOW-VOCABULARY §3) — the dotted event name
+            // lives in `name`, not `event` (that key is the discriminator).
+            if (kind == .event and std.mem.eql(u8, key, "name")) {
+                if (entry.value_ptr.* != .string) return ParseError.BadSchema;
+                node.event_ref = try a.dupe(u8, entry.value_ptr.string);
+                continue;
+            }
+            // Variable-op nodes (RFC-FLOW-VOCABULARY §4) — all use a
+            // `name` field naming the targeted variable. `ChangeVariable`
+            // additionally carries the inline `by` literal.
+            if ((kind == .get_variable or kind == .set_variable or
+                kind == .change_variable or kind == .clear_variable or
+                kind == .has_value_variable) and std.mem.eql(u8, key, "name"))
+            {
+                if (entry.value_ptr.* != .string) return ParseError.BadSchema;
+                node.variable_ref = try a.dupe(u8, entry.value_ptr.string);
+                continue;
+            }
+            if (kind == .change_variable and std.mem.eql(u8, key, "by")) {
+                // `by` is JSON-native (number, bool, …) — captured as
+                // canonical text the writer splices verbatim.
+                node.by_text = try jsonValueToText(a, entry.value_ptr.*);
+                continue;
+            }
+            // `CustomNode` (RFC-FLOW-VOCABULARY §1, §6) — the dotted
+            // plugin/script-FlowNode name lives in `name`.
+            if (kind == .custom_node and std.mem.eql(u8, key, "name")) {
+                if (entry.value_ptr.* != .string) return ParseError.BadSchema;
+                node.custom_name = try a.dupe(u8, entry.value_ptr.string);
                 continue;
             }
 
@@ -1002,50 +1164,75 @@ pub fn render(child_allocator: std.mem.Allocator, doc: FlowDoc) ![]u8 {
         try out.appendSlice(a, ",\n");
     }
 
-    // event — `OnEvent`'s structural fields (`name` / `module` /
-    // `callback` / `params`) are emitted in a fixed order so a re-save
-    // is byte-stable regardless of edit history. Generic `extras` keys
-    // (alphabetical, e.g. `arg_entity` on `OnCreate`) follow. `parseEvent`
-    // already enforces the two-form rule for `OnEvent`, so the writer
-    // just renders what's set.
-    try out.appendSlice(a, indent_unit);
-    try out.appendSlice(a, "\"event\": { \"type\": ");
-    try writeJsonString(a, &out, doc.event.type_name);
-    if (doc.event.name) |n| {
-        try out.appendSlice(a, ", \"name\": ");
-        try writeJsonString(a, &out, n);
-    }
-    if (doc.event.module) |m| {
-        try out.appendSlice(a, ", \"module\": ");
-        try writeJsonString(a, &out, m);
-    }
-    if (doc.event.callback) |c| {
-        try out.appendSlice(a, ", \"callback\": ");
-        try writeJsonString(a, &out, c);
-    }
-    if (doc.event.params.len > 0) {
-        try out.appendSlice(a, ", \"params\": [");
-        for (doc.event.params, 0..) |p, i| {
-            if (i > 0) try out.append(a, ',');
-            try out.appendSlice(a, " { \"name\": ");
-            try writeJsonString(a, &out, p.name);
-            try out.appendSlice(a, ", \"type\": ");
-            try writeJsonString(a, &out, p.type_name);
-            if (p.default_text) |d| {
-                try out.appendSlice(a, ", \"default\": ");
-                try out.appendSlice(a, d);
-            }
-            try out.appendSlice(a, " }");
+    // event — emitted only when the file carries one (RFC-FLOW-VOCABULARY
+    // §3: new-form flows declare their trigger via in-graph `Event`
+    // nodes and have no `event:` header). `OnEvent`'s structural fields
+    // (`name` / `module` / `callback` / `params`) are emitted in a fixed
+    // order so a re-save is byte-stable regardless of edit history.
+    // Generic `extras` keys (alphabetical, e.g. `arg_entity` on
+    // `OnCreate`) follow. `parseEvent` already enforces the two-form
+    // rule for `OnEvent`, so the writer just renders what's set.
+    if (doc.event_present) {
+        try out.appendSlice(a, indent_unit);
+        try out.appendSlice(a, "\"event\": { \"type\": ");
+        try writeJsonString(a, &out, doc.event.type_name);
+        if (doc.event.name) |n| {
+            try out.appendSlice(a, ", \"name\": ");
+            try writeJsonString(a, &out, n);
         }
-        try out.appendSlice(a, " ]");
+        if (doc.event.module) |m| {
+            try out.appendSlice(a, ", \"module\": ");
+            try writeJsonString(a, &out, m);
+        }
+        if (doc.event.callback) |c| {
+            try out.appendSlice(a, ", \"callback\": ");
+            try writeJsonString(a, &out, c);
+        }
+        if (doc.event.params.len > 0) {
+            try out.appendSlice(a, ", \"params\": [");
+            for (doc.event.params, 0..) |p, i| {
+                if (i > 0) try out.append(a, ',');
+                try out.appendSlice(a, " { \"name\": ");
+                try writeJsonString(a, &out, p.name);
+                try out.appendSlice(a, ", \"type\": ");
+                try writeJsonString(a, &out, p.type_name);
+                if (p.default_text) |d| {
+                    try out.appendSlice(a, ", \"default\": ");
+                    try out.appendSlice(a, d);
+                }
+                try out.appendSlice(a, " }");
+            }
+            try out.appendSlice(a, " ]");
+        }
+        for (doc.event.extras) |kv| {
+            try out.appendSlice(a, ", ");
+            try writeJsonString(a, &out, kv.key);
+            try out.appendSlice(a, ": ");
+            try out.appendSlice(a, kv.value_text);
+        }
+        try out.appendSlice(a, " },\n");
     }
-    for (doc.event.extras) |kv| {
-        try out.appendSlice(a, ", ");
-        try writeJsonString(a, &out, kv.key);
-        try out.appendSlice(a, ": ");
-        try out.appendSlice(a, kv.value_text);
+
+    // variables (optional — omitted entirely when empty)
+    // RFC-FLOW-VOCABULARY §4 — top-level flow-scope variable declarations.
+    if (doc.variables.len > 0) {
+        try out.appendSlice(a, indent_unit);
+        try out.appendSlice(a, "\"variables\": [\n");
+        for (doc.variables, 0..) |v, i| {
+            try out.appendSlice(a, indent_unit ** 2);
+            try out.appendSlice(a, "{ \"name\": ");
+            try writeJsonString(a, &out, v.name);
+            try out.appendSlice(a, ", \"type\": ");
+            try writeJsonString(a, &out, v.type_name);
+            try out.appendSlice(a, ", \"default\": ");
+            try out.appendSlice(a, v.default_text);
+            try out.appendSlice(a, " }");
+            if (i + 1 < doc.variables.len) try out.append(a, ',');
+            try out.append(a, '\n');
+        }
+        try out.appendSlice(a, indent_unit);
+        try out.appendSlice(a, "],\n");
     }
-    try out.appendSlice(a, " },\n");
 
     // params (optional — omitted entirely when empty)
     if (doc.params.len > 0) {
@@ -1155,6 +1342,31 @@ fn renderNode(a: std.mem.Allocator, out: *std.ArrayList(u8), n: Node) !void {
         .emit => {
             try out.appendSlice(a, ", \"event\": ");
             try writeJsonString(a, out, n.event_ref);
+        },
+        .event => {
+            // `Event` (RFC-FLOW-VOCABULARY §3) — the dotted event name
+            // is the node's `name`. (Don't confuse with the discriminator
+            // key `type`, which holds `"Event"` itself.)
+            try out.appendSlice(a, ", \"name\": ");
+            try writeJsonString(a, out, n.event_ref);
+        },
+        .get_variable, .set_variable, .clear_variable, .has_value_variable => {
+            try out.appendSlice(a, ", \"name\": ");
+            try writeJsonString(a, out, n.variable_ref);
+        },
+        .change_variable => {
+            try out.appendSlice(a, ", \"name\": ");
+            try writeJsonString(a, out, n.variable_ref);
+            // `by` is the inline-default increment (RFC-FLOW-VOCABULARY
+            // §4). Always emitted so the file is self-describing; defaults
+            // to `"1"` when a fresh node is created.
+            const by = if (n.by_text.len > 0) n.by_text else "1";
+            try out.appendSlice(a, ", \"by\": ");
+            try out.appendSlice(a, by);
+        },
+        .custom_node => {
+            try out.appendSlice(a, ", \"name\": ");
+            try writeJsonString(a, out, n.custom_name);
         },
         .other => {},
     }

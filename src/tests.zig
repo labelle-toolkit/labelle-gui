@@ -16,6 +16,15 @@ const flow_io = @import("flow_io.zig");
 const flow_doc = @import("modules/flow_doc.zig");
 const flow_cycle = @import("flow_cycle.zig");
 const event_catalog = @import("flow_event_catalog.zig");
+const node_catalog = @import("flow_node_catalog.zig");
+
+// Reference the node catalog at file scope so its module-level
+// `test "…"` blocks become reachable from the test root and are
+// included in `builtin.test_functions`. `@import` alone isn't always
+// enough — the Zig test discovery only walks decls that are *used*.
+comptime {
+    _ = node_catalog;
+}
 const gizmos = @import("gizmos.zig");
 const preview = @import("preview.zig");
 const flow_projector = @import("flows/projector.zig");
@@ -5241,12 +5250,13 @@ pub const PluginEventsRfcTests = struct {
         try expect.toBeTrue(std.mem.eql(u8, e.fields[6].type_name, "f32"));
     }
 
-    test "bouncing-ball hit_counter.flow.jsonc parses as new-form OnEvent" {
-        // Real-file ingestion test — phase 3 of `flow-codegen` (commit
-        // 1182a80) converted this in-tree example to the new form. The
-        // editor must load it without complaint and surface the `name`
-        // field, the box2d catalog entry, and the four-node Call→BinOp
-        // chain.
+    test "bouncing-ball hit_counter.flow.jsonc parses as v2-form (Event node + variables)" {
+        // Real-file ingestion test — flow-codegen `a8be4c1` migrated
+        // this in-tree example to the v2 vocabulary (RFC-FLOW-VOCABULARY
+        // phase 3): the trigger lives ON the canvas as an `Event` node
+        // and the counter is a declared top-level `Variable`, not a
+        // sidecar `.zig`. The editor must load it without the legacy
+        // `event:` header.
         const a = std.testing.allocator;
         const path = "../bouncing-ball/scripts/flows/hit_counter.flow.jsonc";
 
@@ -5259,16 +5269,288 @@ pub const PluginEventsRfcTests = struct {
         };
         defer doc.deinit();
 
-        try expect.toBeTrue(std.mem.eql(u8, doc.event.type_name, "OnEvent"));
-        try expect.toBeTrue(doc.event.name != null);
-        try expect.toBeTrue(std.mem.eql(u8, doc.event.name.?, "box2d.collision_begin"));
-        try expect.toBeTrue(doc.event.module == null);
-        try expect.toBeTrue(doc.event.callback == null);
-        try expect.toBeTrue(event_catalog.isKnown(doc.event.name.?));
+        // No file-level event header — the trigger is on-canvas now.
+        try expect.toBeTrue(!doc.event_present);
 
-        // Sanity-check the node chain so the test catches any future
-        // schema drift (e.g. an `Emit` node accidentally injected).
-        try expect.equal(doc.nodes.len, @as(usize, 4));
+        // Two nodes: the `Event` trigger + the `ChangeVariable` action.
+        try expect.equal(doc.nodes.len, @as(usize, 2));
+        try expect.toBeTrue(doc.nodes[0].kind == .event);
+        try expect.toBeTrue(std.mem.eql(u8, doc.nodes[0].event_ref, "box2d.collision_begin"));
+        try expect.toBeTrue(doc.nodes[1].kind == .change_variable);
+        try expect.toBeTrue(std.mem.eql(u8, doc.nodes[1].variable_ref, "hits"));
+
+        // One declared variable.
+        try expect.equal(doc.variables.len, @as(usize, 1));
+        try expect.toBeTrue(std.mem.eql(u8, doc.variables[0].name, "hits"));
+        try expect.toBeTrue(std.mem.eql(u8, doc.variables[0].type_name, "i32"));
+    }
+};
+
+/// RFC-FLOW-VOCABULARY phase 4 — editor support for the new node
+/// vocabulary (Event-as-node, variables block, CustomNode, the variable
+/// ops, and the v1→v2 form where the trigger lives on the canvas).
+/// Round-trip tests are organized the same way as `PluginEventsRfcTests`
+/// above so they are easy to find next to phase 3.
+pub const FlowVocabularyRfcTests = struct {
+    test "top-level variables block parses and round-trips" {
+        // RFC §4 — the canonical shape: name + Zig type text + JSON-native
+        // default. Codegen lowers each entry to a file-scope `var` in the
+        // generated `.zig`. The editor preserves the JSON-native form
+        // verbatim through the writer so re-saves don't churn defaults.
+        const a = std.testing.allocator;
+        const src =
+            \\{
+            \\  "variables": [
+            \\    { "name": "hits", "type": "i32", "default": 0 },
+            \\    { "name": "ready", "type": "bool", "default": true },
+            \\    { "name": "name", "type": "?[]const u8", "default": null }
+            \\  ],
+            \\  "nodes": [],
+            \\  "edges": []
+            \\}
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+        try expect.equal(doc.variables.len, @as(usize, 3));
+        try expect.toBeTrue(std.mem.eql(u8, doc.variables[0].name, "hits"));
+        try expect.toBeTrue(std.mem.eql(u8, doc.variables[0].type_name, "i32"));
+        try expect.toBeTrue(std.mem.eql(u8, doc.variables[0].default_text, "0"));
+        try expect.toBeTrue(std.mem.eql(u8, doc.variables[2].default_text, "null"));
+        try expect.toBeTrue(doc.variables[2].isNullable());
+        try expect.toBeTrue(!doc.variables[0].isNullable());
+
+        // Re-save is byte-stable.
+        const text1 = try flow_io.render(a, doc);
+        defer a.free(text1);
+        var doc2 = try flow_io.parse(a, text1);
+        defer doc2.deinit();
+        const text2 = try flow_io.render(a, doc2);
+        defer a.free(text2);
+        try expect.toBeTrue(std.mem.eql(u8, text1, text2));
+        // Variables block survived the round-trip.
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"variables\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"hits\"") != null);
+    }
+
+    test "variables block rejects a missing default (codegen requires one)" {
+        const a = std.testing.allocator;
+        // Every variable must declare a default — codegen will refuse
+        // an undeclared one (RFC §4). The editor enforces the same at
+        // parse time so a save can't produce a flow codegen would reject.
+        try expect.toReturnError(flow_io.parse(a,
+            \\{ "variables": [ { "name": "hits", "type": "i32" } ], "nodes": [], "edges": [] }
+        ), error.BadSchema);
+    }
+
+    test "Event node (graph-level trigger) parses and round-trips" {
+        // RFC §3 — new-form flows declare their trigger ON the canvas as
+        // an `Event` node, not via a file-level `event:` header. The
+        // editor must round-trip this without injecting a header.
+        const a = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "hit_counter",
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Event", "name": "box2d.collision_begin", "pos": [40, 40] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+
+        try expect.toBeTrue(!doc.event_present);
+        try expect.equal(doc.nodes.len, @as(usize, 1));
+        try expect.toBeTrue(doc.nodes[0].kind == .event);
+        try expect.toBeTrue(std.mem.eql(u8, doc.nodes[0].event_ref, "box2d.collision_begin"));
+
+        const text1 = try flow_io.render(a, doc);
+        defer a.free(text1);
+        // No legacy header was injected.
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"event\":") == null);
+        // Event node survived with its dotted name in `name`.
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"type\": \"Event\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"name\": \"box2d.collision_begin\"") != null);
+
+        var doc2 = try flow_io.parse(a, text1);
+        defer doc2.deinit();
+        const text2 = try flow_io.render(a, doc2);
+        defer a.free(text2);
+        try expect.toBeTrue(std.mem.eql(u8, text1, text2));
+    }
+
+    test "GetVariable / SetVariable / ChangeVariable parse and round-trip" {
+        const a = std.testing.allocator;
+        const src =
+            \\{
+            \\  "variables": [ { "name": "hits", "type": "i32", "default": 0 } ],
+            \\  "nodes": [
+            \\    { "id": 1, "type": "GetVariable", "name": "hits", "pos": [0, 0] },
+            \\    { "id": 2, "type": "SetVariable", "name": "hits", "pos": [120, 0] },
+            \\    { "id": 3, "type": "ChangeVariable", "name": "hits", "by": 5, "pos": [240, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+
+        try expect.toBeTrue(doc.nodes[0].kind == .get_variable);
+        try expect.toBeTrue(std.mem.eql(u8, doc.nodes[0].variable_ref, "hits"));
+        try expect.toBeTrue(doc.nodes[1].kind == .set_variable);
+        try expect.toBeTrue(doc.nodes[2].kind == .change_variable);
+        try expect.toBeTrue(std.mem.eql(u8, doc.nodes[2].by_text, "5"));
+
+        const text1 = try flow_io.render(a, doc);
+        defer a.free(text1);
+        var doc2 = try flow_io.parse(a, text1);
+        defer doc2.deinit();
+        const text2 = try flow_io.render(a, doc2);
+        defer a.free(text2);
+        try expect.toBeTrue(std.mem.eql(u8, text1, text2));
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"by\": 5") != null);
+    }
+
+    test "ChangeVariable defaults to by:1 when omitted on a fresh save" {
+        // codegen treats a missing `by` as `1` (RFC §4 Scratch-style
+        // increment). The editor's writer emits the field unconditionally
+        // so the file is self-describing — never invisible state.
+        const a = std.testing.allocator;
+        const src =
+            \\{
+            \\  "variables": [ { "name": "hits", "type": "i32", "default": 0 } ],
+            \\  "nodes": [
+            \\    { "id": 1, "type": "ChangeVariable", "name": "hits", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+        const text = try flow_io.render(a, doc);
+        defer a.free(text);
+        // The implicit `by` is materialized on save so the next reader
+        // doesn't have to guess.
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"by\": 1") != null);
+    }
+
+    test "ClearVariable and HasValueVariable round-trip with the variable name" {
+        const a = std.testing.allocator;
+        const src =
+            \\{
+            \\  "variables": [ { "name": "target", "type": "?EntityId", "default": null } ],
+            \\  "nodes": [
+            \\    { "id": 1, "type": "ClearVariable", "name": "target", "pos": [0, 0] },
+            \\    { "id": 2, "type": "HasValueVariable", "name": "target", "pos": [200, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+        try expect.toBeTrue(doc.nodes[0].kind == .clear_variable);
+        try expect.toBeTrue(std.mem.eql(u8, doc.nodes[0].variable_ref, "target"));
+        try expect.toBeTrue(doc.nodes[1].kind == .has_value_variable);
+
+        const text1 = try flow_io.render(a, doc);
+        defer a.free(text1);
+        var doc2 = try flow_io.parse(a, text1);
+        defer doc2.deinit();
+        const text2 = try flow_io.render(a, doc2);
+        defer a.free(text2);
+        try expect.toBeTrue(std.mem.eql(u8, text1, text2));
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"type\": \"ClearVariable\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"type\": \"HasValueVariable\"") != null);
+    }
+
+    test "CustomNode parses with the sibling-agent's dotted JSONC shape" {
+        // RFC §1, §6 — plugin/script-contributed FlowNode reference.
+        // Shape per the task body + sibling-agent coordination: the
+        // dotted plugin name lives in `name`, not the discriminator
+        // `type` (which holds `"CustomNode"`). flow-codegen consumes
+        // the same shape via `PluginFlowNodes.resolve(name)` at build
+        // time.
+        const a = std.testing.allocator;
+        const src =
+            \\{
+            \\  "nodes": [
+            \\    { "id": 1, "type": "CustomNode", "name": "box2d.apply_impulse", "pos": [40, 40] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+        try expect.toBeTrue(doc.nodes[0].kind == .custom_node);
+        try expect.toBeTrue(std.mem.eql(u8, doc.nodes[0].custom_name, "box2d.apply_impulse"));
+
+        const text1 = try flow_io.render(a, doc);
+        defer a.free(text1);
+        var doc2 = try flow_io.parse(a, text1);
+        defer doc2.deinit();
+        const text2 = try flow_io.render(a, doc2);
+        defer a.free(text2);
+        try expect.toBeTrue(std.mem.eql(u8, text1, text2));
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"type\": \"CustomNode\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"name\": \"box2d.apply_impulse\"") != null);
+    }
+
+    test "v2-form flow (no event header, Event node + variables) round-trips byte-stably" {
+        // The full new-form shape: no legacy `event:` header, trigger
+        // on-canvas, variables block at the top. This is exactly the
+        // bouncing-ball `hit_counter.flow.jsonc` template.
+        const a = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "hit_counter",
+            \\  "variables": [
+            \\    { "name": "hits", "type": "i32", "default": 0 }
+            \\  ],
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Event", "name": "box2d.collision_begin", "pos": [40, 40] },
+            \\    { "id": 2, "type": "ChangeVariable", "name": "hits", "by": 1, "pos": [40, 160] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+
+        try expect.toBeTrue(!doc.event_present);
+        try expect.equal(doc.variables.len, @as(usize, 1));
+        try expect.equal(doc.nodes.len, @as(usize, 2));
+
+        const text1 = try flow_io.render(a, doc);
+        defer a.free(text1);
+        // No legacy event header in the output.
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"event\":") == null);
+
+        var doc2 = try flow_io.parse(a, text1);
+        defer doc2.deinit();
+        const text2 = try flow_io.render(a, doc2);
+        defer a.free(text2);
+        try expect.toBeTrue(std.mem.eql(u8, text1, text2));
+    }
+
+    test "node_catalog covers every shipped labelle-box2d FlowNode" {
+        // Every FlowNode `labelle-box2d` ships in `pub const FlowNodes`
+        // (root.zig:147-239) must appear in the catalog — the editor's
+        // palette is the user-facing surface of phase 1's discovery
+        // until the assembler-emitted sidecar lands.
+        try expect.toBeTrue(node_catalog.isKnown("box2d.apply_impulse"));
+        try expect.toBeTrue(node_catalog.isKnown("box2d.ray_cast"));
+        try expect.toBeTrue(node_catalog.isKnown("box2d.set_gravity"));
+        try expect.toBeTrue(!node_catalog.isKnown("never.heard.of.it"));
+        // The full count must equal the plugin's shipped decl count.
+        try expect.equal(@as(usize, 14), node_catalog.entries.len);
+    }
+
+    test "node_catalog wire-fit accepts safe widenings only" {
+        try expect.toBeTrue(node_catalog.typesFit("i32", "i32"));
+        try expect.toBeTrue(node_catalog.typesFit("i32", "f64"));
+        try expect.toBeTrue(node_catalog.typesFit("EntityId", "u32"));
+        try expect.toBeTrue(!node_catalog.typesFit("f32", "i32"));
+        try expect.toBeTrue(!node_catalog.typesFit("RayResult", "BodyId"));
     }
 };
 
