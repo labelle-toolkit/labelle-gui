@@ -5546,9 +5546,17 @@ pub const FlowVocabularyRfcTests = struct {
     }
 
     test "node_catalog wire-fit accepts safe widenings only" {
+        // RFC-FLOW-VOCABULARY §2 / O1 resolved: same-sign integer
+        // widening, unsigned → strictly-larger signed, and float
+        // widening are auto-accepted. Int ↔ float in either direction
+        // requires an explicit conversion node and is refused.
         try expect.toBeTrue(node_catalog.typesFit("i32", "i32"));
-        try expect.toBeTrue(node_catalog.typesFit("i32", "f64"));
+        try expect.toBeTrue(node_catalog.typesFit("i32", "i64"));
+        try expect.toBeTrue(node_catalog.typesFit("u8", "i16"));
+        try expect.toBeTrue(node_catalog.typesFit("f32", "f64"));
         try expect.toBeTrue(node_catalog.typesFit("EntityId", "u32"));
+        // O1 explicitly forbids int → float (lossy for large ints).
+        try expect.toBeTrue(!node_catalog.typesFit("i32", "f64"));
         try expect.toBeTrue(!node_catalog.typesFit("f32", "i32"));
         try expect.toBeTrue(!node_catalog.typesFit("RayResult", "BodyId"));
     }

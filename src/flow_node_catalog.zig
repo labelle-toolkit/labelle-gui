@@ -8,16 +8,30 @@
 //! time and emits a `PluginFlowNodes = struct { ... }` block in the
 //! generated `game` module — each entry aliases a
 //! `core.flow.FlowNode(.{ ... })` factory value with its `impl`
-//! function attached. flow-codegen will eventually consume that
-//! registry when lowering `CustomNode` nodes to direct calls.
+//! function attached. flow-codegen consumes that registry when
+//! lowering `CustomNode` nodes to direct calls.
 //!
 //! The flow editor is a separate tool and does *not* import the game's
-//! generated module — doing so would spin up the full assembler. So
-//! for phase 4 the editor consumes a **hard-coded static table**
-//! mirroring `labelle-box2d`'s 14 shipped FlowNodes plus the two pin
-//! styles it declares. The assembler-emitted sidecar (a comptime
-//! catalog file alongside `game.zig`) is the future option; tracking
-//! it is out of scope for this phase. See the TODO below.
+//! generated module — doing so would spin up the full assembler. Two
+//! data paths feed the palette:
+//!
+//!   1. **Per-project sidecar** (labelle-assembler#178): the assembler
+//!      writes a `flow_catalog.json` next to the generated `main.zig`
+//!      every time it regenerates. `App.openProject(dir)` walks
+//!      `<dir>/.labelle/*/flow_catalog.json` and loads the file into a
+//!      `RuntimeCatalog` via `loadFromSidecar`. The catalog's
+//!      `entries` / `pin_styles` slices then point at the loaded
+//!      data, so the palette tracks whatever the project's plugins +
+//!      `scripts/` contribute — labelle-box2d, future plugins, the
+//!      game's own modules, all per-project.
+//!   2. **Static fallback** below — `static_entries` /
+//!      `static_pin_styles` mirror labelle-box2d's 14 shipped
+//!      FlowNodes verbatim. Used when the project hasn't been
+//!      regenerated since the sidecar feature landed, or when the
+//!      editor opens a project whose `.labelle/` directory was
+//!      cleaned. Projects that just ran `labelle generate` /
+//!      `labelle build` get the dynamic path; everyone else stays on
+//!      the hand-maintained mirror until they regenerate.
 //!
 //! ## Shape
 //!
@@ -86,6 +100,13 @@ pub const Entry = struct {
     kind: Kind,
     /// Pin definitions in display order. Inputs first, output(s) after.
     pins: []const Pin,
+    /// Fully-qualified Zig type name this node constructs, or `null`
+    /// when it doesn't (RFC-FLOW-VOCABULARY §1, open question O5).
+    /// Mirrors `core.flow.FlowNode.constructs`. Used by the palette to
+    /// suggest constructor nodes when the user creates a `SetVariable`
+    /// on a struct-typed variable (which can't have an inline default
+    /// widget per the "structs must be wired" rule).
+    constructs: ?[]const u8 = null,
 };
 
 /// Per-Zig-type display metadata (color, label). The editor renders a
@@ -107,7 +128,11 @@ pub const PinStyleEntry = struct {
 /// (primitives + `EntityId`) plus `labelle-box2d`'s two overrides
 /// (`BodyId`, `RayResult`). Later entries win — last write wins —
 /// matching the assembler's deduplication rule (RFC §1 contract).
-pub const pin_styles = [_]PinStyleEntry{
+///
+/// `pin_styles` (below) is a slice view that points here by default
+/// and gets replaced by `setRuntime` when a project's
+/// `flow_catalog.json` loads.
+const static_pin_styles = [_]PinStyleEntry{
     // ─── Primitives (default_pin_styles) ───
     .{ .type_name = "u32", .style = .{ .label = "Integer", .color = .{ 90, 156, 196 } } },
     .{ .type_name = "i32", .style = .{ .label = "Integer", .color = .{ 90, 156, 196 } } },
@@ -245,14 +270,18 @@ const box2d_set_gravity_pins = [_]Pin{
     .{ .name = "gy", .label = "Gravity Y", .type_name = "f32", .dir = .input },
 };
 
-/// Every FlowNode declared on a plugin's `pub const FlowNodes` block
-/// the editor knows about. Update alongside any new plugin ship until
-/// the assembler-emitted sidecar replaces this list.
+/// Static FlowNode catalog — used as the fallback when no
+/// `flow_catalog.json` sidecar is loaded. `entries` (below) is a slice
+/// view that points at this array by default and gets swapped to the
+/// sidecar's owned slice by `setRuntime` when a project opens.
 ///
-/// TODO(O1 follow-up): replace with an assembler-emitted sidecar that
-/// dumps the discovered `PluginFlowNodes` registry as a `.zon` file
-/// alongside `game.zig`. Tracking issue: `labelle-assembler#178`.
-pub const entries = [_]Entry{
+/// Mirrors `labelle-box2d/src/root.zig:127-239`'s `pub const FlowNodes`.
+/// Adding a new plugin FlowNode here is now optional — projects that
+/// have regenerated since labelle-assembler#178 landed surface every
+/// plugin / script FlowNode via the dynamic catalog. Keeping the
+/// static list in sync is only required for the "no sidecar" path
+/// (older projects, fresh checkouts before `labelle generate`).
+const static_entries = [_]Entry{
     .{
         .name = "box2d.apply_impulse",
         .category = "box2d",
@@ -348,6 +377,13 @@ pub const entries = [_]Entry{
         .docs = "Cast a ray from origin to target (pixels). Returns the closest hit.",
         .kind = .reporter,
         .pins = &box2d_ray_cast_pins,
+        // RFC-FLOW-VOCABULARY §1 / O5 — `ray_cast` returns a `RayResult`
+        // struct. Editor uses this to suggest the node from the palette
+        // when the user creates a `SetVariable` on a `RayResult`-typed
+        // variable. TODO(O5 follow-up): the palette suggestion UX itself
+        // is a phase-4 polish item — for v1 we just thread this through
+        // and surface it via `lookup(...).constructs`.
+        .constructs = "labelle_box2d.RayResult",
     },
     .{
         .name = "box2d.body_at",
@@ -384,47 +420,94 @@ pub fn isKnown(name: []const u8) bool {
     return lookup(name) != null;
 }
 
-// ─── Wire-fit type check (RFC §2) ───────────────────────────────────────
+// ─── Wire-fit type check (RFC §2, open question O1 resolved) ────────────
 //
 // Editor-side type compatibility check the canvas runs on every wire
 // drop. Equality always fits. Numeric widening fits in the safe
-// direction (`i32 → i64`, `f32 → f64`, integer → float of equal-or-greater
-// width). Otherwise the drop is refused.
+// direction. Otherwise the drop is refused.
 //
-// Exhaustive set per RFC open question O1 (deferred). For phase 4 MVP
-// this is the safe subset; growing the table doesn't change the
-// editor's UX — it only widens what the user can wire.
+// **Auto-accepted** (mirrors `labelle-core/src/flow.zig:numericFits` —
+// the codegen-side source of truth):
+// - Same-sign integer widening (`i8 → i16 → i32 → i64 → i128`,
+//   `u8 → u16 → u32 → u64 → u128`).
+// - Unsigned → strictly-larger signed (`u8 → i16/i32/i64/i128`, …).
+// - Float widening (`f32 → f64`).
+//
+// **Explicitly refused** (require an explicit conversion node):
+// - Int ↔ float in either direction (lossy / surprising).
+// - Signed → unsigned (sign loss).
+// - Narrowing in either direction.
+//
+// Aliases (`EntityId == u32`) collapse via Zig type equality at codegen
+// time. The editor mirrors the convention with explicit `EntityId ↔ u32`
+// pairs so a wire from a `u32` literal into an `EntityId` pin (or the
+// reverse) reads the same way to the canvas as it does to codegen.
+
+/// Classify a primitive Zig type name into a `(kind, bits)` tuple.
+/// Returns `null` for anything that isn't one of the auto-accepted
+/// primitive families — strings, structs, plugin nominal types
+/// (`BodyId`, `RayResult`, …) all return `null` so they fall through
+/// to the equality-only path in `typesFit`. `EntityId` is collapsed
+/// to `u32` per the toolkit's convention (`labelle-core` aliases
+/// `pub const EntityId = u32`).
+const NumericKind = enum { signed_int, unsigned_int, float };
+const NumericInfo = struct { kind: NumericKind, bits: u16 };
+
+fn parsePrimitive(type_name: []const u8) ?NumericInfo {
+    // `EntityId` collapses to `u32` — same convention codegen uses.
+    if (std.mem.eql(u8, type_name, "EntityId")) {
+        return .{ .kind = .unsigned_int, .bits = 32 };
+    }
+    if (type_name.len < 2) return null;
+    const first = type_name[0];
+    const kind: NumericKind = switch (first) {
+        'i' => .signed_int,
+        'u' => .unsigned_int,
+        'f' => .float,
+        else => return null,
+    };
+    const bits = std.fmt.parseInt(u16, type_name[1..], 10) catch return null;
+    // Sanity-bound the bit width to the Zig 0.16 supported set so a
+    // bogus `i7` from a typo doesn't silently fit `i8`. Auto-accepted
+    // widths are 8/16/32/64/128 for ints and 16/32/64/80/128 for floats.
+    switch (kind) {
+        .signed_int, .unsigned_int => switch (bits) {
+            8, 16, 32, 64, 128 => return .{ .kind = kind, .bits = bits },
+            else => return null,
+        },
+        .float => switch (bits) {
+            16, 32, 64, 80, 128 => return .{ .kind = .float, .bits = bits },
+            else => return null,
+        },
+    }
+}
 
 /// True when a value of `from_type` can be wired into an input pin of
-/// `to_type` per the editor's wire-fit rule. Plain equality plus the
-/// numeric-widening pairs listed below.
+/// `to_type` per the editor's wire-fit rule. Equality plus the
+/// `numericFits` (RFC §2 / O1) widening set; everything else is refused.
 pub fn typesFit(from_type: []const u8, to_type: []const u8) bool {
     if (std.mem.eql(u8, from_type, to_type)) return true;
-    // Hand-rolled widening table. Pairs are `(from, to)`.
-    const widening = [_][2][]const u8{
-        // Integers — widen to the larger same-sign type.
-        .{ "i32", "i64" },
-        .{ "u32", "u64" },
-        // Integer → float: safe at equal or greater width.
-        .{ "i32", "f32" },
-        .{ "i32", "f64" },
-        .{ "i64", "f64" },
-        .{ "u32", "f32" },
-        .{ "u32", "f64" },
-        .{ "u64", "f64" },
-        // Float widening.
-        .{ "f32", "f64" },
-        // `EntityId` is `u32` in the toolkit's convention.
-        .{ "EntityId", "u32" },
-        .{ "u32", "EntityId" },
-        .{ "EntityId", "u64" },
-        .{ "EntityId", "f32" },
-        .{ "EntityId", "f64" },
-    };
-    for (widening) |w| {
-        if (std.mem.eql(u8, from_type, w[0]) and std.mem.eql(u8, to_type, w[1])) return true;
-    }
-    return false;
+
+    // `EntityId` is an alias for `u32`; the canonical equality check in
+    // codegen collapses them via Zig type identity. Mirror it here.
+    const f_norm = if (std.mem.eql(u8, from_type, "EntityId")) "u32" else from_type;
+    const t_norm = if (std.mem.eql(u8, to_type, "EntityId")) "u32" else to_type;
+    if (std.mem.eql(u8, f_norm, t_norm)) return true;
+
+    const f = parsePrimitive(from_type) orelse return false;
+    const t = parsePrimitive(to_type) orelse return false;
+
+    // Mirror of `labelle-core/src/flow.zig:numericFits`. Keep both
+    // implementations in lock-step — the catalog can't import core
+    // (the editor doesn't pull in the assembled game's deps), so the
+    // contract is documented + tested on both sides.
+    if (f.kind == .signed_int and t.kind == .signed_int) return t.bits >= f.bits;
+    if (f.kind == .unsigned_int and t.kind == .unsigned_int) return t.bits >= f.bits;
+    if (f.kind == .unsigned_int and t.kind == .signed_int) return t.bits > f.bits;
+    // Signed → unsigned: sign loss. Int ↔ float: lossy/surprising.
+    if (f.kind == .signed_int and t.kind == .unsigned_int) return false;
+    if (f.kind == .float and t.kind == .float) return t.bits >= f.bits;
+    return false; // int <-> float
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────
@@ -484,26 +567,110 @@ test "pin styles cover primitives and box2d types" {
     try std.testing.expect(lookupStyle("SomeUnknownType") == null);
 }
 
-test "wire-fit accepts equality + safe widening + refuses incompatibles" {
-    // Equality always fits.
+test "wire-fit: equality always fits (RFC §2 rule 1)" {
     try std.testing.expect(typesFit("i32", "i32"));
     try std.testing.expect(typesFit("f32", "f32"));
+    try std.testing.expect(typesFit("bool", "bool"));
     try std.testing.expect(typesFit("EntityId", "EntityId"));
-    // Safe widening.
+    try std.testing.expect(typesFit("BodyId", "BodyId"));
+    try std.testing.expect(typesFit("RayResult", "RayResult"));
+}
+
+test "wire-fit: same-sign integer widening accepted (O1)" {
+    // Mirror of labelle-core/numericFits — keep these tests in sync
+    // with `test/root_test.zig`'s "numericFits: same-sign integer
+    // widening accepted" block.
+    try std.testing.expect(typesFit("i8", "i16"));
+    try std.testing.expect(typesFit("i8", "i32"));
+    try std.testing.expect(typesFit("i16", "i32"));
     try std.testing.expect(typesFit("i32", "i64"));
+    try std.testing.expect(typesFit("i64", "i128"));
+
+    try std.testing.expect(typesFit("u8", "u16"));
+    try std.testing.expect(typesFit("u8", "u32"));
+    try std.testing.expect(typesFit("u16", "u32"));
+    try std.testing.expect(typesFit("u32", "u64"));
+    try std.testing.expect(typesFit("u64", "u128"));
+}
+
+test "wire-fit: unsigned to strictly-larger signed accepted (O1)" {
+    try std.testing.expect(typesFit("u8", "i16"));
+    try std.testing.expect(typesFit("u8", "i32"));
+    try std.testing.expect(typesFit("u16", "i32"));
+    try std.testing.expect(typesFit("u32", "i64"));
+    try std.testing.expect(typesFit("u32", "i128"));
+    try std.testing.expect(typesFit("u64", "i128"));
+}
+
+test "wire-fit: unsigned to equal-or-smaller signed refused (O1)" {
+    // Equal-width unsigned → signed loses the high bit.
+    try std.testing.expect(!typesFit("u8", "i8"));
+    try std.testing.expect(!typesFit("u32", "i32"));
+    try std.testing.expect(!typesFit("u32", "i16"));
+}
+
+test "wire-fit: signed to unsigned refused (sign loss, O1)" {
+    try std.testing.expect(!typesFit("i8", "u8"));
+    try std.testing.expect(!typesFit("i32", "u32"));
+    try std.testing.expect(!typesFit("i32", "u64"));
+}
+
+test "wire-fit: float widening accepted, narrowing refused (O1)" {
     try std.testing.expect(typesFit("f32", "f64"));
-    try std.testing.expect(typesFit("i32", "f64"));
-    // EntityId ↔ u32 (toolkit convention).
+    try std.testing.expect(!typesFit("f64", "f32"));
+}
+
+test "wire-fit: int <-> float refused in both directions (O1)" {
+    // Int → float: lossy for large ints.
+    try std.testing.expect(!typesFit("i32", "f32"));
+    try std.testing.expect(!typesFit("i32", "f64"));
+    try std.testing.expect(!typesFit("u32", "f32"));
+    try std.testing.expect(!typesFit("u32", "f64"));
+    try std.testing.expect(!typesFit("u64", "f64"));
+    // Float → int: truncation surprises.
+    try std.testing.expect(!typesFit("f32", "i32"));
+    try std.testing.expect(!typesFit("f64", "i64"));
+}
+
+test "wire-fit: integer narrowing refused (O1)" {
+    try std.testing.expect(!typesFit("i64", "i32"));
+    try std.testing.expect(!typesFit("u64", "u32"));
+}
+
+test "wire-fit: EntityId aliases u32 per toolkit convention" {
     try std.testing.expect(typesFit("EntityId", "u32"));
     try std.testing.expect(typesFit("u32", "EntityId"));
-    // Narrowing refused.
-    try std.testing.expect(!typesFit("i64", "i32"));
-    try std.testing.expect(!typesFit("f64", "f32"));
-    // Float → int refused (precision loss).
-    try std.testing.expect(!typesFit("f32", "i32"));
-    // Distinct types refused.
+    // EntityId widens to u64 the same way u32 does.
+    try std.testing.expect(typesFit("EntityId", "u64"));
+    // EntityId → i64 (u32 → i64 widens cleanly).
+    try std.testing.expect(typesFit("EntityId", "i64"));
+    // EntityId → i32: same as u32 → i32, sign-bit collision — refused
+    // (this is a tightening from the pre-O1 catalog, which accepted it).
+    try std.testing.expect(!typesFit("EntityId", "i32"));
+}
+
+test "wire-fit: distinct nominal types refused" {
     try std.testing.expect(!typesFit("BodyId", "EntityId"));
     try std.testing.expect(!typesFit("RayResult", "f32"));
+    try std.testing.expect(!typesFit("BodyId", "u32"));
+}
+
+test "constructs hint: ray_cast reports its return type (O5)" {
+    // RFC-FLOW-VOCABULARY §1 / O5 — the editor consults `constructs` to
+    // know which palette entries return a value of a given type, so a
+    // `SetVariable` on a struct-typed variable can suggest matching
+    // constructor nodes. `ray_cast` is the only constructor in the
+    // shipped box2d set; the rest are commands or scalar reporters.
+    const ray_cast = lookup("box2d.ray_cast").?;
+    try std.testing.expect(ray_cast.constructs != null);
+    try std.testing.expectEqualStrings("labelle_box2d.RayResult", ray_cast.constructs.?);
+
+    // Spot-check that non-constructor entries leave `constructs` null
+    // so the palette suggestion code knows to skip them. A SetVariable
+    // on a `RayResult` var would suggest `ray_cast`, not `set_velocity`.
+    try std.testing.expect(lookup("box2d.set_velocity").?.constructs == null);
+    try std.testing.expect(lookup("box2d.apply_impulse").?.constructs == null);
+    try std.testing.expect(lookup("box2d.get_position").?.constructs == null);
 }
 
 test "every catalog entry's pins include at least one user-visible pin" {
