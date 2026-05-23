@@ -180,6 +180,13 @@ pub const FlowDocState = struct {
     /// invalidation. `refreshCycleCheck` frees the previous snapshot
     /// before storing a new one; `deinit` frees the last one.
     cycle_refs_snapshot: []const u8 = "",
+    /// Count of execution-flow arrows emitted by `renderExecEdges` on
+    /// the most recent frame (issue #172). Public so the gui-test
+    /// runner can assert on the canvas state without poking into the
+    /// node editor's opaque link store. Re-set to zero at the top of
+    /// `renderExecEdges` so a flow that loses its last command pair
+    /// reports zero rather than a stale prior frame's count.
+    exec_links_last_frame: usize = 0,
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !FlowDocState {
         const arena = try allocator.create(std.heap.ArenaAllocator);
@@ -563,8 +570,11 @@ fn renderCanvas(s: *FlowDocState, allocator: std.mem.Allocator) void {
     // are rectangular (small corner radius), reporters rounded (large
     // corner radius). The Event node gets a third treatment — the same
     // rectangular command shape with a warm border color to read as the
-    // trigger. The full execution-flow connector wiring on command nodes
-    // is follow-up; phase 4 ships the shape + color difference.
+    // trigger. Command nodes also carry execution-flow anchors (top
+    // exec-in, bottom exec-out — `Event` is exec-out only since it's the
+    // trigger); see `renderNodeBody`. Synthetic exec arrows are emitted
+    // below the data-edge loop based on the topo order of the command
+    // spine (RFC §6 deferral, issue #172).
     for (s.doc.nodes) |n| {
         const visual = nodeVisual(n);
         ne.pushStyleVar1f(.node_rounding, visual.rounding);
@@ -587,6 +597,18 @@ fn renderCanvas(s: *FlowDocState, allocator: std.mem.Allocator) void {
         _ = ne.link(linkId(e), from_pin, to_pin, .{ 0.4, 0.8, 1.0, 1.0 }, 1.5);
     }
 
+    // Derived execution-flow arrows (issue #172, RFC-FLOW-VOCABULARY §6
+    // deferral). The codegen emits node bodies in topo order over data
+    // edges with document-order as the tiebreak; we mirror that algorithm
+    // locally (see `topoCommandOrder`) and draw a thick white arrow
+    // between consecutive command-kind nodes in that order. The arrows
+    // are *derived* — there's no on-disk `exec_edges` block — so any
+    // re-route / delete gesture on one is rejected (exec pin ids are not
+    // recorded in `s.pins`, and exec link ids don't match any
+    // `doc.edges[i]` — both gesture paths bottom out in "unknown id" and
+    // a graceful reject).
+    renderExecEdges(s, allocator);
+
     // Edge authoring (issue #158) — turn a pin drag into a new
     // `flow_io.Edge`, re-route an existing edge's endpoint, or a delete
     // gesture into an edge removal. All gestures are inspected *after*
@@ -595,6 +617,184 @@ fn renderCanvas(s: *FlowDocState, allocator: std.mem.Allocator) void {
     // doc comment for why both ride the same create query.
     handleLinkCreate(s);
     handleLinkDelete(s);
+}
+
+/// Compute and draw execution-flow arrows for the open document
+/// (issue #172). Re-run unconditionally each frame — the cost is
+/// O(N + E) over the small command graph, and `ne.link` dedupes
+/// repeated ids across frames so there's no flicker.
+fn renderExecEdges(s: *FlowDocState, allocator: std.mem.Allocator) void {
+    s.exec_links_last_frame = 0;
+    const order = topoCommandOrder(s, allocator) catch |err| {
+        // A cycle in the data edges or an OOM scratch alloc — neither
+        // is fatal for the canvas. Skip the exec layer this frame; the
+        // data edges and the nodes themselves still rendered above.
+        // TODO #172 follow-up: surface cycle status in the canvas
+        // banner the same way `cycle_report` does for Subflow refs.
+        std.log.debug("flow: exec topo skipped: {s}", .{@errorName(err)});
+        return;
+    };
+    defer allocator.free(order);
+
+    if (order.len < 2) return;
+    var i: usize = 1;
+    while (i < order.len) : (i += 1) {
+        const from = order[i - 1];
+        const to = order[i];
+        const from_pin = execPinId(from, .output);
+        const to_pin = execPinId(to, .input);
+        _ = ne.link(
+            execLinkId(from, to),
+            from_pin,
+            to_pin,
+            .{ 1.0, 1.0, 1.0, 1.0 },
+            2.5,
+        );
+        s.exec_links_last_frame += 1;
+    }
+}
+
+/// Topologically sort the command-kind nodes (issue #172). Mirrors
+/// `flow-codegen/src/codegen.zig:topoSort` so what the canvas shows
+/// matches what codegen emits — but lives here, not as a runtime
+/// import of `flow_codegen`, so the gui keeps its existing module
+/// boundaries (codegen owns the `.flow.jsonc` → `.zig` pipeline; the
+/// editor owns the canvas).
+///
+/// Algorithm: Kahn's, with the document-order tiebreak (within a
+/// ready set, pick the smallest node id) that codegen uses. Returns
+/// only command-kind ids — reporters slot into a command's data
+/// inputs in the codegen lowering and don't need their own exec
+/// step.
+///
+/// The caller frees the returned slice.
+fn topoCommandOrder(s: *FlowDocState, allocator: std.mem.Allocator) ![]u32 {
+    const nodes = s.doc.nodes;
+    if (nodes.len == 0) return try allocator.alloc(u32, 0);
+
+    var indeg = std.AutoHashMap(u32, usize).init(allocator);
+    defer indeg.deinit();
+    for (nodes) |n| try indeg.put(n.id, 0);
+    for (s.doc.edges) |e| {
+        const entry = indeg.getPtr(e.to_node) orelse continue;
+        entry.* += 1;
+    }
+
+    var ready: std.ArrayList(u32) = .empty;
+    defer ready.deinit(allocator);
+    for (nodes) |n| {
+        if (indeg.get(n.id).? == 0) try ready.append(allocator, n.id);
+    }
+    std.mem.sort(u32, ready.items, {}, std.sort.asc(u32));
+
+    var full_order: std.ArrayList(u32) = .empty;
+    defer full_order.deinit(allocator);
+    try full_order.ensureTotalCapacity(allocator, nodes.len);
+
+    while (ready.items.len > 0) {
+        const next = ready.orderedRemove(0);
+        try full_order.append(allocator, next);
+
+        var added: std.ArrayList(u32) = .empty;
+        defer added.deinit(allocator);
+        for (s.doc.edges) |e| {
+            if (e.from_node != next) continue;
+            const d = indeg.getPtr(e.to_node) orelse continue;
+            if (d.* > 0) {
+                d.* -= 1;
+                if (d.* == 0) try added.append(allocator, e.to_node);
+            }
+        }
+        std.mem.sort(u32, added.items, {}, std.sort.asc(u32));
+        for (added.items) |id| {
+            var ins: usize = 0;
+            while (ins < ready.items.len and ready.items[ins] < id) : (ins += 1) {}
+            try ready.insert(allocator, ins, id);
+        }
+    }
+
+    // A cycle leaves nodes un-emitted; fall back to document order so
+    // the canvas still draws *some* exec spine and the user can see the
+    // partial flow. The cycle is surfaced separately (TODO #172
+    // follow-up) — silently dropping the layer would be worse.
+    if (full_order.items.len != nodes.len) {
+        full_order.clearRetainingCapacity();
+        for (nodes) |n| try full_order.append(allocator, n.id);
+    }
+
+    // Filter down to command-kind nodes, in the topo order we just
+    // computed. Reporters are filtered out — they're values inlined
+    // into a command's data inputs by codegen, not exec steps.
+    var out: std.ArrayList(u32) = .empty;
+    errdefer out.deinit(allocator);
+    for (full_order.items) |id| {
+        for (nodes) |n| {
+            if (n.id != id) continue;
+            if (isCommandNode(n)) try out.append(allocator, id);
+            break;
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// True when a node is a command-kind (RFC §6) for exec-anchor
+/// purposes. Mirrors `flow_io.NodeKind.isCommandKind` but resolves
+/// `.custom_node` through the static catalog — a catalog entry with
+/// `kind = .reporter` keeps its rounded silhouette and stays off the
+/// exec spine, while a `.command` entry joins it. An unknown
+/// `custom_name` defaults to command (matching `nodeVisual`'s neutral
+/// fall-through, which uses the rectangular silhouette).
+fn isCommandNode(n: flow_io.Node) bool {
+    return switch (n.kind) {
+        .custom_node => blk: {
+            const entry = node_catalog.lookup(n.custom_name) orelse break :blk true;
+            break :blk entry.kind == .command;
+        },
+        else => n.kind.isCommandKind(),
+    };
+}
+
+/// Synthetic pin id for a node's top-center (exec-in) or
+/// bottom-center (exec-out) execution-flow anchor. Disjoint from
+/// `pinId`'s data-pin id space:
+///
+///   - data:  bits 0–29 = `wyhash(name) & 0x3FFF_FFFF`, bits 30–61 =
+///     node id, bit 62 = direction, bit 63 = 0.
+///   - exec:  bits 0–29 = a fixed sentinel value (`0x3EC0_EC1F` for
+///     exec-in, `0x3EC0_EC07` for exec-out — both fit in 30 bits and
+///     are vanishingly unlikely to match a `wyhash` output), bits
+///     30–61 = node id, bit 62 = direction, bit 63 = 0.
+///
+/// A real pin name would have to wyhash-collide into exactly one of
+/// those sentinel values to clash, which is a ~1 in 10⁹ event per
+/// name; the editor's worst-case failure mode on collision is a
+/// single mis-drawn exec arrow, never data corruption (the document
+/// itself never references exec pin ids — they only live in the
+/// editor's per-frame link table).
+fn execPinId(node_id: u32, dir: PinDir) u64 {
+    const marker: u64 = if (dir == .input) 0x3EC0_EC1F else 0x3EC0_EC07;
+    const base: u64 = marker | (@as(u64, node_id) << 30);
+    return if (dir == .output) base | (@as(u64, 1) << 62) else base;
+}
+
+/// Synthetic link id for a derived exec arrow from `from_node`'s
+/// exec-out to `to_node`'s exec-in. Lives in the link namespace
+/// (bit 63 = 1) like `linkId`, hashed off the two endpoints so the
+/// id is stable across frames — the node editor's internal link
+/// store dedupes by id, so re-emitting the same id every frame is a
+/// no-op (no flicker).
+///
+/// Derived from a Wyhash with a distinct seed (`0xEC1Ed6e`) from
+/// `linkId`'s `0x11f0`. A collision with a data link id is harmless:
+/// the user's delete gesture on an exec link routes through
+/// `deleteEdgeByLinkId`, which only matches against `s.doc.edges` —
+/// an unmatched id is silently rejected, which is exactly the
+/// behaviour we want for a read-only derived edge.
+fn execLinkId(from_node: u32, to_node: u32) u64 {
+    var h = std.hash.Wyhash.init(0xEC1ED6E);
+    h.update(std.mem.asBytes(&from_node));
+    h.update(std.mem.asBytes(&to_node));
+    return (h.final() & 0x7FFF_FFFF_FFFF_FFFF) | (@as(u64, 1) << 63);
 }
 
 /// Record a pin in the per-frame registry so a later `queryNewLink` /
@@ -981,7 +1181,42 @@ fn pinId(node: u32, name: []const u8, dir: PinDir) u64 {
 }
 
 fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Node) void {
+    // Execution-flow anchors (issue #172, RFC §6 deferral). Top-center
+    // *exec-in* anchor on every command node except `Event` (which is
+    // the trigger — exec-out only); bottom-center *exec-out* anchor on
+    // every command node. Reporters skip both — they're values inlined
+    // into a command's data inputs by codegen, not exec steps. The
+    // anchors emit *before* and *after* the data-pin block so the node
+    // editor's vertical layout puts the in-anchor at the top edge and
+    // the out-anchor at the bottom edge. The synthetic exec link
+    // between consecutive command nodes is drawn by `renderExecEdges`
+    // after the data-edge loop in `renderCanvas`.
+    //
+    // We deliberately do *not* call `recordPin` for exec pins so the
+    // `s.pins` per-frame registry stays data-only — any drag gesture
+    // on an exec anchor then fails the `findPin` lookup in
+    // `handleLinkCreate` and the editor rejects it. That's the
+    // "derived, read-only" contract: the user can't author or
+    // re-route an exec arrow, they only see what the topo sort
+    // produced.
+    const is_command = isCommandNode(n);
+    if (is_command and n.kind != .event) {
+        ne.beginPin(execPinId(n.id, .input), .input);
+        zgui.text("▼", .{});
+        ne.endPin();
+    }
     zgui.text("[{d}] {s}", .{ n.id, n.type_name });
+    // Emit the exec-out anchor at the *end* of the body via `defer` so
+    // a switch arm that early-returns (e.g. the "no event selected"
+    // hint on a freshly-placed Emit) still gets its bottom-edge
+    // anchor. Keeping the anchor on every command node — even one with
+    // no resolvable pins — means the exec spine still connects through
+    // the unfinished node instead of breaking the visual flow.
+    defer if (is_command) {
+        ne.beginPin(execPinId(n.id, .output), .output);
+        zgui.text("▼", .{});
+        ne.endPin();
+    };
     switch (n.kind) {
         .subflow => {
             zgui.textDisabled("flow: {s}", .{n.flow_ref});

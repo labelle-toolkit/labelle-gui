@@ -1323,6 +1323,62 @@ pub fn main() !void {
         }
     });
 
+    // Issue #172: derived execution-flow arrows on command nodes (RFC §6
+    // deferral). Open the canonical `hit_counter.flow.jsonc` fixture
+    // (Event + ChangeVariable, no on-disk edges), drive a few frames,
+    // and assert the canvas rendered exactly one synthetic exec link —
+    // the white arrow from the Event node's bottom anchor into the
+    // ChangeVariable's top anchor. The count lives on
+    // `FlowDocState.exec_links_last_frame`, set by `renderExecEdges`.
+    _ = engine.registerTest("flow_vocab", "exec_arrow_between_event_and_change_variable", @src(), struct {
+        pub fn gui(_: *zgui.te.TestContext) !void {
+            if (g_app) |a| a.renderFrame(1.0 / 60.0);
+        }
+        pub fn run(ctx: *zgui.te.TestContext) !void {
+            const a = g_app orelse {
+                _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
+                return;
+            };
+
+            const dir = g_settings_project_dir.?;
+            var path_buf: [512]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buf, "{s}/scripts/flows/hit_counter.flow.jsonc", .{dir}) catch return;
+
+            a.openFlowDoc(path) catch {
+                _ = zgui.te.check(@src(), .{}, false, "openFlowDoc must succeed");
+                return;
+            };
+            // Several frames so `renderCanvas` -> `renderExecEdges` has
+            // run at least once after the doc finished its
+            // first-frame layout pass. The counter is set fresh inside
+            // every `renderExecEdges` invocation, so any post-load
+            // frame is enough.
+            ctx.yield(3);
+
+            const opened_ok = a.open_tabs.items.len == 1 and a.open_tabs.items[0] == .flow_doc;
+            _ = zgui.te.check(@src(), .{}, opened_ok, "flow_doc tab opened");
+            if (!opened_ok) {
+                a.closeTab(0);
+                return;
+            }
+            const tab = &a.open_tabs.items[0].flow_doc;
+
+            // The fixture has two command-kind nodes (Event +
+            // ChangeVariable) and no data edges. The topo sort puts
+            // them in document order (smaller id first), and the
+            // synthetic exec layer connects consecutive commands — so
+            // exactly one exec link is drawn.
+            _ = zgui.te.check(
+                @src(),
+                .{},
+                tab.exec_links_last_frame == 1,
+                "hit_counter renders exactly one exec arrow (Event -> ChangeVariable)",
+            );
+
+            a.closeTab(0);
+        }
+    });
+
     _ = engine.registerTest("phase3", "project_settings_edit_save", @src(), struct {
         pub fn gui(_: *zgui.te.TestContext) !void {
             // Synthetic dt; tests don't observe status_timer decay.

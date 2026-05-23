@@ -143,6 +143,39 @@ pub const NodeKind = enum {
             .other => null,
         };
     }
+
+    /// True when this kind is a *command* (mutation, void-return,
+    /// rectangular silhouette per RFC-FLOW-VOCABULARY §6). Commands sit
+    /// on the execution-flow spine and get top/bottom exec anchors;
+    /// reporters (pure value, rounded silhouette) get only data pins.
+    ///
+    /// `.custom_node` is ambiguous from this enum alone — the catalog
+    /// resolves the per-entry `kind`. Callers that need the catalog's
+    /// answer should consult `flow_node_catalog.lookup(...).kind`
+    /// directly; `isCommandKind` returns false for `.custom_node` so the
+    /// generic classifier never accidentally awards exec anchors to a
+    /// reporter-kind custom node.
+    ///
+    /// `.other` is also false — opaque nodes (`BinOp`, `Literal`, …)
+    /// have no declared command/reporter polarity in the editor.
+    pub fn isCommandKind(self: NodeKind) bool {
+        return switch (self) {
+            .event,
+            .emit,
+            .set_variable,
+            .change_variable,
+            .clear_variable,
+            .subflow,
+            .output,
+            => true,
+            .get_variable,
+            .has_value_variable,
+            .param,
+            .custom_node,
+            .other,
+            => false,
+        };
+    }
 };
 
 /// One literal binding on a `Subflow` node — a parameter *name* paired
