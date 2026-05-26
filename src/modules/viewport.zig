@@ -227,18 +227,35 @@ pub fn render(
         .flags = .{ .mouse_button_left = true, .mouse_button_middle = true },
     });
 
-    // Drag-drop target for components from the project tree (#143).
-    // Must attach to the LAST submitted item (the invisibleButton
-    // above) so `beginDragDropTarget` picks up the canvas region.
-    // Gated on `component_drop` being non-null — only editors that
-    // know how to consume the drop (the prefab editor today) wire
-    // this sink.
-    // One `beginDragDropTarget` covers both kinds — ImGui filters by
-    // payload type inside `acceptDragDropPayload`, so the two sinks
-    // never cross-fire. Gated together on at least one being wired:
-    // the scene tab wires `prefab_drop` (#85); the prefab tab wires
+    // Drag-drop target — must attach to the LAST submitted item (the
+    // invisibleButton above) so `beginDragDropTarget` picks up the
+    // canvas region. One `beginDragDropTarget` covers both payload
+    // kinds — ImGui filters by payload type inside
+    // `acceptDragDropPayload`, so the two sinks never cross-fire.
+    // Gated together on at least one being wired: the scene tab
+    // wires `prefab_drop` (#85); the prefab tab wires
     // `component_drop` (#143); other tabs wire neither.
     if (state.component_drop != null or state.prefab_drop != null) {
+        // Drop-zone discovery: when a compatible payload is in flight
+        // anywhere in the imgui context, tint the canvas border so
+        // the user can tell the viewport will accept the drop. ImGui
+        // draws its own default highlight on the active target rect,
+        // but that only triggers once the cursor enters the target —
+        // this paints the moment a drag starts so the user can spot
+        // where to aim before getting there (#85 spec calls it out).
+        if (zgui.getDragDropPayload()) |payload| {
+            const accepts = (state.component_drop != null and payload.isDataType(dnd.COMPONENT_TYPE)) or
+                (state.prefab_drop != null and payload.isDataType(dnd.PREFAB_TYPE));
+            if (accepts) {
+                dl.addRect(.{
+                    .pmin = canvas_min,
+                    .pmax = canvas_max,
+                    .col = 0x80_55_aa_ff, // soft blue, semi-transparent
+                    .thickness = 3.0,
+                });
+            }
+        }
+
         if (zgui.beginDragDropTarget()) {
             defer zgui.endDragDropTarget();
             if (state.component_drop) |sink| {

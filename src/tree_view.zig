@@ -158,13 +158,22 @@ pub const TreeView = struct {
 
         // Same idea for `prefabs/` — any `.jsonc` file under this
         // prefix (including subdirectories like `prefabs/rooms/`)
-        // becomes a drag source for the scene viewport (#85).
+        // becomes a drag source for the scene viewport (#85). A
+        // bufPrint failure here (project root longer than
+        // `path_buf_size`) yields an empty prefix → `isPrefabFile`
+        // returns false for every entry and the drag source silently
+        // never shows up. Log once per frame so the failure is
+        // visible. Matches the `components_prefix` pattern above by
+        // omission today — bug #143 carries the same risk.
         var prefabs_prefix_buf: [path_buf_size]u8 = undefined;
         const prefabs_prefix = std.fmt.bufPrint(
             &prefabs_prefix_buf,
             "{s}/{s}/",
             .{ base_path, project.ProjectFolders.prefabs },
-        ) catch "";
+        ) catch blk: {
+            std.log.warn("tree_view: project root too long for prefabs_prefix_buf; drag-drop of prefab files disabled this frame", .{});
+            break :blk "";
+        };
 
         // Render each top-level project folder. Entries that contain a
         // path separator (`scripts/flows`) are skipped — they belong
@@ -435,7 +444,7 @@ pub const TreeView = struct {
 /// project's `components/` folder. Non-recursive: only top-level
 /// files match. Used by `renderFolder` to wrap the file-leaf in a
 /// drag-source so the prefab editor can accept it (#143).
-fn isComponentFile(full_path: []const u8, file_name: []const u8, components_prefix: []const u8) bool {
+pub fn isComponentFile(full_path: []const u8, file_name: []const u8, components_prefix: []const u8) bool {
     if (components_prefix.len == 0) return false;
     if (!std.mem.endsWith(u8, file_name, ".zig")) return false;
     if (!std.mem.startsWith(u8, full_path, components_prefix)) return false;

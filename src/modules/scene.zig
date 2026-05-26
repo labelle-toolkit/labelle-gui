@@ -440,7 +440,7 @@ fn renderViewport(
         openPrefabFromEntity(app, s, idx);
     }
     if (prefab_drop) |drop| {
-        handlePrefabDrop(s, drop);
+        handlePrefabDrop(s, app, drop);
     }
 }
 
@@ -451,7 +451,13 @@ fn renderViewport(
 /// drag source already filters to `prefabs/**/*.jsonc`, so reaching
 /// here with an empty stem would mean somebody else is emitting
 /// `PREFAB_TYPE`.
-fn handlePrefabDrop(s: *SceneState, drop: viewport.PrefabDrop) void {
+///
+/// Snap math: passes `0` as the snap origin to match the viewport's
+/// default `snap_origin` (which the scene editor leaves at `{0, 0}`
+/// because it doesn't surface a UI for that field). If `snap_origin`
+/// ever becomes per-tab, thread it through here so a drop lands on
+/// the same cell a drag-to-move on the same world coord would.
+fn handlePrefabDrop(s: *SceneState, app: *App, drop: viewport.PrefabDrop) void {
     const name = drop.name();
     if (name.len == 0) {
         std.log.warn("scene: prefab drop ignored, empty stem", .{});
@@ -464,6 +470,11 @@ fn handlePrefabDrop(s: *SceneState, drop: viewport.PrefabDrop) void {
     }
     addPrefabEntity(s, name, world) catch |err| {
         std.log.err("scene: addPrefabEntity failed for {s}: {s}", .{ name, @errorName(err) });
+        // Surface to the status bar so the user knows the drop hit
+        // and failed — otherwise the gesture would noop visually
+        // with only a log line for evidence. Same shape as the
+        // "Add entity from prefab" failure path uses.
+        app.setStatus("Add prefab failed!");
     };
 }
 
