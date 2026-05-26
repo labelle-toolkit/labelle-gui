@@ -398,6 +398,12 @@ fn renderViewport(
     var right_click: ?[2]f32 = null;
     var right_click_entity: ?usize = null;
     var double_click: ?usize = null;
+    // Drag-drop prefab sink (#85). Filled when the user drops a prefab
+    // file from the project tree on the viewport. The stem is copied
+    // into the sink's own buffer (see `viewport.PrefabDrop`), so it
+    // outlives ImGui's payload memory; we still consume it before
+    // returning since the next frame might emit another drop.
+    var prefab_drop: ?viewport.PrefabDrop = null;
     viewport.render(
         .{
             .pan = &s.pan,
@@ -411,6 +417,7 @@ fn renderViewport(
             .double_click_entity = &double_click,
             .grid_step = s.grid_step,
             .snap_enabled = s.snap_enabled,
+            .prefab_drop = &prefab_drop,
         },
         s.loaded.scene.entities,
         s.loaded.extras.entity_components,
@@ -432,6 +439,32 @@ fn renderViewport(
     if (double_click) |idx| {
         openPrefabFromEntity(app, s, idx);
     }
+    if (prefab_drop) |drop| {
+        handlePrefabDrop(s, drop);
+    }
+}
+
+/// Resolve a drag-drop prefab landing on the scene viewport (#85).
+/// Applies the scene's snap setting to the drop position and routes
+/// to the same `addPrefabEntity` helper the toolbar / right-click
+/// flows use. Empty names (malformed payload) log and noop; the
+/// drag source already filters to `prefabs/**/*.jsonc`, so reaching
+/// here with an empty stem would mean somebody else is emitting
+/// `PREFAB_TYPE`.
+fn handlePrefabDrop(s: *SceneState, drop: viewport.PrefabDrop) void {
+    const name = drop.name();
+    if (name.len == 0) {
+        std.log.warn("scene: prefab drop ignored, empty stem", .{});
+        return;
+    }
+    var world = drop.world;
+    if (s.snap_enabled and s.grid_step > 0) {
+        world[0] = viewport.snapValue(world[0], 0, s.grid_step);
+        world[1] = viewport.snapValue(world[1], 0, s.grid_step);
+    }
+    addPrefabEntity(s, name, world) catch |err| {
+        std.log.err("scene: addPrefabEntity failed for {s}: {s}", .{ name, @errorName(err) });
+    };
 }
 
 /// Per-entity right-click context menu — currently just Delete, room

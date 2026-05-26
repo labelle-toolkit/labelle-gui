@@ -156,6 +156,16 @@ pub const TreeView = struct {
             .{ base_path, project.ProjectFolders.components },
         ) catch "";
 
+        // Same idea for `prefabs/` — any `.jsonc` file under this
+        // prefix (including subdirectories like `prefabs/rooms/`)
+        // becomes a drag source for the scene viewport (#85).
+        var prefabs_prefix_buf: [path_buf_size]u8 = undefined;
+        const prefabs_prefix = std.fmt.bufPrint(
+            &prefabs_prefix_buf,
+            "{s}/{s}/",
+            .{ base_path, project.ProjectFolders.prefabs },
+        ) catch "";
+
         // Render each top-level project folder. Entries that contain a
         // path separator (`scripts/flows`) are skipped — they belong
         // under their parent in the tree, and the recursive walker
@@ -167,7 +177,7 @@ pub const TreeView = struct {
             var folder_path_buf: [path_buf_size:0]u8 = undefined;
             const folder_path = std.fmt.bufPrintZ(&folder_path_buf, "{s}/{s}", .{ base_path, folder_name }) catch continue;
 
-            if (self.renderDirectoryRow(folder_path, folder_name, managed_paths, components_prefix)) {
+            if (self.renderDirectoryRow(folder_path, folder_name, managed_paths, components_prefix, prefabs_prefix)) {
                 file_selected = true;
             }
         }
@@ -187,6 +197,7 @@ pub const TreeView = struct {
         display_name: []const u8,
         managed_paths: []const []const u8,
         components_prefix: []const u8,
+        prefabs_prefix: []const u8,
     ) bool {
         var file_selected = false;
         const is_open_state = self.isOpen(folder_path);
@@ -216,7 +227,7 @@ pub const TreeView = struct {
             defer zgui.unindent(.{});
 
             const line_top_y = zgui.getCursorScreenPos()[1];
-            if (self.renderFolder(folder_path, managed_paths, components_prefix)) {
+            if (self.renderFolder(folder_path, managed_paths, components_prefix, prefabs_prefix)) {
                 file_selected = true;
             }
             const line_bottom_y = zgui.getCursorScreenPos()[1];
@@ -250,7 +261,7 @@ pub const TreeView = struct {
     /// files. Subdirectories whose absolute path matches a
     /// `managed_paths` entry are suppressed because they're already
     /// rendered at top level (e.g. `scripts/flows`).
-    fn renderFolder(self: *Self, folder_path: []const u8, managed_paths: []const []const u8, components_prefix: []const u8) bool {
+    fn renderFolder(self: *Self, folder_path: []const u8, managed_paths: []const []const u8, components_prefix: []const u8, prefabs_prefix: []const u8) bool {
         var file_selected = false;
 
         const files = self.getFilesForFolder(folder_path) catch {
@@ -285,7 +296,7 @@ pub const TreeView = struct {
             }
 
             if (file_entry.is_directory) {
-                if (self.renderDirectoryRow(full_path, file_entry.name, managed_paths, components_prefix)) {
+                if (self.renderDirectoryRow(full_path, file_entry.name, managed_paths, components_prefix, prefabs_prefix)) {
                     file_selected = true;
                 }
             } else {
@@ -334,6 +345,31 @@ pub const TreeView = struct {
                             .once,
                         );
                         zgui.text("⚙ {s}", .{stem});
+                    }
+                }
+
+                // Drag source for prefab `.jsonc` files (#85). Recursive:
+                // any `.jsonc` anywhere under `prefabs/` qualifies (a
+                // real project keeps them in subfolders like
+                // `prefabs/rooms/canteen.jsonc`). The scene viewport's
+                // drop target unpacks the stem and routes through
+                // `addPrefabEntity`, same as the toolbar / right-click
+                // "Add prefab" flows.
+                if (isPrefabFile(full_path, file_entry.name, prefabs_prefix)) {
+                    if (zgui.beginDragDropSource(.{})) {
+                        defer zgui.endDragDropSource();
+                        const stem = file_entry.name[0 .. file_entry.name.len - ".jsonc".len];
+                        const payload = dnd.packPrefab(stem);
+                        _ = zgui.setDragDropPayload(
+                            dnd.PREFAB_TYPE,
+                            std.mem.asBytes(&payload),
+                            .once,
+                        );
+                        // Same icon family as the prefab-tab tab label;
+                        // distinct from the ⚙ component glyph so the
+                        // tooltip can't be confused with a component
+                        // drag mid-flight.
+                        zgui.text("⌖ {s}", .{stem});
                     }
                 }
             }
@@ -411,4 +447,16 @@ fn isComponentFile(full_path: []const u8, file_name: []const u8, components_pref
     // still carry a '/' here and is rejected.
     const remainder = full_path[components_prefix.len..];
     return std.mem.indexOfScalar(u8, remainder, '/') == null;
+}
+
+/// True when `full_path` is a `.jsonc` file anywhere under the
+/// project's `prefabs/` folder — including subdirectories like
+/// `prefabs/rooms/canteen.jsonc`. Recursive (in contrast to
+/// `isComponentFile`) because real projects keep prefabs in
+/// subfolders. Used by `renderFolder` to wrap the file-leaf in a
+/// drag-source the scene viewport accepts (#85).
+pub fn isPrefabFile(full_path: []const u8, file_name: []const u8, prefabs_prefix: []const u8) bool {
+    if (prefabs_prefix.len == 0) return false;
+    if (!std.mem.endsWith(u8, file_name, ".jsonc")) return false;
+    return std.mem.startsWith(u8, full_path, prefabs_prefix);
 }

@@ -55,3 +55,44 @@ pub fn packComponent(stem: []const u8) ComponentPayload {
 pub fn unpackComponent(payload: *const ComponentPayload) []const u8 {
     return payload.name[0..payload.name_len];
 }
+
+/// Payload identifier for a prefab `.jsonc` file dragged from the
+/// project tree onto a scene viewport (issue #85). The prefab is
+/// identified by its filename stem (e.g. "canteen") — the same key
+/// the engine uses when a scene entity writes
+/// `{ "prefab": "canteen" }`. Distinct from `COMPONENT_TYPE` so the
+/// two drag kinds can coexist without the wrong target accepting
+/// the wrong payload.
+pub const PREFAB_TYPE: [:0]const u8 = "labelle_prefab_name";
+
+/// Plain-data payload carried by a prefab drag. Same fixed-buffer
+/// shape as `ComponentPayload` so the two share `PAYLOAD_NAME_CAP`
+/// and the receive-side `@memcpy` pattern is identical. We carry
+/// the *stem* (basename minus `.jsonc`), not the absolute path —
+/// the engine + `prefab_index` both key on stem, and a stem is
+/// always shorter than the OS-level path it came from.
+pub const PrefabPayload = extern struct {
+    /// Valid prefix length of `name`. Always ≤ PAYLOAD_NAME_CAP.
+    name_len: u8,
+    /// Zero-padded prefab stem bytes (e.g. "canteen", "movement_node").
+    name: [PAYLOAD_NAME_CAP]u8,
+};
+
+/// Build a prefab payload from a caller-supplied stem. Truncates if
+/// the stem exceeds `PAYLOAD_NAME_CAP` — OS path limits make that
+/// effectively impossible, but the clamp keeps us robust against a
+/// malformed tree entry.
+pub fn packPrefab(stem: []const u8) PrefabPayload {
+    var p: PrefabPayload = .{ .name_len = 0, .name = [_]u8{0} ** PAYLOAD_NAME_CAP };
+    const n = @min(stem.len, PAYLOAD_NAME_CAP);
+    @memcpy(p.name[0..n], stem[0..n]);
+    p.name_len = @intCast(n);
+    return p;
+}
+
+/// Read the prefab stem back out of a received payload. Returns a
+/// slice into the payload buffer — caller must dupe before the
+/// next imgui frame.
+pub fn unpackPrefab(payload: *const PrefabPayload) []const u8 {
+    return payload.name[0..payload.name_len];
+}
