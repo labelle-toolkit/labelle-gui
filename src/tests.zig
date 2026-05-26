@@ -17,6 +17,7 @@ const flow_doc = @import("modules/flow_doc.zig");
 const flow_cycle = @import("flow_cycle.zig");
 const event_catalog = @import("flow_event_catalog.zig");
 const node_catalog = @import("flow_node_catalog.zig");
+const hierarchy = @import("modules/hierarchy.zig");
 
 // Reference the node catalog at file scope so its module-level
 // `test "…"` blocks become reachable from the test root and are
@@ -1580,6 +1581,47 @@ pub const SceneIoTests = struct {
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"root\":") == null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"include\":") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"meta\":") != null);
+    }
+};
+
+pub const HierarchyTests = struct {
+    // Filter logic lives in `modules/hierarchy.zig` as pure helpers
+    // (no imgui draw context) so the search/label code is testable
+    // without standing up a GUI. The panel render itself stays
+    // unit-untested; gui-test covers it via TE.
+
+    test "matchesFilter case-insensitive substring" {
+        try expect.toBeTrue(hierarchy.matchesFilter("Canteen", "cant"));
+        try expect.toBeTrue(hierarchy.matchesFilter("CANTEEN", "een"));
+        try expect.toBeTrue(hierarchy.matchesFilter("workstation_drill", "DRIL"));
+    }
+
+    test "matchesFilter rejects non-matching needle" {
+        try expect.toBeFalse(hierarchy.matchesFilter("canteen", "fitness"));
+    }
+
+    test "matchesFilter empty needle matches everything" {
+        try expect.toBeTrue(hierarchy.matchesFilter("anything", ""));
+    }
+
+    test "matchesFilter rejects needle longer than haystack" {
+        try expect.toBeFalse(hierarchy.matchesFilter("ab", "abc"));
+    }
+
+    test "firstCommentLine strips marker and surrounding whitespace" {
+        try expect.toBeTrue(std.mem.eql(u8, hierarchy.firstCommentLine("// first\n// second"), "first"));
+        try expect.toBeTrue(std.mem.eql(u8, hierarchy.firstCommentLine("//   note  \n"), "note"));
+    }
+
+    test "firstCommentLine returns empty for whitespace-only or empty input" {
+        try expect.toBeTrue(hierarchy.firstCommentLine("\n\n").len == 0);
+        try expect.toBeTrue(hierarchy.firstCommentLine("").len == 0);
+    }
+
+    test "firstCommentLine caps the returned slice at 60 bytes" {
+        // 70-char line should be truncated to 60.
+        const long = "//" ++ ("a" ** 70);
+        try expect.equal(hierarchy.firstCommentLine(long).len, 60);
     }
 };
 

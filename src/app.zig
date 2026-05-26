@@ -29,6 +29,7 @@ const gizmo_mod = @import("modules/gizmo.zig");
 const entity_inspector_mod = @import("modules/entity_inspector.zig");
 const game_view_mod = @import("modules/game_view.zig");
 const atlas_viewer_mod = @import("modules/atlas_viewer.zig");
+const hierarchy_mod = @import("modules/hierarchy.zig");
 const game_view = @import("game_view.zig");
 const io_global = @import("io_global.zig");
 const flow_runtime_mod = @import("modules/flow_runtime.zig");
@@ -201,6 +202,15 @@ pub const App = struct {
     /// packed-and-opened atlases.
     atlas_viewer: atlas_viewer_mod.AtlasViewer = .{},
 
+    /// Hierarchy panel toggle (#144). When open and the active tab is
+    /// a scene or prefab editor, lists every entity in the tab's data
+    /// with click-to-select bidirectional sync against the canvas.
+    show_hierarchy: bool = false,
+    /// Sticky search-filter buffer for the hierarchy panel. Kept in
+    /// App so the filter survives panel close/reopen — same pattern
+    /// as `prefab_picker_filter` on SceneState.
+    hierarchy_filter: [128:0]u8 = [_:0]u8{0} ** 128,
+
     /// Phase 3 (#84): Entity Inspector panel toggle.
     show_entity_inspector: bool = false,
     /// Entity Inspector state — fed by `PreviewSession`'s
@@ -290,7 +300,7 @@ pub const App = struct {
 
     /// Fixed-size storage for registered modules. Grow the array literal
     /// when adding modules; Zig will tell you if it overflows.
-    modules: [9]module.Module = undefined,
+    modules: [10]module.Module = undefined,
     registry: module.Registry = .{ .modules = &.{} },
 
     const Self = @This();
@@ -387,6 +397,7 @@ pub const App = struct {
         app.modules[6] = flow_runtime_mod.makeModule(app);
         app.modules[7] = game_view_mod.makeModule(app);
         app.modules[8] = atlas_viewer_mod.makeModule(app);
+        app.modules[9] = hierarchy_mod.makeModule(app);
         app.registry = .{ .modules = &app.modules };
 
         // Honor LABELLE_GAME_VIEW_SHM as a manual attach path until
