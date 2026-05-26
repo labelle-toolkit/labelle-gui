@@ -115,6 +115,12 @@ pub const SceneState = struct {
     /// drag-release so the chosen width persists across editor
     /// restarts (#140).
     inspector_width: f32 = @import("../prefs.zig").default_inspector_width,
+    /// Mirror of `selected_index` consumed by the Hierarchy panel
+    /// (#144) to detect externally-driven selection changes. When
+    /// the live value differs from this mirror, the panel scrolls
+    /// the matching row into view; in-panel clicks update the
+    /// mirror in lockstep so they don't trigger the scroll branch.
+    hierarchy_last_seen: ?usize = null,
 
     /// Load a scene from disk and wrap it in a fresh SceneState. The
     /// returned state owns an arena holding the path + display name,

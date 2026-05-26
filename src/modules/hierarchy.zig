@@ -75,6 +75,19 @@ fn renderSceneRows(s: *scene_mod.SceneState, filter: []const u8) void {
         return;
     }
 
+    // Auto-scroll on externally-driven selection changes (e.g. user
+    // clicked an entity on the canvas). `last_seen_selected_index`
+    // mirrors the field the previous frame saw — when the live value
+    // diverges and was NOT set by clicking a row in this panel, the
+    // selectable for that row calls `setScrollHereY` so the user
+    // gets visual confirmation that the click registered, even when
+    // the panel is unfocused / dimmed behind the canvas.
+    const auto_scroll_to: ?usize = if (s.selected_index) |cur|
+        if (s.hierarchy_last_seen != cur) cur else null
+    else
+        null;
+    s.hierarchy_last_seen = s.selected_index;
+
     var visible: usize = 0;
     for (s.loaded.scene.entities, 0..) |entity, i| {
         var label_buf: [256:0]u8 = undefined;
@@ -84,6 +97,12 @@ fn renderSceneRows(s: *scene_mod.SceneState, filter: []const u8) void {
         const selected = if (s.selected_index) |sel| sel == i else false;
         if (zgui.selectable(label, .{ .selected = selected })) {
             s.selected_index = i;
+            // Update the mirror so the auto-scroll branch above
+            // doesn't fire next frame for an in-panel click.
+            s.hierarchy_last_seen = i;
+        }
+        if (auto_scroll_to) |target| {
+            if (target == i) zgui.setScrollHereY(.{});
         }
         visible += 1;
     }
@@ -94,10 +113,19 @@ fn renderSceneRows(s: *scene_mod.SceneState, filter: []const u8) void {
 }
 
 fn renderPrefabRows(p: *prefab_mod.PrefabState, filter: []const u8) void {
+    // Same auto-scroll rule scene tabs use: externally-driven changes
+    // to the selection (canvas click) trigger a scroll to the row,
+    // in-panel clicks don't.
+    const auto_scroll_to: ?usize = if (p.selected_child_idx) |cur|
+        if (p.hierarchy_last_seen != cur) cur else null
+    else
+        null;
+    p.hierarchy_last_seen = p.selected_child_idx;
+
     // The prefab body itself is row #0 (`null` selection on the
     // canvas), so the panel offers a way back to it after navigating
     // a child without having to click the canvas's empty background.
-    const body_label = "▸ (prefab body)";
+    const body_label = "(prefab body)";
     const body_selected = p.selected_child_idx == null;
     if (filter.len == 0 or matchesFilter(body_label, filter)) {
         if (zgui.selectable(body_label, .{ .selected = body_selected })) {
@@ -119,6 +147,10 @@ fn renderPrefabRows(p: *prefab_mod.PrefabState, filter: []const u8) void {
         const selected = if (p.selected_child_idx) |sel| sel == i else false;
         if (zgui.selectable(label, .{ .selected = selected })) {
             p.selected_child_idx = i;
+            p.hierarchy_last_seen = i;
+        }
+        if (auto_scroll_to) |target| {
+            if (target == i) zgui.setScrollHereY(.{});
         }
         visible += 1;
     }
@@ -131,7 +163,9 @@ fn renderPrefabRows(p: *prefab_mod.PrefabState, filter: []const u8) void {
 /// `#N <prefab_name>` for prefab refs; `#N (inline)` for entities
 /// without a prefab field. The comment buffer's first non-empty line
 /// rides along as a hint when present so authored notes stay
-/// discoverable in the list.
+/// discoverable in the list. Separator stays ASCII (`-`) — the
+/// emdash glyph isn't covered by ImGui's default font and renders
+/// as `?` on the panel.
 fn entityLabel(buf: *[256:0]u8, idx: usize, entity: *const scene_io.Entity) ![:0]u8 {
     const name: []const u8 = entity.prefab orelse "(inline)";
     const comment = std.mem.sliceTo(&entity.comment, 0);
@@ -139,7 +173,7 @@ fn entityLabel(buf: *[256:0]u8, idx: usize, entity: *const scene_io.Entity) ![:0
     if (hint.len == 0) {
         return std.fmt.bufPrintZ(buf, "#{d} {s}", .{ idx, name });
     }
-    return std.fmt.bufPrintZ(buf, "#{d} {s}  — {s}", .{ idx, name, hint });
+    return std.fmt.bufPrintZ(buf, "#{d} {s}  - {s}", .{ idx, name, hint });
 }
 
 /// Return the first non-empty, comment-marker-stripped line from a
