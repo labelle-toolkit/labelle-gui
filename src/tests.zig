@@ -1514,6 +1514,57 @@ pub const SceneIoTests = struct {
         try expect.equal(loaded.scene.entities.len, 1);
         try expect.equal(loaded.scene.entities[0].position.?.x, 7);
     }
+
+    test "renderSceneJsonc emits components (not overrides) for inline entries" {
+        // §B2 §writer half: an entry without `prefab` is inline and
+        // must emit its component map as `components`. Sister test
+        // to "renderSceneJsonc emits root + children + overrides for
+        // refs" — together they cover both §B2 disjoint branches.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "x",
+            \\    "root": {
+            \\        "children": [
+            \\            { "components": { "Position": { "x": 1, "y": 2 } } }
+            \\        ]
+            \\    }
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+
+        const text = try scene_io.renderSceneJsonc(allocator, loaded);
+        defer allocator.free(text);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"components\":") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"overrides\":") == null);
+    }
+
+    test "renderSceneJsonc skips `root` as a top-level extra" {
+        // The reader's `isManagedTopLevelKey` lists `root` so it
+        // never lands in `extras.top_level`. If the predicate ever
+        // regresses, the writer would double-emit `"root":` (once
+        // as the modeled wrapper, once verbatim from extras),
+        // producing duplicate-key JSON the engine refuses.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "x",
+            \\    "include": "shared.jsonc",
+            \\    "root": { "children": [] }
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+
+        const text = try scene_io.renderSceneJsonc(allocator, loaded);
+        defer allocator.free(text);
+        // `include` survives as a top-level extra; `root` appears
+        // exactly once (the writer's wrapper, not a verbatim re-emit).
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"include\":") != null);
+        const first_root = std.mem.indexOf(u8, text, "\"root\":") orelse unreachable;
+        try expect.toBeTrue(std.mem.indexOf(u8, text[first_root + 1 ..], "\"root\":") == null);
+    }
 };
 
 pub const AtlasJsonTests = struct {

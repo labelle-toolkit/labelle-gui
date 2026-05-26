@@ -386,10 +386,14 @@ pub fn parsePrefab(allocator: std.mem.Allocator, raw: []const u8) !LoadedPrefab 
     const ChildEntry = struct {
         prefab: ?[]const u8 = null,
         components: ?std.json.Value = null,
-        // Unified prefab refs spell `components` as `overrides`. We
-        // accept both during the read so legacy and unified-rooted
-        // children parse with one schema; the writer normalises on
-        // emit (refs → overrides, inline → components).
+        // Unified prefab refs spell `components` as `overrides`
+        // (RFC #560 §B2). The reader accepts both keys on either
+        // entry shape — strict §B2 enforcement is the engine
+        // loader's job, the editor stays permissive so a hand-
+        // edited prefab with the wrong-mode key doesn't refuse to
+        // open. `components orelse overrides` resolves whichever
+        // is populated; the writer always normalises on emit
+        // (refs → overrides, inline → components).
         overrides: ?std.json.Value = null,
     };
     const Intermediate = struct {
@@ -404,6 +408,15 @@ pub fn parsePrefab(allocator: std.mem.Allocator, raw: []const u8) !LoadedPrefab 
         .ignore_unknown_fields = true,
     });
     defer parsed.deinit();
+
+    // Legacy schema → one warning per load so a contributor on an
+    // older branch sees they're not yet on the unified format
+    // (issue #174 acceptance bullet). The writer always normalises
+    // on save, so the warning fires on read but not subsequent
+    // saves of the same file.
+    if (parsed.value.root == null) {
+        std.log.warn("scene_io: prefab parsed in legacy schema (no `root` wrapper); will re-emit as unified RFC #560 on save", .{});
+    }
 
     const eff_components: ?std.json.Value = if (parsed.value.root) |r| r.components else parsed.value.components;
     const eff_children: []const ChildEntry = if (parsed.value.root) |r| r.children else parsed.value.children;
@@ -492,6 +505,15 @@ pub fn renderPrefabJsonc(allocator: std.mem.Allocator, loaded: LoadedPrefab) ![]
     const w: ListWriter = .{ .list = &out, .allocator = allocator };
 
     try out.appendSlice(allocator, "{\n");
+    // Mirror the scene writer's layout: file-level metadata first
+    // (passed-through extras like `name`, `version`, custom keys),
+    // then `root` carries the entity body. Keeps both writers
+    // emitting in the same order so a prefab that ever grows
+    // top-level extras (none in the toolkit today) lines up with
+    // the scene's `name → extras → root` shape.
+    for (loaded.top_level_extras) |kv| {
+        try out.print(allocator, "    \"{s}\": {s},\n", .{ kv.name, kv.value_text });
+    }
     try out.appendSlice(allocator, "    \"root\": {\n");
     try out.appendSlice(allocator, "        \"components\": {");
     var first = true;
@@ -603,18 +625,9 @@ pub fn renderPrefabJsonc(allocator: std.mem.Allocator, loaded: LoadedPrefab) ![]
         try out.appendSlice(allocator, "        ]");
     }
 
-    // Close `root` block.
-    try out.appendSlice(allocator, "\n    }");
-
-    // Splice unmodeled top-level keys back in, after `root`. Order
-    // shifts relative to the source (managed first) but the content
-    // is faithful — same trade-off scenes make.
-    for (loaded.top_level_extras) |kv| {
-        try out.appendSlice(allocator, ",\n");
-        try out.print(allocator, "    \"{s}\": {s}", .{ kv.name, kv.value_text });
-    }
-
-    try out.appendSlice(allocator, "\n}\n");
+    // Close `root` block. Top-level extras were emitted before
+    // `root` above so the layout matches the scene writer.
+    try out.appendSlice(allocator, "\n    }\n}\n");
     return out.toOwnedSlice(allocator);
 }
 
@@ -635,6 +648,18 @@ pub fn parseScene(allocator: std.mem.Allocator, raw: []const u8) !LoadedScene {
     // inside `children` may spell `components` as `overrides` —
     // both fields are present on `SceneEntry` and the read-side
     // takes whichever is populated.
+    // Both `components` and `overrides` fields are present per entry
+    // (RFC #560 §B2 — refs use overrides, inline uses components).
+    // The reader accepts whichever spelling appeared, even cross-
+    // mode; strict §B2 enforcement is the engine loader's job, so
+    // the editor stays permissive and a hand-edited scene with the
+    // wrong-mode key still opens. The writer always normalises on
+    // emit. RFC §"Effective name" says when `name` is absent the
+    // basename becomes the registry key — the gui keeps it as the
+    // empty default since `scene.name` is display-only (tab title +
+    // saved value); the engine, not the gui, is the registry-key
+    // consumer. If the tab title ever becomes empty in practice,
+    // `loadFromFile` could fall back to the file basename here.
     const SceneEntry = struct {
         prefab: ?[]const u8 = null,
         components: ?std.json.Value = null,
@@ -656,6 +681,13 @@ pub fn parseScene(allocator: std.mem.Allocator, raw: []const u8) !LoadedScene {
     // freed wholesale on `LoadedScene.deinit`). Calling it anyway keeps
     // the ownership story consistent with other call sites.
     defer parsed.deinit();
+
+    // Legacy schema → one warning per load (issue #174 acceptance).
+    // Saves always re-emit as unified, so the warning fires on read
+    // but not on subsequent saves of the same file.
+    if (parsed.value.root == null) {
+        std.log.warn("scene_io: scene parsed in legacy schema (no `root` wrapper); will re-emit as unified RFC #560 on save", .{});
+    }
 
     const eff_entries: []const SceneEntry = if (parsed.value.root) |r| r.children else parsed.value.entities;
 
