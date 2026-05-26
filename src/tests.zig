@@ -1396,6 +1396,124 @@ pub const SceneIoTests = struct {
         defer loaded2.deinit();
         try expect.equal(loaded2.scene.entities.len, 0);
     }
+
+    // ─── RFC #560 unified prefab/scene format ─────────────────────────
+    //
+    // Scenes wrap entries under `root: { children: [...] }`; prefab
+    // refs spell their data as `overrides`. The reader accepts both
+    // layouts; the writer emits unified. These tests pin the new
+    // shape and the legacy fallback against silent regression.
+
+    test "parseScene accepts unified-format root.children" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "main",
+            \\    "root": {
+            \\        "children": [
+            \\            { "prefab": "wall", "overrides": { "Position": { "x": 12, "y": 34 } } }
+            \\        ]
+            \\    }
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+        try expect.equal(loaded.scene.entities.len, 1);
+        const e = loaded.scene.entities[0];
+        try expect.toBeTrue(e.prefab != null);
+        try expect.toBeTrue(std.mem.eql(u8, e.prefab.?, "wall"));
+        try expect.toBeTrue(e.position != null);
+        try expect.equal(e.position.?.x, 12);
+        try expect.equal(e.position.?.y, 34);
+    }
+
+    test "parsePrefab accepts unified-format root wrapper" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "root": {
+            \\        "components": { "Position": { "x": 1, "y": 2 } },
+            \\        "children": [
+            \\            { "components": { "Position": { "x": 5, "y": 6 } } }
+            \\        ]
+            \\    }
+            \\}
+        ;
+        var loaded = try scene_io.parsePrefab(allocator, src);
+        defer loaded.deinit();
+        try expect.toBeTrue(loaded.entity.position != null);
+        try expect.equal(loaded.entity.position.?.x, 1);
+        try expect.equal(loaded.children.len, 1);
+        try expect.equal(loaded.children[0].position.?.x, 5);
+    }
+
+    test "renderSceneJsonc emits root + children + overrides for refs" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "x",
+            \\    "root": {
+            \\        "children": [
+            \\            { "prefab": "coin", "overrides": { "Position": { "x": 10, "y": 20 } } }
+            \\        ]
+            \\    }
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+
+        const text = try scene_io.renderSceneJsonc(allocator, loaded);
+        defer allocator.free(text);
+        // Wrapper is present.
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"root\": {") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"children\": [") != null);
+        // Ref uses `overrides`, not `components`. The legacy emit
+        // would have written `"components":` here, which the engine
+        // would reject under RFC #560 §B2.
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"overrides\":") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"prefab\": \"coin\"") != null);
+    }
+
+    test "renderSceneJsonc preserves top-level metadata sibling to root" {
+        // `assets`, `include`, etc. live outside the `root` block in
+        // unified scenes. Top-level extras must round-trip even when
+        // the writer wraps entity content in `root: { ... }`.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "m",
+            \\    "assets": ["a", "b"],
+            \\    "root": {
+            \\        "children": []
+            \\    }
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+
+        const text = try scene_io.renderSceneJsonc(allocator, loaded);
+        defer allocator.free(text);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"assets\":") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "[\"a\", \"b\"]") != null);
+    }
+
+    test "parseScene still accepts legacy entities format" {
+        // Backward compat: projects under our control are migrated,
+        // but the reader still has to open older files cleanly.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "old",
+            \\    "entities": [
+            \\        { "components": { "Position": { "x": 7, "y": 8 } } }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+        try expect.equal(loaded.scene.entities.len, 1);
+        try expect.equal(loaded.scene.entities[0].position.?.x, 7);
+    }
 };
 
 pub const AtlasJsonTests = struct {
