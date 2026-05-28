@@ -153,6 +153,21 @@ pub const Entity = struct {
     /// the arena, but its fixed-cap point buffer lives inline so
     /// adding / removing points doesn't need a realloc.
     polygon: ?*Polygon = null,
+    /// Optional inline child entities — populated when a scene entity
+    /// (or a prefab body) has stamped sub-entities. Empty when the
+    /// entity is a leaf or a bare prefab ref. Recursive in shape;
+    /// the scene parser fills one level today, deeper levels stay
+    /// default-empty until the stamp UI / inspector grows them. The
+    /// prefab side keeps using `LoadedPrefab.children` for its
+    /// top-level children (#143 Phase 2); the field here exists so
+    /// scene entities can carry stamped bodies under #143 Phase 5.
+    children: []Entity = &.{},
+    /// Per-child unmodeled components, parallel to `children`. Empty
+    /// when `children` is empty. On save the writer splices each
+    /// slot back into its corresponding child's `components: { ... }`
+    /// block — same contract scene-level `entity_components` extras
+    /// use.
+    children_extras: []const []const ComponentExtra = &.{},
     /// Leading `//` comments captured from the source file, attached
     /// to the first entity that follows them — same rule we use for
     /// project.labelle pass-through. Lines keep their `//` markers and
@@ -586,11 +601,14 @@ pub fn parseScene(allocator: std.mem.Allocator, raw: []const u8) !LoadedScene {
     const stripped = try stripLineComments(arena.allocator(), raw);
     // The intermediate JSON deserialization needs both fields & ignore-unknowns
     // because real scenes carry component keys (Sprite, Shape, …) we don't model.
+    // `children` rides as raw json.Value so the reader can walk it without
+    // declaring a recursive schema — see `readEntityChildren` below (#143 Phase 5).
     const Intermediate = struct {
         name: []const u8 = "",
         entities: []const struct {
             prefab: ?[]const u8 = null,
             components: ?std.json.Value = null,
+            children: ?std.json.Value = null,
         } = &.{},
     };
 
@@ -608,6 +626,12 @@ pub fn parseScene(allocator: std.mem.Allocator, raw: []const u8) !LoadedScene {
     // text — the stripped buffer has spaces where `//` lines used to be,
     // so we can't recover comments from it.
     const comments = try extractEntityComments(arena.allocator(), raw);
+    // Per-entity child extras: parallel to `parsed.value.entities`. Each
+    // slot is the list of unmodeled component-extras for each child of
+    // that entity. Empty when an entity has no children. Same shape the
+    // prefab side already uses for its single `children:` array, just
+    // walked per entity.
+    const children_extras_per_entity = try extractEntityChildrenExtras(arena.allocator(), raw);
 
     var entities = try arena.allocator().alloc(Entity, parsed.value.entities.len);
     for (parsed.value.entities, 0..) |e, i| {
@@ -618,6 +642,11 @@ pub fn parseScene(allocator: std.mem.Allocator, raw: []const u8) !LoadedScene {
             .rectangle = try readRectangle(arena.allocator(), e.components),
             .circle = try readCircle(arena.allocator(), e.components),
             .polygon = try readPolygon(arena.allocator(), e.components),
+            .children = try readEntityChildren(arena.allocator(), e.children),
+            .children_extras = if (i < children_extras_per_entity.len)
+                children_extras_per_entity[i]
+            else
+                &.{},
         };
         // Comments are extracted on a best-effort basis: if the scanner
         // landed fewer entries than parser saw entities (recovery from
@@ -1184,6 +1213,82 @@ fn extractEntityComponentExtras(arena: std.mem.Allocator, raw: []const u8) ![]co
     return extractArrayItemComponentExtras(arena, raw, findEntitiesArray(raw) orelse return &.{});
 }
 
+/// Per-entity, per-child component extras. Walks the scene's
+/// `entities: [...]` array; for each entity body, locates its
+/// `children: [...]` sub-array (if any) and captures the unmodeled
+/// component keys on each child. Result shape: outer slot per entity
+/// in source order, inner slot per child of that entity, innermost
+/// the verbatim `ComponentExtra` list. Entities without children get
+/// an empty inner slice. Used by `parseScene` to feed
+/// `Entity.children_extras` so per-child verbatim components round-trip
+/// even when the gui doesn't model them. (#143 Phase 5)
+fn extractEntityChildrenExtras(arena: std.mem.Allocator, raw: []const u8) ![]const []const []const ComponentExtra {
+    var out: std.ArrayList([]const []const ComponentExtra) = .empty;
+    errdefer out.deinit(arena);
+
+    const entities_lbracket = findEntitiesArray(raw) orelse return out.toOwnedSlice(arena);
+    var i: usize = entities_lbracket + 1; // past '['
+
+    while (i < raw.len) {
+        skipWhitespaceJson(raw, &i);
+        skipCommentBlock(raw, &i);
+        skipWhitespaceJson(raw, &i);
+        if (i >= raw.len) break;
+        if (raw[i] == ']') break;
+        if (raw[i] == ',') {
+            i += 1;
+            continue;
+        }
+        if (raw[i] != '{') break;
+
+        const entity_start = i;
+        scanBalanced(raw, &i, '{', '}');
+        const entity_end = i;
+        const entity_body = raw[entity_start..entity_end];
+
+        if (findArrayByKey(entity_body, "\"children\"")) |lbracket| {
+            const per_child = try extractArrayItemComponentExtras(arena, entity_body, lbracket);
+            try out.append(arena, per_child);
+        } else {
+            try out.append(arena, &.{});
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// Read a scene entity's `children: [...]` JSON value into a slice
+/// of modeled `Entity` records. One level deep — children's children
+/// (grandchildren) ride along via `children_extras` if any, modeled
+/// fields stay default-empty. Mirrors how `parsePrefab` reads the
+/// prefab body's children, but driven off `std.json.Value` so the
+/// caller doesn't need to declare a recursive schema. (#143 Phase 5)
+fn readEntityChildren(arena: std.mem.Allocator, children_val: ?std.json.Value) ![]Entity {
+    const v = children_val orelse return &.{};
+    if (v != .array) return &.{};
+    const arr = v.array.items;
+    var out = try arena.alloc(Entity, arr.len);
+    for (arr, 0..) |item, i| {
+        if (item != .object) {
+            out[i] = .{};
+            continue;
+        }
+        const prefab_val = item.object.get("prefab");
+        const components_val = item.object.get("components");
+        out[i] = .{
+            .prefab = if (prefab_val) |pv|
+                (if (pv == .string) try arena.dupe(u8, pv.string) else null)
+            else
+                null,
+            .position = readPosition(components_val),
+            .sprite = try readSprite(arena, components_val),
+            .rectangle = try readRectangle(arena, components_val),
+            .circle = try readCircle(arena, components_val),
+            .polygon = try readPolygon(arena, components_val),
+        };
+    }
+    return out;
+}
+
 /// Per-child component extras for prefabs. Same scanner the scene
 /// side uses, just rooted at the `children` array instead of
 /// `entities`.
@@ -1481,6 +1586,70 @@ pub fn renderSceneJsonc(allocator: std.mem.Allocator, loaded: LoadedScene) ![]u8
                 c_first = false;
             }
             try out.appendSlice(allocator, " }");
+            first = false;
+        }
+        if (e.children.len > 0) {
+            if (!first) try out.appendSlice(allocator, ",");
+            try out.appendSlice(allocator, " \"children\": [\n");
+            for (e.children, 0..) |child, ci| {
+                try out.appendSlice(allocator, "            {");
+                var c_first = true;
+                if (child.prefab) |p| {
+                    try out.print(allocator, " \"prefab\": \"{s}\"", .{p});
+                    c_first = false;
+                }
+                const cextras = if (ci < e.children_extras.len)
+                    e.children_extras[ci]
+                else
+                    &[_]ComponentExtra{};
+                const child_has_components = child.position != null or
+                    child.sprite != null or
+                    child.rectangle != null or
+                    child.circle != null or
+                    child.polygon != null or
+                    cextras.len > 0;
+                if (child_has_components) {
+                    if (!c_first) try out.appendSlice(allocator, ",");
+                    try out.appendSlice(allocator, " \"components\": {");
+                    var cc_first = true;
+                    if (child.position) |p| {
+                        try out.print(allocator, " \"Position\": {{ \"x\": {d}, \"y\": {d} }}", .{ p.x, p.y });
+                        cc_first = false;
+                    }
+                    if (child.sprite) |sp| {
+                        if (!cc_first) try out.appendSlice(allocator, ",");
+                        _ = try emitSprite(w, sp.*);
+                        cc_first = false;
+                    }
+                    if (child.rectangle) |re| {
+                        if (!cc_first) try out.appendSlice(allocator, ",");
+                        _ = try emitRectangle(w, re.*);
+                        cc_first = false;
+                    }
+                    if (child.circle) |ci2| {
+                        if (!cc_first) try out.appendSlice(allocator, ",");
+                        _ = try emitCircle(w, ci2.*);
+                        cc_first = false;
+                    }
+                    if (child.polygon) |po| {
+                        if (!cc_first) try out.appendSlice(allocator, ",");
+                        _ = try emitPolygon(w, po.*);
+                        cc_first = false;
+                    }
+                    for (cextras) |extra| {
+                        if (!cc_first) try out.appendSlice(allocator, ",");
+                        try out.print(allocator, " \"{s}\": {s}", .{ extra.name, extra.value_text });
+                        cc_first = false;
+                    }
+                    try out.appendSlice(allocator, " }");
+                    c_first = false;
+                }
+                if (c_first) try out.appendSlice(allocator, " ");
+                try out.appendSlice(allocator, " }");
+                if (ci + 1 < e.children.len) try out.appendSlice(allocator, ",");
+                try out.appendSlice(allocator, "\n");
+            }
+            try out.appendSlice(allocator, "        ]");
             first = false;
         }
         if (first) try out.appendSlice(allocator, " "); // empty entity body — keep braces apart

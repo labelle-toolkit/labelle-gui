@@ -1396,6 +1396,202 @@ pub const SceneIoTests = struct {
         defer loaded2.deinit();
         try expect.equal(loaded2.scene.entities.len, 0);
     }
+
+    // ---- #143 Phase 5: Entity.children persistence ----
+
+    test "parseScene reads an entity's children array" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "stamps",
+            \\    "entities": [
+            \\        {
+            \\            "prefab": "canteen",
+            \\            "components": { "Position": { "x": 100, "y": 50 } },
+            \\            "children": [
+            \\                { "prefab": "canteen_seat", "components": { "Position": { "x": 12, "y": 0 } } },
+            \\                { "prefab": "canteen_seat", "components": { "Position": { "x": 24, "y": 0 } } }
+            \\            ]
+            \\        }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+
+        try expect.equal(loaded.scene.entities.len, 1);
+        const root = loaded.scene.entities[0];
+        try expect.equal(root.children.len, 2);
+        try expect.toBeTrue(std.mem.eql(u8, root.children[0].prefab.?, "canteen_seat"));
+        try expect.equal(root.children[0].position.?.x, 12);
+        try expect.equal(root.children[1].position.?.x, 24);
+    }
+
+    test "parseScene leaves children empty when the entity has none" {
+        // Regression guard: pre-Phase-5 scenes (no `children:` key) must
+        // continue to parse with `entities[i].children == &.{}`. The
+        // writer's `if (e.children.len > 0)` branch then skips emission,
+        // so no behavioral or on-disk shape change for existing scenes.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "legacy",
+            \\    "entities": [
+            \\        { "prefab": "coin", "components": { "Position": { "x": 0, "y": 0 } } }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+
+        try expect.equal(loaded.scene.entities[0].children.len, 0);
+        try expect.equal(loaded.scene.entities[0].children_extras.len, 0);
+    }
+
+    test "renderSceneJsonc skips children block when entity has no children" {
+        // Same regression guard from the writer side: a parsed-then-rendered
+        // legacy scene must NOT gain a `"children":` substring.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "legacy",
+            \\    "entities": [
+            \\        { "prefab": "coin", "components": { "Position": { "x": 0, "y": 0 } } }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+
+        const text = try scene_io.renderSceneJsonc(allocator, loaded);
+        defer allocator.free(text);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"children\"") == null);
+    }
+
+    test "renderSceneJsonc emits children block when entity has children" {
+        // Round-trip: parse → write → assert each child's prefab name
+        // and Position survive into the rendered text.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "stamps",
+            \\    "entities": [
+            \\        {
+            \\            "prefab": "canteen",
+            \\            "components": { "Position": { "x": 100, "y": 50 } },
+            \\            "children": [
+            \\                { "prefab": "canteen_seat", "components": { "Position": { "x": 12, "y": 0 } } },
+            \\                { "prefab": "canteen_seat", "components": { "Position": { "x": 24, "y": 0 } } }
+            \\            ]
+            \\        }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+
+        const text = try scene_io.renderSceneJsonc(allocator, loaded);
+        defer allocator.free(text);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"children\":") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"canteen_seat\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"x\": 12") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"x\": 24") != null);
+    }
+
+    test "children round-trip via parseScene → renderSceneJsonc → parseScene" {
+        // Double-pass: render the loaded scene, parse it back, assert
+        // the in-memory shape matches. This is the test that catches
+        // writer↔parser drift end-to-end.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "stamps",
+            \\    "entities": [
+            \\        {
+            \\            "prefab": "canteen",
+            \\            "components": { "Position": { "x": 100, "y": 50 } },
+            \\            "children": [
+            \\                { "prefab": "canteen_seat", "components": { "Position": { "x": 12, "y": 0 } } }
+            \\            ]
+            \\        }
+            \\    ]
+            \\}
+        ;
+        var first = try scene_io.parseScene(allocator, src);
+        defer first.deinit();
+        const text = try scene_io.renderSceneJsonc(allocator, first);
+        defer allocator.free(text);
+
+        var second = try scene_io.parseScene(allocator, text);
+        defer second.deinit();
+        try expect.equal(second.scene.entities.len, 1);
+        try expect.equal(second.scene.entities[0].children.len, 1);
+        try expect.toBeTrue(std.mem.eql(u8, second.scene.entities[0].children[0].prefab.?, "canteen_seat"));
+        try expect.equal(second.scene.entities[0].children[0].position.?.x, 12);
+    }
+
+    test "children_extras preserve unmodeled per-child components verbatim" {
+        // Stamped children may carry custom components the gui doesn't
+        // model (e.g. Coin, Spin). Those must ride along through parse
+        // → write so saving never silently drops fields. Mirrors the
+        // entity-level extras contract.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "stamps",
+            \\    "entities": [
+            \\        {
+            \\            "prefab": "root",
+            \\            "children": [
+            \\                { "components": { "Position": { "x": 5, "y": 7 }, "Coin": { "value": 10 } } }
+            \\            ]
+            \\        }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+
+        const root = loaded.scene.entities[0];
+        try expect.equal(root.children_extras.len, 1);
+        try expect.equal(root.children_extras[0].len, 1);
+        try expect.toBeTrue(std.mem.eql(u8, root.children_extras[0][0].name, "Coin"));
+
+        const text = try scene_io.renderSceneJsonc(allocator, loaded);
+        defer allocator.free(text);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Coin\":") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"value\": 10") != null);
+    }
+
+    test "entities without children get empty children_extras slots" {
+        // Per-entity extras-array must stay parallel to entities even
+        // when some entities have no children. Mixed scene: entity 0
+        // bare, entity 1 with children. Parser must produce
+        // children_extras of len 0 for entity 0 and len 1 for entity 1.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "mixed",
+            \\    "entities": [
+            \\        { "prefab": "bare", "components": { "Position": { "x": 0, "y": 0 } } },
+            \\        {
+            \\            "prefab": "with_kids",
+            \\            "children": [
+            \\                { "prefab": "kid", "components": { "Position": { "x": 1, "y": 1 } } }
+            \\            ]
+            \\        }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+
+        try expect.equal(loaded.scene.entities[0].children.len, 0);
+        try expect.equal(loaded.scene.entities[0].children_extras.len, 0);
+        try expect.equal(loaded.scene.entities[1].children.len, 1);
+        try expect.equal(loaded.scene.entities[1].children_extras.len, 1);
+    }
 };
 
 pub const AtlasJsonTests = struct {
