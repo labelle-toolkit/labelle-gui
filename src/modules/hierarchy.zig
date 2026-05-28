@@ -89,9 +89,9 @@ fn renderSceneRows(s: *scene_mod.SceneState, filter: []const u8) void {
     s.hierarchy_last_seen = s.selected_index;
 
     var visible: usize = 0;
-    for (s.loaded.scene.entities, 0..) |entity, i| {
-        var label_buf: [256:0]u8 = undefined;
-        const label = entityLabel(&label_buf, i, &entity) catch continue;
+    for (s.loaded.scene.entities, 0..) |*entity, i| {
+        var label_buf: [512:0]u8 = undefined;
+        const label = entityLabel(&label_buf, i, entity) catch continue;
         if (filter.len > 0 and !matchesFilter(label, filter)) continue;
 
         const selected = if (s.selected_index) |sel| sel == i else false;
@@ -113,11 +113,23 @@ fn renderSceneRows(s: *scene_mod.SceneState, filter: []const u8) void {
 }
 
 fn renderPrefabRows(p: *prefab_mod.PrefabState, filter: []const u8) void {
-    // Same auto-scroll rule scene tabs use: externally-driven changes
-    // to the selection (canvas click) trigger a scroll to the row,
-    // in-panel clicks don't.
-    const auto_scroll_to: ?usize = if (p.selected_child_idx) |cur|
-        if (p.hierarchy_last_seen != cur) cur else null
+    // Auto-scroll on externally-driven selection changes. Unlike the
+    // scene panel (which only has child rows), the prefab panel has
+    // an extra `(prefab body)` row that represents `selected_child_idx
+    // == null`. Tracking the mirror as a bare `?usize` would conflate
+    // "no selection yet" with "body row picked" and skip scroll-to-
+    // body, so the target is encoded as a tagged union and the change
+    // detection compares both nullness and value.
+    const Target = union(enum) { body, child: usize };
+    const changed = blk: {
+        const a = p.hierarchy_last_seen;
+        const b = p.selected_child_idx;
+        if (a == null and b == null) break :blk false;
+        if (a == null or b == null) break :blk true;
+        break :blk a.? != b.?;
+    };
+    const auto_scroll_to: ?Target = if (changed)
+        (if (p.selected_child_idx) |cur| Target{ .child = cur } else .body)
     else
         null;
     p.hierarchy_last_seen = p.selected_child_idx;
@@ -130,6 +142,10 @@ fn renderPrefabRows(p: *prefab_mod.PrefabState, filter: []const u8) void {
     if (filter.len == 0 or matchesFilter(body_label, filter)) {
         if (zgui.selectable(body_label, .{ .selected = body_selected })) {
             p.selected_child_idx = null;
+            p.hierarchy_last_seen = null;
+        }
+        if (auto_scroll_to) |target| {
+            if (target == .body) zgui.setScrollHereY(.{});
         }
     }
 
@@ -139,9 +155,9 @@ fn renderPrefabRows(p: *prefab_mod.PrefabState, filter: []const u8) void {
     }
 
     var visible: usize = 0;
-    for (p.loaded.children, 0..) |child, i| {
-        var label_buf: [256:0]u8 = undefined;
-        const label = entityLabel(&label_buf, i, &child) catch continue;
+    for (p.loaded.children, 0..) |*child, i| {
+        var label_buf: [512:0]u8 = undefined;
+        const label = entityLabel(&label_buf, i, child) catch continue;
         if (filter.len > 0 and !matchesFilter(label, filter)) continue;
 
         const selected = if (p.selected_child_idx) |sel| sel == i else false;
@@ -149,9 +165,10 @@ fn renderPrefabRows(p: *prefab_mod.PrefabState, filter: []const u8) void {
             p.selected_child_idx = i;
             p.hierarchy_last_seen = i;
         }
-        if (auto_scroll_to) |target| {
-            if (target == i) zgui.setScrollHereY(.{});
-        }
+        if (auto_scroll_to) |target| switch (target) {
+            .child => |idx| if (idx == i) zgui.setScrollHereY(.{}),
+            .body => {},
+        };
         visible += 1;
     }
 
@@ -166,7 +183,7 @@ fn renderPrefabRows(p: *prefab_mod.PrefabState, filter: []const u8) void {
 /// discoverable in the list. Separator stays ASCII (`-`) — the
 /// emdash glyph isn't covered by ImGui's default font and renders
 /// as `?` on the panel.
-fn entityLabel(buf: *[256:0]u8, idx: usize, entity: *const scene_io.Entity) ![:0]u8 {
+fn entityLabel(buf: *[512:0]u8, idx: usize, entity: *const scene_io.Entity) ![:0]u8 {
     const name: []const u8 = entity.prefab orelse "(inline)";
     const comment = std.mem.sliceTo(&entity.comment, 0);
     const hint = firstCommentLine(comment);
@@ -187,7 +204,15 @@ pub fn firstCommentLine(comment: []const u8) []const u8 {
         // Strip the `//` marker and any leading whitespace after it.
         if (std.mem.startsWith(u8, line, "//")) line = std.mem.trim(u8, line[2..], " \t\r");
         if (line.len == 0) continue;
-        return if (line.len > 60) line[0..60] else line;
+        if (line.len > 60) {
+            // Walk back while byte at `limit` is a UTF-8 continuation
+            // byte (top bits 10xxxxxx) so we never slice mid-codepoint
+            // — ImGui chokes on invalid UTF-8 and shows tofu/glitches.
+            var limit: usize = 60;
+            while (limit > 0 and (line[limit] & 0xC0) == 0x80) : (limit -= 1) {}
+            return line[0..limit];
+        }
+        return line;
     }
     return &.{};
 }

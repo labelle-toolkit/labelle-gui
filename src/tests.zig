@@ -1623,6 +1623,18 @@ pub const HierarchyTests = struct {
         const long = "//" ++ ("a" ** 70);
         try expect.equal(hierarchy.firstCommentLine(long).len, 60);
     }
+
+    test "firstCommentLine truncates UTF-8 cleanly at codepoint boundary" {
+        // A 3-byte codepoint (`€` = 0xE2 0x82 0xAC) crossing byte 60
+        // would otherwise leave invalid UTF-8. Layout: 58 'a's + '€'
+        // (3 bytes) → 61 bytes total. Byte 60 is the middle continuation
+        // byte of `€`, so the walk-back must drop the whole codepoint.
+        const text = "//" ++ ("a" ** 58) ++ "€" ++ "tail";
+        const got = hierarchy.firstCommentLine(text);
+        try expect.equal(got.len, 58);
+        // Last byte must not be a UTF-8 continuation byte (top bits 10xx).
+        try expect.toBeTrue((got[got.len - 1] & 0xC0) != 0x80);
+    }
 };
 
 pub const AtlasJsonTests = struct {
