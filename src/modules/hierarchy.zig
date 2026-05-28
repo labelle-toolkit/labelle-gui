@@ -23,6 +23,13 @@ const scene_io = @import("../scene_io.zig");
 const scene_mod = @import("scene.zig");
 const prefab_mod = @import("prefab.zig");
 
+/// Maximum byte length of the comment-hint suffix appended to a row
+/// label. Caps a long captured block from blowing the row's horizontal
+/// layout. Picked to fit one or two typical authored notes
+/// (`Background`, `Bandit raids disabled for now`) without truncating
+/// them mid-word at the most common panel widths.
+pub const hint_cap_bytes: usize = 60;
+
 pub fn makeModule(app: *App) module.Module {
     return .{
         .name = "hierarchy",
@@ -76,23 +83,26 @@ fn renderSceneRows(s: *scene_mod.SceneState, filter: []const u8) void {
     }
 
     // Auto-scroll on externally-driven selection changes (e.g. user
-    // clicked an entity on the canvas). `last_seen_selected_index`
-    // mirrors the field the previous frame saw — when the live value
-    // diverges and was NOT set by clicking a row in this panel, the
-    // selectable for that row calls `setScrollHereY` so the user
-    // gets visual confirmation that the click registered, even when
-    // the panel is unfocused / dimmed behind the canvas.
-    const auto_scroll_to: ?usize = if (s.selected_index) |cur|
-        if (s.hierarchy_last_seen != cur) cur else null
-    else
-        null;
+    // clicked an entity on the canvas). The mirror compares both
+    // nullness and value — same shape as the prefab path's check —
+    // so a deselect-then-reselect of the same index still scrolls
+    // and a same-value redundant write doesn't.
+    const auto_scroll_to: ?usize = blk: {
+        const prev = s.hierarchy_last_seen;
+        const cur = s.selected_index;
+        if (prev == null and cur == null) break :blk null;
+        if (prev == null or cur == null) break :blk cur;
+        if (prev.? == cur.?) break :blk null;
+        break :blk cur;
+    };
     s.hierarchy_last_seen = s.selected_index;
 
     var visible: usize = 0;
     for (s.loaded.scene.entities, 0..) |*entity, i| {
+        if (!entityMatchesFilter(entity, filter)) continue;
+
         var label_buf: [512:0]u8 = undefined;
         const label = entityLabel(&label_buf, i, entity) catch continue;
-        if (filter.len > 0 and !matchesFilter(label, filter)) continue;
 
         const selected = if (s.selected_index) |sel| sel == i else false;
         if (zgui.selectable(label, .{ .selected = selected })) {
@@ -137,16 +147,17 @@ fn renderPrefabRows(p: *prefab_mod.PrefabState, filter: []const u8) void {
     // The prefab body itself is row #0 (`null` selection on the
     // canvas), so the panel offers a way back to it after navigating
     // a child without having to click the canvas's empty background.
+    // Always rendered regardless of filter — it's a single fixed-
+    // purpose row, and hiding it via filter only strands the user
+    // mid-search with no way back to the prefab's own components.
     const body_label = "(prefab body)";
     const body_selected = p.selected_child_idx == null;
-    if (filter.len == 0 or matchesFilter(body_label, filter)) {
-        if (zgui.selectable(body_label, .{ .selected = body_selected })) {
-            p.selected_child_idx = null;
-            p.hierarchy_last_seen = null;
-        }
-        if (auto_scroll_to) |target| {
-            if (target == .body) zgui.setScrollHereY(.{});
-        }
+    if (zgui.selectable(body_label, .{ .selected = body_selected })) {
+        p.selected_child_idx = null;
+        p.hierarchy_last_seen = null;
+    }
+    if (auto_scroll_to) |target| {
+        if (target == .body) zgui.setScrollHereY(.{});
     }
 
     if (p.loaded.children.len == 0) {
@@ -156,9 +167,10 @@ fn renderPrefabRows(p: *prefab_mod.PrefabState, filter: []const u8) void {
 
     var visible: usize = 0;
     for (p.loaded.children, 0..) |*child, i| {
+        if (!entityMatchesFilter(child, filter)) continue;
+
         var label_buf: [512:0]u8 = undefined;
         const label = entityLabel(&label_buf, i, child) catch continue;
-        if (filter.len > 0 and !matchesFilter(label, filter)) continue;
 
         const selected = if (p.selected_child_idx) |sel| sel == i else false;
         if (zgui.selectable(label, .{ .selected = selected })) {
@@ -193,10 +205,26 @@ fn entityLabel(buf: *[512:0]u8, idx: usize, entity: *const scene_io.Entity) ![:0
     return std.fmt.bufPrintZ(buf, "#{d} {s}  - {s}", .{ idx, name, hint });
 }
 
+/// Filter predicate for one entity. Matches the typed prefab name
+/// and the first comment line, but **not** the index prefix — typing
+/// `5` should narrow to entities whose name or note contains `5`,
+/// not to every row whose index ends in 5 (e.g. #5, #15, #25, ...).
+/// Pub so `tests.zig` can exercise without imgui.
+pub fn entityMatchesFilter(entity: *const scene_io.Entity, filter: []const u8) bool {
+    if (filter.len == 0) return true;
+    const name: []const u8 = entity.prefab orelse "(inline)";
+    if (matchesFilter(name, filter)) return true;
+    const comment = std.mem.sliceTo(&entity.comment, 0);
+    const hint = firstCommentLine(comment);
+    if (hint.len > 0 and matchesFilter(hint, filter)) return true;
+    return false;
+}
+
 /// Return the first non-empty, comment-marker-stripped line from a
-/// captured comment block, capped to 60 chars so a long block doesn't
-/// blow the row layout. Returns an empty slice when nothing useful
-/// survives the trim. Pub so `tests.zig` can exercise without imgui.
+/// captured comment block, capped to `hint_cap_bytes` chars so a long
+/// block doesn't blow the row layout. Returns an empty slice when
+/// nothing useful survives the trim. Pub so `tests.zig` can exercise
+/// without imgui.
 pub fn firstCommentLine(comment: []const u8) []const u8 {
     var it = std.mem.splitScalar(u8, comment, '\n');
     while (it.next()) |raw_line| {
@@ -204,11 +232,11 @@ pub fn firstCommentLine(comment: []const u8) []const u8 {
         // Strip the `//` marker and any leading whitespace after it.
         if (std.mem.startsWith(u8, line, "//")) line = std.mem.trim(u8, line[2..], " \t\r");
         if (line.len == 0) continue;
-        if (line.len > 60) {
+        if (line.len > hint_cap_bytes) {
             // Walk back while byte at `limit` is a UTF-8 continuation
             // byte (top bits 10xxxxxx) so we never slice mid-codepoint
             // — ImGui chokes on invalid UTF-8 and shows tofu/glitches.
-            var limit: usize = 60;
+            var limit: usize = hint_cap_bytes;
             while (limit > 0 and (line[limit] & 0xC0) == 0x80) : (limit -= 1) {}
             return line[0..limit];
         }

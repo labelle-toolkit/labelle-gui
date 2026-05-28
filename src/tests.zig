@@ -1618,10 +1618,11 @@ pub const HierarchyTests = struct {
         try expect.toBeTrue(hierarchy.firstCommentLine("").len == 0);
     }
 
-    test "firstCommentLine caps the returned slice at 60 bytes" {
-        // 70-char line should be truncated to 60.
-        const long = "//" ++ ("a" ** 70);
-        try expect.equal(hierarchy.firstCommentLine(long).len, 60);
+    test "firstCommentLine caps the returned slice at hint_cap_bytes" {
+        // A line `hint_cap_bytes + 10` long should be truncated to
+        // exactly the cap.
+        const long = "//" ++ ("a" ** (hierarchy.hint_cap_bytes + 10));
+        try expect.equal(hierarchy.firstCommentLine(long).len, hierarchy.hint_cap_bytes);
     }
 
     test "firstCommentLine truncates UTF-8 cleanly at codepoint boundary" {
@@ -1634,6 +1635,43 @@ pub const HierarchyTests = struct {
         try expect.equal(got.len, 58);
         // Last byte must not be a UTF-8 continuation byte (top bits 10xx).
         try expect.toBeTrue((got[got.len - 1] & 0xC0) != 0x80);
+    }
+
+    test "entityMatchesFilter matches prefab name" {
+        var e: scene_io.Entity = .{ .prefab = "rabbit" };
+        try expect.toBeTrue(hierarchy.entityMatchesFilter(&e, "rab"));
+        try expect.toBeTrue(hierarchy.entityMatchesFilter(&e, "BIT"));
+        try expect.toBeFalse(hierarchy.entityMatchesFilter(&e, "wolf"));
+    }
+
+    test "entityMatchesFilter empty filter matches everything" {
+        const e: scene_io.Entity = .{ .prefab = "any" };
+        try expect.toBeTrue(hierarchy.entityMatchesFilter(&e, ""));
+    }
+
+    test "entityMatchesFilter does NOT search the index prefix" {
+        // The row's display label is `#N <name>`, but typing `5` must
+        // not narrow to every #5/#15/#25 row — only rows whose actual
+        // name or comment hint contains `5`. The predicate operates
+        // on the entity, not the rendered label, so the index can't
+        // bleed in.
+        const e: scene_io.Entity = .{ .prefab = "rabbit" };
+        try expect.toBeFalse(hierarchy.entityMatchesFilter(&e, "5"));
+        try expect.toBeFalse(hierarchy.entityMatchesFilter(&e, "#"));
+    }
+
+    test "entityMatchesFilter matches the comment hint" {
+        var e: scene_io.Entity = .{ .prefab = "wall" };
+        const note = "// Building exterior";
+        @memcpy(e.comment[0..note.len], note);
+        try expect.toBeTrue(hierarchy.entityMatchesFilter(&e, "exterior"));
+        try expect.toBeTrue(hierarchy.entityMatchesFilter(&e, "BUILDING"));
+    }
+
+    test "entityMatchesFilter falls back to `(inline)` when prefab is null" {
+        const e: scene_io.Entity = .{};
+        try expect.toBeTrue(hierarchy.entityMatchesFilter(&e, "inline"));
+        try expect.toBeTrue(hierarchy.entityMatchesFilter(&e, "INLINE"));
     }
 };
 
