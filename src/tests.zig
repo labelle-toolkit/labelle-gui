@@ -540,17 +540,21 @@ pub const SceneIoTests = struct {
         const text = try scene_io.renderSceneJsonc(allocator, loaded);
         defer allocator.free(text);
 
-        // Managed fields landed in canonical form.
-        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"name\": \"lab\"") != null);
+        // Managed fields landed in canonical RFC #596 bundle form.
+        // `name` is gone (#596 dropped it), the writer emits the
+        // top-level array directly, and component keys sit inline
+        // with no `components:`/`overrides:` wrapper.
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"name\":") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"components\":") == null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"prefab\": \"coin\"") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Position\":") != null);
 
-        // Unmodeled components round-tripped verbatim.
+        // Unmodeled components round-tripped verbatim, also inline.
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Sprite\":") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"sprite_name\": \"coin\"") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Coin\":") != null);
 
-        // Comment preserved at the entities-array indent.
+        // Comment preserved at the array indent.
         try expect.toBeTrue(std.mem.indexOf(u8, text, "// Collectible") != null);
     }
 
@@ -949,14 +953,15 @@ pub const SceneIoTests = struct {
         const text = try scene_io.renderPrefabJsonc(allocator, loaded);
         defer allocator.free(text);
 
-        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"components\":") != null);
+        // RFC #596 bundle output: no `components:` wrapper, Sprite +
+        // Coin appear inline as PascalCase keys.
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"components\":") == null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Sprite\"") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"sprite_name\": \"coin\"") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Coin\"") != null);
 
-        // Re-parse the rendered text to confirm the writer's output
-        // is self-consistent — Sprite back on entity.sprite, Coin
-        // back in extras.
+        // Re-parse the rendered text — Sprite typed on entity.sprite,
+        // Coin lands in component_extras.
         var loaded2 = try scene_io.parsePrefab(allocator, text);
         defer loaded2.deinit();
         try expect.equal(loaded2.component_extras.len, 1);
@@ -1051,11 +1056,13 @@ pub const SceneIoTests = struct {
     }
 
     test "parsePrefab preserves unmodeled top-level keys verbatim" {
-        // Regression for copilot PR #30 review: a prefab with custom
-        // top-level keys (metadata, schema_version, anything outside
-        // `components` / `children`) must round-trip those fields
-        // unchanged. Without this, editing+saving a prefab would
-        // silently drop everything the gui doesn't model.
+        // Custom top-level keys (metadata, schema_version) must
+        // round-trip unchanged through a save. The input here is a
+        // legacy `{components: {...}}` shape — those keys land in
+        // `top_level_extras`. After bundle save + re-read the
+        // top-level object IS the components map, so both keys end
+        // up in `component_extras` instead. Either way the data
+        // survives the round-trip — that's the regression contract.
         const allocator = std.testing.allocator;
         const src =
             \\{
@@ -1067,22 +1074,25 @@ pub const SceneIoTests = struct {
         var loaded = try scene_io.parsePrefab(allocator, src);
         defer loaded.deinit();
 
+        // Legacy parse keeps `metadata` + `schema_version` outside
+        // the `components:` block, so they're top-level extras here.
         try expect.equal(loaded.top_level_extras.len, 2);
-        try expect.toBeTrue(std.mem.eql(u8, loaded.top_level_extras[0].name, "metadata"));
-        try expect.toBeTrue(std.mem.eql(u8, loaded.top_level_extras[1].name, "schema_version"));
 
         const text = try scene_io.renderPrefabJsonc(allocator, loaded);
         defer allocator.free(text);
 
-        // Both extras must reappear in the output…
+        // Both extras must reappear verbatim in the bundle output.
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"metadata\":") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"author\": \"alex\"") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"schema_version\": 3") != null);
-        // …and the output must re-parse cleanly, with the same
-        // extras captured the second time.
+
+        // Re-parse the bundle output. Now `Coin` + `metadata` +
+        // `schema_version` all sit at top level → all three land in
+        // `component_extras`; `top_level_extras` is empty.
         var loaded2 = try scene_io.parsePrefab(allocator, text);
         defer loaded2.deinit();
-        try expect.equal(loaded2.top_level_extras.len, 2);
+        try expect.equal(loaded2.top_level_extras.len, 0);
+        try expect.equal(loaded2.component_extras.len, 3);
     }
 
     test "parsePrefab captures extras when file has leading whitespace + comment" {
@@ -1447,7 +1457,11 @@ pub const SceneIoTests = struct {
         try expect.equal(loaded.children[0].position.?.x, 5);
     }
 
-    test "renderSceneJsonc emits root + children + overrides for refs" {
+    test "renderSceneJsonc migrates RFC #560 ref to inline bundle entry" {
+        // A scene fed in as RFC #560 (with `root`/`children`/`overrides`)
+        // must round-trip into RFC #596 bundle shape: top-level array,
+        // `prefab` + Position inline as sibling keys (no `overrides:`
+        // wrapper).
         const allocator = std.testing.allocator;
         const src =
             \\{
@@ -1464,20 +1478,20 @@ pub const SceneIoTests = struct {
 
         const text = try scene_io.renderSceneJsonc(allocator, loaded);
         defer allocator.free(text);
-        // Wrapper is present.
-        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"root\": {") != null);
-        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"children\": [") != null);
-        // Ref uses `overrides`, not `components`. The legacy emit
-        // would have written `"components":` here, which the engine
-        // would reject under RFC #560 §B2.
-        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"overrides\":") != null);
+        // No more #560 wrappers in the output.
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"root\":") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"overrides\":") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"components\":") == null);
+        // Bundle shape: prefab + Position sit inline on the entry.
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"prefab\": \"coin\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Position\":") != null);
     }
 
-    test "renderSceneJsonc preserves top-level metadata sibling to root" {
-        // `assets`, `include`, etc. live outside the `root` block in
-        // unified scenes. Top-level extras must round-trip even when
-        // the writer wraps entity content in `root: { ... }`.
+    test "renderSceneJsonc migrates legacy/#560 top-level metadata into bundle meta" {
+        // `assets`, `include`, etc. used to live as siblings of `root`
+        // in RFC #560 scenes (and at the file root in legacy). Bundle
+        // shape carries them as keys inside the leading
+        // `{ "meta": { ... } }` array entry.
         const allocator = std.testing.allocator;
         const src =
             \\{
@@ -1493,8 +1507,12 @@ pub const SceneIoTests = struct {
 
         const text = try scene_io.renderSceneJsonc(allocator, loaded);
         defer allocator.free(text);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"meta\":") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"assets\":") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "[\"a\", \"b\"]") != null);
+        // Bundle output never contains `name` / `root`.
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"name\":") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"root\":") == null);
     }
 
     test "parseScene still accepts legacy entities format" {
@@ -1515,11 +1533,11 @@ pub const SceneIoTests = struct {
         try expect.equal(loaded.scene.entities[0].position.?.x, 7);
     }
 
-    test "renderSceneJsonc emits components (not overrides) for inline entries" {
-        // §B2 §writer half: an entry without `prefab` is inline and
-        // must emit its component map as `components`. Sister test
-        // to "renderSceneJsonc emits root + children + overrides for
-        // refs" — together they cover both §B2 disjoint branches.
+    test "renderSceneJsonc emits inline component keys (no wrapper)" {
+        // Bundle shape collapses both #560 §B2 branches (refs use
+        // `overrides`, inline use `components`) into the same flat
+        // inline-key emit. Verify with an inline entry: `components`
+        // and `overrides` both stay absent.
         const allocator = std.testing.allocator;
         const src =
             \\{
@@ -1536,16 +1554,16 @@ pub const SceneIoTests = struct {
 
         const text = try scene_io.renderSceneJsonc(allocator, loaded);
         defer allocator.free(text);
-        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"components\":") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"components\":") == null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"overrides\":") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Position\":") != null);
     }
 
-    test "renderSceneJsonc skips `root` as a top-level extra" {
-        // The reader's `isManagedTopLevelKey` lists `root` so it
-        // never lands in `extras.top_level`. If the predicate ever
-        // regresses, the writer would double-emit `"root":` (once
-        // as the modeled wrapper, once verbatim from extras),
-        // producing duplicate-key JSON the engine refuses.
+    test "renderSceneJsonc never emits `root` in bundle output" {
+        // RFC #596 dropped the `root` wrapper entirely. Even a scene
+        // fed in with a `root` block must come back out without it,
+        // and `include`-style siblings need to migrate into `meta`
+        // rather than disappearing.
         const allocator = std.testing.allocator;
         const src =
             \\{
@@ -1559,11 +1577,9 @@ pub const SceneIoTests = struct {
 
         const text = try scene_io.renderSceneJsonc(allocator, loaded);
         defer allocator.free(text);
-        // `include` survives as a top-level extra; `root` appears
-        // exactly once (the writer's wrapper, not a verbatim re-emit).
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"root\":") == null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"include\":") != null);
-        const first_root = std.mem.indexOf(u8, text, "\"root\":") orelse unreachable;
-        try expect.toBeTrue(std.mem.indexOf(u8, text[first_root + 1 ..], "\"root\":") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"meta\":") != null);
     }
 };
 
@@ -1942,38 +1958,48 @@ pub const SceneTemplateTests = struct {
         return out;
     }
 
-    test "renders scene name into name field" {
+    test "emits an RFC #596 bundle (top-level array)" {
         const allocator = std.testing.allocator;
-        const out = try new_scene.renderSceneJsonc(allocator, "my_scene");
+        const out = try new_scene.renderSceneJsonc(allocator);
         defer allocator.free(out);
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "\"name\": \"my_scene\"") != null);
+        // First non-trivia character must be `[`.
+        var i: usize = 0;
+        while (i < out.len) : (i += 1) {
+            const c = out[i];
+            if (c == ' ' or c == '\t' or c == '\r' or c == '\n') continue;
+            if (c == '/' and i + 1 < out.len and out[i + 1] == '/') {
+                while (i < out.len and out[i] != '\n') : (i += 1) {}
+                continue;
+            }
+            break;
+        }
+        try expect.toBeTrue(i < out.len and out[i] == '[');
     }
 
-    test "includes an entities array" {
+    test "scaffold emits no legacy fields" {
         const allocator = std.testing.allocator;
-        const out = try new_scene.renderSceneJsonc(allocator, "anything");
+        const out = try new_scene.renderSceneJsonc(allocator);
         defer allocator.free(out);
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "\"entities\":") != null);
+        // Must not carry the dropped `name` field or the legacy
+        // `entities:` / `components:` wrappers.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "\"name\":") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "\"entities\":") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "\"components\":") == null);
     }
 
-    test "uses .jsonc-compatible content (parses as JSON after stripping comments)" {
+    test "scaffold parses as JSON after stripping comments" {
         const allocator = std.testing.allocator;
-        const out = try new_scene.renderSceneJsonc(allocator, "parse_check");
+        const out = try new_scene.renderSceneJsonc(allocator);
         defer allocator.free(out);
 
         const stripped = try stripLineComments(allocator, out);
         defer allocator.free(stripped);
 
-        const SceneSchema = struct {
-            name: []const u8,
-            entities: []const struct {} = &.{},
-        };
-
-        const parsed = try std.json.parseFromSlice(SceneSchema, allocator, stripped, .{ .ignore_unknown_fields = true });
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, stripped, .{});
         defer parsed.deinit();
 
-        try expect.toBeTrue(std.mem.eql(u8, parsed.value.name, "parse_check"));
-        try expect.equal(parsed.value.entities.len, 0);
+        try expect.toBeTrue(parsed.value == .array);
+        try expect.equal(parsed.value.array.items.len, 0);
     }
 };
 
@@ -5992,7 +6018,7 @@ pub const AtomicWriteTests = struct {
         const path = try std.fs.path.join(allocator, &.{ tmp, "main.jsonc" });
         defer allocator.free(path);
 
-        const src = "{ \"name\": \"main\", \"entities\": [] }\n";
+        const src = "[]\n";
         var scene = try scene_io.parseScene(allocator, src);
         defer scene.deinit();
 
@@ -6000,7 +6026,9 @@ pub const AtomicWriteTests = struct {
 
         const got = try readFile(allocator, path);
         defer allocator.free(got);
-        try expect.toBeTrue(std.mem.indexOf(u8, got, "\"main\"") != null);
+        // The file landed on disk; bundle save canonicalises to `[]`.
+        // No `.tmp` sibling left behind from the atomic write.
+        try expect.toBeTrue(got.len > 0);
         try expect.equal(try countTempFiles(tmp), 0);
     }
 };
