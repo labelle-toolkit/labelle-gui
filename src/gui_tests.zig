@@ -363,7 +363,9 @@ pub fn main() !void {
         // applyLive(1.0) lands on the same style as a fresh
         // applyLive(1.0), not on 1× scale compounded from 2× (which
         // would leave padding at the DPI baseline either way only by
-        // accident).
+        // accident). The sibling `applyDragPreview` is asserted to
+        // touch only `font_scale_main` so mid-drag use doesn't twitch
+        // the auto-resized Preferences modal.
         pub fn gui(_: *zgui.te.TestContext) !void {
             if (g_app) |a| a.renderFrame(1.0 / 60.0);
         }
@@ -411,6 +413,25 @@ pub fn main() !void {
                 .{},
                 @abs(pad_1x_b - pad_1x_a) < 0.001,
                 "applyLive(1.0) returns frame_padding to its 1× baseline (idempotent reset)",
+            );
+
+            // applyDragPreview must NOT touch padding — it's the mid-
+            // drag entry point and the whole point is to keep widget
+            // dimensions stable while the user is holding the slider.
+            const pad_before_preview = style.frame_padding[0];
+            preferences_dialog.applyDragPreview(2.5);
+            const pad_after_preview = style.frame_padding[0];
+            _ = zgui.te.check(
+                @src(),
+                .{},
+                style.font_scale_main == 2.5,
+                "applyDragPreview sets font_scale_main",
+            );
+            _ = zgui.te.check(
+                @src(),
+                .{},
+                @abs(pad_after_preview - pad_before_preview) < 0.001,
+                "applyDragPreview leaves frame_padding untouched",
             );
         }
     });

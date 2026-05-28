@@ -6,14 +6,23 @@
 //! top via `zgui.getStyle().font_scale_main` for text (ImGui 1.92's
 //! per-frame draw multiplier) AND via `Style.scaleAllSizes` for
 //! padding/spacing/borders so buttons + checkboxes track the text
-//! instead of looking stranded at extreme slider values. Slider edits
-//! re-enter the same code path so the change takes effect on the next
-//! frame — no restart needed.
+//! instead of looking stranded at extreme slider values.
 //!
-//! Persistence is debounced: every drag frame applies the new value
-//! live (visual feedback), but the platform-appropriate app-data dir
-//! is written once on slider release / Reset click via `prefs.save`.
-//! The next launch reads it from `prefs.loadOrDefault`.
+//! Slider editing is split across two entry points to avoid the
+//! Preferences modal (which is `always_auto_resize`) jittering under
+//! the user's cursor mid-drag:
+//!
+//! - `applyDragPreview` runs on every drag frame, writes only
+//!   `font_scale_main` — text rescales smoothly while the modal's
+//!   bounds stay constant, so the slider knob stays put.
+//! - `applyLive` runs once on slider release (and on Reset / startup),
+//!   resets to the captured baseline and re-runs `scaleAllSizes` so
+//!   padding/spacing snap to the final value.
+//!
+//! Persistence is debounced to the same release event via
+//! `isItemDeactivatedAfterEdit` so an interactive drag doesn't
+//! atomic-write the prefs file dozens of times. The next launch
+//! reads back from `prefs.loadOrDefault`.
 
 const std = @import("std");
 const zgui = @import("zgui");
@@ -62,14 +71,20 @@ pub fn render(app: *App) void {
             prefs_mod.min_font_scale,
             prefs_mod.max_font_scale,
         );
-        applyLive(app.prefs.font_scale);
+        // Text-only preview during the drag — keeps the modal's auto-
+        // resized bounds steady so the slider knob stays put under the
+        // user's cursor. The padding/spacing scale catches up on
+        // release below.
+        applyDragPreview(app.prefs.font_scale);
     }
     if (zgui.isItemDeactivatedAfterEdit()) {
+        applyLive(app.prefs.font_scale);
         persist(app);
     }
 
     if (zgui.button("Reset to default", .{})) {
         app.prefs.font_scale = prefs_mod.default_font_scale;
+        // Single click — no drag to keep stable. Full scale immediately.
         applyLive(app.prefs.font_scale);
         persist(app);
     }
@@ -89,13 +104,25 @@ pub fn render(app: *App) void {
 /// transform is idempotent (`applyLive(2.0)` then `applyLive(0.5)`
 /// lands at exactly 0.5× DPI, not 1× DPI from compounded scales).
 /// Pub so `main.zig` calls it once at startup for the saved value
-/// and the dialog's slider re-enters it for live edits.
+/// and the dialog uses it on slider release / Reset click.
 pub fn applyLive(font_scale: f32) void {
     const style = zgui.getStyle();
     if (baseline_style == null) baseline_style = style.*;
     style.* = baseline_style.?;
     style.scaleAllSizes(font_scale);
     style.font_scale_main = font_scale;
+}
+
+/// Text-only preview for mid-drag use: writes `font_scale_main` so
+/// glyphs re-rasterise next frame, but leaves padding/spacing/borders
+/// alone. Calling `scaleAllSizes` on every drag frame resizes the
+/// Preferences modal (it's `always_auto_resize`) every frame, which
+/// shifts the slider knob out from under the user's cursor mid-drag
+/// and produces visible jitter / flicker. Drag uses this entry; the
+/// slider's `isItemDeactivatedAfterEdit` then calls `applyLive` once
+/// on release so the rest of the UI catches up to the final value.
+pub fn applyDragPreview(font_scale: f32) void {
+    zgui.getStyle().font_scale_main = font_scale;
 }
 
 /// Atomic-write the current prefs to disk and surface any failure
