@@ -7,9 +7,10 @@
 //! multiplier. Slider edits write the live style field so the change
 //! takes effect on the next frame — no restart needed.
 //!
-//! Persistence is per-edit: every slider tick writes the new value to
-//! the platform-appropriate app-data dir via `prefs.save`. The next
-//! launch reads it from `prefs.loadOrDefault`.
+//! Persistence is debounced: every drag frame applies the new value
+//! live (visual feedback), but the platform-appropriate app-data dir
+//! is written once on slider release / Reset click via `prefs.save`.
+//! The next launch reads it from `prefs.loadOrDefault`.
 
 const std = @import("std");
 const zgui = @import("zgui");
@@ -31,9 +32,13 @@ pub fn render(app: *App) void {
         .{},
     );
 
-    // `sliderFloat` returns true on the frames the value changed. We
-    // clamp before persisting so a hand-edited prefs file can't push the
-    // slider past its bounds via a previous launch.
+    // `sliderFloat` returns true on every frame the value changed
+    // during a drag — we apply the new size live each frame so the
+    // user sees their slider move in real time. Disk persistence is
+    // debounced to slider release (`isItemDeactivatedAfterEdit`) so
+    // an interactive drag doesn't atomic-write the prefs file dozens
+    // of times. Clamp on both paths so a hand-edited prefs file
+    // can't push the slider past its bounds via a previous launch.
     var v: f32 = app.prefs.font_scale;
     const changed = zgui.sliderFloat("##font_scale", .{
         .v = &v,
@@ -48,19 +53,15 @@ pub fn render(app: *App) void {
             prefs_mod.max_font_scale,
         );
         applyLive(app.prefs.font_scale);
-        prefs_mod.save(app.allocator, app.prefs) catch |err| {
-            std.log.err("prefs: save failed: {s}", .{@errorName(err)});
-            app.setStatus("Could not save preferences!");
-        };
+    }
+    if (zgui.isItemDeactivatedAfterEdit()) {
+        persist(app);
     }
 
     if (zgui.button("Reset to default", .{})) {
         app.prefs.font_scale = prefs_mod.default_font_scale;
         applyLive(app.prefs.font_scale);
-        prefs_mod.save(app.allocator, app.prefs) catch |err| {
-            std.log.err("prefs: save failed: {s}", .{@errorName(err)});
-            app.setStatus("Could not save preferences!");
-        };
+        persist(app);
     }
 
     zgui.spacing();
@@ -73,4 +74,15 @@ pub fn render(app: *App) void {
 /// of bilinear-blurring through the old atlas.
 fn applyLive(font_scale: f32) void {
     zgui.getStyle().font_scale_main = font_scale;
+}
+
+/// Atomic-write the current prefs to disk and surface any failure
+/// through the status bar. Called once per slider-release / Reset
+/// click — not on every drag frame, to keep the prefs file off the
+/// disk-write hot path during interactive editing.
+fn persist(app: *App) void {
+    prefs_mod.save(app.allocator, app.prefs) catch |err| {
+        std.log.err("prefs: save failed: {s}", .{@errorName(err)});
+        app.setStatus("Could not save preferences!");
+    };
 }

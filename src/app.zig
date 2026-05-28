@@ -277,10 +277,11 @@ pub const App = struct {
     show_dpi_warning: bool = false,
 
     show_preferences: bool = false,
-    /// Live preferences edited by the Preferences dialog. Changes are
-    /// persisted to disk on every slider/stepper edit; `font_scale`
+    /// Live preferences edited by the Preferences dialog. `font_scale`
     /// is applied live via `zgui.getStyle().font_scale_main` so the
-    /// new size shows up on the next frame (no restart).
+    /// new size shows up on the next frame (no restart); disk
+    /// persistence is debounced to slider release so an interactive
+    /// drag doesn't atomic-write the prefs file dozens of times.
     prefs: prefs_mod.Preferences = .{},
 
     /// Fixed-size storage for registered modules. Grow the array literal
