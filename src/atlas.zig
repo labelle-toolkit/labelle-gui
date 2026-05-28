@@ -58,11 +58,18 @@ pub const Atlas = struct {
     height: u32,
     /// `name → Frame` for every entry in this atlas's JSON.
     frames: std.StringHashMapUnmanaged(Frame) = .empty,
+    /// Pre-sorted view of `frames`'s keys (alpha-asc). Built once at
+    /// load time so the tree-view's atlas-expansion render path
+    /// (#143 phase 8) doesn't re-collect + re-sort the hashmap every
+    /// frame. The slices reference the same strings owned by
+    /// `frames` — no extra dupes.
+    sorted_frame_keys: []const []const u8 = &.{},
 
     pub fn deinit(self: *Atlas, allocator: std.mem.Allocator) void {
         var it = self.frames.iterator();
         while (it.next()) |entry| allocator.free(entry.key_ptr.*);
         self.frames.deinit(allocator);
+        if (self.sorted_frame_keys.len > 0) allocator.free(self.sorted_frame_keys);
         allocator.free(self.name);
         if (self.json_path.len > 0) allocator.free(self.json_path);
         if (self.texture_id != 0) {
@@ -302,6 +309,24 @@ pub fn parseFramesFromJsonText(allocator: std.mem.Allocator, raw: []const u8, at
         errdefer allocator.free(name_copy);
         try atlas.frames.put(allocator, name_copy, frame);
     }
+
+    // Materialise the alpha-sorted key view once at load. The
+    // tree-view's atlas-expansion render path iterates this slice
+    // every frame; rebuilding + sorting it on each frame instead
+    // would cost N allocs + an O(N log N) sort per open atlas at
+    // 60 fps (#143 phase 8 review feedback). Slices alias the
+    // frame-map's keys — no extra dupes, no double free.
+    var keys = try allocator.alloc([]const u8, atlas.frames.count());
+    errdefer allocator.free(keys);
+    var k_it = atlas.frames.iterator();
+    var k_i: usize = 0;
+    while (k_it.next()) |kv| : (k_i += 1) keys[k_i] = kv.key_ptr.*;
+    std.mem.sort([]const u8, keys, {}, struct {
+        fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+            return std.mem.lessThan(u8, lhs, rhs);
+        }
+    }.lessThan);
+    atlas.sorted_frame_keys = keys;
 }
 
 fn jsonU32(v: ?std.json.Value) ?u32 {

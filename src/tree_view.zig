@@ -439,21 +439,13 @@ pub const TreeView = struct {
 
         const line_top_y = zgui.getCursorScreenPos()[1];
 
-        // Collect sprite names and sort so render order is stable
-        // across frames — `Atlas.frames` is a HashMap, so its iterator
-        // order can shift after rehash. The user expects an alpha-
-        // ordered list, same as the file tree.
-        var names: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer names.deinit(self.allocator);
-        var it = a.frames.iterator();
-        while (it.next()) |kv| names.append(self.allocator, kv.key_ptr.*) catch break;
-        std.mem.sort([]const u8, names.items, {}, struct {
-            fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
-                return std.mem.lessThan(u8, lhs, rhs);
-            }
-        }.lessThan);
-
-        for (names.items) |sprite_name| {
+        // Iterate the pre-sorted view built once at load time
+        // (`Atlas.sorted_frame_keys`). Doing the alloc + sort per
+        // frame here would have cost N allocs + O(N log N) per open
+        // atlas at 60 fps (#143 phase 8 review feedback). The HashMap
+        // is immutable post-load so the sorted view never goes
+        // stale.
+        for (a.sorted_frame_keys) |sprite_name| {
             var row_buf: [512:0]u8 = undefined;
             const row_label = std.fmt.bufPrintZ(
                 &row_buf,
@@ -473,10 +465,11 @@ pub const TreeView = struct {
                     std.mem.asBytes(&payload),
                     .once,
                 );
-                // ◆ glyph distinguishes sprite drags from component
-                // (⚙) and prefab (⌖) drags mid-flight so the user can
-                // see what kind of payload they grabbed.
-                zgui.text("◆ {s}", .{sprite_name});
+                // Use the same file glyph the row carries — it's part
+                // of the merged FontAwesome atlas (see icons.zig) so
+                // we don't depend on the fallback font covering a
+                // BMP symbol like U+25C6.
+                zgui.text("{s} {s}", .{ FolderIcons.file, sprite_name });
             }
         }
 
