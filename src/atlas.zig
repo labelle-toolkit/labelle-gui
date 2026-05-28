@@ -47,6 +47,12 @@ pub const Atlas = struct {
     /// `resources[i].name` from `project.labelle`. Useful for
     /// diagnostics — "sprite X belongs to atlas Y".
     name: []const u8,
+    /// Absolute path to the JSON manifest this atlas was loaded from.
+    /// Empty when constructed via `loadFromPaths` (the Atlas Viewer
+    /// uses that entry point for atlases outside `resources`). The
+    /// tree-view uses this to match a file row to its sprite list
+    /// when expanding an atlas manifest inline (#143 phase 8).
+    json_path: []const u8 = "",
     texture_id: c_uint,
     width: u32,
     height: u32,
@@ -58,6 +64,7 @@ pub const Atlas = struct {
         while (it.next()) |entry| allocator.free(entry.key_ptr.*);
         self.frames.deinit(allocator);
         allocator.free(self.name);
+        if (self.json_path.len > 0) allocator.free(self.json_path);
         if (self.texture_id != 0) {
             gl.deleteTextures(1, &self.texture_id);
         }
@@ -136,6 +143,19 @@ pub const Index = struct {
         const a = self.atlases.items[ref.atlas];
         return .{ @floatFromInt(a.width), @floatFromInt(a.height) };
     }
+
+    /// Look up a loaded atlas by its absolute JSON path. Returns the
+    /// `Atlas` so the caller can iterate its `frames` (e.g. the
+    /// tree-view expanding a manifest file inline as a list of
+    /// draggable sprite names). `null` when no atlas's `json_path`
+    /// matches — either the file isn't a project resource or it
+    /// failed to load during `build`.
+    pub fn atlasByJsonPath(self: Index, json_path: []const u8) ?*const Atlas {
+        for (self.atlases.items) |*a| {
+            if (a.json_path.len > 0 and std.mem.eql(u8, a.json_path, json_path)) return a;
+        }
+        return null;
+    }
 };
 
 /// A subset of `project.ProjectConfig.resources` needed by the atlas
@@ -154,7 +174,14 @@ fn loadOne(allocator: std.mem.Allocator, project_dir: []const u8, r: Resource) !
     const tex_path = try std.fs.path.join(allocator, &.{ project_dir, r.texture });
     defer allocator.free(tex_path);
 
-    return loadFromPaths(allocator, r.name, json_path, tex_path);
+    var atlas = try loadFromPaths(allocator, r.name, json_path, tex_path);
+    errdefer atlas.deinit(allocator);
+    // Project-loaded atlases get their absolute manifest path stamped
+    // so the tree-view can match a file row to its sprite list. The
+    // viewer-only entry point (`loadFromPaths` directly) skips this
+    // because that atlas isn't part of the project's resources block.
+    atlas.json_path = try allocator.dupe(u8, json_path);
+    return atlas;
 }
 
 /// Load a single atlas from explicit JSON + PNG paths (not project-

@@ -96,3 +96,41 @@ pub fn packPrefab(stem: []const u8) PrefabPayload {
 pub fn unpackPrefab(payload: *const PrefabPayload) []const u8 {
     return payload.name[0..payload.name_len];
 }
+
+/// Payload identifier for a sprite name dragged from an expanded
+/// atlas manifest in the project tree onto an entity's `sprite_name`
+/// inspector input (#143 phase 8). The sprite is identified by its
+/// atlas-frame key — the same string the engine looks up against the
+/// `name → Frame` map a TexturePacker manifest produces. Distinct
+/// from the other types so the inspector field accepts only sprite
+/// drops, never a prefab or component.
+pub const SPRITE_TYPE: [:0]const u8 = "labelle_sprite_name";
+
+/// Plain-data payload carried by a sprite drag. Same fixed-buffer
+/// shape as `ComponentPayload` / `PrefabPayload` so the receive side
+/// uses the same `@memcpy` pattern; the cap (`PAYLOAD_NAME_CAP`)
+/// matches the `Sprite.sprite_name` buffer's writable region.
+pub const SpritePayload = extern struct {
+    /// Valid prefix length of `name`. Always ≤ PAYLOAD_NAME_CAP.
+    name_len: u8,
+    /// Zero-padded sprite key bytes (e.g. "player_idle_0").
+    name: [PAYLOAD_NAME_CAP]u8,
+};
+
+/// Build a sprite payload from a caller-supplied frame name.
+/// Truncates if the name exceeds `PAYLOAD_NAME_CAP` (a TexturePacker
+/// manifest key longer than 128 bytes is effectively impossible).
+pub fn packSprite(name: []const u8) SpritePayload {
+    var p: SpritePayload = .{ .name_len = 0, .name = [_]u8{0} ** PAYLOAD_NAME_CAP };
+    const n = @min(name.len, PAYLOAD_NAME_CAP);
+    @memcpy(p.name[0..n], name[0..n]);
+    p.name_len = @intCast(n);
+    return p;
+}
+
+/// Read the sprite name back out of a received payload. Returns a
+/// slice into the payload buffer — caller must dupe (or memcpy into
+/// the inspector's edit buffer) before the next imgui frame.
+pub fn unpackSprite(payload: *const SpritePayload) []const u8 {
+    return payload.name[0..payload.name_len];
+}

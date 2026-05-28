@@ -3,6 +3,7 @@ const zgui = @import("zgui");
 const project = @import("project.zig");
 const icons = @import("icons.zig");
 const io_global = @import("io_global.zig");
+const atlas = @import("atlas.zig");
 const dnd = @import("modules/dnd.zig");
 
 /// Icons for each folder type (FontAwesome icons)
@@ -119,8 +120,15 @@ pub const TreeView = struct {
     }
 
     /// Render the tree view widget
-    /// Returns true if a file was selected
-    pub fn render(self: *Self, project_path: ?[]const u8) bool {
+    /// Returns true if a file was selected.
+    ///
+    /// `atlas_index` is optional: when non-null, any `.json` file
+    /// whose absolute path matches a loaded atlas's manifest becomes
+    /// expandable inline (caret + per-sprite drag-source rows) instead
+    /// of a plain leaf. Pass `null` while no project is open or the
+    /// atlas index hasn't built yet — the tree falls back to the
+    /// non-expanding leaf behaviour.
+    pub fn render(self: *Self, project_path: ?[]const u8, atlas_index: ?*const atlas.Index) bool {
         var file_selected = false;
 
         if (project_path == null) {
@@ -186,7 +194,7 @@ pub const TreeView = struct {
             var folder_path_buf: [path_buf_size:0]u8 = undefined;
             const folder_path = std.fmt.bufPrintZ(&folder_path_buf, "{s}/{s}", .{ base_path, folder_name }) catch continue;
 
-            if (self.renderDirectoryRow(folder_path, folder_name, managed_paths, components_prefix, prefabs_prefix)) {
+            if (self.renderDirectoryRow(folder_path, folder_name, managed_paths, components_prefix, prefabs_prefix, atlas_index)) {
                 file_selected = true;
             }
         }
@@ -207,6 +215,7 @@ pub const TreeView = struct {
         managed_paths: []const []const u8,
         components_prefix: []const u8,
         prefabs_prefix: []const u8,
+        atlas_index: ?*const atlas.Index,
     ) bool {
         var file_selected = false;
         const is_open_state = self.isOpen(folder_path);
@@ -236,7 +245,7 @@ pub const TreeView = struct {
             defer zgui.unindent(.{});
 
             const line_top_y = zgui.getCursorScreenPos()[1];
-            if (self.renderFolder(folder_path, managed_paths, components_prefix, prefabs_prefix)) {
+            if (self.renderFolder(folder_path, managed_paths, components_prefix, prefabs_prefix, atlas_index)) {
                 file_selected = true;
             }
             const line_bottom_y = zgui.getCursorScreenPos()[1];
@@ -270,7 +279,7 @@ pub const TreeView = struct {
     /// files. Subdirectories whose absolute path matches a
     /// `managed_paths` entry are suppressed because they're already
     /// rendered at top level (e.g. `scripts/flows`).
-    fn renderFolder(self: *Self, folder_path: []const u8, managed_paths: []const []const u8, components_prefix: []const u8, prefabs_prefix: []const u8) bool {
+    fn renderFolder(self: *Self, folder_path: []const u8, managed_paths: []const []const u8, components_prefix: []const u8, prefabs_prefix: []const u8, atlas_index: ?*const atlas.Index) bool {
         var file_selected = false;
 
         const files = self.getFilesForFolder(folder_path) catch {
@@ -305,9 +314,15 @@ pub const TreeView = struct {
             }
 
             if (file_entry.is_directory) {
-                if (self.renderDirectoryRow(full_path, file_entry.name, managed_paths, components_prefix, prefabs_prefix)) {
+                if (self.renderDirectoryRow(full_path, file_entry.name, managed_paths, components_prefix, prefabs_prefix, atlas_index)) {
                     file_selected = true;
                 }
+            } else if (atlasMatch(atlas_index, full_path)) |loaded| {
+                // Atlas manifest: expand inline as a list of draggable
+                // sprite-key rows instead of treating as a leaf. The
+                // user can still drop directly onto the `sprite_name`
+                // inspector field (#143 phase 8).
+                self.renderAtlasRow(full_path, file_entry.name, loaded);
             } else {
                 var label_buf: [512:0]u8 = undefined;
                 // No leading space — files have no caret column, so their
@@ -385,6 +400,99 @@ pub const TreeView = struct {
         }
 
         return file_selected;
+    }
+
+    /// Render one atlas-manifest file row: a caret + file glyph, and on
+    /// expansion the sorted list of sprite keys, each a drag source
+    /// emitting `SPRITE_TYPE`. Mirrors `renderDirectoryRow`'s caret /
+    /// open-state / vertical guide-line treatment so atlas expansion
+    /// reads the same as folder expansion to the user.
+    fn renderAtlasRow(
+        self: *Self,
+        full_path: [:0]const u8,
+        display_name: []const u8,
+        a: *const atlas.Atlas,
+    ) void {
+        const is_open_state = self.isOpen(full_path);
+        const caret = if (is_open_state) icons.FA_CARET_DOWN else icons.FA_CARET_RIGHT;
+
+        var label_buf: [512:0]u8 = undefined;
+        const label = std.fmt.bufPrintZ(
+            &label_buf,
+            "{s}{s} {s}",
+            .{ caret, FolderIcons.file, display_name },
+        ) catch return;
+
+        zgui.pushStrIdZ(full_path);
+        defer zgui.popId();
+
+        const parent_screen_x = zgui.getCursorScreenPos()[0];
+
+        if (zgui.selectable(label, .{})) {
+            self.toggleOpen(full_path);
+        }
+
+        if (!self.isOpen(full_path)) return;
+
+        zgui.indent(.{});
+        defer zgui.unindent(.{});
+
+        const line_top_y = zgui.getCursorScreenPos()[1];
+
+        // Collect sprite names and sort so render order is stable
+        // across frames — `Atlas.frames` is a HashMap, so its iterator
+        // order can shift after rehash. The user expects an alpha-
+        // ordered list, same as the file tree.
+        var names: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer names.deinit(self.allocator);
+        var it = a.frames.iterator();
+        while (it.next()) |kv| names.append(self.allocator, kv.key_ptr.*) catch break;
+        std.mem.sort([]const u8, names.items, {}, struct {
+            fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+                return std.mem.lessThan(u8, lhs, rhs);
+            }
+        }.lessThan);
+
+        for (names.items) |sprite_name| {
+            var row_buf: [512:0]u8 = undefined;
+            const row_label = std.fmt.bufPrintZ(
+                &row_buf,
+                "{s} {s}",
+                .{ FolderIcons.file, sprite_name },
+            ) catch continue;
+            // The sprite row is non-actionable on click (no associated
+            // file to open) — its sole purpose is being a drag source
+            // for the `sprite_name` inspector field. Return value is
+            // intentionally discarded.
+            _ = zgui.selectable(row_label, .{});
+            if (zgui.beginDragDropSource(.{})) {
+                defer zgui.endDragDropSource();
+                const payload = dnd.packSprite(sprite_name);
+                _ = zgui.setDragDropPayload(
+                    dnd.SPRITE_TYPE,
+                    std.mem.asBytes(&payload),
+                    .once,
+                );
+                // ◆ glyph distinguishes sprite drags from component
+                // (⚙) and prefab (⌖) drags mid-flight so the user can
+                // see what kind of payload they grabbed.
+                zgui.text("◆ {s}", .{sprite_name});
+            }
+        }
+
+        const line_bottom_y = zgui.getCursorScreenPos()[1];
+
+        const draw_list = zgui.getWindowDrawList();
+        const color_u32 = zgui.colorConvertFloat4ToU32(
+            zgui.getStyle().getColor(.tree_lines),
+        );
+        const line_x = parent_screen_x + zgui.getFontSize() * 0.4;
+        draw_list.addLine(.{
+            .p1 = .{ line_x, line_top_y },
+            .p2 = .{ line_x, line_bottom_y },
+            .col = color_u32,
+            .thickness = 1.0,
+        });
     }
 
     fn getFilesForFolder(self: *Self, folder_path: []const u8) ![]const FileEntry {
@@ -468,4 +576,13 @@ pub fn isPrefabFile(full_path: []const u8, file_name: []const u8, prefabs_prefix
     if (prefabs_prefix.len == 0) return false;
     if (!std.mem.endsWith(u8, file_name, ".jsonc")) return false;
     return std.mem.startsWith(u8, full_path, prefabs_prefix);
+}
+
+/// Return the loaded atlas whose JSON manifest matches `full_path`,
+/// or null when the file isn't a project resource (or the atlas
+/// failed to load). Used by `renderFolder` to decide whether to
+/// expand the file row inline with sprite drag-sources (#143 phase 8).
+fn atlasMatch(atlas_index: ?*const atlas.Index, full_path: []const u8) ?*const atlas.Atlas {
+    const idx = atlas_index orelse return null;
+    return idx.atlasByJsonPath(full_path);
 }

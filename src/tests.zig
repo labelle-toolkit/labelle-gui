@@ -4755,6 +4755,42 @@ pub const PrefabDndTests = struct {
     }
 };
 
+pub const SpriteDndTests = struct {
+    // Mirrors `ComponentDndTests` / `PrefabDndTests`. pack/unpack are
+    // the contract between the project tree's expanded-atlas drag
+    // source and the inspector's `sprite_name` drop target (#143
+    // phase 8). Pure data helpers — no ImGui context needed.
+
+    test "packSprite round-trips a short name" {
+        const name = "coin";
+        const p = dnd.packSprite(name);
+        try expect.equal(@as(usize, p.name_len), name.len);
+        try expect.equal(std.mem.eql(u8, dnd.unpackSprite(&p), name), true);
+    }
+
+    test "packSprite round-trips an atlas-frame key with underscores and digits" {
+        // TexturePacker keys frequently include suffixes like
+        // `_idle_0`. The pack path must preserve them byte-for-byte.
+        const name = "player_idle_0";
+        const p = dnd.packSprite(name);
+        try expect.equal(@as(usize, p.name_len), name.len);
+        try expect.equal(std.mem.eql(u8, dnd.unpackSprite(&p), name), true);
+    }
+
+    test "packSprite truncates a name longer than PAYLOAD_NAME_CAP" {
+        var oversize: [dnd.PAYLOAD_NAME_CAP + 1]u8 = undefined;
+        @memset(&oversize, 'x');
+        const p = dnd.packSprite(&oversize);
+        try expect.equal(@as(usize, p.name_len), dnd.PAYLOAD_NAME_CAP);
+    }
+
+    test "packSprite zero-pads the unused tail" {
+        const p = dnd.packSprite("coin");
+        try expect.equal(p.name[4], @as(u8, 0));
+        try expect.equal(p.name[p.name.len - 1], @as(u8, 0));
+    }
+};
+
 pub const TreeViewClassifierTests = struct {
     // `isComponentFile` / `isPrefabFile` decide which file leaves
     // become drag sources. They're `pub fn` to be reachable from
