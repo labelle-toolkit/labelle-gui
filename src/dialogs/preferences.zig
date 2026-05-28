@@ -39,9 +39,19 @@ var baseline_style: ?zgui.Style = null;
 
 pub fn render(app: *App) void {
     if (app.show_preferences) zgui.openPopup("Preferences", .{});
+
+    // Pin the modal at a size large enough for the 3× extreme so the
+    // window doesn't auto-resize as the slider changes `font_scale_main`
+    // mid-drag — auto-resize was the root cause of the user-visible
+    // flicker (modal grew/shrank → slider knob moved out from under
+    // the cursor → drag delta jittered). At 1× the modal has some
+    // unused vertical space; that's an explicit trade for stable drag.
+    // `.always` forces the size every frame so the user can't manual-
+    // resize into a too-small layout either.
+    zgui.setNextWindowSize(.{ .w = 380, .h = 200, .cond = .always });
     if (!zgui.beginPopupModal("Preferences", .{
         .popen = &app.show_preferences,
-        .flags = .{ .always_auto_resize = true },
+        .flags = .{},
     })) return;
     defer zgui.endPopup();
 
@@ -52,12 +62,11 @@ pub fn render(app: *App) void {
     );
 
     // `sliderFloat` returns true on every frame the value changed
-    // during a drag — we apply the new size live each frame so the
-    // user sees their slider move in real time. Disk persistence is
-    // debounced to slider release (`isItemDeactivatedAfterEdit`) so
-    // an interactive drag doesn't atomic-write the prefs file dozens
-    // of times. Clamp on both paths so a hand-edited prefs file
-    // can't push the slider past its bounds via a previous launch.
+    // during a drag. Disk persistence is debounced to slider release
+    // (`isItemDeactivatedAfterEdit`) so an interactive drag doesn't
+    // atomic-write the prefs file dozens of times. Clamp on every
+    // input path so a hand-edited prefs file can't push values past
+    // the documented bounds.
     var v: f32 = app.prefs.font_scale;
     const changed = zgui.sliderFloat("##font_scale", .{
         .v = &v,
@@ -71,10 +80,10 @@ pub fn render(app: *App) void {
             prefs_mod.min_font_scale,
             prefs_mod.max_font_scale,
         );
-        // Text-only preview during the drag — keeps the modal's auto-
-        // resized bounds steady so the slider knob stays put under the
-        // user's cursor. The padding/spacing scale catches up on
-        // release below.
+        // Text-only preview during the drag — keeps widget dimensions
+        // (and therefore the slider knob's screen position) constant
+        // so the cursor doesn't drift off the knob mid-drag. Padding
+        // catches up on release below.
         applyDragPreview(app.prefs.font_scale);
     }
     if (zgui.isItemDeactivatedAfterEdit()) {
@@ -82,6 +91,29 @@ pub fn render(app: *App) void {
         persist(app);
     }
 
+    // Numeric entry for the user who knows the exact value they want.
+    // `enter_returns_true` collapses "edit + Enter" into one event we
+    // can treat like a slider release — apply full scale + persist
+    // once, no per-keystroke disk writes.
+    var typed: f32 = app.prefs.font_scale;
+    zgui.setNextItemWidth(120);
+    if (zgui.inputFloat("##font_scale_input", .{
+        .v = &typed,
+        .step = 0.05,
+        .step_fast = 0.25,
+        .cfmt = "%.2f",
+        .flags = .{ .enter_returns_true = true },
+    })) {
+        app.prefs.font_scale = std.math.clamp(
+            typed,
+            prefs_mod.min_font_scale,
+            prefs_mod.max_font_scale,
+        );
+        applyLive(app.prefs.font_scale);
+        persist(app);
+    }
+
+    zgui.spacing();
     if (zgui.button("Reset to default", .{})) {
         app.prefs.font_scale = prefs_mod.default_font_scale;
         // Single click — no drag to keep stable. Full scale immediately.
