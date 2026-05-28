@@ -1,11 +1,14 @@
 //! Preferences modal — user-scoped settings that live across projects.
 //!
-//! Currently surfaces one knob: `font_scale`, a multiplier applied on
-//! top of the DPI-derived font size. The atlas is baked once at
-//! launch at DPI-scaled base size; `font_scale` rides on top via
-//! `zgui.getStyle().font_scale_main`, ImGui 1.92's per-frame draw
-//! multiplier. Slider edits write the live style field so the change
-//! takes effect on the next frame — no restart needed.
+//! Currently surfaces one knob: `font_scale`, a multiplier applied to
+//! the entire UI on top of the DPI-derived base. The atlas is baked
+//! once at launch at the DPI-scaled base size; `font_scale` rides on
+//! top via `zgui.getStyle().font_scale_main` for text (ImGui 1.92's
+//! per-frame draw multiplier) AND via `Style.scaleAllSizes` for
+//! padding/spacing/borders so buttons + checkboxes track the text
+//! instead of looking stranded at extreme slider values. Slider edits
+//! re-enter the same code path so the change takes effect on the next
+//! frame — no restart needed.
 //!
 //! Persistence is debounced: every drag frame applies the new value
 //! live (visual feedback), but the platform-appropriate app-data dir
@@ -17,6 +20,13 @@ const zgui = @import("zgui");
 
 const App = @import("../app.zig").App;
 const prefs_mod = @import("../prefs.zig");
+
+/// Snapshot of `Style` taken on the first `applyLive` call, before any
+/// font-scale multiplier has been applied. Resets to this on every
+/// subsequent call so we scale relative to the DPI-only baseline
+/// instead of compounding (`scaleAllSizes(2)` then `scaleAllSizes(0.5)`
+/// would otherwise leave padding at 1× DPI when it should be 0.5×).
+var baseline_style: ?zgui.Style = null;
 
 pub fn render(app: *App) void {
     if (app.show_preferences) zgui.openPopup("Preferences", .{});
@@ -68,12 +78,24 @@ pub fn render(app: *App) void {
     if (zgui.button("Close", .{ .w = 120 })) app.show_preferences = false;
 }
 
-/// Push the user's `font_scale` to ImGui's per-frame text-size
-/// multiplier. The 1.92 dynamic atlas re-rasterises glyphs at the
-/// new rendered size on the next frame, so text stays crisp instead
-/// of bilinear-blurring through the old atlas.
-fn applyLive(font_scale: f32) void {
-    zgui.getStyle().font_scale_main = font_scale;
+/// Apply the user's `font_scale` to the entire ImGui style — text via
+/// `font_scale_main` (the 1.92 dynamic atlas re-rasterises glyphs at
+/// the new rendered size next frame, so text stays crisp) AND
+/// padding/spacing/border sizes via `scaleAllSizes` so controls track
+/// the text instead of looking stranded at extreme values.
+///
+/// First call captures the current style as the post-DPI baseline.
+/// Subsequent calls reset to that baseline then re-scale, so the
+/// transform is idempotent (`applyLive(2.0)` then `applyLive(0.5)`
+/// lands at exactly 0.5× DPI, not 1× DPI from compounded scales).
+/// Pub so `main.zig` calls it once at startup for the saved value
+/// and the dialog's slider re-enters it for live edits.
+pub fn applyLive(font_scale: f32) void {
+    const style = zgui.getStyle();
+    if (baseline_style == null) baseline_style = style.*;
+    style.* = baseline_style.?;
+    style.scaleAllSizes(font_scale);
+    style.font_scale_main = font_scale;
 }
 
 /// Atomic-write the current prefs to disk and surface any failure

@@ -13,6 +13,7 @@ const zgui = @import("zgui");
 const App = @import("app.zig").App;
 const scene_mod = @import("modules/scene.zig");
 const prefab_mod = @import("modules/prefab.zig");
+const preferences_dialog = @import("dialogs/preferences.zig");
 const io_global = @import("io_global.zig");
 const flow_io = @import("flow_io.zig");
 const node_catalog = @import("flow_node_catalog.zig");
@@ -350,6 +351,67 @@ pub fn main() !void {
             ctx.menuAction(.click, "View/Atlas Viewer");
             ctx.yield(1);
             _ = zgui.te.check(@src(), .{}, !a.show_atlas_viewer, "View/Atlas Viewer closes panel");
+        }
+    });
+
+    _ = engine.registerTest("phase3", "preferences_applyLive_scales_text_and_padding", @src(), struct {
+        // Regression for #182's reviewer concern: `applyLive` must
+        // scale BOTH text (via `font_scale_main`) AND padding/spacing
+        // (via `scaleAllSizes`) so controls track the slider instead
+        // of looking stranded at extreme values. Also pins the
+        // idempotent reset-to-baseline contract: applyLive(2.0) then
+        // applyLive(1.0) lands on the same style as a fresh
+        // applyLive(1.0), not on 1× scale compounded from 2× (which
+        // would leave padding at the DPI baseline either way only by
+        // accident).
+        pub fn gui(_: *zgui.te.TestContext) !void {
+            if (g_app) |a| a.renderFrame(1.0 / 60.0);
+        }
+        pub fn run(_: *zgui.te.TestContext) !void {
+            const a = g_app orelse {
+                _ = zgui.te.check(@src(), .{}, false, "g_app must be set");
+                return;
+            };
+            const style = zgui.getStyle();
+            const original = a.prefs.font_scale;
+            // Restore the live font_scale at exit so subsequent tests
+            // run against the style the app booted with.
+            defer preferences_dialog.applyLive(original);
+
+            preferences_dialog.applyLive(1.0);
+            const pad_1x_a = style.frame_padding[0];
+            const text_1x_a = style.font_scale_main;
+
+            preferences_dialog.applyLive(2.0);
+            const pad_2x = style.frame_padding[0];
+            const text_2x = style.font_scale_main;
+
+            preferences_dialog.applyLive(1.0);
+            const pad_1x_b = style.frame_padding[0];
+            const text_1x_b = style.font_scale_main;
+
+            // font_scale_main is the direct write; assert it lands at
+            // the slider value verbatim.
+            _ = zgui.te.check(@src(), .{}, text_1x_a == 1.0, "applyLive(1.0) sets font_scale_main = 1.0");
+            _ = zgui.te.check(@src(), .{}, text_2x == 2.0, "applyLive(2.0) sets font_scale_main = 2.0");
+            _ = zgui.te.check(@src(), .{}, text_1x_b == 1.0, "applyLive(1.0) after 2.0 resets font_scale_main");
+
+            // Padding flows through ImGui's `ScaleAllSizes` which
+            // uses `ImTrunc` internally — a tolerance of 1 px
+            // absorbs the rounding without making the assertion
+            // trivially true for any value.
+            _ = zgui.te.check(
+                @src(),
+                .{},
+                @abs(pad_2x - 2.0 * pad_1x_a) < 1.0,
+                "applyLive(2.0) scales frame_padding to ~2× the 1× value",
+            );
+            _ = zgui.te.check(
+                @src(),
+                .{},
+                @abs(pad_1x_b - pad_1x_a) < 0.001,
+                "applyLive(1.0) returns frame_padding to its 1× baseline (idempotent reset)",
+            );
         }
     });
 

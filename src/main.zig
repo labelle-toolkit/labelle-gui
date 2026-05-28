@@ -9,6 +9,7 @@ const config = @import("config.zig");
 const prefs_mod = @import("prefs.zig");
 const App = @import("app.zig").App;
 const io_global = @import("io_global.zig");
+const preferences_dialog = @import("dialogs/preferences.zig");
 
 const gl = zopengl.bindings;
 
@@ -181,12 +182,16 @@ pub fn main(proc_init: std.process.Init.Minimal) !void {
         &icons.FA_ICON_RANGES,
     );
 
+    // DPI scale lands on padding/border/spacing first so it forms the
+    // "natural" baseline that future font-scale changes scale on top
+    // of. `preferences_dialog.applyLive` captures the current style as
+    // the baseline on its first call, then applies the user's saved
+    // font_scale uniformly — text (via `style.font_scale_main`) AND
+    // padding/spacing (via `scaleAllSizes`). The Preferences dialog
+    // re-enters the same path on every slider edit so the whole layout
+    // (not just text) tracks the slider.
     zgui.getStyle().scaleAllSizes(scale_factor);
-    // `font_scale_main` is the per-frame multiplier ImGui 1.92 applies
-    // to rendered text. Writing it once at startup gives the user's
-    // saved `font_scale` immediate effect; the Preferences dialog
-    // updates the same field on slider edits for live preview.
-    zgui.getStyle().font_scale_main = user_prefs.font_scale;
+    preferences_dialog.applyLive(user_prefs.font_scale);
 
     zgui.backend.init(window);
     defer zgui.backend.deinit();
