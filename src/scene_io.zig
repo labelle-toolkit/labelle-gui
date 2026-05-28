@@ -376,45 +376,88 @@ pub fn parsePrefab(allocator: std.mem.Allocator, raw: []const u8) !LoadedPrefab 
 
     const stripped = try stripLineComments(arena.allocator(), raw);
 
+    // RFC #560 unified prefab/scene format: entity content is wrapped
+    // in a top-level `root: { ... }` object. The intermediate JSON
+    // schema accepts both shapes — `root` (unified) and direct
+    // `components`/`children` (legacy) — and the read-side picks
+    // whichever the file actually carries. `ignore_unknown_fields`
+    // keeps untouched-by-us metadata (name, version, etc.) flowing
+    // through `extractPrefabTopLevelExtras` unchanged.
+    const ChildEntry = struct {
+        prefab: ?[]const u8 = null,
+        components: ?std.json.Value = null,
+        // Unified prefab refs spell `components` as `overrides`
+        // (RFC #560 §B2). The reader accepts both keys on either
+        // entry shape — strict §B2 enforcement is the engine
+        // loader's job, the editor stays permissive so a hand-
+        // edited prefab with the wrong-mode key doesn't refuse to
+        // open. `components orelse overrides` resolves whichever
+        // is populated; the writer always normalises on emit
+        // (refs → overrides, inline → components).
+        overrides: ?std.json.Value = null,
+    };
     const Intermediate = struct {
         components: ?std.json.Value = null,
-        children: []const struct {
-            prefab: ?[]const u8 = null,
+        children: []const ChildEntry = &.{},
+        root: ?struct {
             components: ?std.json.Value = null,
-        } = &.{},
+            children: []const ChildEntry = &.{},
+        } = null,
     };
     var parsed = try std.json.parseFromSlice(Intermediate, arena.allocator(), stripped, .{
         .ignore_unknown_fields = true,
     });
     defer parsed.deinit();
 
+    // Legacy schema → one warning per load so a contributor on an
+    // older branch sees they're not yet on the unified format
+    // (issue #174 acceptance bullet). The writer always normalises
+    // on save, so the warning fires on read but not subsequent
+    // saves of the same file.
+    if (parsed.value.root == null) {
+        std.log.warn("scene_io: prefab parsed in legacy schema (no `root` wrapper); will re-emit as unified RFC #560 on save", .{});
+    }
+
+    const eff_components: ?std.json.Value = if (parsed.value.root) |r| r.components else parsed.value.components;
+    const eff_children: []const ChildEntry = if (parsed.value.root) |r| r.children else parsed.value.children;
+
     const entity: Entity = .{
-        .position = readPosition(parsed.value.components),
-        .sprite = try readSprite(arena.allocator(), parsed.value.components),
-        .rectangle = try readRectangle(arena.allocator(), parsed.value.components),
-        .circle = try readCircle(arena.allocator(), parsed.value.components),
-        .polygon = try readPolygon(arena.allocator(), parsed.value.components),
+        .position = readPosition(eff_components),
+        .sprite = try readSprite(arena.allocator(), eff_components),
+        .rectangle = try readRectangle(arena.allocator(), eff_components),
+        .circle = try readCircle(arena.allocator(), eff_components),
+        .polygon = try readPolygon(arena.allocator(), eff_components),
     };
+
+    // Entity-level scanners walk the prefab body (inside root if
+    // unified; the file top otherwise). Top-level extras still run
+    // against the full raw because they need to capture metadata
+    // that sits *outside* root in unified files.
+    const scope = entityScope(raw);
 
     // Re-use the entity-body scanner — walks `{ ... }`, finds the
     // `components` key, captures every non-managed entry as verbatim
     // extras. Works the same for prefab body and child bodies.
-    const component_extras = try extractComponentExtras(arena.allocator(), raw);
+    const component_extras = try extractComponentExtras(arena.allocator(), scope);
 
     // Children: mutable so the editor can drag-to-move them. Each
     // child gets its leading `//` comment block attached via the
     // same rule scenes use.
-    const child_comments = try extractChildComments(arena.allocator(), raw);
-    const child_extras = try extractChildComponentExtras(arena.allocator(), raw);
-    var children = try arena.allocator().alloc(Entity, parsed.value.children.len);
-    for (parsed.value.children, 0..) |c, i| {
+    const child_comments = try extractChildComments(arena.allocator(), scope);
+    const child_extras = try extractChildComponentExtras(arena.allocator(), scope);
+    var children = try arena.allocator().alloc(Entity, eff_children.len);
+    for (eff_children, 0..) |c, i| {
+        // Refs carry their data under `overrides`; inline children
+        // use `components`. The reader doesn't care which spelling
+        // appeared — pick whichever is populated.
+        const co = c.components orelse c.overrides;
         children[i] = .{
             .prefab = if (c.prefab) |p| try arena.allocator().dupe(u8, p) else null,
-            .position = readPosition(c.components),
-            .sprite = try readSprite(arena.allocator(), c.components),
-            .rectangle = try readRectangle(arena.allocator(), c.components),
-            .circle = try readCircle(arena.allocator(), c.components),
-            .polygon = try readPolygon(arena.allocator(), c.components),
+            .position = readPosition(co),
+            .sprite = try readSprite(arena.allocator(), co),
+            .rectangle = try readRectangle(arena.allocator(), co),
+            .circle = try readCircle(arena.allocator(), co),
+            .polygon = try readPolygon(arena.allocator(), co),
         };
         if (i < child_comments.len) {
             buf.writeZeroed(&children[i].comment, child_comments[i]);
@@ -449,17 +492,30 @@ pub fn savePrefab(allocator: std.mem.Allocator, path: []const u8, loaded: Loaded
     );
 }
 
-/// Emit the prefab as `{ "components": { ... }, "children": [ ... ] }`.
+/// Emit the prefab in the RFC #560 unified format:
+/// `{ "root": { "components": { ... }, "children": [ ... ] }, <extras> }`.
 /// The `components` block mirrors a scene entity's; the `children`
 /// array (omitted when empty) emits one entry per child with its
 /// modeled Position + verbatim component extras + leading comment.
+/// Refs (children with `prefab:`) spell their data under `overrides`
+/// per RFC #560 §B2; inline children keep `components`.
 pub fn renderPrefabJsonc(allocator: std.mem.Allocator, loaded: LoadedPrefab) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     const w: ListWriter = .{ .list = &out, .allocator = allocator };
 
     try out.appendSlice(allocator, "{\n");
-    try out.appendSlice(allocator, "    \"components\": {");
+    // Mirror the scene writer's layout: file-level metadata first
+    // (passed-through extras like `name`, `version`, custom keys),
+    // then `root` carries the entity body. Keeps both writers
+    // emitting in the same order so a prefab that ever grows
+    // top-level extras (none in the toolkit today) lines up with
+    // the scene's `name → extras → root` shape.
+    for (loaded.top_level_extras) |kv| {
+        try out.print(allocator, "    \"{s}\": {s},\n", .{ kv.name, kv.value_text });
+    }
+    try out.appendSlice(allocator, "    \"root\": {\n");
+    try out.appendSlice(allocator, "        \"components\": {");
     var first = true;
     if (loaded.entity.position) |p| {
         try out.print(allocator, " \"Position\": {{ \"x\": {d}, \"y\": {d} }}", .{ p.x, p.y });
@@ -495,17 +551,17 @@ pub fn renderPrefabJsonc(allocator: std.mem.Allocator, loaded: LoadedPrefab) ![]
 
     if (loaded.children.len > 0) {
         try out.appendSlice(allocator, ",\n");
-        try out.appendSlice(allocator, "    \"children\": [\n");
+        try out.appendSlice(allocator, "        \"children\": [\n");
         for (loaded.children, 0..) |child, i| {
             const comment = std.mem.sliceTo(&child.comment, 0);
             if (comment.len > 0) {
                 var lines = std.mem.splitScalar(u8, std.mem.trim(u8, comment, " \t\r\n"), '\n');
                 while (lines.next()) |line| {
-                    try out.print(allocator, "        {s}\n", .{std.mem.trim(u8, line, " \t\r")});
+                    try out.print(allocator, "            {s}\n", .{std.mem.trim(u8, line, " \t\r")});
                 }
             }
 
-            try out.appendSlice(allocator, "        {");
+            try out.appendSlice(allocator, "            {");
             var c_first = true;
             if (child.prefab) |p| {
                 try out.print(allocator, " \"prefab\": \"{s}\"", .{p});
@@ -523,7 +579,11 @@ pub fn renderPrefabJsonc(allocator: std.mem.Allocator, loaded: LoadedPrefab) ![]
                 cextras.len > 0;
             if (has_components) {
                 if (!c_first) try out.appendSlice(allocator, ",");
-                try out.appendSlice(allocator, " \"components\": {");
+                // Refs (entries with a `prefab` field) spell the
+                // component map as `overrides`; inline children keep
+                // `components`. RFC #560 §B2.
+                const block_key: []const u8 = if (child.prefab != null) " \"overrides\": {" else " \"components\": {";
+                try out.appendSlice(allocator, block_key);
                 var cc_first = true;
                 if (child.position) |p| {
                     try out.print(allocator, " \"Position\": {{ \"x\": {d}, \"y\": {d} }}", .{ p.x, p.y });
@@ -562,18 +622,12 @@ pub fn renderPrefabJsonc(allocator: std.mem.Allocator, loaded: LoadedPrefab) ![]
             if (i + 1 < loaded.children.len) try out.appendSlice(allocator, ",");
             try out.appendSlice(allocator, "\n");
         }
-        try out.appendSlice(allocator, "    ]");
+        try out.appendSlice(allocator, "        ]");
     }
 
-    // Splice unmodeled top-level keys back in, after the modeled
-    // fields. Order shifts relative to the source (managed first)
-    // but the content is faithful — same trade-off scenes make.
-    for (loaded.top_level_extras) |kv| {
-        try out.appendSlice(allocator, ",\n");
-        try out.print(allocator, "    \"{s}\": {s}", .{ kv.name, kv.value_text });
-    }
-
-    try out.appendSlice(allocator, "\n}\n");
+    // Close `root` block. Top-level extras were emitted before
+    // `root` above so the layout matches the scene writer.
+    try out.appendSlice(allocator, "\n    }\n}\n");
     return out.toOwnedSlice(allocator);
 }
 
@@ -586,12 +640,37 @@ pub fn parseScene(allocator: std.mem.Allocator, raw: []const u8) !LoadedScene {
     const stripped = try stripLineComments(arena.allocator(), raw);
     // The intermediate JSON deserialization needs both fields & ignore-unknowns
     // because real scenes carry component keys (Sprite, Shape, …) we don't model.
+    //
+    // Accepts both layouts (RFC #560):
+    //   - Legacy: `{ "name": "...", "entities": [ ... ] }`
+    //   - Unified: `{ "name": "...", "root": { "children": [ ... ] } }`
+    // The reader picks whichever the file actually carries; refs
+    // inside `children` may spell `components` as `overrides` —
+    // both fields are present on `SceneEntry` and the read-side
+    // takes whichever is populated.
+    // Both `components` and `overrides` fields are present per entry
+    // (RFC #560 §B2 — refs use overrides, inline uses components).
+    // The reader accepts whichever spelling appeared, even cross-
+    // mode; strict §B2 enforcement is the engine loader's job, so
+    // the editor stays permissive and a hand-edited scene with the
+    // wrong-mode key still opens. The writer always normalises on
+    // emit. RFC §"Effective name" says when `name` is absent the
+    // basename becomes the registry key — the gui keeps it as the
+    // empty default since `scene.name` is display-only (tab title +
+    // saved value); the engine, not the gui, is the registry-key
+    // consumer. If the tab title ever becomes empty in practice,
+    // `loadFromFile` could fall back to the file basename here.
+    const SceneEntry = struct {
+        prefab: ?[]const u8 = null,
+        components: ?std.json.Value = null,
+        overrides: ?std.json.Value = null,
+    };
     const Intermediate = struct {
         name: []const u8 = "",
-        entities: []const struct {
-            prefab: ?[]const u8 = null,
-            components: ?std.json.Value = null,
-        } = &.{},
+        entities: []const SceneEntry = &.{},
+        root: ?struct {
+            children: []const SceneEntry = &.{},
+        } = null,
     };
 
     var parsed = try std.json.parseFromSlice(Intermediate, arena.allocator(), stripped, .{
@@ -603,21 +682,37 @@ pub fn parseScene(allocator: std.mem.Allocator, raw: []const u8) !LoadedScene {
     // the ownership story consistent with other call sites.
     defer parsed.deinit();
 
+    // Legacy schema → one warning per load (issue #174 acceptance).
+    // Saves always re-emit as unified, so the warning fires on read
+    // but not on subsequent saves of the same file.
+    if (parsed.value.root == null) {
+        std.log.warn("scene_io: scene parsed in legacy schema (no `root` wrapper); will re-emit as unified RFC #560 on save", .{});
+    }
+
+    const eff_entries: []const SceneEntry = if (parsed.value.root) |r| r.children else parsed.value.entities;
+
+    // Entity-level scanners walk inside the root wrapper when present,
+    // and the full file otherwise. `extractTopLevelExtras` keeps the
+    // raw scope so metadata sibling to `root` (e.g. `assets`,
+    // `include`) is preserved.
+    const scope = entityScope(raw);
+
     // Walk the source a second time to pluck out each entity's leading
     // comments. Done as a separate pass over the *raw* (pre-stripped)
     // text — the stripped buffer has spaces where `//` lines used to be,
     // so we can't recover comments from it.
-    const comments = try extractEntityComments(arena.allocator(), raw);
+    const comments = try extractEntityComments(arena.allocator(), scope);
 
-    var entities = try arena.allocator().alloc(Entity, parsed.value.entities.len);
-    for (parsed.value.entities, 0..) |e, i| {
+    var entities = try arena.allocator().alloc(Entity, eff_entries.len);
+    for (eff_entries, 0..) |e, i| {
+        const oc = e.components orelse e.overrides;
         entities[i] = .{
             .prefab = if (e.prefab) |p| try arena.allocator().dupe(u8, p) else null,
-            .position = readPosition(e.components),
-            .sprite = try readSprite(arena.allocator(), e.components),
-            .rectangle = try readRectangle(arena.allocator(), e.components),
-            .circle = try readCircle(arena.allocator(), e.components),
-            .polygon = try readPolygon(arena.allocator(), e.components),
+            .position = readPosition(oc),
+            .sprite = try readSprite(arena.allocator(), oc),
+            .rectangle = try readRectangle(arena.allocator(), oc),
+            .circle = try readCircle(arena.allocator(), oc),
+            .polygon = try readPolygon(arena.allocator(), oc),
         };
         // Comments are extracted on a best-effort basis: if the scanner
         // landed fewer entries than parser saw entities (recovery from
@@ -631,7 +726,7 @@ pub fn parseScene(allocator: std.mem.Allocator, raw: []const u8) !LoadedScene {
     // get re-emitted verbatim on save so external scenes round-trip
     // without losing data the gui doesn't yet know how to edit.
     const top_level_extras = try extractTopLevelExtras(arena.allocator(), raw);
-    const entity_components_extras = try extractEntityComponentExtras(arena.allocator(), raw);
+    const entity_components_extras = try extractEntityComponentExtras(arena.allocator(), scope);
 
     return .{
         .arena = arena,
@@ -924,7 +1019,9 @@ pub fn displayNameFromPath(path: []const u8) []const u8 {
 /// an entity opening brace (uncommon and would conflate with the
 /// previous entity).
 pub fn extractEntityComments(arena: std.mem.Allocator, raw: []const u8) ![]const []const u8 {
-    return extractArrayItemComments(arena, raw, findEntitiesArray(raw) orelse return &.{});
+    // Unified scenes (RFC #560) name the array `children` (inside
+    // `root: { ... }`); legacy scenes use `entities`. Either resolves.
+    return extractArrayItemComments(arena, raw, findSceneEntriesArray(raw) orelse return &.{});
 }
 
 /// Same shape as `extractEntityComments` but rooted at a prefab's
@@ -1007,6 +1104,75 @@ fn findEntitiesArray(raw: []const u8) ?usize {
 
 fn findChildrenArray(raw: []const u8) ?usize {
     return findArrayByKey(raw, "\"children\"");
+}
+
+/// Scene-side array of top-level entries. Legacy scenes call it
+/// `entities`; unified scenes (RFC #560) wrap the array under
+/// `root: { "children": [...] }`. The caller is expected to pass
+/// the in-scope body (root body if unified, the file root if legacy);
+/// either name resolves so a single helper covers both eras.
+fn findSceneEntriesArray(scope: []const u8) ?usize {
+    return findEntitiesArray(scope) orelse findChildrenArray(scope);
+}
+
+/// When `raw` is wrapped in a top-level `"root": { ... }` (RFC #560
+/// unified prefab/scene format), return the slice spanning the body
+/// of that wrapper inclusive of the outer braces. Returns null for
+/// legacy files, signalling the caller to keep scanning the entire
+/// `raw` buffer.
+///
+/// The returned slice is a view into `raw` — no allocation. Callers
+/// that need a scope-for-scanners convenience should use
+/// `entityScope` below, which folds the null case into `raw` itself.
+fn findRootBraceBody(raw: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    skipWhitespaceJson(raw, &i);
+    skipCommentBlock(raw, &i);
+    skipWhitespaceJson(raw, &i);
+    if (i >= raw.len or raw[i] != '{') return null;
+    i += 1;
+
+    while (i < raw.len) {
+        skipWhitespaceJson(raw, &i);
+        skipCommentBlock(raw, &i);
+        skipWhitespaceJson(raw, &i);
+        if (i >= raw.len) return null;
+        if (raw[i] == '}') return null;
+        if (raw[i] == ',') {
+            i += 1;
+            continue;
+        }
+        if (raw[i] != '"') return null;
+
+        const key = parseStringLiteral(raw, &i) orelse return null;
+        skipWhitespaceJson(raw, &i);
+        skipCommentBlock(raw, &i);
+        skipWhitespaceJson(raw, &i);
+        if (i >= raw.len or raw[i] != ':') return null;
+        i += 1;
+        skipWhitespaceJson(raw, &i);
+        skipCommentBlock(raw, &i);
+        skipWhitespaceJson(raw, &i);
+
+        if (std.mem.eql(u8, key, "root")) {
+            if (i >= raw.len or raw[i] != '{') return null;
+            const start = i;
+            scanBalanced(raw, &i, '{', '}');
+            return raw[start..i];
+        }
+        // Not root — skip its value and keep looking.
+        scanValueJson(raw, &i);
+    }
+    return null;
+}
+
+/// Convenience wrapper: returns the root body slice when present, or
+/// `raw` itself otherwise. Entity-level scanners
+/// (`extractEntityComments`, `extractComponentExtras`, etc.) should
+/// run against this scope so they look inside the `root` wrapper on
+/// unified files and against the legacy top-level otherwise.
+fn entityScope(raw: []const u8) []const u8 {
+    return findRootBraceBody(raw) orelse raw;
 }
 
 fn skipWhitespaceJson(raw: []const u8, i: *usize) void {
@@ -1181,7 +1347,10 @@ fn extractPrefabTopLevelExtras(arena: std.mem.Allocator, raw: []const u8) ![]con
 /// key+value pair that isn't `Position` (the only component the gui
 /// models today).
 fn extractEntityComponentExtras(arena: std.mem.Allocator, raw: []const u8) ![]const []const ComponentExtra {
-    return extractArrayItemComponentExtras(arena, raw, findEntitiesArray(raw) orelse return &.{});
+    // Unified scenes (#560) spell the scene-entities array `children`
+    // (inside `root: { ... }`); legacy scenes use `entities` at the
+    // file root. `findSceneEntriesArray` accepts either.
+    return extractArrayItemComponentExtras(arena, raw, findSceneEntriesArray(raw) orelse return &.{});
 }
 
 /// Per-child component extras for prefabs. Same scanner the scene
@@ -1229,8 +1398,12 @@ fn extractComponentExtras(arena: std.mem.Allocator, entity_body: []const u8) ![]
     var out: std.ArrayList(ComponentExtra) = .empty;
     errdefer out.deinit(arena);
 
-    // Find `"components"` key inside the entity body.
-    const components_obj_start = findKeyObject(entity_body, "components") orelse return out.toOwnedSlice(arena);
+    // Find `"components"` key inside the entity body. Unified prefab
+    // refs (RFC #560) spell this as `overrides`; either name resolves
+    // to the same shape of object so we accept whichever is present.
+    const components_obj_start = findKeyObject(entity_body, "components") orelse
+        findKeyObject(entity_body, "overrides") orelse
+        return out.toOwnedSlice(arena);
     var i: usize = components_obj_start + 1; // past '{'
 
     while (i < entity_body.len) {
@@ -1371,11 +1544,21 @@ fn scanValueJson(raw: []const u8, i: *usize) void {
 }
 
 fn isManagedTopLevelKey(name: []const u8) bool {
-    return std.mem.eql(u8, name, "name") or std.mem.eql(u8, name, "entities");
+    // `root` is the RFC #560 unified-format wrapper holding entities
+    // (under `children` inside it). The writer re-emits it from the
+    // modeled scene, so capturing it as a pass-through extra would
+    // double-emit on save.
+    return std.mem.eql(u8, name, "name") or
+        std.mem.eql(u8, name, "entities") or
+        std.mem.eql(u8, name, "root");
 }
 
 fn isManagedPrefabTopLevelKey(name: []const u8) bool {
-    return std.mem.eql(u8, name, "components") or std.mem.eql(u8, name, "children");
+    // Same reasoning: `root` is the unified wrapper and gets
+    // re-emitted by the writer from the modeled prefab body.
+    return std.mem.eql(u8, name, "components") or
+        std.mem.eql(u8, name, "children") or
+        std.mem.eql(u8, name, "root");
 }
 
 // ─── Writer ────────────────────────────────────────────────────────────
@@ -1396,12 +1579,16 @@ pub fn saveScene(allocator: std.mem.Allocator, path: []const u8, loaded: LoadedS
     );
 }
 
-/// Render the loaded scene back to JSONC. Managed fields (`name`,
-/// per-entity `prefab` and `Position`) come from the typed model;
-/// everything else (top-level keys other than `name`/`entities`, and
-/// per-entity components other than `Position`) is spliced verbatim
-/// from the extras captured at load time. Per-entity comments are
-/// emitted at the entities-array indent above their owning entity.
+/// Render the loaded scene back to JSONC in the RFC #560 unified
+/// format: `{ "name": ..., <extras>, "root": { "children": [ ... ] } }`.
+/// Managed fields (`name`, per-entity `prefab` and `Position`) come
+/// from the typed model; everything else (top-level keys other than
+/// `name`/`entities`/`root`, and per-entity components other than the
+/// modeled set) is spliced verbatim from the extras captured at load
+/// time. Per-entity comments are emitted at the children-array
+/// indent above their owning entity. Refs (entries with `prefab`)
+/// spell their component data under `overrides`; inline entries keep
+/// `components`.
 pub fn renderSceneJsonc(allocator: std.mem.Allocator, loaded: LoadedScene) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -1414,24 +1601,25 @@ pub fn renderSceneJsonc(allocator: std.mem.Allocator, loaded: LoadedScene) ![]u8
         try out.print(allocator, "    \"{s}\": {s},\n", .{ kv.name, kv.value_text });
     }
 
-    try out.appendSlice(allocator, "    \"entities\": [");
+    try out.appendSlice(allocator, "    \"root\": {\n");
+    try out.appendSlice(allocator, "        \"children\": [");
     if (loaded.scene.entities.len == 0) {
-        try out.appendSlice(allocator, "]\n}\n");
+        try out.appendSlice(allocator, "]\n    }\n}\n");
         return out.toOwnedSlice(allocator);
     }
     try out.appendSlice(allocator, "\n");
 
     for (loaded.scene.entities, 0..) |e, i| {
-        // Comment lines first (each at the entities-array indent).
+        // Comment lines first (each at the children-array indent).
         const comment = std.mem.sliceTo(&e.comment, 0);
         if (comment.len > 0) {
             var lines = std.mem.splitScalar(u8, std.mem.trim(u8, comment, " \t\r\n"), '\n');
             while (lines.next()) |line| {
-                try out.print(allocator, "        {s}\n", .{std.mem.trim(u8, line, " \t\r")});
+                try out.print(allocator, "            {s}\n", .{std.mem.trim(u8, line, " \t\r")});
             }
         }
 
-        try out.appendSlice(allocator, "        {");
+        try out.appendSlice(allocator, "            {");
         var first = true;
         if (e.prefab) |p| {
             try out.print(allocator, " \"prefab\": \"{s}\"", .{p});
@@ -1449,7 +1637,10 @@ pub fn renderSceneJsonc(allocator: std.mem.Allocator, loaded: LoadedScene) ![]u8
             extras.len > 0;
         if (has_components) {
             if (!first) try out.appendSlice(allocator, ",");
-            try out.appendSlice(allocator, " \"components\": {");
+            // RFC #560 §B2: refs use `overrides`, inline entities
+            // use `components`. The two are disjoint per-entry.
+            const block_key: []const u8 = if (e.prefab != null) " \"overrides\": {" else " \"components\": {";
+            try out.appendSlice(allocator, block_key);
             var c_first = true;
             if (e.position) |p| {
                 try out.print(allocator, " \"Position\": {{ \"x\": {d}, \"y\": {d} }}", .{ p.x, p.y });
@@ -1488,7 +1679,7 @@ pub fn renderSceneJsonc(allocator: std.mem.Allocator, loaded: LoadedScene) ![]u8
         if (i + 1 < loaded.scene.entities.len) try out.appendSlice(allocator, ",");
         try out.appendSlice(allocator, "\n");
     }
-    try out.appendSlice(allocator, "    ]\n}\n");
+    try out.appendSlice(allocator, "        ]\n    }\n}\n");
 
     return out.toOwnedSlice(allocator);
 }
