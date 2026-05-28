@@ -188,11 +188,20 @@ pub const ComponentExtra = struct {
 
 pub const SceneExtras = struct {
     /// Captured verbatim text for top-level scene keys we don't model.
+    /// Used by legacy + RFC #560 reads where file-level metadata
+    /// (`include`, `assets`, ...) sits as siblings of `root`. Bundle
+    /// scenes (RFC #596) carry these inside the leading
+    /// `{ "meta": { ... } }` entry instead — see `meta` below.
     top_level: []const TopLevelExtra = &.{},
     /// Per-entity components we don't model. Indexed by source order.
     /// Inner slice may be empty when an entity has only modeled
     /// components (or no components block at all).
     entity_components: []const []const ComponentExtra = &.{},
+    /// RFC #596 bundle scenes encode file-level directives as a leading
+    /// `{ "meta": { ... } }` array entry. Each key+value pair is
+    /// captured here verbatim and re-emitted on save. Empty for
+    /// non-bundle scenes (where `top_level` carries the same data).
+    meta: []const TopLevelExtra = &.{},
 };
 
 /// Loaded scene plus the arena that owns its memory. Caller frees via
@@ -376,6 +385,15 @@ pub fn parsePrefab(allocator: std.mem.Allocator, raw: []const u8) !LoadedPrefab 
 
     const stripped = try stripLineComments(arena.allocator(), raw);
 
+    // RFC #596 bundle prefab shape: inline PascalCase component keys
+    // at top-level, no `root`/`components` wrapper. Detected by
+    // absence of both wrapper keys; dispatched to a separate code
+    // path that walks each key directly. The #175 path below stays
+    // unchanged for legacy + RFC #560 inputs.
+    if (isBundlePrefab(stripped)) {
+        return parsePrefabBundle(arena, raw, stripped);
+    }
+
     // RFC #560 unified prefab/scene format: entity content is wrapped
     // in a top-level `root: { ... }` object. The intermediate JSON
     // schema accepts both shapes — `root` (unified) and direct
@@ -480,6 +498,62 @@ pub fn parsePrefab(allocator: std.mem.Allocator, raw: []const u8) !LoadedPrefab 
     };
 }
 
+/// RFC #596 bundle prefab parser. Top-level object IS the components
+/// map directly — no `components`/`overrides` wrapper, no `root`.
+/// PascalCase keys are components; `children` (when present) is the
+/// sub-entity array with the same scene-entry shape used by
+/// `parseSceneBundle`. The caller (`parsePrefab`) set up the arena
+/// and stripped comments.
+fn parsePrefabBundle(
+    arena: *std.heap.ArenaAllocator,
+    raw: []const u8,
+    stripped: []const u8,
+) !LoadedPrefab {
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.PrefabNotAnObject;
+
+    const top = parsed.value;
+    const entity: Entity = .{
+        .position = readPosition(top),
+        .sprite = try readSprite(arena.allocator(), top),
+        .rectangle = try readRectangle(arena.allocator(), top),
+        .circle = try readCircle(arena.allocator(), top),
+        .polygon = try readPolygon(arena.allocator(), top),
+    };
+
+    // Component extras: every top-level key except `prefab`,
+    // `children`, and the five typed components rides along verbatim.
+    const component_extras = try extractInlineComponentExtras(arena.allocator(), raw);
+
+    // Children entries use the same inline-key shape as scene entries.
+    const child_comments = try extractChildComments(arena.allocator(), raw);
+    const child_extras = try extractChildBundleEntryComponentExtras(arena.allocator(), raw);
+    const children_items: []std.json.Value = if (top.object.get("children")) |c|
+        if (c == .array) c.array.items else &.{}
+    else
+        &.{};
+    var children = try arena.allocator().alloc(Entity, children_items.len);
+    for (children_items, 0..) |c, i| {
+        children[i] = try parseBundleEntryToEntity(arena.allocator(), c);
+        if (i < child_comments.len) {
+            buf.writeZeroed(&children[i].comment, child_comments[i]);
+        }
+    }
+
+    return .{
+        .arena = arena,
+        .entity = entity,
+        .component_extras = component_extras,
+        .children = children,
+        .children_extras = child_extras,
+        // RFC #596 collapses top-level prefab keys into components +
+        // children; no separate "metadata above components" channel
+        // exists, so this is always empty for bundle prefabs.
+        .top_level_extras = &.{},
+    };
+}
+
 pub fn savePrefab(allocator: std.mem.Allocator, path: []const u8, loaded: LoadedPrefab) !void {
     const text = try renderPrefabJsonc(allocator, loaded);
     defer allocator.free(text);
@@ -492,143 +566,138 @@ pub fn savePrefab(allocator: std.mem.Allocator, path: []const u8, loaded: Loaded
     );
 }
 
-/// Emit the prefab in the RFC #560 unified format:
-/// `{ "root": { "components": { ... }, "children": [ ... ] }, <extras> }`.
-/// The `components` block mirrors a scene entity's; the `children`
-/// array (omitted when empty) emits one entry per child with its
-/// modeled Position + verbatim component extras + leading comment.
-/// Refs (children with `prefab:`) spell their data under `overrides`
-/// per RFC #560 §B2; inline children keep `components`.
+/// Emit the prefab in RFC #596 bundle shape: a top-level object whose
+/// PascalCase keys are component blocks (no `components:` wrapper, no
+/// `root:` wrapper), with `children: [...]` (when non-empty) carrying
+/// sub-entities in the same scene-entry shape. All saves migrate
+/// legacy + RFC #560 inputs to this canonical form — flying-platform
+/// and the rest of the toolkit already moved to it.
 pub fn renderPrefabJsonc(allocator: std.mem.Allocator, loaded: LoadedPrefab) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     const w: ListWriter = .{ .list = &out, .allocator = allocator };
 
-    try out.appendSlice(allocator, "{\n");
-    // Mirror the scene writer's layout: file-level metadata first
-    // (passed-through extras like `name`, `version`, custom keys),
-    // then `root` carries the entity body. Keeps both writers
-    // emitting in the same order so a prefab that ever grows
-    // top-level extras (none in the toolkit today) lines up with
-    // the scene's `name → extras → root` shape.
-    for (loaded.top_level_extras) |kv| {
-        try out.print(allocator, "    \"{s}\": {s},\n", .{ kv.name, kv.value_text });
-    }
-    try out.appendSlice(allocator, "    \"root\": {\n");
-    try out.appendSlice(allocator, "        \"components\": {");
+    try out.appendSlice(allocator, "{");
+
     var first = true;
     if (loaded.entity.position) |p| {
-        try out.print(allocator, " \"Position\": {{ \"x\": {d}, \"y\": {d} }}", .{ p.x, p.y });
+        try out.print(allocator, "\n    \"Position\": {{ \"x\": {d}, \"y\": {d} }}", .{ p.x, p.y });
         first = false;
     }
     if (loaded.entity.sprite) |sp| {
         if (!first) try out.appendSlice(allocator, ",");
+        try out.appendSlice(allocator, "\n   ");
         _ = try emitSprite(w, sp.*);
         first = false;
     }
     if (loaded.entity.rectangle) |re| {
         if (!first) try out.appendSlice(allocator, ",");
+        try out.appendSlice(allocator, "\n   ");
         _ = try emitRectangle(w, re.*);
         first = false;
     }
     if (loaded.entity.circle) |ci| {
         if (!first) try out.appendSlice(allocator, ",");
+        try out.appendSlice(allocator, "\n   ");
         _ = try emitCircle(w, ci.*);
         first = false;
     }
     if (loaded.entity.polygon) |po| {
         if (!first) try out.appendSlice(allocator, ",");
+        try out.appendSlice(allocator, "\n   ");
         _ = try emitPolygon(w, po.*);
+        first = false;
+    }
+    // `top_level_extras` only populates from legacy / RFC #560 reads.
+    // Bundle prefabs collapse everything into components, so on a
+    // bundle round-trip this is empty. Emit them as additional inline
+    // keys when present — same shape as component extras.
+    for (loaded.top_level_extras) |kv| {
+        if (!first) try out.appendSlice(allocator, ",");
+        try out.print(allocator, "\n    \"{s}\": {s}", .{ kv.name, kv.value_text });
         first = false;
     }
     for (loaded.component_extras) |extra| {
         if (!first) try out.appendSlice(allocator, ",");
-        try out.print(allocator, " \"{s}\": {s}", .{ extra.name, extra.value_text });
+        try out.print(allocator, "\n    \"{s}\": {s}", .{ extra.name, extra.value_text });
         first = false;
     }
-    if (first) try out.appendSlice(allocator, " ");
-    try out.appendSlice(allocator, " }");
 
     if (loaded.children.len > 0) {
-        try out.appendSlice(allocator, ",\n");
-        try out.appendSlice(allocator, "        \"children\": [\n");
+        if (!first) try out.appendSlice(allocator, ",");
+        try out.appendSlice(allocator, "\n    \"children\": [\n");
         for (loaded.children, 0..) |child, i| {
             const comment = std.mem.sliceTo(&child.comment, 0);
             if (comment.len > 0) {
                 var lines = std.mem.splitScalar(u8, std.mem.trim(u8, comment, " \t\r\n"), '\n');
                 while (lines.next()) |line| {
-                    try out.print(allocator, "            {s}\n", .{std.mem.trim(u8, line, " \t\r")});
+                    try out.print(allocator, "        {s}\n", .{std.mem.trim(u8, line, " \t\r")});
                 }
             }
 
-            try out.appendSlice(allocator, "            {");
-            var c_first = true;
-            if (child.prefab) |p| {
-                try out.print(allocator, " \"prefab\": \"{s}\"", .{p});
-                c_first = false;
-            }
-            const cextras = if (i < loaded.children_extras.len)
-                loaded.children_extras[i]
-            else
-                &[_]ComponentExtra{};
-            const has_components = child.position != null or
-                child.sprite != null or
-                child.rectangle != null or
-                child.circle != null or
-                child.polygon != null or
-                cextras.len > 0;
-            if (has_components) {
-                if (!c_first) try out.appendSlice(allocator, ",");
-                // Refs (entries with a `prefab` field) spell the
-                // component map as `overrides`; inline children keep
-                // `components`. RFC #560 §B2.
-                const block_key: []const u8 = if (child.prefab != null) " \"overrides\": {" else " \"components\": {";
-                try out.appendSlice(allocator, block_key);
-                var cc_first = true;
-                if (child.position) |p| {
-                    try out.print(allocator, " \"Position\": {{ \"x\": {d}, \"y\": {d} }}", .{ p.x, p.y });
-                    cc_first = false;
-                }
-                if (child.sprite) |sp| {
-                    if (!cc_first) try out.appendSlice(allocator, ",");
-                    _ = try emitSprite(w, sp.*);
-                    cc_first = false;
-                }
-                if (child.rectangle) |re| {
-                    if (!cc_first) try out.appendSlice(allocator, ",");
-                    _ = try emitRectangle(w, re.*);
-                    cc_first = false;
-                }
-                if (child.circle) |ci| {
-                    if (!cc_first) try out.appendSlice(allocator, ",");
-                    _ = try emitCircle(w, ci.*);
-                    cc_first = false;
-                }
-                if (child.polygon) |po| {
-                    if (!cc_first) try out.appendSlice(allocator, ",");
-                    _ = try emitPolygon(w, po.*);
-                    cc_first = false;
-                }
-                for (cextras) |extra| {
-                    if (!cc_first) try out.appendSlice(allocator, ",");
-                    try out.print(allocator, " \"{s}\": {s}", .{ extra.name, extra.value_text });
-                    cc_first = false;
-                }
-                try out.appendSlice(allocator, " }");
-                c_first = false;
-            }
-            if (c_first) try out.appendSlice(allocator, " ");
+            try out.appendSlice(allocator, "        {");
+            try emitEntityBody(w, child, sliceExtrasAt(loaded.children_extras, i));
             try out.appendSlice(allocator, " }");
             if (i + 1 < loaded.children.len) try out.appendSlice(allocator, ",");
             try out.appendSlice(allocator, "\n");
         }
-        try out.appendSlice(allocator, "        ]");
+        try out.appendSlice(allocator, "    ]");
+        first = false;
     }
 
-    // Close `root` block. Top-level extras were emitted before
-    // `root` above so the layout matches the scene writer.
-    try out.appendSlice(allocator, "\n    }\n}\n");
+    if (first) {
+        try out.appendSlice(allocator, "}\n");
+    } else {
+        try out.appendSlice(allocator, "\n}\n");
+    }
     return out.toOwnedSlice(allocator);
+}
+
+fn sliceExtrasAt(table: []const []const ComponentExtra, i: usize) []const ComponentExtra {
+    return if (i < table.len) table[i] else &.{};
+}
+
+/// Emit the inside of one entity object `{ ... }` — optional `prefab`
+/// key plus inline PascalCase component keys (typed + verbatim
+/// extras). Caller owns the surrounding `{` `}`. Used by both the
+/// scene-entity and prefab-child writers.
+fn emitEntityBody(w: ListWriter, e: Entity, extras: []const ComponentExtra) !void {
+    var first = true;
+    if (e.prefab) |p| {
+        try w.print(" \"prefab\": \"{s}\"", .{p});
+        first = false;
+    }
+    if (e.position) |p| {
+        if (!first) try w.writeAll(",");
+        try w.print(" \"Position\": {{ \"x\": {d}, \"y\": {d} }}", .{ p.x, p.y });
+        first = false;
+    }
+    if (e.sprite) |sp| {
+        if (!first) try w.writeAll(",");
+        _ = try emitSprite(w, sp.*);
+        first = false;
+    }
+    if (e.rectangle) |re| {
+        if (!first) try w.writeAll(",");
+        _ = try emitRectangle(w, re.*);
+        first = false;
+    }
+    if (e.circle) |ci| {
+        if (!first) try w.writeAll(",");
+        _ = try emitCircle(w, ci.*);
+        first = false;
+    }
+    if (e.polygon) |po| {
+        if (!first) try w.writeAll(",");
+        _ = try emitPolygon(w, po.*);
+        first = false;
+    }
+    for (extras) |extra| {
+        if (!first) try w.writeAll(",");
+        try w.print(" \"{s}\": {s}", .{ extra.name, extra.value_text });
+        first = false;
+    }
+    if (first) try w.writeAll(" ");
 }
 
 pub fn parseScene(allocator: std.mem.Allocator, raw: []const u8) !LoadedScene {
@@ -638,6 +707,17 @@ pub fn parseScene(allocator: std.mem.Allocator, raw: []const u8) !LoadedScene {
     errdefer arena.deinit();
 
     const stripped = try stripLineComments(arena.allocator(), raw);
+
+    // RFC #596 bundle scene shape: top-level JSON array, optional
+    // leading `{ "meta": { ... } }` entry, inline PascalCase component
+    // keys per entity (no `root`/`children`/`components` wrappers).
+    // Detected by the first non-trivia token being `[`. Dispatched to
+    // a separate parser; the #175 path below stays untouched for
+    // legacy + RFC #560 inputs.
+    if (isBundleScene(stripped)) {
+        return parseSceneBundle(arena, raw, stripped);
+    }
+
     // The intermediate JSON deserialization needs both fields & ignore-unknowns
     // because real scenes carry component keys (Sprite, Shape, …) we don't model.
     //
@@ -738,6 +818,80 @@ pub fn parseScene(allocator: std.mem.Allocator, raw: []const u8) !LoadedScene {
             .top_level = top_level_extras,
             .entity_components = entity_components_extras,
         },
+    };
+}
+
+/// RFC #596 bundle scene parser. Reads a top-level JSON array,
+/// splits off the optional leading `{ "meta": { ... } }` directive
+/// entry, and turns each remaining array item into an `Entity` with
+/// inline PascalCase component keys (no `components`/`overrides`
+/// wrapper). The caller (`parseScene`) has already set up the arena
+/// and stripped comments.
+fn parseSceneBundle(
+    arena: *std.heap.ArenaAllocator,
+    raw: []const u8,
+    stripped: []const u8,
+) !LoadedScene {
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
+    defer parsed.deinit();
+    if (parsed.value != .array) return error.SceneNotAnArray;
+
+    var first_entity_idx: usize = 0;
+    var meta_entries: []const TopLevelExtra = &.{};
+    if (parsed.value.array.items.len > 0) {
+        const first = parsed.value.array.items[0];
+        if (first == .object and first.object.get("meta") != null) {
+            meta_entries = try extractMetaEntries(arena.allocator(), raw);
+            first_entity_idx = 1;
+        }
+    }
+
+    const entity_items = parsed.value.array.items[first_entity_idx..];
+    var entities = try arena.allocator().alloc(Entity, entity_items.len);
+    for (entity_items, 0..) |entry, i| {
+        entities[i] = try parseBundleEntryToEntity(arena.allocator(), entry);
+    }
+
+    // Per-entity scanners walk the top-level array, skipping the meta
+    // entry when present so the resulting per-entity slices line up
+    // with `entities` above.
+    const comments = try extractBundleEntryComments(arena.allocator(), raw, first_entity_idx);
+    for (entities, 0..) |*e, i| {
+        if (i < comments.len) buf.writeZeroed(&e.comment, comments[i]);
+    }
+    const entity_components_extras = try extractBundleEntryComponentExtras(arena.allocator(), raw, first_entity_idx);
+
+    return .{
+        .arena = arena,
+        .scene = .{ .entities = entities },
+        .extras = .{
+            .meta = meta_entries,
+            .entity_components = entity_components_extras,
+        },
+    };
+}
+
+/// Build an `Entity` from a single bundle-shape entry object. Entry
+/// shape is `{ "prefab"?: string, "ComponentName": {...}, ... }` —
+/// inline PascalCase keys sit alongside the optional `prefab`
+/// reference. The typed component readers only look up their own
+/// key on the passed value, so handing them the whole entry is
+/// correct.
+fn parseBundleEntryToEntity(arena: std.mem.Allocator, entry: std.json.Value) !Entity {
+    if (entry != .object) return error.EntityNotAnObject;
+    const prefab: ?[]const u8 = blk: {
+        if (entry.object.get("prefab")) |p| {
+            if (p == .string) break :blk try arena.dupe(u8, p.string);
+        }
+        break :blk null;
+    };
+    return .{
+        .prefab = prefab,
+        .position = readPosition(entry),
+        .sprite = try readSprite(arena, entry),
+        .rectangle = try readRectangle(arena, entry),
+        .circle = try readCircle(arena, entry),
+        .polygon = try readPolygon(arena, entry),
     };
 }
 
@@ -1036,10 +1190,25 @@ fn extractArrayItemComments(
     raw: []const u8,
     array_lbracket: usize,
 ) ![]const []const u8 {
+    return extractArrayItemCommentsSkip(arena, raw, array_lbracket, 0);
+}
+
+/// Same as `extractArrayItemComments` but skips the first `skip`
+/// items before recording comments. Bundle scenes use this with
+/// `skip = 1` when a leading `{ "meta": { ... } }` directive entry
+/// is present so the returned per-entity comment list lines up with
+/// `loaded.scene.entities`.
+fn extractArrayItemCommentsSkip(
+    arena: std.mem.Allocator,
+    raw: []const u8,
+    array_lbracket: usize,
+    skip: usize,
+) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     errdefer out.deinit(arena);
 
     var i: usize = array_lbracket + 1; // past '['
+    var item_index: usize = 0;
 
     while (i < raw.len) {
         skipWhitespaceJson(raw, &i);
@@ -1056,12 +1225,25 @@ fn extractArrayItemComments(
         }
         if (raw[i] != '{') break;
 
-        const trimmed = std.mem.trim(u8, raw[comment_start..comment_end], " \t\r\n");
-        try out.append(arena, try arena.dupe(u8, trimmed));
+        if (item_index >= skip) {
+            const trimmed = std.mem.trim(u8, raw[comment_start..comment_end], " \t\r\n");
+            try out.append(arena, try arena.dupe(u8, trimmed));
+        }
+        item_index += 1;
 
         scanBalanced(raw, &i, '{', '}');
     }
     return out.toOwnedSlice(arena);
+}
+
+/// Bundle-scene per-entity comments. Walks the top-level array,
+/// dropping the leading meta entry when present.
+fn extractBundleEntryComments(
+    arena: std.mem.Allocator,
+    raw: []const u8,
+    skip: usize,
+) ![]const []const u8 {
+    return extractArrayItemCommentsSkip(arena, raw, findTopLevelArrayStart(raw) orelse return &.{}, skip);
 }
 
 /// Locate a `"<key>": [` array in `raw` and return the byte offset
@@ -1173,6 +1355,43 @@ fn findRootBraceBody(raw: []const u8) ?[]const u8 {
 /// unified files and against the legacy top-level otherwise.
 fn entityScope(raw: []const u8) []const u8 {
     return findRootBraceBody(raw) orelse raw;
+}
+
+// ─── RFC #596 bundle detection ─────────────────────────────────────────
+
+/// True when `raw` (already comment-stripped) opens with `[` after
+/// any leading whitespace/comments — i.e. a bundle-shape scene per
+/// RFC #596. Cheap one-pass scan; the parser dispatches on this.
+fn isBundleScene(raw: []const u8) bool {
+    return findTopLevelArrayStart(raw) != null;
+}
+
+/// Locate the opening `[` of a bundle scene's top-level array.
+/// Skips leading whitespace + `//` comments. Returns null when the
+/// first non-trivia byte isn't `[`.
+fn findTopLevelArrayStart(raw: []const u8) ?usize {
+    var i: usize = 0;
+    skipWhitespaceJson(raw, &i);
+    skipCommentBlock(raw, &i);
+    skipWhitespaceJson(raw, &i);
+    if (i < raw.len and raw[i] == '[') return i;
+    return null;
+}
+
+/// True when `raw` (already comment-stripped) is a JSON object whose
+/// top-level lacks both `root` and `components` keys — i.e. a
+/// bundle-shape prefab per RFC #596. Bundle prefabs hoist component
+/// blocks to the top level as inline PascalCase keys, so any prefab
+/// without a wrapper key takes the bundle path. Empty `{}` also
+/// matches and parses harmlessly as a no-op prefab.
+fn isBundlePrefab(raw: []const u8) bool {
+    var i: usize = 0;
+    skipWhitespaceJson(raw, &i);
+    skipCommentBlock(raw, &i);
+    skipWhitespaceJson(raw, &i);
+    if (i >= raw.len or raw[i] != '{') return false;
+    return findKeyObject(raw, "root") == null and
+        findKeyObject(raw, "components") == null;
 }
 
 fn skipWhitespaceJson(raw: []const u8, i: *usize) void {
@@ -1367,10 +1586,25 @@ fn extractArrayItemComponentExtras(
     raw: []const u8,
     array_lbracket: usize,
 ) ![]const []const ComponentExtra {
+    return extractArrayItemComponentExtrasSkip(arena, raw, array_lbracket, 0, extractComponentExtras);
+}
+
+/// Same as `extractArrayItemComponentExtras` but skips the first
+/// `skip` items and runs the caller-supplied per-entity extractor on
+/// the rest. Bundle scenes use this with the inline-keys extractor;
+/// legacy/#560 scenes use it with the `components`-wrapper one.
+fn extractArrayItemComponentExtrasSkip(
+    arena: std.mem.Allocator,
+    raw: []const u8,
+    array_lbracket: usize,
+    skip: usize,
+    perEntity: *const fn (std.mem.Allocator, []const u8) anyerror![]const ComponentExtra,
+) ![]const []const ComponentExtra {
     var out: std.ArrayList([]const ComponentExtra) = .empty;
     errdefer out.deinit(arena);
 
     var i: usize = array_lbracket + 1; // past '['
+    var item_index: usize = 0;
 
     while (i < raw.len) {
         skipWhitespaceJson(raw, &i);
@@ -1387,9 +1621,153 @@ fn extractArrayItemComponentExtras(
         const entity_start = i;
         scanBalanced(raw, &i, '{', '}');
         const entity_end = i;
-        const entity_body = raw[entity_start..entity_end];
+        if (item_index >= skip) {
+            try out.append(arena, try perEntity(arena, raw[entity_start..entity_end]));
+        }
+        item_index += 1;
+    }
+    return out.toOwnedSlice(arena);
+}
 
-        try out.append(arena, try extractComponentExtras(arena, entity_body));
+/// Bundle-scene per-entity component extras. Walks the top-level
+/// array, drops the leading meta entry when present, and captures
+/// each entity's unmodeled components via the inline-key extractor.
+fn extractBundleEntryComponentExtras(
+    arena: std.mem.Allocator,
+    raw: []const u8,
+    skip: usize,
+) ![]const []const ComponentExtra {
+    return extractArrayItemComponentExtrasSkip(
+        arena,
+        raw,
+        findTopLevelArrayStart(raw) orelse return &.{},
+        skip,
+        extractInlineComponentExtras,
+    );
+}
+
+/// Bundle-prefab per-child component extras. Walks the `children:`
+/// array (still keyed by name in bundle prefabs) and runs the
+/// inline-key extractor on each entry.
+fn extractChildBundleEntryComponentExtras(
+    arena: std.mem.Allocator,
+    raw: []const u8,
+) ![]const []const ComponentExtra {
+    return extractArrayItemComponentExtrasSkip(
+        arena,
+        raw,
+        findChildrenArray(raw) orelse return &.{},
+        0,
+        extractInlineComponentExtras,
+    );
+}
+
+/// Walk an object body and capture every key+value pair whose key
+/// isn't a typed component (`Position`, `Sprite`, `Rectangle`,
+/// `Circle`, `Polygon`) or an entry-level reserved key (`prefab`,
+/// `children`). `body` may begin with leading whitespace / `//`
+/// comments before its outer `{`. Used by the RFC #596 bundle paths
+/// where component blocks sit inline rather than under a wrapper.
+fn extractInlineComponentExtras(arena: std.mem.Allocator, body: []const u8) anyerror![]const ComponentExtra {
+    var out: std.ArrayList(ComponentExtra) = .empty;
+    errdefer out.deinit(arena);
+
+    var i: usize = 0;
+    skipWhitespaceJson(body, &i);
+    skipCommentBlock(body, &i);
+    skipWhitespaceJson(body, &i);
+    if (i < body.len and body[i] == '{') i += 1;
+
+    while (i < body.len) {
+        skipWhitespaceJson(body, &i);
+        skipCommentBlock(body, &i);
+        skipWhitespaceJson(body, &i);
+        if (i >= body.len) break;
+        if (body[i] == '}') break;
+        if (body[i] == ',') {
+            i += 1;
+            continue;
+        }
+        if (body[i] != '"') break;
+
+        const key = parseStringLiteral(body, &i) orelse break;
+
+        skipWhitespaceJson(body, &i);
+        if (i >= body.len or body[i] != ':') break;
+        i += 1;
+        skipWhitespaceJson(body, &i);
+
+        const value_start = i;
+        scanValueJson(body, &i);
+        const value_end = i;
+
+        const is_reserved = std.mem.eql(u8, key, "prefab") or std.mem.eql(u8, key, "children");
+        const is_typed = std.mem.eql(u8, key, "Position") or
+            std.mem.eql(u8, key, "Sprite") or
+            std.mem.eql(u8, key, "Rectangle") or
+            std.mem.eql(u8, key, "Circle") or
+            std.mem.eql(u8, key, "Polygon");
+        if (!is_reserved and !is_typed) {
+            try out.append(arena, .{
+                .name = try arena.dupe(u8, key),
+                .value_text = try arena.dupe(u8, std.mem.trim(u8, body[value_start..value_end], " \t\r\n")),
+            });
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// Capture key+value pairs of the leading `{ "meta": { ... } }` entry
+/// of a bundle scene. Caller has already confirmed (via the parsed
+/// JSON) that a meta entry exists; this scanner finds it in raw
+/// text so embedded comments / formatting survive the round-trip.
+fn extractMetaEntries(arena: std.mem.Allocator, raw: []const u8) ![]const TopLevelExtra {
+    const array_start = findTopLevelArrayStart(raw) orelse return &.{};
+    var i: usize = array_start + 1;
+    skipWhitespaceJson(raw, &i);
+    skipCommentBlock(raw, &i);
+    skipWhitespaceJson(raw, &i);
+    if (i >= raw.len or raw[i] != '{') return &.{};
+
+    const entry_start = i;
+    var probe = i;
+    scanBalanced(raw, &probe, '{', '}');
+    const entry_body = raw[entry_start..probe];
+
+    const meta_obj_start = findKeyObject(entry_body, "meta") orelse return &.{};
+    // Walk the meta object body and capture every key+value pair
+    // verbatim. Unlike `extractInlineComponentExtras`, nothing is
+    // filtered — meta is fully pass-through.
+    var out: std.ArrayList(TopLevelExtra) = .empty;
+    errdefer out.deinit(arena);
+
+    var j: usize = meta_obj_start + 1; // past '{'
+    while (j < entry_body.len) {
+        skipWhitespaceJson(entry_body, &j);
+        skipCommentBlock(entry_body, &j);
+        skipWhitespaceJson(entry_body, &j);
+        if (j >= entry_body.len) break;
+        if (entry_body[j] == '}') break;
+        if (entry_body[j] == ',') {
+            j += 1;
+            continue;
+        }
+        if (entry_body[j] != '"') break;
+
+        const key = parseStringLiteral(entry_body, &j) orelse break;
+        skipWhitespaceJson(entry_body, &j);
+        if (j >= entry_body.len or entry_body[j] != ':') break;
+        j += 1;
+        skipWhitespaceJson(entry_body, &j);
+
+        const value_start = j;
+        scanValueJson(entry_body, &j);
+        const value_end = j;
+
+        try out.append(arena, .{
+            .name = try arena.dupe(u8, key),
+            .value_text = try arena.dupe(u8, std.mem.trim(u8, entry_body[value_start..value_end], " \t\r\n")),
+        });
     }
     return out.toOwnedSlice(arena);
 }
@@ -1579,107 +1957,68 @@ pub fn saveScene(allocator: std.mem.Allocator, path: []const u8, loaded: LoadedS
     );
 }
 
-/// Render the loaded scene back to JSONC in the RFC #560 unified
-/// format: `{ "name": ..., <extras>, "root": { "children": [ ... ] } }`.
-/// Managed fields (`name`, per-entity `prefab` and `Position`) come
-/// from the typed model; everything else (top-level keys other than
-/// `name`/`entities`/`root`, and per-entity components other than the
-/// modeled set) is spliced verbatim from the extras captured at load
-/// time. Per-entity comments are emitted at the children-array
-/// indent above their owning entity. Refs (entries with `prefab`)
-/// spell their component data under `overrides`; inline entries keep
-/// `components`.
+/// Render the loaded scene back to JSONC in RFC #596 bundle shape: a
+/// top-level JSON array. When meta or legacy top-level extras exist a
+/// leading `{ "meta": { ... } }` entry is emitted first, carrying
+/// every directive verbatim. Each entity then becomes one array entry
+/// with optional `prefab` plus inline PascalCase component keys — no
+/// `components`/`overrides`/`root` wrappers. All saves migrate legacy
+/// + RFC #560 inputs to this canonical form.
 pub fn renderSceneJsonc(allocator: std.mem.Allocator, loaded: LoadedScene) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     const w: ListWriter = .{ .list = &out, .allocator = allocator };
 
-    try out.appendSlice(allocator, "{\n");
-    try out.print(allocator, "    \"name\": \"{s}\",\n", .{loaded.scene.name});
+    const meta_count = loaded.extras.meta.len + loaded.extras.top_level.len;
+    const has_meta = meta_count > 0;
+    const total_items: usize = loaded.scene.entities.len + @as(usize, if (has_meta) 1 else 0);
 
-    for (loaded.extras.top_level) |kv| {
-        try out.print(allocator, "    \"{s}\": {s},\n", .{ kv.name, kv.value_text });
-    }
-
-    try out.appendSlice(allocator, "    \"root\": {\n");
-    try out.appendSlice(allocator, "        \"children\": [");
-    if (loaded.scene.entities.len == 0) {
-        try out.appendSlice(allocator, "]\n    }\n}\n");
+    try out.appendSlice(allocator, "[");
+    if (total_items == 0) {
+        try out.appendSlice(allocator, "]\n");
         return out.toOwnedSlice(allocator);
     }
     try out.appendSlice(allocator, "\n");
 
+    if (has_meta) {
+        try out.appendSlice(allocator, "    { \"meta\": {");
+        var mi: usize = 0;
+        // Native bundle meta entries first; then legacy/#560 top-level
+        // extras (`include`, `assets`, ...) folded under the same key
+        // so a #560 scene saved through here ends up with directives
+        // canonicalised into `meta`.
+        for (loaded.extras.meta) |kv| {
+            if (mi > 0) try out.appendSlice(allocator, ",");
+            try out.print(allocator, " \"{s}\": {s}", .{ kv.name, kv.value_text });
+            mi += 1;
+        }
+        for (loaded.extras.top_level) |kv| {
+            if (mi > 0) try out.appendSlice(allocator, ",");
+            try out.print(allocator, " \"{s}\": {s}", .{ kv.name, kv.value_text });
+            mi += 1;
+        }
+        try out.appendSlice(allocator, " } }");
+        if (loaded.scene.entities.len > 0) try out.appendSlice(allocator, ",");
+        try out.appendSlice(allocator, "\n");
+    }
+
     for (loaded.scene.entities, 0..) |e, i| {
-        // Comment lines first (each at the children-array indent).
+        // Comment lines first, at the array indent.
         const comment = std.mem.sliceTo(&e.comment, 0);
         if (comment.len > 0) {
             var lines = std.mem.splitScalar(u8, std.mem.trim(u8, comment, " \t\r\n"), '\n');
             while (lines.next()) |line| {
-                try out.print(allocator, "            {s}\n", .{std.mem.trim(u8, line, " \t\r")});
+                try out.print(allocator, "    {s}\n", .{std.mem.trim(u8, line, " \t\r")});
             }
         }
 
-        try out.appendSlice(allocator, "            {");
-        var first = true;
-        if (e.prefab) |p| {
-            try out.print(allocator, " \"prefab\": \"{s}\"", .{p});
-            first = false;
-        }
-        const extras = if (i < loaded.extras.entity_components.len)
-            loaded.extras.entity_components[i]
-        else
-            &[_]ComponentExtra{};
-        const has_components = e.position != null or
-            e.sprite != null or
-            e.rectangle != null or
-            e.circle != null or
-            e.polygon != null or
-            extras.len > 0;
-        if (has_components) {
-            if (!first) try out.appendSlice(allocator, ",");
-            // RFC #560 §B2: refs use `overrides`, inline entities
-            // use `components`. The two are disjoint per-entry.
-            const block_key: []const u8 = if (e.prefab != null) " \"overrides\": {" else " \"components\": {";
-            try out.appendSlice(allocator, block_key);
-            var c_first = true;
-            if (e.position) |p| {
-                try out.print(allocator, " \"Position\": {{ \"x\": {d}, \"y\": {d} }}", .{ p.x, p.y });
-                c_first = false;
-            }
-            if (e.sprite) |sp| {
-                if (!c_first) try out.appendSlice(allocator, ",");
-                _ = try emitSprite(w, sp.*);
-                c_first = false;
-            }
-            if (e.rectangle) |re| {
-                if (!c_first) try out.appendSlice(allocator, ",");
-                _ = try emitRectangle(w, re.*);
-                c_first = false;
-            }
-            if (e.circle) |ci| {
-                if (!c_first) try out.appendSlice(allocator, ",");
-                _ = try emitCircle(w, ci.*);
-                c_first = false;
-            }
-            if (e.polygon) |po| {
-                if (!c_first) try out.appendSlice(allocator, ",");
-                _ = try emitPolygon(w, po.*);
-                c_first = false;
-            }
-            for (extras) |extra| {
-                if (!c_first) try out.appendSlice(allocator, ",");
-                try out.print(allocator, " \"{s}\": {s}", .{ extra.name, extra.value_text });
-                c_first = false;
-            }
-            try out.appendSlice(allocator, " }");
-            first = false;
-        }
-        if (first) try out.appendSlice(allocator, " "); // empty entity body — keep braces apart
+        try out.appendSlice(allocator, "    {");
+        try emitEntityBody(w, e, sliceExtrasAt(loaded.extras.entity_components, i));
         try out.appendSlice(allocator, " }");
         if (i + 1 < loaded.scene.entities.len) try out.appendSlice(allocator, ",");
         try out.appendSlice(allocator, "\n");
     }
-    try out.appendSlice(allocator, "        ]\n    }\n}\n");
+    try out.appendSlice(allocator, "]\n");
 
     return out.toOwnedSlice(allocator);
 }

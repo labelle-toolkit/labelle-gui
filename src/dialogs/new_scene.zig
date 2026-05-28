@@ -71,7 +71,7 @@ fn createScene(app: *App, scene_name: []const u8) void {
     };
     defer app.allocator.free(scene_path);
 
-    const content = renderSceneJsonc(app.allocator, scene_name) catch {
+    const content = renderSceneJsonc(app.allocator) catch {
         app.setStatus("Error formatting scene content!");
         return;
     };
@@ -89,31 +89,22 @@ fn createScene(app: *App, scene_name: []const u8) void {
     app.tree_view.refresh();
 }
 
-/// Format an engine-compatible JSONC scene scaffold for `scene_name`.
-/// Top-level shape matches `labelle-engine`'s scene loader (see
-/// `labelle-assembler/examples/*/scenes/main.jsonc` for canonical
-/// examples): `name` and `entities`, with `include` reserved for
-/// composition. The `entities` array is empty but accompanied by one
-/// commented-out example so the user can see how prefab + component
-/// entries are written without us guessing which prefabs they
-/// registered.
+/// Format an engine-compatible JSONC scene scaffold in RFC #596
+/// bundle shape (see `../scene_io.zig` for the schema). The scene's
+/// identity comes from its filename, so no name field appears on
+/// disk. The array body is empty but accompanied by one
+/// commented-out example so the user can see how prefab + inline-
+/// component entries are written without us guessing which prefabs
+/// they registered.
 ///
 /// Pure / no I/O so it can be exercised from zspec without touching the
 /// filesystem.
-pub fn renderSceneJsonc(allocator: std.mem.Allocator, scene_name: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator,
-        \\{{
-        \\    "name": "{s}",
-        \\    // "include": ["scenes/other.jsonc"],
-        \\    "entities": [
-        \\        // {{
-        \\        //     "prefab": "my_prefab",
-        \\        //     "components": {{
-        \\        //         "Position": {{ "x": 0, "y": 0 }}
-        \\        //     }}
-        \\        // }}
-        \\    ]
-        \\}}
+pub fn renderSceneJsonc(allocator: std.mem.Allocator) ![]u8 {
+    return allocator.dupe(u8,
+        \\[
+        \\    // { "meta": { "initial_state": "playing" } },
+        \\    // { "prefab": "my_prefab", "Position": { "x": 0, "y": 0 } }
+        \\]
         \\
-    , .{scene_name});
+    );
 }

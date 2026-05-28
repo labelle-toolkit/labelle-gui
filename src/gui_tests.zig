@@ -362,12 +362,9 @@ pub fn main() !void {
         try std.Io.Dir.cwd().writeFile(io_global.io(), .{
             .sub_path = scene_path,
             .data = 
-            \\{
-            \\    "name": "scene_with_sprite",
-            \\    "entities": [
-            \\        { "prefab": "coin", "components": { "Position": { "x": 1, "y": 2 }, "Sprite": { "n": "coin" } } }
-            \\    ]
-            \\}
+            \\[
+            \\    { "prefab": "coin", "Position": { "x": 1, "y": 2 }, "Sprite": { "sprite_name": "coin" } }
+            \\]
         ,
         });
     }
@@ -488,12 +485,10 @@ pub fn main() !void {
             .sub_path = prefab_path,
             .data = 
             \\{
-            \\    "components": {
-            \\        "Sprite": { "sprite_name": "coin", "pivot": "center" },
-            \\        "Coin": {}
-            \\    },
+            \\    "Sprite": { "sprite_name": "coin", "pivot": "center" },
+            \\    "Coin": {},
             \\    "children": [
-            \\        { "components": { "Sprite": { "n": "deco" }, "Position": { "x": 1, "y": 2 } } }
+            \\        { "Sprite": { "sprite_name": "deco" }, "Position": { "x": 1, "y": 2 } }
             \\    ]
             \\}
         ,
