@@ -278,15 +278,10 @@ pub const App = struct {
 
     show_preferences: bool = false,
     /// Live preferences edited by the Preferences dialog. Changes are
-    /// persisted to disk on every slider/stepper edit; the ImGui font
-    /// atlas isn't rebuilt mid-session so values take effect on the
-    /// next launch (the dialog surfaces a "Restart to apply" notice
-    /// when `prefs.font_scale != startup_font_scale`).
+    /// persisted to disk on every slider/stepper edit; `font_scale`
+    /// is applied live via `zgui.getStyle().font_scale_main` so the
+    /// new size shows up on the next frame (no restart).
     prefs: prefs_mod.Preferences = .{},
-    /// Snapshot of `prefs` at startup. Drives the "Restart to apply"
-    /// hint: when `prefs` diverges from this we know the user changed
-    /// something that won't take effect until next launch.
-    startup_prefs: prefs_mod.Preferences = .{},
 
     /// Fixed-size storage for registered modules. Grow the array literal
     /// when adding modules; Zig will tell you if it overflows.
@@ -308,7 +303,6 @@ pub const App = struct {
             .preview = preview.PreviewSession.init(allocator),
             .game_view = game_view.GameView.init(allocator),
             .prefs = user_prefs,
-            .startup_prefs = user_prefs,
         };
 
         // The inspector keeps a `*PreviewSession` so it can call
