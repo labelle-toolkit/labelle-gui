@@ -92,9 +92,12 @@ pub fn render(app: *App) void {
     }
 
     // Numeric entry for the user who knows the exact value they want.
-    // `enter_returns_true` collapses "edit + Enter" into one event we
-    // can treat like a slider release — apply full scale + persist
-    // once, no per-keystroke disk writes.
+    // ImGui's `inputFloat` already fires its return value only on
+    // commit (Enter, focus-loss, or a step button click) — it
+    // explicitly asserts `EnterReturnsTrue` is NOT set, since the
+    // widget owns its own commit timing. So the callback fires once
+    // per committed edit, and we treat each like a slider release:
+    // full scale apply + persist, no per-keystroke disk writes.
     var typed: f32 = app.prefs.font_scale;
     zgui.setNextItemWidth(120);
     if (zgui.inputFloat("##font_scale_input", .{
@@ -102,7 +105,6 @@ pub fn render(app: *App) void {
         .step = 0.05,
         .step_fast = 0.25,
         .cfmt = "%.2f",
-        .flags = .{ .enter_returns_true = true },
     })) {
         app.prefs.font_scale = std.math.clamp(
             typed,
