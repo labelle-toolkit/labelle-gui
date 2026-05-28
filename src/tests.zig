@@ -4548,6 +4548,139 @@ pub const ComponentDndTests = struct {
     }
 };
 
+pub const PrefabDndTests = struct {
+    // Mirrors `ComponentDndTests`. pack/unpack are the contract
+    // between the project tree (drag source on `prefabs/**/*.jsonc`)
+    // and the scene viewport (drop target). Pure data helpers — no
+    // ImGui context needed.
+
+    test "packPrefab round-trips a short stem" {
+        const stem = "canteen";
+        const p = dnd.packPrefab(stem);
+        try expect.equal(@as(usize, p.name_len), stem.len);
+        try expect.equal(std.mem.eql(u8, dnd.unpackPrefab(&p), stem), true);
+    }
+
+    test "packPrefab round-trips a snake_case stem" {
+        // Real prefab names use snake_case (e.g. movement_node,
+        // bandit_raid_enabled). Pack must preserve underscores.
+        const stem = "movement_node";
+        const p = dnd.packPrefab(stem);
+        try expect.equal(@as(usize, p.name_len), stem.len);
+        try expect.equal(std.mem.eql(u8, dnd.unpackPrefab(&p), stem), true);
+    }
+
+    test "packPrefab truncates a stem longer than PAYLOAD_NAME_CAP" {
+        var oversize: [dnd.PAYLOAD_NAME_CAP + 1]u8 = undefined;
+        @memset(&oversize, 'x');
+        const p = dnd.packPrefab(&oversize);
+        try expect.equal(@as(usize, p.name_len), dnd.PAYLOAD_NAME_CAP);
+    }
+
+    test "packPrefab zero-pads the unused tail" {
+        const p = dnd.packPrefab("canteen");
+        // Tail must be zeroed for the same reason packComponent's is —
+        // the struct is memcpy'd into ImGui's buffer wholesale.
+        try expect.equal(p.name[7], @as(u8, 0));
+        try expect.equal(p.name[p.name.len - 1], @as(u8, 0));
+    }
+};
+
+pub const TreeViewClassifierTests = struct {
+    // `isComponentFile` / `isPrefabFile` decide which file leaves
+    // become drag sources. They're `pub fn` to be reachable from
+    // here; the production code only calls them from `renderFolder`.
+
+    test "isComponentFile accepts a top-level .zig under components/" {
+        const prefix = "/proj/components/";
+        try expect.toBeTrue(tree_view.isComponentFile(
+            "/proj/components/bed.zig",
+            "bed.zig",
+            prefix,
+        ));
+    }
+
+    test "isComponentFile rejects a .zig in a subfolder" {
+        // Non-recursive by design — only top-level component files
+        // are draggable. Nested .zig (e.g. shared helpers) shouldn't
+        // surface as a drag source.
+        const prefix = "/proj/components/";
+        try expect.toBeFalse(tree_view.isComponentFile(
+            "/proj/components/shared/helper.zig",
+            "helper.zig",
+            prefix,
+        ));
+    }
+
+    test "isComponentFile rejects non-.zig files" {
+        const prefix = "/proj/components/";
+        try expect.toBeFalse(tree_view.isComponentFile(
+            "/proj/components/notes.md",
+            "notes.md",
+            prefix,
+        ));
+    }
+
+    test "isComponentFile rejects when prefix is empty (bufPrint failure)" {
+        try expect.toBeFalse(tree_view.isComponentFile(
+            "/proj/components/bed.zig",
+            "bed.zig",
+            "",
+        ));
+    }
+
+    test "isPrefabFile accepts a .jsonc directly under prefabs/" {
+        const prefix = "/proj/prefabs/";
+        try expect.toBeTrue(tree_view.isPrefabFile(
+            "/proj/prefabs/canteen.jsonc",
+            "canteen.jsonc",
+            prefix,
+        ));
+    }
+
+    test "isPrefabFile accepts a .jsonc in a subfolder (recursive)" {
+        // Real projects nest prefabs (e.g.
+        // flying-platform-labelle/prefabs/rooms/canteen.jsonc).
+        // This is the key behavioral difference from
+        // `isComponentFile`.
+        const prefix = "/proj/prefabs/";
+        try expect.toBeTrue(tree_view.isPrefabFile(
+            "/proj/prefabs/rooms/canteen.jsonc",
+            "canteen.jsonc",
+            prefix,
+        ));
+    }
+
+    test "isPrefabFile rejects non-.jsonc files" {
+        const prefix = "/proj/prefabs/";
+        try expect.toBeFalse(tree_view.isPrefabFile(
+            "/proj/prefabs/notes.md",
+            "notes.md",
+            prefix,
+        ));
+    }
+
+    test "isPrefabFile rejects .jsonc outside prefabs/" {
+        // Scene .jsonc files share the extension but live under
+        // scenes/. They must not become drag sources for the
+        // viewport.
+        const prefix = "/proj/prefabs/";
+        try expect.toBeFalse(tree_view.isPrefabFile(
+            "/proj/scenes/main.jsonc",
+            "main.jsonc",
+            prefix,
+        ));
+    }
+
+    test "isPrefabFile rejects when prefix is empty (bufPrint failure)" {
+        try expect.toBeFalse(tree_view.isPrefabFile(
+            "/proj/prefabs/canteen.jsonc",
+            "canteen.jsonc",
+            "",
+        ));
+    }
+};
+
 pub const MatchingPrefabSpriteTests = struct {
     // Helper covers the "drop component → find same-named prefab →
     // copy its body Sprite" pairing. Full happy path needs a real

@@ -35,6 +35,22 @@ pub const ComponentDrop = struct {
     }
 };
 
+/// One-shot sink for a prefab drag-drop that landed on the canvas
+/// (#85). Same shape as `ComponentDrop` — the prefab name is copied
+/// into a fixed buffer so the caller doesn't depend on ImGui's
+/// payload buffer past the accept callback — plus the drop's
+/// world-space coordinate so the caller can place the new entity
+/// where the cursor released.
+pub const PrefabDrop = struct {
+    name_buf: [dnd.PAYLOAD_NAME_CAP]u8 = [_]u8{0} ** dnd.PAYLOAD_NAME_CAP,
+    name_len: u8 = 0,
+    world: [2]f32 = .{ 0, 0 },
+
+    pub fn name(self: *const PrefabDrop) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+};
+
 /// Mutable per-tab state the viewport reads and writes.
 pub const State = struct {
     pan: *[2]f32,
@@ -83,6 +99,14 @@ pub const State = struct {
     /// prefab's body Sprite and the component as an unmodeled extra.
     /// Null in editor tabs that don't accept component drops.
     component_drop: ?*?ComponentDrop = null,
+    /// Optional sink for "a prefab `.jsonc` dragged from the project
+    /// tree's prefabs/ folder was dropped on the canvas" (#85). The
+    /// viewport fills the `PrefabDrop` with the prefab stem + drop
+    /// world position; the caller routes through `addPrefabEntity`.
+    /// Null in tabs that don't accept prefab drops (the prefab
+    /// editor passes null — dropping a prefab on a different prefab
+    /// would edit a file other than the active tab, surprising).
+    prefab_drop: ?*?PrefabDrop = null,
     /// World-space spacing for the visual grid AND, when snapping is on,
     /// the snap step. One number drives both so the grid the user sees
     /// is the grid their drags land on. Default 16 matches what most 2D
@@ -203,24 +227,66 @@ pub fn render(
         .flags = .{ .mouse_button_left = true, .mouse_button_middle = true },
     });
 
-    // Drag-drop target for components from the project tree (#143).
-    // Must attach to the LAST submitted item (the invisibleButton
-    // above) so `beginDragDropTarget` picks up the canvas region.
-    // Gated on `component_drop` being non-null — only editors that
-    // know how to consume the drop (the prefab editor today) wire
-    // this sink.
-    if (state.component_drop) |sink| {
+    // Drag-drop target — must attach to the LAST submitted item (the
+    // invisibleButton above) so `beginDragDropTarget` picks up the
+    // canvas region. One `beginDragDropTarget` covers both payload
+    // kinds — ImGui filters by payload type inside
+    // `acceptDragDropPayload`, so the two sinks never cross-fire.
+    // Gated together on at least one being wired: the scene tab
+    // wires `prefab_drop` (#85); the prefab tab wires
+    // `component_drop` (#143); other tabs wire neither.
+    if (state.component_drop != null or state.prefab_drop != null) {
+        // Drop-zone discovery: when a compatible payload is in flight
+        // anywhere in the imgui context, tint the canvas border so
+        // the user can tell the viewport will accept the drop. ImGui
+        // draws its own default highlight on the active target rect,
+        // but that only triggers once the cursor enters the target —
+        // this paints the moment a drag starts so the user can spot
+        // where to aim before getting there (#85 spec calls it out).
+        if (zgui.getDragDropPayload()) |payload| {
+            const accepts = (state.component_drop != null and payload.isDataType(dnd.COMPONENT_TYPE)) or
+                (state.prefab_drop != null and payload.isDataType(dnd.PREFAB_TYPE));
+            if (accepts) {
+                dl.addRect(.{
+                    .pmin = canvas_min,
+                    .pmax = canvas_max,
+                    .col = 0x80_55_aa_ff, // soft blue, semi-transparent
+                    .thickness = 3.0,
+                });
+            }
+        }
+
         if (zgui.beginDragDropTarget()) {
             defer zgui.endDragDropTarget();
-            if (zgui.acceptDragDropPayload(dnd.COMPONENT_TYPE, .{})) |raw| {
-                if (raw.data) |ptr| {
-                    const p: *const dnd.ComponentPayload = @ptrCast(@alignCast(ptr));
-                    const stem = dnd.unpackComponent(p);
-                    var out: ComponentDrop = .{};
-                    const n = @min(stem.len, out.name_buf.len);
-                    @memcpy(out.name_buf[0..n], stem[0..n]);
-                    out.name_len = @intCast(n);
-                    sink.* = out;
+            if (state.component_drop) |sink| {
+                if (zgui.acceptDragDropPayload(dnd.COMPONENT_TYPE, .{})) |raw| {
+                    if (raw.data) |ptr| {
+                        const p: *const dnd.ComponentPayload = @ptrCast(@alignCast(ptr));
+                        const stem = dnd.unpackComponent(p);
+                        var out: ComponentDrop = .{};
+                        const n = @min(stem.len, out.name_buf.len);
+                        @memcpy(out.name_buf[0..n], stem[0..n]);
+                        out.name_len = @intCast(n);
+                        sink.* = out;
+                    }
+                }
+            }
+            if (state.prefab_drop) |sink| {
+                if (zgui.acceptDragDropPayload(dnd.PREFAB_TYPE, .{})) |raw| {
+                    if (raw.data) |ptr| {
+                        const p: *const dnd.PrefabPayload = @ptrCast(@alignCast(ptr));
+                        const stem = dnd.unpackPrefab(p);
+                        var out: PrefabDrop = .{};
+                        const n = @min(stem.len, out.name_buf.len);
+                        @memcpy(out.name_buf[0..n], stem[0..n]);
+                        out.name_len = @intCast(n);
+                        // Mouse pos at the drop instant maps through
+                        // the same world transform other drops/clicks
+                        // use, so snap-to-grid downstream lands on the
+                        // expected cell.
+                        out.world = worldFromScreen(zgui.getMousePos(), canvas_min, state.pan.*, state.zoom.*);
+                        sink.* = out;
+                    }
                 }
             }
         }
