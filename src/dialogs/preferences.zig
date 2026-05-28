@@ -38,18 +38,16 @@ var baseline_style: ?zgui.Style = null;
 pub fn render(app: *App) void {
     if (app.show_preferences) zgui.openPopup("Preferences", .{});
 
-    // Pin the modal at a size large enough for the 3× extreme so the
-    // window doesn't auto-resize as the slider changes `font_scale_main`
-    // mid-drag — auto-resize was the root cause of the user-visible
-    // flicker (modal grew/shrank → slider knob moved out from under
-    // the cursor → drag delta jittered). At 1× the modal has some
-    // unused vertical space; that's an explicit trade for stable drag.
-    // `.always` forces the size every frame so the user can't manual-
-    // resize into a too-small layout either.
-    zgui.setNextWindowSize(.{ .w = 380, .h = 200, .cond = .always });
+    // `always_auto_resize` lets the modal grow / shrink to fit its
+    // contents at the current font scale, so it looks natural at 0.5×
+    // (compact) and 3× (roomy). Auto-resize used to cause mid-drag
+    // flicker when the slider wrote `font_scale_main` every frame —
+    // that's gone now that drag is purely value-tracking (commit-only
+    // visual rescale via `applyLive` on release). The modal only
+    // resizes once per commit, which the user is already expecting.
     if (!zgui.beginPopupModal("Preferences", .{
         .popen = &app.show_preferences,
-        .flags = .{},
+        .flags = .{ .always_auto_resize = true },
     })) return;
     defer zgui.endPopup();
 
