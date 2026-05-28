@@ -8,18 +8,16 @@
 //! padding/spacing/borders so buttons + checkboxes track the text
 //! instead of looking stranded at extreme slider values.
 //!
-//! Slider editing is split across two entry points to avoid the
-//! Preferences modal (which is `always_auto_resize`) jittering under
-//! the user's cursor mid-drag:
+//! Slider editing applies on commit only (release, Enter on the
+//! numeric input, or Reset click). No mid-drag visual preview —
+//! writing `font_scale_main` every drag frame grew the slider widget
+//! itself (font size feeds widget height), which shifted the knob
+//! out from under the cursor and caused user-visible jitter. The
+//! slider's formatted label (`1.50x`) shows the value during drag;
+//! the actual UI rescale happens once on release. The numeric input
+//! field covers the "I need an exact value" path without dragging.
 //!
-//! - `applyDragPreview` runs on every drag frame, writes only
-//!   `font_scale_main` — text rescales smoothly while the modal's
-//!   bounds stay constant, so the slider knob stays put.
-//! - `applyLive` runs once on slider release (and on Reset / startup),
-//!   resets to the captured baseline and re-runs `scaleAllSizes` so
-//!   padding/spacing snap to the final value.
-//!
-//! Persistence is debounced to the same release event via
+//! Persistence is debounced to the same commit event via
 //! `isItemDeactivatedAfterEdit` so an interactive drag doesn't
 //! atomic-write the prefs file dozens of times. The next launch
 //! reads back from `prefs.loadOrDefault`.
@@ -74,17 +72,21 @@ pub fn render(app: *App) void {
         .max = prefs_mod.max_font_scale,
         .cfmt = "%.2fx",
     });
+    // No visual scaling at all during the drag — even writing only
+    // `font_scale_main` (text-only) grows the slider widget's own
+    // height, which shifts the input field below downward and the
+    // cursor's relative position on the knob with it. The slider's
+    // formatted label (`1.50x` etc.) gives mid-drag feedback for the
+    // value; the actual UI rescale fires once on release, by which
+    // point the user has settled on a value and isn't tracking pixel
+    // precision any more. The numeric input below covers the
+    // "I want exactly this value" path without dragging at all.
     if (changed) {
         app.prefs.font_scale = std.math.clamp(
             v,
             prefs_mod.min_font_scale,
             prefs_mod.max_font_scale,
         );
-        // Text-only preview during the drag — keeps widget dimensions
-        // (and therefore the slider knob's screen position) constant
-        // so the cursor doesn't drift off the knob mid-drag. Padding
-        // catches up on release below.
-        applyDragPreview(app.prefs.font_scale);
     }
     if (zgui.isItemDeactivatedAfterEdit()) {
         applyLive(app.prefs.font_scale);
@@ -145,18 +147,6 @@ pub fn applyLive(font_scale: f32) void {
     style.* = baseline_style.?;
     style.scaleAllSizes(font_scale);
     style.font_scale_main = font_scale;
-}
-
-/// Text-only preview for mid-drag use: writes `font_scale_main` so
-/// glyphs re-rasterise next frame, but leaves padding/spacing/borders
-/// alone. Calling `scaleAllSizes` on every drag frame resizes the
-/// Preferences modal (it's `always_auto_resize`) every frame, which
-/// shifts the slider knob out from under the user's cursor mid-drag
-/// and produces visible jitter / flicker. Drag uses this entry; the
-/// slider's `isItemDeactivatedAfterEdit` then calls `applyLive` once
-/// on release so the rest of the UI catches up to the final value.
-pub fn applyDragPreview(font_scale: f32) void {
-    zgui.getStyle().font_scale_main = font_scale;
 }
 
 /// Atomic-write the current prefs to disk and surface any failure
