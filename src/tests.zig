@@ -17,6 +17,7 @@ const flow_doc = @import("modules/flow_doc.zig");
 const flow_cycle = @import("flow_cycle.zig");
 const event_catalog = @import("flow_event_catalog.zig");
 const node_catalog = @import("flow_node_catalog.zig");
+const hierarchy = @import("modules/hierarchy.zig");
 
 // Reference the node catalog at file scope so its module-level
 // `test "…"` blocks become reachable from the test root and are
@@ -1580,6 +1581,97 @@ pub const SceneIoTests = struct {
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"root\":") == null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"include\":") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"meta\":") != null);
+    }
+};
+
+pub const HierarchyTests = struct {
+    // Filter logic lives in `modules/hierarchy.zig` as pure helpers
+    // (no imgui draw context) so the search/label code is testable
+    // without standing up a GUI. The panel render itself stays
+    // unit-untested; gui-test covers it via TE.
+
+    test "matchesFilter case-insensitive substring" {
+        try expect.toBeTrue(hierarchy.matchesFilter("Canteen", "cant"));
+        try expect.toBeTrue(hierarchy.matchesFilter("CANTEEN", "een"));
+        try expect.toBeTrue(hierarchy.matchesFilter("workstation_drill", "DRIL"));
+    }
+
+    test "matchesFilter rejects non-matching needle" {
+        try expect.toBeFalse(hierarchy.matchesFilter("canteen", "fitness"));
+    }
+
+    test "matchesFilter empty needle matches everything" {
+        try expect.toBeTrue(hierarchy.matchesFilter("anything", ""));
+    }
+
+    test "matchesFilter rejects needle longer than haystack" {
+        try expect.toBeFalse(hierarchy.matchesFilter("ab", "abc"));
+    }
+
+    test "firstCommentLine strips marker and surrounding whitespace" {
+        try expect.toBeTrue(std.mem.eql(u8, hierarchy.firstCommentLine("// first\n// second"), "first"));
+        try expect.toBeTrue(std.mem.eql(u8, hierarchy.firstCommentLine("//   note  \n"), "note"));
+    }
+
+    test "firstCommentLine returns empty for whitespace-only or empty input" {
+        try expect.toBeTrue(hierarchy.firstCommentLine("\n\n").len == 0);
+        try expect.toBeTrue(hierarchy.firstCommentLine("").len == 0);
+    }
+
+    test "firstCommentLine caps the returned slice at hint_cap_bytes" {
+        // A line `hint_cap_bytes + 10` long should be truncated to
+        // exactly the cap.
+        const long = "//" ++ ("a" ** (hierarchy.hint_cap_bytes + 10));
+        try expect.equal(hierarchy.firstCommentLine(long).len, hierarchy.hint_cap_bytes);
+    }
+
+    test "firstCommentLine truncates UTF-8 cleanly at codepoint boundary" {
+        // A 3-byte codepoint (`€` = 0xE2 0x82 0xAC) crossing byte 60
+        // would otherwise leave invalid UTF-8. Layout: 58 'a's + '€'
+        // (3 bytes) → 61 bytes total. Byte 60 is the middle continuation
+        // byte of `€`, so the walk-back must drop the whole codepoint.
+        const text = "//" ++ ("a" ** 58) ++ "€" ++ "tail";
+        const got = hierarchy.firstCommentLine(text);
+        try expect.equal(got.len, 58);
+        // Last byte must not be a UTF-8 continuation byte (top bits 10xx).
+        try expect.toBeTrue((got[got.len - 1] & 0xC0) != 0x80);
+    }
+
+    test "entityMatchesFilter matches prefab name" {
+        var e: scene_io.Entity = .{ .prefab = "rabbit" };
+        try expect.toBeTrue(hierarchy.entityMatchesFilter(&e, "rab"));
+        try expect.toBeTrue(hierarchy.entityMatchesFilter(&e, "BIT"));
+        try expect.toBeFalse(hierarchy.entityMatchesFilter(&e, "wolf"));
+    }
+
+    test "entityMatchesFilter empty filter matches everything" {
+        const e: scene_io.Entity = .{ .prefab = "any" };
+        try expect.toBeTrue(hierarchy.entityMatchesFilter(&e, ""));
+    }
+
+    test "entityMatchesFilter does NOT search the index prefix" {
+        // The row's display label is `#N <name>`, but typing `5` must
+        // not narrow to every #5/#15/#25 row — only rows whose actual
+        // name or comment hint contains `5`. The predicate operates
+        // on the entity, not the rendered label, so the index can't
+        // bleed in.
+        const e: scene_io.Entity = .{ .prefab = "rabbit" };
+        try expect.toBeFalse(hierarchy.entityMatchesFilter(&e, "5"));
+        try expect.toBeFalse(hierarchy.entityMatchesFilter(&e, "#"));
+    }
+
+    test "entityMatchesFilter matches the comment hint" {
+        var e: scene_io.Entity = .{ .prefab = "wall" };
+        const note = "// Building exterior";
+        @memcpy(e.comment[0..note.len], note);
+        try expect.toBeTrue(hierarchy.entityMatchesFilter(&e, "exterior"));
+        try expect.toBeTrue(hierarchy.entityMatchesFilter(&e, "BUILDING"));
+    }
+
+    test "entityMatchesFilter falls back to `(inline)` when prefab is null" {
+        const e: scene_io.Entity = .{};
+        try expect.toBeTrue(hierarchy.entityMatchesFilter(&e, "inline"));
+        try expect.toBeTrue(hierarchy.entityMatchesFilter(&e, "INLINE"));
     }
 };
 
