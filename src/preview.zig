@@ -38,6 +38,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const project = @import("project.zig");
 const io_global = @import("io_global.zig");
+const buf_mod = @import("buf.zig");
 
 extern "c" fn close(fd: c_int) c_int;
 extern "c" fn read(fd: c_int, buf: [*]u8, len: usize) isize;
@@ -121,6 +122,14 @@ pub const Bye = struct {
 /// alive, no connection yet) from "really crashed" (child exited)
 /// — see #134-follow-up. For now, generous flat budget.
 pub const connecting_timeout_ms: i64 = 60_000;
+
+/// Cap on the stderr ring-buffer kept inside `PreviewSession` and
+/// mirrored by `App.preview_tail` in the Compiler Output panel. Two
+/// callers (producer-side in `appendStderrChunk`, consumer-side in
+/// `appendPreviewTail`) — sharing the constant guarantees the two
+/// caps can't drift; a smaller consumer cap would silently lose
+/// bytes the producer already streamed (#139 cleanup).
+pub const stderr_cap: usize = 16 * 1024;
 
 /// Heartbeat watchdog window for the `.running` state (#79).
 ///
@@ -1169,21 +1178,40 @@ pub const PreviewSession = struct {
         const pid = child.id orelse return; // already waited/killed
         var status: c_int = 0;
         const rc = waitpid(@intCast(pid), &status, WNOHANG);
-        if (rc <= 0) return; // 0 = still running; -1 = error (race with kill); leave for the next tick
-        // Decode wait(2) status — same shape as `<sys/wait.h>` macros
-        // (`WIFEXITED` / `WEXITSTATUS` / `WIFSIGNALED` / `WTERMSIG`).
-        // The high byte is the exit code on a normal exit; the low 7
-        // bits are the terminating signal otherwise. Keep the reason
-        // string short — the panel surfaces it inline.
+        if (rc == 0) return; // still running
+        if (rc < 0) {
+            // waitpid error. EINTR = signal during syscall, retry next
+            // tick. Everything else (notably ECHILD when something
+            // else reaped the child) is permanent — sitting here would
+            // wait the full `connecting_timeout_ms` backstop, which on
+            // the 60s pin is a baffling user experience for what's
+            // already a crashed session (#136 / #139 nit 3).
+            if (std.posix.errno(rc) == .INTR) return;
+            std.log.warn("preview: waitpid failed errno={s}; marking crashed", .{@tagName(std.posix.errno(rc))});
+            self.drainChildStderr();
+            self.markCrashed("labelle reaper failed");
+            return;
+        }
+        // rc > 0 — decode wait(2) status with the idiomatic posix
+        // helpers (#139 nit 2). The previous inline bit-ops worked,
+        // but now read like the stdlib does.
         var reason_buf: [64]u8 = undefined;
-        const exited_normally = (status & 0x7F) == 0;
-        const exit_code: c_int = (status >> 8) & 0xFF;
+        const status_u32: u32 = @bitCast(status);
+        const exited_normally = std.posix.W.IFEXITED(status_u32);
+        const exit_code: u8 = std.posix.W.EXITSTATUS(status_u32);
         const reason: []const u8 = blk: {
             if (exited_normally) {
                 break :blk std.fmt.bufPrint(&reason_buf, "labelle exited (code {d})", .{exit_code}) catch "labelle exited";
+            } else if (std.posix.W.IFSIGNALED(status_u32)) {
+                const sig = std.posix.W.TERMSIG(status_u32);
+                break :blk std.fmt.bufPrint(&reason_buf, "labelle killed by signal {d}", .{@intFromEnum(sig)}) catch "labelle killed";
             } else {
-                const sig = status & 0x7F;
-                break :blk std.fmt.bufPrint(&reason_buf, "labelle killed by signal {d}", .{sig}) catch "labelle killed";
+                // Stopped/continued statuses don't fit the "child
+                // exited" exit-decoding contract. The kernel
+                // shouldn't surface those under WNOHANG without
+                // WUNTRACED/WCONTINUED, so this branch is mostly a
+                // belt-and-suspenders log site.
+                break :blk "labelle status unclear";
             }
         };
         // A clean exit (code 0) from an already-`running` session is
@@ -1268,28 +1296,7 @@ pub const PreviewSession = struct {
     /// the dropped prefix). `pub` so the tests can drive it without
     /// a real subprocess.
     pub fn appendStderrChunk(self: *Self, chunk: []const u8) void {
-        const stderr_cap: usize = 16 * 1024;
-        if (chunk.len == 0) return;
-        if (chunk.len >= stderr_cap) {
-            self.stderr_buf.clearRetainingCapacity();
-            const tail_off = chunk.len - stderr_cap;
-            self.stderr_buf.appendSlice(self.allocator, chunk[tail_off..]) catch return;
-            self.stderr_cursor = 0;
-            return;
-        }
-        if (self.stderr_buf.items.len + chunk.len > stderr_cap) {
-            const overflow = self.stderr_buf.items.len + chunk.len - stderr_cap;
-            const drop = @min(overflow, self.stderr_buf.items.len);
-            const remaining = self.stderr_buf.items.len - drop;
-            std.mem.copyForwards(
-                u8,
-                self.stderr_buf.items[0..remaining],
-                self.stderr_buf.items[drop..],
-            );
-            self.stderr_buf.shrinkRetainingCapacity(remaining);
-            self.stderr_cursor = if (self.stderr_cursor > drop) self.stderr_cursor - drop else 0;
-        }
-        self.stderr_buf.appendSlice(self.allocator, chunk) catch return;
+        buf_mod.appendCapped(&self.stderr_buf, self.allocator, chunk, stderr_cap, &self.stderr_cursor);
     }
 
     fn markCrashed(self: *Self, reason: []const u8) void {

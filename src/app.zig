@@ -14,6 +14,7 @@ const project = @import("project.zig");
 const tree_view = @import("tree_view.zig");
 const compiler = @import("compiler.zig");
 const preview = @import("preview.zig");
+const buf = @import("buf.zig");
 const config = @import("config.zig");
 const module = @import("module.zig");
 const compiler_output = @import("modules/compiler_output.zig");
@@ -1065,37 +1066,16 @@ pub const App = struct {
     }
 
     /// Append `bytes` to the Compiler Output panel's live preview
-    /// tail buffer (#127). Bounded by `preview_tail_cap` — when the
-    /// buffer would exceed the cap, the oldest bytes are dropped from
-    /// the front so the *recent* tail (where the build error or panic
-    /// trace lives) is what the user sees. Called from the panel's
-    /// per-frame `consumeStderr` drain; safe to call with an empty
-    /// slice.
+    /// tail buffer (#127). Bounded by `preview.stderr_cap` (16 KiB,
+    /// shared with the producer-side stderr buffer) — when the
+    /// buffer would exceed the cap, the oldest bytes are dropped
+    /// from the front so the *recent* tail (where the build error
+    /// or panic trace lives) is what the user sees. Called from the
+    /// panel's per-frame `consumeStderr` drain; safe to call with
+    /// an empty slice. Cursor is null because the panel doesn't
+    /// carry a separate read offset.
     pub fn appendPreviewTail(self: *Self, bytes: []const u8) void {
-        if (bytes.len == 0) return;
-        // Cap matches `preview.stderr_buf`'s cap (16 KiB) so the panel
-        // never holds more than two windows' worth of stderr in flight.
-        const preview_tail_cap: usize = 16 * 1024;
-        if (bytes.len >= preview_tail_cap) {
-            // Single record already exceeds the cap — keep only the
-            // tail end.
-            self.preview_tail.clearRetainingCapacity();
-            const start = bytes.len - preview_tail_cap;
-            self.preview_tail.appendSlice(self.allocator, bytes[start..]) catch return;
-            return;
-        }
-        // Drop from the front if appending `bytes` would overflow.
-        if (self.preview_tail.items.len + bytes.len > preview_tail_cap) {
-            const need_to_drop = self.preview_tail.items.len + bytes.len - preview_tail_cap;
-            const remaining = self.preview_tail.items.len - need_to_drop;
-            std.mem.copyForwards(
-                u8,
-                self.preview_tail.items[0..remaining],
-                self.preview_tail.items[need_to_drop..],
-            );
-            self.preview_tail.shrinkRetainingCapacity(remaining);
-        }
-        self.preview_tail.appendSlice(self.allocator, bytes) catch return;
+        buf.appendCapped(&self.preview_tail, self.allocator, bytes, preview.stderr_cap, null);
     }
 
     pub fn stopPreview(self: *Self) void {
