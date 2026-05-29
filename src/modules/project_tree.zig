@@ -11,6 +11,7 @@ const App = @import("../app.zig").App;
 const module = @import("../module.zig");
 const config = @import("../config.zig");
 const project = @import("../project.zig");
+const atlas = @import("../atlas.zig");
 const flow_io = @import("../flow_io.zig");
 
 pub fn makeModule(app: *App) module.Module {
@@ -126,7 +127,8 @@ fn render(app: *App) void {
             // the gizmo editor. The three are mutually exclusive
             // (different folders and/or extensions) so a single
             // click never opens more than one.
-            if (app.tree_view.render(proj.getProjectDir())) {
+            const atlas_idx_opt: ?*const atlas.Index = if (app.atlas_index) |*idx| idx else null;
+            if (app.tree_view.render(proj.getProjectDir(), atlas_idx_opt)) {
                 if (app.tree_view.getSelectedPath()) |path| {
                     const proj_dir = proj.getProjectDir();
                     if (isScenePath(proj_dir, path)) {

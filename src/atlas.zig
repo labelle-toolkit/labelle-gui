@@ -47,17 +47,31 @@ pub const Atlas = struct {
     /// `resources[i].name` from `project.labelle`. Useful for
     /// diagnostics — "sprite X belongs to atlas Y".
     name: []const u8,
+    /// Absolute path to the JSON manifest this atlas was loaded from.
+    /// Empty when constructed via `loadFromPaths` (the Atlas Viewer
+    /// uses that entry point for atlases outside `resources`). The
+    /// tree-view uses this to match a file row to its sprite list
+    /// when expanding an atlas manifest inline (#143 phase 8).
+    json_path: []const u8 = "",
     texture_id: c_uint,
     width: u32,
     height: u32,
     /// `name → Frame` for every entry in this atlas's JSON.
     frames: std.StringHashMapUnmanaged(Frame) = .empty,
+    /// Pre-sorted view of `frames`'s keys (alpha-asc). Built once at
+    /// load time so the tree-view's atlas-expansion render path
+    /// (#143 phase 8) doesn't re-collect + re-sort the hashmap every
+    /// frame. The slices reference the same strings owned by
+    /// `frames` — no extra dupes.
+    sorted_frame_keys: []const []const u8 = &.{},
 
     pub fn deinit(self: *Atlas, allocator: std.mem.Allocator) void {
         var it = self.frames.iterator();
         while (it.next()) |entry| allocator.free(entry.key_ptr.*);
         self.frames.deinit(allocator);
+        if (self.sorted_frame_keys.len > 0) allocator.free(self.sorted_frame_keys);
         allocator.free(self.name);
+        if (self.json_path.len > 0) allocator.free(self.json_path);
         if (self.texture_id != 0) {
             gl.deleteTextures(1, &self.texture_id);
         }
@@ -136,6 +150,19 @@ pub const Index = struct {
         const a = self.atlases.items[ref.atlas];
         return .{ @floatFromInt(a.width), @floatFromInt(a.height) };
     }
+
+    /// Look up a loaded atlas by its absolute JSON path. Returns the
+    /// `Atlas` so the caller can iterate its `frames` (e.g. the
+    /// tree-view expanding a manifest file inline as a list of
+    /// draggable sprite names). `null` when no atlas's `json_path`
+    /// matches — either the file isn't a project resource or it
+    /// failed to load during `build`.
+    pub fn atlasByJsonPath(self: Index, json_path: []const u8) ?*const Atlas {
+        for (self.atlases.items) |*a| {
+            if (a.json_path.len > 0 and std.mem.eql(u8, a.json_path, json_path)) return a;
+        }
+        return null;
+    }
 };
 
 /// A subset of `project.ProjectConfig.resources` needed by the atlas
@@ -154,7 +181,14 @@ fn loadOne(allocator: std.mem.Allocator, project_dir: []const u8, r: Resource) !
     const tex_path = try std.fs.path.join(allocator, &.{ project_dir, r.texture });
     defer allocator.free(tex_path);
 
-    return loadFromPaths(allocator, r.name, json_path, tex_path);
+    var atlas = try loadFromPaths(allocator, r.name, json_path, tex_path);
+    errdefer atlas.deinit(allocator);
+    // Project-loaded atlases get their absolute manifest path stamped
+    // so the tree-view can match a file row to its sprite list. The
+    // viewer-only entry point (`loadFromPaths` directly) skips this
+    // because that atlas isn't part of the project's resources block.
+    atlas.json_path = try allocator.dupe(u8, json_path);
+    return atlas;
 }
 
 /// Load a single atlas from explicit JSON + PNG paths (not project-
@@ -275,6 +309,24 @@ pub fn parseFramesFromJsonText(allocator: std.mem.Allocator, raw: []const u8, at
         errdefer allocator.free(name_copy);
         try atlas.frames.put(allocator, name_copy, frame);
     }
+
+    // Materialise the alpha-sorted key view once at load. The
+    // tree-view's atlas-expansion render path iterates this slice
+    // every frame; rebuilding + sorting it on each frame instead
+    // would cost N allocs + an O(N log N) sort per open atlas at
+    // 60 fps (#143 phase 8 review feedback). Slices alias the
+    // frame-map's keys — no extra dupes, no double free.
+    var keys = try allocator.alloc([]const u8, atlas.frames.count());
+    errdefer allocator.free(keys);
+    var k_it = atlas.frames.iterator();
+    var k_i: usize = 0;
+    while (k_it.next()) |kv| : (k_i += 1) keys[k_i] = kv.key_ptr.*;
+    std.mem.sort([]const u8, keys, {}, struct {
+        fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+            return std.mem.lessThan(u8, lhs, rhs);
+        }
+    }.lessThan);
+    atlas.sorted_frame_keys = keys;
 }
 
 fn jsonU32(v: ?std.json.Value) ?u32 {

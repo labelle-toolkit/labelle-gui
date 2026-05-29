@@ -9,6 +9,7 @@ const zgui = @import("zgui");
 
 const scene_io = @import("../../scene_io.zig");
 const atlas = @import("../../atlas.zig");
+const dnd = @import("../dnd.zig");
 const InspectorSection = @import("section.zig").InspectorSection;
 
 /// Canonical Sprite.pivot values, matching the engine's pivot enum
@@ -71,6 +72,22 @@ fn render(
     // doesn't kiss the border.
     zgui.setNextItemWidth(@max(60, zgui.getContentRegionAvail()[0] - trailing - 4));
     if (zgui.inputText(sprite_name_label, .{ .buf = &sprite.sprite_name })) is_dirty.* = true;
+    // Drop target: accept a sprite name dragged from the project
+    // tree's expanded atlas manifest (#143 phase 8). The drop replaces
+    // the field contents rather than appending — same UX as picking
+    // from a combo. `acceptDragDropPayload` returns the payload bytes
+    // ImGui has already validated as `SPRITE_TYPE`-tagged.
+    if (zgui.beginDragDropTarget()) {
+        defer zgui.endDragDropTarget();
+        if (zgui.acceptDragDropPayload(dnd.SPRITE_TYPE, .{})) |payload| {
+            const data: *const dnd.SpritePayload = @ptrCast(@alignCast(payload.data));
+            const name = dnd.unpackSprite(data);
+            @memset(&sprite.sprite_name, 0);
+            const n = @min(name.len, sprite.sprite_name.len);
+            @memcpy(sprite.sprite_name[0..n], name[0..n]);
+            is_dirty.* = true;
+        }
+    }
     if (is_missing) {
         zgui.sameLine(.{});
         zgui.textColored(.{ 1.0, 0.5, 0.4, 1.0 }, "(missing)", .{});
