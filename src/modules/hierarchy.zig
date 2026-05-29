@@ -69,6 +69,15 @@ fn render(app: *App) void {
 
     const filter = std.mem.sliceTo(&app.hierarchy_filter, 0);
 
+    // Scroll the entity list inside its own region so the filter box
+    // and separator stay pinned at the top instead of scrolling away
+    // on long lists — the panel exists precisely for 50+ entity scenes,
+    // where losing the search bar mid-scroll defeats the purpose. The
+    // auto-scroll `setScrollHereY` below now targets this child, which
+    // is also the correct scope (it no longer shoves the header).
+    _ = zgui.beginChild("##hierarchy_list", .{});
+    defer zgui.endChild();
+
     switch (app.open_tabs.items[tab_idx]) {
         .scene => |*s| renderSceneRows(s, filter),
         .prefab => |*p| renderPrefabRows(p, filter),
