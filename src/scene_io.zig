@@ -153,6 +153,21 @@ pub const Entity = struct {
     /// the arena, but its fixed-cap point buffer lives inline so
     /// adding / removing points doesn't need a realloc.
     polygon: ?*Polygon = null,
+    /// Optional inline child entities — populated when a scene entity
+    /// (or a prefab body) has stamped sub-entities. Empty when the
+    /// entity is a leaf or a bare prefab ref. Recursive in shape;
+    /// the scene parser fills one level today, deeper levels stay
+    /// default-empty until the stamp UI / inspector grows them. The
+    /// prefab side keeps using `LoadedPrefab.children` for its
+    /// top-level children (#143 Phase 2); the field here exists so
+    /// scene entities can carry stamped bodies under #143 Phase 5.
+    children: []Entity = &.{},
+    /// Per-child unmodeled components, parallel to `children`. Empty
+    /// when `children` is empty. On save the writer splices each
+    /// slot back into its corresponding child's `components: { ... }`
+    /// block — same contract scene-level `entity_components` extras
+    /// use.
+    children_extras: []const []const ComponentExtra = &.{},
     /// Leading `//` comments captured from the source file, attached
     /// to the first entity that follows them — same rule we use for
     /// project.labelle pass-through. Lines keep their `//` markers and
@@ -697,6 +712,26 @@ fn emitEntityBody(w: ListWriter, e: Entity, extras: []const ComponentExtra) !voi
         try w.print(" \"{s}\": {s}", .{ extra.name, extra.value_text });
         first = false;
     }
+    // Recursive children block (#143 Phase 5). Emits inline within the
+    // entity body the same way components do — `"children": [...]` is
+    // just one more key on the bundle entity. Each child round-trips
+    // through `emitEntityBody` itself, so nesting is supported even
+    // though `Entity.children` only carries one level of modeled data
+    // today (grandchildren still ride in extras).
+    if (e.children.len > 0) {
+        if (!first) try w.writeAll(",");
+        try w.writeAll(" \"children\": [\n");
+        for (e.children, 0..) |child, ci| {
+            const cextras = if (ci < e.children_extras.len) e.children_extras[ci] else &[_]ComponentExtra{};
+            try w.writeAll("        {");
+            try emitEntityBody(w, child, cextras);
+            try w.writeAll(" }");
+            if (ci + 1 < e.children.len) try w.writeAll(",");
+            try w.writeAll("\n");
+        }
+        try w.writeAll("    ]");
+        first = false;
+    }
     if (first) try w.writeAll(" ");
 }
 
@@ -727,23 +762,14 @@ pub fn parseScene(allocator: std.mem.Allocator, raw: []const u8) !LoadedScene {
     // The reader picks whichever the file actually carries; refs
     // inside `children` may spell `components` as `overrides` —
     // both fields are present on `SceneEntry` and the read-side
-    // takes whichever is populated.
-    // Both `components` and `overrides` fields are present per entry
-    // (RFC #560 §B2 — refs use overrides, inline uses components).
-    // The reader accepts whichever spelling appeared, even cross-
-    // mode; strict §B2 enforcement is the engine loader's job, so
-    // the editor stays permissive and a hand-edited scene with the
-    // wrong-mode key still opens. The writer always normalises on
-    // emit. RFC §"Effective name" says when `name` is absent the
-    // basename becomes the registry key — the gui keeps it as the
-    // empty default since `scene.name` is display-only (tab title +
-    // saved value); the engine, not the gui, is the registry-key
-    // consumer. If the tab title ever becomes empty in practice,
-    // `loadFromFile` could fall back to the file basename here.
+    // takes whichever is populated. `children` rides as raw
+    // json.Value so the reader can walk it without declaring a
+    // recursive schema — see `readEntityChildren` below (#143 Phase 5).
     const SceneEntry = struct {
         prefab: ?[]const u8 = null,
         components: ?std.json.Value = null,
         overrides: ?std.json.Value = null,
+        children: ?std.json.Value = null,
     };
     const Intermediate = struct {
         name: []const u8 = "",
@@ -782,6 +808,14 @@ pub fn parseScene(allocator: std.mem.Allocator, raw: []const u8) !LoadedScene {
     // text — the stripped buffer has spaces where `//` lines used to be,
     // so we can't recover comments from it.
     const comments = try extractEntityComments(arena.allocator(), scope);
+    // Per-entity child extras: parallel to the entities slice. Each
+    // slot is the list of unmodeled component-extras for each child of
+    // that entity. Empty when an entity has no children. Same shape
+    // the prefab side already uses for its single `children:` array,
+    // just walked per entity. Scans the raw source so embedded
+    // comments / formatting in a child component value survive the
+    // round-trip (#143 Phase 5).
+    const children_extras_per_entity = try extractEntityChildrenExtras(arena.allocator(), raw);
 
     var entities = try arena.allocator().alloc(Entity, eff_entries.len);
     for (eff_entries, 0..) |e, i| {
@@ -793,6 +827,11 @@ pub fn parseScene(allocator: std.mem.Allocator, raw: []const u8) !LoadedScene {
             .rectangle = try readRectangle(arena.allocator(), oc),
             .circle = try readCircle(arena.allocator(), oc),
             .polygon = try readPolygon(arena.allocator(), oc),
+            .children = try readEntityChildren(arena.allocator(), e.children),
+            .children_extras = if (i < children_extras_per_entity.len)
+                children_extras_per_entity[i]
+            else
+                &.{},
         };
         // Comments are extracted on a best-effort basis: if the scanner
         // landed fewer entries than parser saw entities (recovery from
@@ -892,6 +931,14 @@ fn parseBundleEntryToEntity(arena: std.mem.Allocator, entry: std.json.Value) !En
         .rectangle = try readRectangle(arena, entry),
         .circle = try readCircle(arena, entry),
         .polygon = try readPolygon(arena, entry),
+        // #143 Phase 5: bundle entities carry `children` as the same
+        // inline array shape `readEntityChildren` already walks for
+        // the legacy/#560 path. `children_extras` is best-effort here
+        // — the bundle source-text scanner that would surface them
+        // isn't wired yet; downstream code tolerates an empty extras
+        // slice (the writer just emits modeled components for each
+        // child).
+        .children = try readEntityChildren(arena, entry.object.get("children")),
     };
 }
 
@@ -1570,6 +1617,92 @@ fn extractEntityComponentExtras(arena: std.mem.Allocator, raw: []const u8) ![]co
     // (inside `root: { ... }`); legacy scenes use `entities` at the
     // file root. `findSceneEntriesArray` accepts either.
     return extractArrayItemComponentExtras(arena, raw, findSceneEntriesArray(raw) orelse return &.{});
+}
+
+/// Per-entity, per-child component extras. Walks the scene's
+/// `entities: [...]` array; for each entity body, locates its
+/// `children: [...]` sub-array (if any) and captures the unmodeled
+/// component keys on each child. Result shape: outer slot per entity
+/// in source order, inner slot per child of that entity, innermost
+/// the verbatim `ComponentExtra` list. Entities without children get
+/// an empty inner slice. Used by `parseScene` to feed
+/// `Entity.children_extras` so per-child verbatim components round-trip
+/// even when the gui doesn't model them. (#143 Phase 5)
+fn extractEntityChildrenExtras(arena: std.mem.Allocator, raw: []const u8) ![]const []const []const ComponentExtra {
+    var out: std.ArrayList([]const []const ComponentExtra) = .empty;
+    errdefer out.deinit(arena);
+
+    const entities_lbracket = findEntitiesArray(raw) orelse return out.toOwnedSlice(arena);
+    var i: usize = entities_lbracket + 1; // past '['
+
+    while (i < raw.len) {
+        skipWhitespaceJson(raw, &i);
+        skipCommentBlock(raw, &i);
+        skipWhitespaceJson(raw, &i);
+        if (i >= raw.len) break;
+        if (raw[i] == ']') break;
+        if (raw[i] == ',') {
+            i += 1;
+            continue;
+        }
+        if (raw[i] != '{') break;
+
+        const entity_start = i;
+        scanBalanced(raw, &i, '{', '}');
+        const entity_end = i;
+        const entity_body = raw[entity_start..entity_end];
+
+        if (findArrayByKey(entity_body, "\"children\"")) |lbracket| {
+            const per_child = try extractArrayItemComponentExtras(arena, entity_body, lbracket);
+            try out.append(arena, per_child);
+        } else {
+            try out.append(arena, &.{});
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// Read a scene entity's `children: [...]` JSON value into a slice
+/// of modeled `Entity` records. One level deep — children's children
+/// (grandchildren) ride along via `children_extras` if any, modeled
+/// fields stay default-empty. Mirrors how `parsePrefab` reads the
+/// prefab body's children, but driven off `std.json.Value` so the
+/// caller doesn't need to declare a recursive schema. (#143 Phase 5)
+fn readEntityChildren(arena: std.mem.Allocator, children_val: ?std.json.Value) ![]Entity {
+    const v = children_val orelse return &.{};
+    if (v != .array) return &.{};
+    const arr = v.array.items;
+    var out = try arena.alloc(Entity, arr.len);
+    for (arr, 0..) |item, i| {
+        if (item != .object) {
+            out[i] = .{};
+            continue;
+        }
+        const prefab_val = item.object.get("prefab");
+        // Accept both shapes per child entry:
+        //   - Legacy/#560: components live under a `components` (or
+        //     `overrides` for refs) sub-object.
+        //   - Bundle (#596): no wrapper — component keys sit inline on
+        //     the entry itself.
+        // Fallback chain handles both so a scene fed in as legacy
+        // round-trips back through bundle output without the children
+        // becoming naked rows on the second read (#143 Phase 5).
+        const components_val: ?std.json.Value = item.object.get("components") orelse
+            item.object.get("overrides") orelse
+            item;
+        out[i] = .{
+            .prefab = if (prefab_val) |pv|
+                (if (pv == .string) try arena.dupe(u8, pv.string) else null)
+            else
+                null,
+            .position = readPosition(components_val),
+            .sprite = try readSprite(arena, components_val),
+            .rectangle = try readRectangle(arena, components_val),
+            .circle = try readCircle(arena, components_val),
+            .polygon = try readPolygon(arena, components_val),
+        };
+    }
+    return out;
 }
 
 /// Per-child component extras for prefabs. Same scanner the scene
