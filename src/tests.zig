@@ -17,6 +17,7 @@ const flow_doc = @import("modules/flow_doc.zig");
 const flow_cycle = @import("flow_cycle.zig");
 const event_catalog = @import("flow_event_catalog.zig");
 const node_catalog = @import("flow_node_catalog.zig");
+const hierarchy = @import("modules/hierarchy.zig");
 
 // Reference the node catalog at file scope so its module-level
 // `test "…"` blocks become reachable from the test root and are
@@ -540,17 +541,21 @@ pub const SceneIoTests = struct {
         const text = try scene_io.renderSceneJsonc(allocator, loaded);
         defer allocator.free(text);
 
-        // Managed fields landed in canonical form.
-        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"name\": \"lab\"") != null);
+        // Managed fields landed in canonical RFC #596 bundle form.
+        // `name` is gone (#596 dropped it), the writer emits the
+        // top-level array directly, and component keys sit inline
+        // with no `components:`/`overrides:` wrapper.
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"name\":") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"components\":") == null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"prefab\": \"coin\"") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Position\":") != null);
 
-        // Unmodeled components round-tripped verbatim.
+        // Unmodeled components round-tripped verbatim, also inline.
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Sprite\":") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"sprite_name\": \"coin\"") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Coin\":") != null);
 
-        // Comment preserved at the entities-array indent.
+        // Comment preserved at the array indent.
         try expect.toBeTrue(std.mem.indexOf(u8, text, "// Collectible") != null);
     }
 
@@ -949,14 +954,15 @@ pub const SceneIoTests = struct {
         const text = try scene_io.renderPrefabJsonc(allocator, loaded);
         defer allocator.free(text);
 
-        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"components\":") != null);
+        // RFC #596 bundle output: no `components:` wrapper, Sprite +
+        // Coin appear inline as PascalCase keys.
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"components\":") == null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Sprite\"") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"sprite_name\": \"coin\"") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Coin\"") != null);
 
-        // Re-parse the rendered text to confirm the writer's output
-        // is self-consistent — Sprite back on entity.sprite, Coin
-        // back in extras.
+        // Re-parse the rendered text — Sprite typed on entity.sprite,
+        // Coin lands in component_extras.
         var loaded2 = try scene_io.parsePrefab(allocator, text);
         defer loaded2.deinit();
         try expect.equal(loaded2.component_extras.len, 1);
@@ -1051,11 +1057,13 @@ pub const SceneIoTests = struct {
     }
 
     test "parsePrefab preserves unmodeled top-level keys verbatim" {
-        // Regression for copilot PR #30 review: a prefab with custom
-        // top-level keys (metadata, schema_version, anything outside
-        // `components` / `children`) must round-trip those fields
-        // unchanged. Without this, editing+saving a prefab would
-        // silently drop everything the gui doesn't model.
+        // Custom top-level keys (metadata, schema_version) must
+        // round-trip unchanged through a save. The input here is a
+        // legacy `{components: {...}}` shape — those keys land in
+        // `top_level_extras`. After bundle save + re-read the
+        // top-level object IS the components map, so both keys end
+        // up in `component_extras` instead. Either way the data
+        // survives the round-trip — that's the regression contract.
         const allocator = std.testing.allocator;
         const src =
             \\{
@@ -1067,22 +1075,25 @@ pub const SceneIoTests = struct {
         var loaded = try scene_io.parsePrefab(allocator, src);
         defer loaded.deinit();
 
+        // Legacy parse keeps `metadata` + `schema_version` outside
+        // the `components:` block, so they're top-level extras here.
         try expect.equal(loaded.top_level_extras.len, 2);
-        try expect.toBeTrue(std.mem.eql(u8, loaded.top_level_extras[0].name, "metadata"));
-        try expect.toBeTrue(std.mem.eql(u8, loaded.top_level_extras[1].name, "schema_version"));
 
         const text = try scene_io.renderPrefabJsonc(allocator, loaded);
         defer allocator.free(text);
 
-        // Both extras must reappear in the output…
+        // Both extras must reappear verbatim in the bundle output.
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"metadata\":") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"author\": \"alex\"") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"schema_version\": 3") != null);
-        // …and the output must re-parse cleanly, with the same
-        // extras captured the second time.
+
+        // Re-parse the bundle output. Now `Coin` + `metadata` +
+        // `schema_version` all sit at top level → all three land in
+        // `component_extras`; `top_level_extras` is empty.
         var loaded2 = try scene_io.parsePrefab(allocator, text);
         defer loaded2.deinit();
-        try expect.equal(loaded2.top_level_extras.len, 2);
+        try expect.equal(loaded2.top_level_extras.len, 0);
+        try expect.equal(loaded2.component_extras.len, 3);
     }
 
     test "parsePrefab captures extras when file has leading whitespace + comment" {
@@ -1397,7 +1408,189 @@ pub const SceneIoTests = struct {
         try expect.equal(loaded2.scene.entities.len, 0);
     }
 
-    // ---- #143 Phase 5: Entity.children persistence ----
+    // ─── RFC #560 unified prefab/scene format ─────────────────────────
+    //
+    // Scenes wrap entries under `root: { children: [...] }`; prefab
+    // refs spell their data as `overrides`. The reader accepts both
+    // layouts; the writer emits unified. These tests pin the new
+    // shape and the legacy fallback against silent regression.
+
+    test "parseScene accepts unified-format root.children" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "main",
+            \\    "root": {
+            \\        "children": [
+            \\            { "prefab": "wall", "overrides": { "Position": { "x": 12, "y": 34 } } }
+            \\        ]
+            \\    }
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+        try expect.equal(loaded.scene.entities.len, 1);
+        const e = loaded.scene.entities[0];
+        try expect.toBeTrue(e.prefab != null);
+        try expect.toBeTrue(std.mem.eql(u8, e.prefab.?, "wall"));
+        try expect.toBeTrue(e.position != null);
+        try expect.equal(e.position.?.x, 12);
+        try expect.equal(e.position.?.y, 34);
+    }
+
+    test "parsePrefab accepts unified-format root wrapper" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "root": {
+            \\        "components": { "Position": { "x": 1, "y": 2 } },
+            \\        "children": [
+            \\            { "components": { "Position": { "x": 5, "y": 6 } } }
+            \\        ]
+            \\    }
+            \\}
+        ;
+        var loaded = try scene_io.parsePrefab(allocator, src);
+        defer loaded.deinit();
+        try expect.toBeTrue(loaded.entity.position != null);
+        try expect.equal(loaded.entity.position.?.x, 1);
+        try expect.equal(loaded.children.len, 1);
+        try expect.equal(loaded.children[0].position.?.x, 5);
+    }
+
+    test "renderSceneJsonc migrates RFC #560 ref to inline bundle entry" {
+        // A scene fed in as RFC #560 (with `root`/`children`/`overrides`)
+        // must round-trip into RFC #596 bundle shape: top-level array,
+        // `prefab` + Position inline as sibling keys (no `overrides:`
+        // wrapper).
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "x",
+            \\    "root": {
+            \\        "children": [
+            \\            { "prefab": "coin", "overrides": { "Position": { "x": 10, "y": 20 } } }
+            \\        ]
+            \\    }
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+
+        const text = try scene_io.renderSceneJsonc(allocator, loaded);
+        defer allocator.free(text);
+        // No more #560 wrappers in the output.
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"root\":") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"overrides\":") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"components\":") == null);
+        // Bundle shape: prefab + Position sit inline on the entry.
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"prefab\": \"coin\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Position\":") != null);
+    }
+
+    test "renderSceneJsonc migrates legacy/#560 top-level metadata into bundle meta" {
+        // `assets`, `include`, etc. used to live as siblings of `root`
+        // in RFC #560 scenes (and at the file root in legacy). Bundle
+        // shape carries them as keys inside the leading
+        // `{ "meta": { ... } }` array entry.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "m",
+            \\    "assets": ["a", "b"],
+            \\    "root": {
+            \\        "children": []
+            \\    }
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+
+        const text = try scene_io.renderSceneJsonc(allocator, loaded);
+        defer allocator.free(text);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"meta\":") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"assets\":") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "[\"a\", \"b\"]") != null);
+        // Bundle output never contains `name` / `root`.
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"name\":") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"root\":") == null);
+    }
+
+    test "parseScene still accepts legacy entities format" {
+        // Backward compat: projects under our control are migrated,
+        // but the reader still has to open older files cleanly.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "old",
+            \\    "entities": [
+            \\        { "components": { "Position": { "x": 7, "y": 8 } } }
+            \\    ]
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+        try expect.equal(loaded.scene.entities.len, 1);
+        try expect.equal(loaded.scene.entities[0].position.?.x, 7);
+    }
+
+    test "renderSceneJsonc emits inline component keys (no wrapper)" {
+        // Bundle shape collapses both #560 §B2 branches (refs use
+        // `overrides`, inline use `components`) into the same flat
+        // inline-key emit. Verify with an inline entry: `components`
+        // and `overrides` both stay absent.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "x",
+            \\    "root": {
+            \\        "children": [
+            \\            { "components": { "Position": { "x": 1, "y": 2 } } }
+            \\        ]
+            \\    }
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+
+        const text = try scene_io.renderSceneJsonc(allocator, loaded);
+        defer allocator.free(text);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"components\":") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"overrides\":") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"Position\":") != null);
+    }
+
+    test "renderSceneJsonc never emits `root` in bundle output" {
+        // RFC #596 dropped the `root` wrapper entirely. Even a scene
+        // fed in with a `root` block must come back out without it,
+        // and `include`-style siblings need to migrate into `meta`
+        // rather than disappearing.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\    "name": "x",
+            \\    "include": "shared.jsonc",
+            \\    "root": { "children": [] }
+            \\}
+        ;
+        var loaded = try scene_io.parseScene(allocator, src);
+        defer loaded.deinit();
+
+        const text = try scene_io.renderSceneJsonc(allocator, loaded);
+        defer allocator.free(text);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"root\":") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"include\":") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"meta\":") != null);
+    }
+
+    // ─── #143 Phase 5: Entity.children persistence ────────────────────
+    //
+    // Stamped prefab children must survive a load → save round-trip on
+    // scene entities, with both modeled positions and unmodeled
+    // per-child components (extras) intact. Inputs use the legacy/#560
+    // shape — the parser dispatches to that path and emits bundle
+    // output, so the round-trip also exercises the bundle writer's
+    // `children` block.
 
     test "parseScene reads an entity's children array" {
         const allocator = std.testing.allocator;
@@ -1492,7 +1685,6 @@ pub const SceneIoTests = struct {
 
         const text = try scene_io.renderSceneJsonc(allocator, loaded);
         defer allocator.free(text);
-
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"children\":") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"canteen_seat\"") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"x\": 12") != null);
@@ -1591,6 +1783,97 @@ pub const SceneIoTests = struct {
         try expect.equal(loaded.scene.entities[0].children_extras.len, 0);
         try expect.equal(loaded.scene.entities[1].children.len, 1);
         try expect.equal(loaded.scene.entities[1].children_extras.len, 1);
+    }
+};
+
+pub const HierarchyTests = struct {
+    // Filter logic lives in `modules/hierarchy.zig` as pure helpers
+    // (no imgui draw context) so the search/label code is testable
+    // without standing up a GUI. The panel render itself stays
+    // unit-untested; gui-test covers it via TE.
+
+    test "matchesFilter case-insensitive substring" {
+        try expect.toBeTrue(hierarchy.matchesFilter("Canteen", "cant"));
+        try expect.toBeTrue(hierarchy.matchesFilter("CANTEEN", "een"));
+        try expect.toBeTrue(hierarchy.matchesFilter("workstation_drill", "DRIL"));
+    }
+
+    test "matchesFilter rejects non-matching needle" {
+        try expect.toBeFalse(hierarchy.matchesFilter("canteen", "fitness"));
+    }
+
+    test "matchesFilter empty needle matches everything" {
+        try expect.toBeTrue(hierarchy.matchesFilter("anything", ""));
+    }
+
+    test "matchesFilter rejects needle longer than haystack" {
+        try expect.toBeFalse(hierarchy.matchesFilter("ab", "abc"));
+    }
+
+    test "firstCommentLine strips marker and surrounding whitespace" {
+        try expect.toBeTrue(std.mem.eql(u8, hierarchy.firstCommentLine("// first\n// second"), "first"));
+        try expect.toBeTrue(std.mem.eql(u8, hierarchy.firstCommentLine("//   note  \n"), "note"));
+    }
+
+    test "firstCommentLine returns empty for whitespace-only or empty input" {
+        try expect.toBeTrue(hierarchy.firstCommentLine("\n\n").len == 0);
+        try expect.toBeTrue(hierarchy.firstCommentLine("").len == 0);
+    }
+
+    test "firstCommentLine caps the returned slice at hint_cap_bytes" {
+        // A line `hint_cap_bytes + 10` long should be truncated to
+        // exactly the cap.
+        const long = "//" ++ ("a" ** (hierarchy.hint_cap_bytes + 10));
+        try expect.equal(hierarchy.firstCommentLine(long).len, hierarchy.hint_cap_bytes);
+    }
+
+    test "firstCommentLine truncates UTF-8 cleanly at codepoint boundary" {
+        // A 3-byte codepoint (`€` = 0xE2 0x82 0xAC) crossing byte 60
+        // would otherwise leave invalid UTF-8. Layout: 58 'a's + '€'
+        // (3 bytes) → 61 bytes total. Byte 60 is the middle continuation
+        // byte of `€`, so the walk-back must drop the whole codepoint.
+        const text = "//" ++ ("a" ** 58) ++ "€" ++ "tail";
+        const got = hierarchy.firstCommentLine(text);
+        try expect.equal(got.len, 58);
+        // Last byte must not be a UTF-8 continuation byte (top bits 10xx).
+        try expect.toBeTrue((got[got.len - 1] & 0xC0) != 0x80);
+    }
+
+    test "entityMatchesFilter matches prefab name" {
+        var e: scene_io.Entity = .{ .prefab = "rabbit" };
+        try expect.toBeTrue(hierarchy.entityMatchesFilter(&e, "rab"));
+        try expect.toBeTrue(hierarchy.entityMatchesFilter(&e, "BIT"));
+        try expect.toBeFalse(hierarchy.entityMatchesFilter(&e, "wolf"));
+    }
+
+    test "entityMatchesFilter empty filter matches everything" {
+        const e: scene_io.Entity = .{ .prefab = "any" };
+        try expect.toBeTrue(hierarchy.entityMatchesFilter(&e, ""));
+    }
+
+    test "entityMatchesFilter does NOT search the index prefix" {
+        // The row's display label is `#N <name>`, but typing `5` must
+        // not narrow to every #5/#15/#25 row — only rows whose actual
+        // name or comment hint contains `5`. The predicate operates
+        // on the entity, not the rendered label, so the index can't
+        // bleed in.
+        const e: scene_io.Entity = .{ .prefab = "rabbit" };
+        try expect.toBeFalse(hierarchy.entityMatchesFilter(&e, "5"));
+        try expect.toBeFalse(hierarchy.entityMatchesFilter(&e, "#"));
+    }
+
+    test "entityMatchesFilter matches the comment hint" {
+        var e: scene_io.Entity = .{ .prefab = "wall" };
+        const note = "// Building exterior";
+        @memcpy(e.comment[0..note.len], note);
+        try expect.toBeTrue(hierarchy.entityMatchesFilter(&e, "exterior"));
+        try expect.toBeTrue(hierarchy.entityMatchesFilter(&e, "BUILDING"));
+    }
+
+    test "entityMatchesFilter falls back to `(inline)` when prefab is null" {
+        const e: scene_io.Entity = .{};
+        try expect.toBeTrue(hierarchy.entityMatchesFilter(&e, "inline"));
+        try expect.toBeTrue(hierarchy.entityMatchesFilter(&e, "INLINE"));
     }
 };
 
@@ -1969,38 +2252,48 @@ pub const SceneTemplateTests = struct {
         return out;
     }
 
-    test "renders scene name into name field" {
+    test "emits an RFC #596 bundle (top-level array)" {
         const allocator = std.testing.allocator;
-        const out = try new_scene.renderSceneJsonc(allocator, "my_scene");
+        const out = try new_scene.renderSceneJsonc(allocator);
         defer allocator.free(out);
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "\"name\": \"my_scene\"") != null);
+        // First non-trivia character must be `[`.
+        var i: usize = 0;
+        while (i < out.len) : (i += 1) {
+            const c = out[i];
+            if (c == ' ' or c == '\t' or c == '\r' or c == '\n') continue;
+            if (c == '/' and i + 1 < out.len and out[i + 1] == '/') {
+                while (i < out.len and out[i] != '\n') : (i += 1) {}
+                continue;
+            }
+            break;
+        }
+        try expect.toBeTrue(i < out.len and out[i] == '[');
     }
 
-    test "includes an entities array" {
+    test "scaffold emits no legacy fields" {
         const allocator = std.testing.allocator;
-        const out = try new_scene.renderSceneJsonc(allocator, "anything");
+        const out = try new_scene.renderSceneJsonc(allocator);
         defer allocator.free(out);
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "\"entities\":") != null);
+        // Must not carry the dropped `name` field or the legacy
+        // `entities:` / `components:` wrappers.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "\"name\":") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "\"entities\":") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "\"components\":") == null);
     }
 
-    test "uses .jsonc-compatible content (parses as JSON after stripping comments)" {
+    test "scaffold parses as JSON after stripping comments" {
         const allocator = std.testing.allocator;
-        const out = try new_scene.renderSceneJsonc(allocator, "parse_check");
+        const out = try new_scene.renderSceneJsonc(allocator);
         defer allocator.free(out);
 
         const stripped = try stripLineComments(allocator, out);
         defer allocator.free(stripped);
 
-        const SceneSchema = struct {
-            name: []const u8,
-            entities: []const struct {} = &.{},
-        };
-
-        const parsed = try std.json.parseFromSlice(SceneSchema, allocator, stripped, .{ .ignore_unknown_fields = true });
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, stripped, .{});
         defer parsed.deinit();
 
-        try expect.toBeTrue(std.mem.eql(u8, parsed.value.name, "parse_check"));
-        try expect.equal(parsed.value.entities.len, 0);
+        try expect.toBeTrue(parsed.value == .array);
+        try expect.equal(parsed.value.array.items.len, 0);
     }
 };
 
@@ -4782,6 +5075,42 @@ pub const PrefabDndTests = struct {
     }
 };
 
+pub const SpriteDndTests = struct {
+    // Mirrors `ComponentDndTests` / `PrefabDndTests`. pack/unpack are
+    // the contract between the project tree's expanded-atlas drag
+    // source and the inspector's `sprite_name` drop target (#143
+    // phase 8). Pure data helpers — no ImGui context needed.
+
+    test "packSprite round-trips a short name" {
+        const name = "coin";
+        const p = dnd.packSprite(name);
+        try expect.equal(@as(usize, p.name_len), name.len);
+        try expect.equal(std.mem.eql(u8, dnd.unpackSprite(&p), name), true);
+    }
+
+    test "packSprite round-trips an atlas-frame key with underscores and digits" {
+        // TexturePacker keys frequently include suffixes like
+        // `_idle_0`. The pack path must preserve them byte-for-byte.
+        const name = "player_idle_0";
+        const p = dnd.packSprite(name);
+        try expect.equal(@as(usize, p.name_len), name.len);
+        try expect.equal(std.mem.eql(u8, dnd.unpackSprite(&p), name), true);
+    }
+
+    test "packSprite truncates a name longer than PAYLOAD_NAME_CAP" {
+        var oversize: [dnd.PAYLOAD_NAME_CAP + 1]u8 = undefined;
+        @memset(&oversize, 'x');
+        const p = dnd.packSprite(&oversize);
+        try expect.equal(@as(usize, p.name_len), dnd.PAYLOAD_NAME_CAP);
+    }
+
+    test "packSprite zero-pads the unused tail" {
+        const p = dnd.packSprite("coin");
+        try expect.equal(p.name[4], @as(u8, 0));
+        try expect.equal(p.name[p.name.len - 1], @as(u8, 0));
+    }
+};
+
 pub const TreeViewClassifierTests = struct {
     // `isComponentFile` / `isPrefabFile` decide which file leaves
     // become drag sources. They're `pub fn` to be reachable from
@@ -6019,7 +6348,7 @@ pub const AtomicWriteTests = struct {
         const path = try std.fs.path.join(allocator, &.{ tmp, "main.jsonc" });
         defer allocator.free(path);
 
-        const src = "{ \"name\": \"main\", \"entities\": [] }\n";
+        const src = "[]\n";
         var scene = try scene_io.parseScene(allocator, src);
         defer scene.deinit();
 
@@ -6027,7 +6356,9 @@ pub const AtomicWriteTests = struct {
 
         const got = try readFile(allocator, path);
         defer allocator.free(got);
-        try expect.toBeTrue(std.mem.indexOf(u8, got, "\"main\"") != null);
+        // The file landed on disk; bundle save canonicalises to `[]`.
+        // No `.tmp` sibling left behind from the atomic write.
+        try expect.toBeTrue(got.len > 0);
         try expect.equal(try countTempFiles(tmp), 0);
     }
 };

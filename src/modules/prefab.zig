@@ -33,6 +33,10 @@ pub const PrefabState = struct {
     /// Index into `loaded.children`; null means "the prefab itself
     /// is selected" (inspector shows the prefab's own components).
     selected_child_idx: ?usize = null,
+    /// Mirror of `selected_child_idx` consumed by the Hierarchy
+    /// panel (#144) to detect externally-driven selection changes.
+    /// Same shape as `SceneState.hierarchy_last_seen`.
+    hierarchy_last_seen: ?usize = null,
     is_dirty: bool = false,
     drag_armed: bool = false,
     /// Entity's world-space position at the moment a drag was armed.

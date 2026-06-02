@@ -14,6 +14,7 @@ const project = @import("project.zig");
 const tree_view = @import("tree_view.zig");
 const compiler = @import("compiler.zig");
 const preview = @import("preview.zig");
+const buf = @import("buf.zig");
 const config = @import("config.zig");
 const module = @import("module.zig");
 const compiler_output = @import("modules/compiler_output.zig");
@@ -29,6 +30,7 @@ const gizmo_mod = @import("modules/gizmo.zig");
 const entity_inspector_mod = @import("modules/entity_inspector.zig");
 const game_view_mod = @import("modules/game_view.zig");
 const atlas_viewer_mod = @import("modules/atlas_viewer.zig");
+const hierarchy_mod = @import("modules/hierarchy.zig");
 const game_view = @import("game_view.zig");
 const io_global = @import("io_global.zig");
 const flow_runtime_mod = @import("modules/flow_runtime.zig");
@@ -201,6 +203,15 @@ pub const App = struct {
     /// packed-and-opened atlases.
     atlas_viewer: atlas_viewer_mod.AtlasViewer = .{},
 
+    /// Hierarchy panel toggle (#144). When open and the active tab is
+    /// a scene or prefab editor, lists every entity in the tab's data
+    /// with click-to-select bidirectional sync against the canvas.
+    show_hierarchy: bool = false,
+    /// Sticky search-filter buffer for the hierarchy panel. Kept in
+    /// App so the filter survives panel close/reopen — same pattern
+    /// as `prefab_picker_filter` on SceneState.
+    hierarchy_filter: [128:0]u8 = [_:0]u8{0} ** 128,
+
     /// Phase 3 (#84): Entity Inspector panel toggle.
     show_entity_inspector: bool = false,
     /// Entity Inspector state — fed by `PreviewSession`'s
@@ -277,20 +288,16 @@ pub const App = struct {
     show_dpi_warning: bool = false,
 
     show_preferences: bool = false,
-    /// Live preferences edited by the Preferences dialog. Changes are
-    /// persisted to disk on every slider/stepper edit; the ImGui font
-    /// atlas isn't rebuilt mid-session so values take effect on the
-    /// next launch (the dialog surfaces a "Restart to apply" notice
-    /// when `prefs.font_scale != startup_font_scale`).
+    /// Live preferences edited by the Preferences dialog. `font_scale`
+    /// is applied live via `zgui.getStyle().font_scale_main` so the
+    /// new size shows up on the next frame (no restart); disk
+    /// persistence is debounced to slider release so an interactive
+    /// drag doesn't atomic-write the prefs file dozens of times.
     prefs: prefs_mod.Preferences = .{},
-    /// Snapshot of `prefs` at startup. Drives the "Restart to apply"
-    /// hint: when `prefs` diverges from this we know the user changed
-    /// something that won't take effect until next launch.
-    startup_prefs: prefs_mod.Preferences = .{},
 
     /// Fixed-size storage for registered modules. Grow the array literal
     /// when adding modules; Zig will tell you if it overflows.
-    modules: [9]module.Module = undefined,
+    modules: [10]module.Module = undefined,
     registry: module.Registry = .{ .modules = &.{} },
 
     const Self = @This();
@@ -308,7 +315,6 @@ pub const App = struct {
             .preview = preview.PreviewSession.init(allocator),
             .game_view = game_view.GameView.init(allocator),
             .prefs = user_prefs,
-            .startup_prefs = user_prefs,
         };
 
         // The inspector keeps a `*PreviewSession` so it can call
@@ -387,6 +393,7 @@ pub const App = struct {
         app.modules[6] = flow_runtime_mod.makeModule(app);
         app.modules[7] = game_view_mod.makeModule(app);
         app.modules[8] = atlas_viewer_mod.makeModule(app);
+        app.modules[9] = hierarchy_mod.makeModule(app);
         app.registry = .{ .modules = &app.modules };
 
         // Honor LABELLE_GAME_VIEW_SHM as a manual attach path until
@@ -1065,37 +1072,16 @@ pub const App = struct {
     }
 
     /// Append `bytes` to the Compiler Output panel's live preview
-    /// tail buffer (#127). Bounded by `preview_tail_cap` — when the
-    /// buffer would exceed the cap, the oldest bytes are dropped from
-    /// the front so the *recent* tail (where the build error or panic
-    /// trace lives) is what the user sees. Called from the panel's
-    /// per-frame `consumeStderr` drain; safe to call with an empty
-    /// slice.
+    /// tail buffer (#127). Bounded by `preview.stderr_cap` (16 KiB,
+    /// shared with the producer-side stderr buffer) — when the
+    /// buffer would exceed the cap, the oldest bytes are dropped
+    /// from the front so the *recent* tail (where the build error
+    /// or panic trace lives) is what the user sees. Called from the
+    /// panel's per-frame `consumeStderr` drain; safe to call with
+    /// an empty slice. Cursor is null because the panel doesn't
+    /// carry a separate read offset.
     pub fn appendPreviewTail(self: *Self, bytes: []const u8) void {
-        if (bytes.len == 0) return;
-        // Cap matches `preview.stderr_buf`'s cap (16 KiB) so the panel
-        // never holds more than two windows' worth of stderr in flight.
-        const preview_tail_cap: usize = 16 * 1024;
-        if (bytes.len >= preview_tail_cap) {
-            // Single record already exceeds the cap — keep only the
-            // tail end.
-            self.preview_tail.clearRetainingCapacity();
-            const start = bytes.len - preview_tail_cap;
-            self.preview_tail.appendSlice(self.allocator, bytes[start..]) catch return;
-            return;
-        }
-        // Drop from the front if appending `bytes` would overflow.
-        if (self.preview_tail.items.len + bytes.len > preview_tail_cap) {
-            const need_to_drop = self.preview_tail.items.len + bytes.len - preview_tail_cap;
-            const remaining = self.preview_tail.items.len - need_to_drop;
-            std.mem.copyForwards(
-                u8,
-                self.preview_tail.items[0..remaining],
-                self.preview_tail.items[need_to_drop..],
-            );
-            self.preview_tail.shrinkRetainingCapacity(remaining);
-        }
-        self.preview_tail.appendSlice(self.allocator, bytes) catch return;
+        buf.appendCapped(&self.preview_tail, self.allocator, bytes, preview.stderr_cap, null);
     }
 
     pub fn stopPreview(self: *Self) void {
