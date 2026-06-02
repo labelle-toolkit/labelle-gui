@@ -9,6 +9,7 @@ const config = @import("config.zig");
 const prefs_mod = @import("prefs.zig");
 const App = @import("app.zig").App;
 const io_global = @import("io_global.zig");
+const preferences_dialog = @import("dialogs/preferences.zig");
 
 const gl = zopengl.bindings;
 
@@ -148,11 +149,15 @@ pub fn main(proc_init: std.process.Init.Minimal) !void {
     g_current_scale.store(scale_factor, .release);
     _ = window.setContentScaleCallback(contentScaleCallback);
 
-    // Load user preferences before sizing fonts — `font_scale` rides on
-    // top of the DPI factor (see `src/prefs.zig`). On first run or any
-    // read error this falls back to defaults, so the GUI always starts.
+    // Load user preferences before sizing fonts. The atlas is baked
+    // at the DPI-scaled base size; `font_scale` rides on top of that
+    // at draw time via `style.font_scale_main` (ImGui 1.92's dynamic
+    // atlas re-rasterises glyphs at any requested rendered size, so
+    // slider drags reflect crisply on the next frame — no rebuild).
+    // On first run or any read error this falls back to defaults, so
+    // the GUI always starts.
     const user_prefs = prefs_mod.loadOrDefault(allocator);
-    const font_size = config.ui.base_font_size * scale_factor * user_prefs.font_scale;
+    const font_size = config.ui.base_font_size * scale_factor;
 
     var default_config = zgui.FontConfig.init();
     default_config.size_pixels = font_size;
@@ -164,11 +169,11 @@ pub fn main(proc_init: std.process.Init.Minimal) !void {
     fa_config.glyph_min_advance_x = font_size;
     // FontAwesome glyphs sit above the default text baseline because the
     // icon designs center on the glyph box's visual middle while letters
-    // hang from the cap line. Push the merged icon range down by ~25 %
-    // of the active font size so folder/file icons sit centered against
-    // the x-height of their accompanying text (in the tree view and
-    // elsewhere). Proportional to font_size, so it scales correctly with
-    // DPI and the user's font-scale preference.
+    // hang from the cap line. Push the merged icon range down by ~10 %
+    // of the atlas-bake font size so folder/file icons sit centered
+    // against the x-height of their accompanying text. Computed against
+    // the unscaled font_size so the offset scales uniformly with text
+    // when `font_scale_main` changes at runtime — icons follow text.
     fa_config.glyph_offset = .{ 0.0, font_size * 0.1 };
     _ = zgui.io.addFontFromFileWithConfig(
         "assets/fonts/fa-solid-900.ttf",
@@ -177,7 +182,16 @@ pub fn main(proc_init: std.process.Init.Minimal) !void {
         &icons.FA_ICON_RANGES,
     );
 
+    // DPI scale lands on padding/border/spacing first so it forms the
+    // "natural" baseline that future font-scale changes scale on top
+    // of. `preferences_dialog.applyLive` captures the current style as
+    // the baseline on its first call, then applies the user's saved
+    // font_scale uniformly — text (via `style.font_scale_main`) AND
+    // padding/spacing (via `scaleAllSizes`). The Preferences dialog
+    // re-enters the same path on every slider edit so the whole layout
+    // (not just text) tracks the slider.
     zgui.getStyle().scaleAllSizes(scale_factor);
+    preferences_dialog.applyLive(user_prefs.font_scale);
 
     zgui.backend.init(window);
     defer zgui.backend.deinit();

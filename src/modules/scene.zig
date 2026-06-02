@@ -158,7 +158,13 @@ const splitter = @import("splitter.zig");
 /// scene-level header + controls across the top, then a viewport
 /// child on the left and an inspector child on the right.
 pub fn render(s: *SceneState, app: *App) void {
-    zgui.text("Scene: {s}", .{s.loaded.scene.name});
+    // RFC #596 dropped the on-disk `name` field — bundle scenes leave
+    // `loaded.scene.name` as the empty default. Identity now comes
+    // from the filename (already captured as `display_name` for the
+    // tab label), so the header sources from there too. Legacy /
+    // RFC #560 scenes that still carry `name` flow through bundle
+    // save and lose it on first re-save anyway.
+    zgui.text("Scene: {s}", .{s.display_name});
     zgui.sameLine(.{});
     zgui.text("(entities: {d})", .{s.loaded.scene.entities.len});
     if (s.is_dirty) {
