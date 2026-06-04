@@ -6557,6 +6557,35 @@ pub const FlowDocSubflowTests = struct {
     }
 };
 
+// ─── flow_doc: explicit exec-edge reconciliation (issues #193, #194) ─────
+
+/// Covers `flow_doc.isExplicitExecTarget` — the predicate that
+/// suppresses a contradictory *derived* exec arrow into a node that is
+/// already entered by an explicit `Branch`/loop control arrow.
+pub const FlowDocExecEdgeTests = struct {
+    test "isExplicitExecTarget flags only nodes that are exec-edge targets" {
+        const edges = [_]flow_io.ExecEdge{
+            .{ .from_node = 4, .from_pin = "then", .to_node = 6 },
+            .{ .from_node = 4, .from_pin = "else", .to_node = 7 },
+            .{ .from_node = 9, .from_pin = "body", .to_node = 10 },
+        };
+        // Targets (6, 7, 10) are entered by a control arrow — suppress
+        // their derived arrow.
+        try expect.toBeTrue(flow_doc.isExplicitExecTarget(&edges, 6));
+        try expect.toBeTrue(flow_doc.isExplicitExecTarget(&edges, 7));
+        try expect.toBeTrue(flow_doc.isExplicitExecTarget(&edges, 10));
+        // Source nodes and unrelated nodes keep the linear spine.
+        try expect.toBeTrue(!flow_doc.isExplicitExecTarget(&edges, 4));
+        try expect.toBeTrue(!flow_doc.isExplicitExecTarget(&edges, 9));
+        try expect.toBeTrue(!flow_doc.isExplicitExecTarget(&edges, 99));
+    }
+
+    test "isExplicitExecTarget is false for a flow with no exec edges" {
+        const none: []const flow_io.ExecEdge = &.{};
+        try expect.toBeTrue(!flow_doc.isExplicitExecTarget(none, 1));
+    }
+};
+
 // ─── flow_cycle: Subflow reference-cycle check (issue #159) ──────────────
 
 /// Covers `flow_cycle.detectCycle` (the pure DFS walk over the
