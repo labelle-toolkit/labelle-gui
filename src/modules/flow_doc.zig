@@ -1415,14 +1415,28 @@ fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Nod
             defer seen_in.deinit();
             var seen_out = PinNameSet.init(allocator);
             defer seen_out.deinit();
+            // On-disk `.flow.jsonc` edges + flow-codegen address CustomNode
+            // inputs *positionally* (`arg0`, `arg1`, …; codegen resolves
+            // `arg{d}`), not by catalog pin name. Render each input pin under
+            // its positional id so data edges resolve, while showing the
+            // catalog label for the human (labelle-gui#189). Static names
+            // keep `recordPin`'s borrowed slice valid past this frame.
+            const arg_pin_names = [_][]const u8{
+                "arg0", "arg1", "arg2",  "arg3",  "arg4",  "arg5",  "arg6",  "arg7",
+                "arg8", "arg9", "arg10", "arg11", "arg12", "arg13", "arg14", "arg15",
+            };
+            var in_idx: usize = 0;
             for (entry.pins) |p| switch (p.dir) {
                 .input => {
-                    const dup = (seen_in.fetchPut(p.name, {}) catch null) != null;
+                    if (in_idx >= arg_pin_names.len) continue;
+                    const arg_name = arg_pin_names[in_idx];
+                    in_idx += 1;
+                    const dup = (seen_in.fetchPut(arg_name, {}) catch null) != null;
                     if (dup) continue;
-                    ne.beginPin(pinId(n.id, p.name, .input), .input);
+                    ne.beginPin(pinId(n.id, arg_name, .input), .input);
                     zgui.text("> {s}: {s}", .{ p.label, p.type_name });
                     ne.endPin();
-                    recordPin(s, n.id, p.name, .input);
+                    recordPin(s, n.id, arg_name, .input);
                 },
                 .output => {
                     const dup = (seen_out.fetchPut(p.name, {}) catch null) != null;
@@ -1435,8 +1449,43 @@ fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Nod
             };
         },
         .other => {
-            // Show extras as a compact hint so the user can tell nodes
-            // apart even though the editor can't field-edit them.
+            // Value/expression node kinds the model doesn't field-edit but
+            // that DO carry data pins the edges reference. Pin names mirror
+            // flow-codegen's convention so links resolve (labelle-gui#189).
+            // String literals are static, so `recordPin`'s borrowed slice
+            // stays valid.
+            if (std.mem.eql(u8, n.type_name, "BinOp")) {
+                ne.beginPin(pinId(n.id, "a", .input), .input);
+                zgui.text("> a", .{});
+                ne.endPin();
+                recordPin(s, n.id, "a", .input);
+                ne.beginPin(pinId(n.id, "b", .input), .input);
+                zgui.text("> b", .{});
+                ne.endPin();
+                recordPin(s, n.id, "b", .input);
+                ne.beginPin(pinId(n.id, "result", .output), .output);
+                zgui.text("result >", .{});
+                ne.endPin();
+                recordPin(s, n.id, "result", .output);
+            } else if (std.mem.eql(u8, n.type_name, "Literal") or
+                std.mem.eql(u8, n.type_name, "Identifier"))
+            {
+                ne.beginPin(pinId(n.id, "value", .output), .output);
+                zgui.text("value >", .{});
+                ne.endPin();
+                recordPin(s, n.id, "value", .output);
+            } else if (std.mem.eql(u8, n.type_name, "SetField")) {
+                ne.beginPin(pinId(n.id, "entity", .input), .input);
+                zgui.text("> entity", .{});
+                ne.endPin();
+                recordPin(s, n.id, "entity", .input);
+                ne.beginPin(pinId(n.id, "value", .input), .input);
+                zgui.text("> value", .{});
+                ne.endPin();
+                recordPin(s, n.id, "value", .input);
+            }
+            // Show extras as a compact hint (e.g. BinOp `op`, Literal
+            // `value`) so the user can tell nodes apart.
             for (n.extras) |kv| {
                 zgui.textDisabled("{s}: {s}", .{ kv.key, kv.value_text });
             }
