@@ -326,16 +326,26 @@ pub const OtherFieldSpec = struct {
     /// Inspector label shown next to the widget.
     label: []const u8,
     widget: OtherFieldWidget,
+    /// Closed choice list for `.op_combo` (empty for other widgets).
+    choices: []const []const u8 = &.{},
 };
 
 /// The closed list of `BinOp.op` values offered by the combo box.
 pub const bin_ops = [_][]const u8{ "add", "sub", "mul", "div" };
 
+/// `Compare.op` values — comparison operators (flow-codegen#7).
+pub const compare_ops = [_][]const u8{ "eq", "ne", "lt", "le", "gt", "ge" };
+
+/// `Logic.op` values — boolean operators (flow-codegen#7).
+pub const logic_ops = [_][]const u8{ "and", "or", "not" };
+
 /// Recognised `.other` node types and their one editable field. Keeping
 /// this in `flow_io` (next to the model) makes it unit-testable without
 /// a GUI and keeps the editor a thin consumer.
 pub const other_field_specs = [_]OtherFieldSpec{
-    .{ .type_name = "BinOp", .key = "op", .label = "Operator", .widget = .op_combo },
+    .{ .type_name = "BinOp", .key = "op", .label = "Operator", .widget = .op_combo, .choices = &bin_ops },
+    .{ .type_name = "Compare", .key = "op", .label = "Comparison", .widget = .op_combo, .choices = &compare_ops },
+    .{ .type_name = "Logic", .key = "op", .label = "Logic", .widget = .op_combo, .choices = &logic_ops },
     .{ .type_name = "GetComponent", .key = "component", .label = "Component", .widget = .text },
     .{ .type_name = "SetField", .key = "target", .label = "Target", .widget = .text },
     .{ .type_name = "Literal", .key = "value", .label = "Value", .widget = .literal },

@@ -1454,7 +1454,11 @@ fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Nod
             // flow-codegen's convention so links resolve (labelle-gui#189).
             // String literals are static, so `recordPin`'s borrowed slice
             // stays valid.
-            if (std.mem.eql(u8, n.type_name, "BinOp")) {
+            if (std.mem.eql(u8, n.type_name, "BinOp") or
+                std.mem.eql(u8, n.type_name, "Compare"))
+            {
+                // Arithmetic (BinOp) and comparison (Compare) share the
+                // binary a/b -> result shape (flow-codegen#7).
                 ne.beginPin(pinId(n.id, "a", .input), .input);
                 zgui.text("> a", .{});
                 ne.endPin();
@@ -1463,6 +1467,29 @@ fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Nod
                 zgui.text("> b", .{});
                 ne.endPin();
                 recordPin(s, n.id, "b", .input);
+                ne.beginPin(pinId(n.id, "result", .output), .output);
+                zgui.text("result >", .{});
+                ne.endPin();
+                recordPin(s, n.id, "result", .output);
+            } else if (std.mem.eql(u8, n.type_name, "Logic")) {
+                // Boolean logic (flow-codegen#7): `not` is unary (`a`
+                // only), `and`/`or` are binary. Read the op from extras to
+                // decide whether to expose the `b` pin.
+                var logic_unary = false;
+                for (n.extras) |kv| {
+                    if (std.mem.eql(u8, kv.key, "op") and
+                        std.mem.eql(u8, kv.value_text, "not")) logic_unary = true;
+                }
+                ne.beginPin(pinId(n.id, "a", .input), .input);
+                zgui.text("> a", .{});
+                ne.endPin();
+                recordPin(s, n.id, "a", .input);
+                if (!logic_unary) {
+                    ne.beginPin(pinId(n.id, "b", .input), .input);
+                    zgui.text("> b", .{});
+                    ne.endPin();
+                    recordPin(s, n.id, "b", .input);
+                }
                 ne.beginPin(pinId(n.id, "result", .output), .output);
                 zgui.text("result >", .{});
                 ne.endPin();
@@ -2552,13 +2579,13 @@ fn renderOtherField(s: *FlowDocState, n: *flow_io.Node, spec: flow_io.OtherField
                 // and could never be committed — the combo would show
                 // `add` without it ever being written to the node.
                 var sel: ?usize = null;
-                for (flow_io.bin_ops, 0..) |op, i| {
+                for (spec.choices, 0..) |op, i| {
                     if (std.mem.eql(u8, op, decoded.text)) sel = i;
                 }
                 var preview_z: IdentBuf = undefined;
-                seedBuf(&preview_z, if (sel) |i| flow_io.bin_ops[i] else "");
+                seedBuf(&preview_z, if (sel) |i| spec.choices[i] else "");
                 if (zgui.beginCombo("##other_op", .{ .preview_value = &preview_z })) {
-                    for (flow_io.bin_ops, 0..) |op, i| {
+                    for (spec.choices, 0..) |op, i| {
                         var op_z: IdentBuf = undefined;
                         seedBuf(&op_z, op);
                         if (zgui.selectable(&op_z, .{ .selected = sel == i })) {

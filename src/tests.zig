@@ -5401,6 +5401,13 @@ pub const FlowIoTests = struct {
         try expect.toBeTrue(flow_io.otherFieldSpec("Literal").?.widget == .literal);
         try expect.toBeTrue(std.mem.eql(u8, flow_io.otherFieldSpec("Identifier").?.key, "name"));
         try expect.toBeTrue(std.mem.eql(u8, flow_io.otherFieldSpec("Call").?.key, "callee"));
+        // Comparison + boolean operators (flow-codegen#7) — op_combo with
+        // their own choice lists, distinct from BinOp's arithmetic ops.
+        try expect.toBeTrue(flow_io.otherFieldSpec("Compare").?.widget == .op_combo);
+        try expect.equal(flow_io.otherFieldSpec("Compare").?.choices.len, @as(usize, 6));
+        try expect.toBeTrue(flow_io.otherFieldSpec("Logic").?.widget == .op_combo);
+        try expect.equal(flow_io.otherFieldSpec("Logic").?.choices.len, @as(usize, 3));
+        try expect.equal(flow_io.otherFieldSpec("BinOp").?.choices.len, @as(usize, 4));
         // A genuinely-unknown node type has no spec → verbatim fallback.
         try expect.toBeTrue(flow_io.otherFieldSpec("MysteryNode") == null);
     }
