@@ -5251,12 +5251,14 @@ pub const PluginEventsRfcTests = struct {
     }
 
     test "bouncing-ball hit_counter.flow.jsonc parses as v2-form (Event node + variables)" {
-        // Real-file ingestion test — flow-codegen `a8be4c1` migrated
-        // this in-tree example to the v2 vocabulary (RFC-FLOW-VOCABULARY
-        // phase 3): the trigger lives ON the canvas as an `Event` node
-        // and the counter is a declared top-level `Variable`, not a
-        // sidecar `.zig`. The editor must load it without the legacy
-        // `event:` header.
+        // Real-file ingestion test. The in-tree example uses the v2
+        // vocabulary (RFC-FLOW-VOCABULARY phase 3): the trigger lives ON
+        // the canvas as an `Event` node and the counter is a declared
+        // top-level `Variable`, not a sidecar `.zig`. The example is now
+        // the explicit data-flow form — Event → GetVariable + Literal →
+        // BinOp(add) → SetVariable, plus a `log_i32` CustomNode — which
+        // exercises the data-node pin rendering this PR adds. Assert by
+        // scanning kinds so the test isn't brittle to node ordering.
         const a = std.testing.allocator;
         const path = "../bouncing-ball/scripts/flows/hit_counter.flow.jsonc";
 
@@ -5272,12 +5274,36 @@ pub const PluginEventsRfcTests = struct {
         // No file-level event header — the trigger is on-canvas now.
         try expect.toBeTrue(!doc.event_present);
 
-        // Two nodes: the `Event` trigger + the `ChangeVariable` action.
-        try expect.equal(doc.nodes.len, @as(usize, 2));
-        try expect.toBeTrue(doc.nodes[0].kind == .event);
-        try expect.toBeTrue(std.mem.eql(u8, doc.nodes[0].event_ref, "box2d.collision_begin"));
-        try expect.toBeTrue(doc.nodes[1].kind == .change_variable);
-        try expect.toBeTrue(std.mem.eql(u8, doc.nodes[1].variable_ref, "hits"));
+        var has_event = false;
+        var has_get = false;
+        var has_set = false;
+        var has_binop = false;
+        var has_log = false;
+        for (doc.nodes) |node| {
+            switch (node.kind) {
+                .event => if (std.mem.eql(u8, node.event_ref, "box2d.collision_begin")) {
+                    has_event = true;
+                },
+                .get_variable => if (std.mem.eql(u8, node.variable_ref, "hits")) {
+                    has_get = true;
+                },
+                .set_variable => if (std.mem.eql(u8, node.variable_ref, "hits")) {
+                    has_set = true;
+                },
+                .custom_node => if (std.mem.eql(u8, node.custom_name, "bouncing_ball.log_i32")) {
+                    has_log = true;
+                },
+                .other => if (std.mem.eql(u8, node.type_name, "BinOp")) {
+                    has_binop = true;
+                },
+                else => {},
+            }
+        }
+        try expect.toBeTrue(has_event);
+        try expect.toBeTrue(has_get);
+        try expect.toBeTrue(has_set);
+        try expect.toBeTrue(has_binop);
+        try expect.toBeTrue(has_log);
 
         // One declared variable.
         try expect.equal(doc.variables.len, @as(usize, 1));
