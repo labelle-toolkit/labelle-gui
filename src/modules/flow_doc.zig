@@ -3147,6 +3147,15 @@ fn deleteNode(s: *FlowDocState, id: u32) !void {
         try kept.append(a, e);
     }
     s.doc.edges = try kept.toOwnedSlice(a);
+    // Drop any exec edges touching the deleted node too — otherwise a
+    // dangling `exec_edges` entry survives the delete and corrupts the
+    // control flow on save (flow-codegen#8/#21, bugbot).
+    var kept_exec: std.ArrayList(flow_io.ExecEdge) = .empty;
+    for (s.doc.exec_edges) |x| {
+        if (x.from_node == id or x.to_node == id) continue;
+        try kept_exec.append(a, x);
+    }
+    s.doc.exec_edges = try kept_exec.toOwnedSlice(a);
     s.is_dirty = true;
 }
 
