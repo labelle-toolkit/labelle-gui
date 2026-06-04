@@ -1288,7 +1288,14 @@ fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Nod
     // re-route an exec arrow, they only see what the topo sort
     // produced.
     const is_command = isCommandNode(n);
-    if (is_command and n.kind != .event) {
+    // The exec-in anchor is where an incoming control arrow lands. Emit it
+    // for command nodes (the derived linear spine) AND for any explicit
+    // `exec_edge` target — a branch/loop body node may be `.other` (e.g. a
+    // nested Branch/loop) and still needs the anchor, else the amber
+    // control arrow has nothing to attach to (labelle-gui#193/#194, bugbot).
+    const needs_exec_in = (is_command or
+        isExplicitExecTarget(s.doc.exec_edges, n.id)) and n.kind != .event;
+    if (needs_exec_in) {
         ne.beginPin(execPinId(n.id, .input), .input);
         zgui.text("▼", .{});
         ne.endPin();
