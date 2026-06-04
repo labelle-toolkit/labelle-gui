@@ -566,6 +566,20 @@ pub const Edge = struct {
     to_pin: []const u8,
 };
 
+/// One control-flow (execution) edge — the top-level `exec_edges` block
+/// (flow-codegen#8, #21). Distinct from a data `Edge`: the source is a
+/// named exec-output pin on a `Branch` (`then`/`else`) or loop
+/// (`ForRange`/`While` → `body`); the target is a *bare* node ref (the
+/// node is *entered*, not wired to an input pin), so there's no
+/// `to_pin`. Mirrors flow-codegen's `ExecEdge`
+/// (`flow-codegen/src/flow_io.zig`), flattened to match the shape of
+/// `Edge` above.
+pub const ExecEdge = struct {
+    from_node: u32,
+    from_pin: []const u8,
+    to_node: u32,
+};
+
 /// The flow's entry point. `type` is a lifecycle event name (e.g.
 /// `OnCreate`) or `OnCall` for a subgraph (RFC §3). `arg_entity` and any
 /// other event keys are captured in `extras` so they round-trip.
@@ -629,6 +643,13 @@ pub const FlowDoc = struct {
     variables: []Variable = &.{},
     nodes: []Node = &.{},
     edges: []Edge = &.{},
+    /// Control-flow (execution) edges (flow-codegen#8, #21). Empty for
+    /// every flow that declares no `Branch`/`ForRange`/`While` node — the
+    /// default and the only shape that existed before control flow.
+    /// Absence in the source file is indistinguishable from
+    /// `"exec_edges": []`; the writer emits the key only when non-empty so
+    /// pre-control-flow files round-trip byte-for-byte.
+    exec_edges: []ExecEdge = &.{},
     /// Highest node id seen — the editor allocates fresh ids above this.
     max_node_id: u32 = 0,
 
@@ -739,6 +760,14 @@ pub fn parse(child_allocator: std.mem.Allocator, raw: []const u8) !FlowDoc {
     if (root.get("edges")) |v| {
         if (v != .array) return ParseError.BadSchema;
         doc.edges = try parseEdges(a, v.array);
+    }
+
+    // ── exec_edges ── (flow-codegen#8, #21) Control-flow edges. Absent →
+    // empty slice; the writer then omits the key so the file round-trips
+    // byte-for-byte.
+    if (root.get("exec_edges")) |v| {
+        if (v != .array) return ParseError.BadSchema;
+        doc.exec_edges = try parseExecEdges(a, v.array);
     }
 
     return doc;
@@ -1032,6 +1061,31 @@ fn parseEndpoint(a: std.mem.Allocator, obj: std.json.ObjectMap) !Endpoint {
     return .{ .node = node, .pin = try a.dupe(u8, pin_v.string) };
 }
 
+/// Parse the top-level `exec_edges` array (flow-codegen#8, #21). Each
+/// entry is `{ "from": { "node", "pin" }, "to": { "node" } }`: `from` is
+/// a full pin ref (the named exec output — `then`/`else`/`body`); `to` is
+/// a *bare* node ref with no `pin` (the target node is entered, not wired
+/// to an input).
+fn parseExecEdges(a: std.mem.Allocator, arr: std.json.Array) ![]ExecEdge {
+    var out: std.ArrayList(ExecEdge) = .empty;
+    for (arr.items) |item| {
+        if (item != .object) return ParseError.BadEdge;
+        const o = item.object;
+        const from = o.get("from") orelse return ParseError.BadEdge;
+        const to = o.get("to") orelse return ParseError.BadEdge;
+        if (from != .object or to != .object) return ParseError.BadEdge;
+        const fe = try parseEndpoint(a, from.object);
+        const to_node_v = to.object.get("node") orelse return ParseError.BadEdge;
+        const to_node = jsonIntId(to_node_v) orelse return ParseError.BadEdge;
+        try out.append(a, .{
+            .from_node = fe.node,
+            .from_pin = fe.pin,
+            .to_node = to_node,
+        });
+    }
+    return out.toOwnedSlice(a);
+}
+
 /// Read a JSON number expected to be a non-negative `u32` node id.
 /// Accepts a plain integer, and also a float (or `number_string`) that
 /// has no fractional part — hand-authored files and exporters often
@@ -1316,10 +1370,17 @@ pub fn render(child_allocator: std.mem.Allocator, doc: FlowDoc) ![]u8 {
     }
 
     // edges
+    //
+    // The `edges` block carries a trailing comma only when an `exec_edges`
+    // block follows it — emitted (below) only when non-empty so
+    // pre-control-flow files round-trip byte-for-byte. This mirrors
+    // flow-codegen's writer (`renderFlowJsonc` → the `flow.exec_edges.len
+    // == 0` branch).
+    const has_exec = doc.exec_edges.len > 0;
     try out.appendSlice(a, indent_unit);
     try out.appendSlice(a, "\"edges\": [");
     if (doc.edges.len == 0) {
-        try out.appendSlice(a, "]\n");
+        try out.appendSlice(a, if (has_exec) "],\n" else "]\n");
     } else {
         try out.append(a, '\n');
         for (doc.edges, 0..) |e, i| {
@@ -1333,11 +1394,48 @@ pub fn render(child_allocator: std.mem.Allocator, doc: FlowDoc) ![]u8 {
             try out.append(a, '\n');
         }
         try out.appendSlice(a, indent_unit);
+        try out.appendSlice(a, if (has_exec) "],\n" else "]\n");
+    }
+
+    // exec_edges (flow-codegen#8, #21) — control-flow edges. Emitted only
+    // when non-empty, deterministically sorted to match flow-codegen's
+    // `lessThanExecEdge` (by source node id, then exec pin lexically —
+    // `else` < `then` — then target node) so editor re-saves stay
+    // diff-clean and byte-compatible with codegen's own writer. Each entry
+    // is `{ "from": { "node": N, "pin": "<pin>" }, "to": { "node": M } }`
+    // (bare target node ref, no `pin`).
+    if (has_exec) {
+        const sorted = try a.dupe(ExecEdge, doc.exec_edges);
+        defer a.free(sorted);
+        std.mem.sort(ExecEdge, sorted, {}, execEdgeLessThan);
+
+        try out.appendSlice(a, indent_unit);
+        try out.appendSlice(a, "\"exec_edges\": [\n");
+        for (sorted, 0..) |x, i| {
+            try out.appendSlice(a, indent_unit ** 2);
+            try out.print(a, "{{ \"from\": {{ \"node\": {d}, \"pin\": ", .{x.from_node});
+            try writeJsonString(a, &out, x.from_pin);
+            try out.print(a, " }}, \"to\": {{ \"node\": {d} }} }}", .{x.to_node});
+            if (i + 1 < sorted.len) try out.append(a, ',');
+            try out.append(a, '\n');
+        }
+        try out.appendSlice(a, indent_unit);
         try out.appendSlice(a, "]\n");
     }
 
     try out.appendSlice(a, "}\n");
     return out.toOwnedSlice(a);
+}
+
+/// Deterministic order for exec edges (flow-codegen#8) — by source node
+/// id, then exec pin lexically (`else` < `then`; `body` is the loops'
+/// only pin), then target node. Mirrors flow-codegen's `lessThanExecEdge`
+/// so editor re-saves stay byte-compatible with codegen's writer.
+fn execEdgeLessThan(_: void, x: ExecEdge, y: ExecEdge) bool {
+    if (x.from_node != y.from_node) return x.from_node < y.from_node;
+    const fp = std.mem.order(u8, x.from_pin, y.from_pin);
+    if (fp != .eq) return fp == .lt;
+    return x.to_node < y.to_node;
 }
 
 fn renderNode(a: std.mem.Allocator, out: *std.ArrayList(u8), n: Node) !void {
@@ -1626,6 +1724,132 @@ test "empty graph round-trips" {
     const text2 = try render(std.testing.allocator, doc2);
     defer std.testing.allocator.free(text2);
     try std.testing.expectEqualStrings(text, text2);
+}
+
+test "exec_edges round-trip preserves a Branch's then/else control flow" {
+    // A Branch flow: `cond` is a data edge into node 4; `then`/`else` are
+    // exec edges (flow-codegen#8). Loading then saving must NOT drop the
+    // `exec_edges` block — doing so silently corrupts the control flow.
+    const src =
+        \\{
+        \\  "event": { "type": "OnUpdate" },
+        \\  "nodes": [
+        \\    { "id": 1, "type": "Literal", "pos": [0, 0] },
+        \\    { "id": 4, "type": "Branch", "pos": [5, 0] },
+        \\    { "id": 6, "type": "Print", "pos": [10, 0] },
+        \\    { "id": 7, "type": "Print", "pos": [10, 5] }
+        \\  ],
+        \\  "edges": [
+        \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 4, "pin": "cond" } }
+        \\  ],
+        \\  "exec_edges": [
+        \\    { "from": { "node": 4, "pin": "then" }, "to": { "node": 6 } },
+        \\    { "from": { "node": 4, "pin": "else" }, "to": { "node": 7 } }
+        \\  ]
+        \\}
+    ;
+    var doc = try parse(std.testing.allocator, src);
+    defer doc.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), doc.exec_edges.len);
+    // Parsed in source order (sorting happens at render time).
+    try std.testing.expectEqual(@as(u32, 4), doc.exec_edges[0].from_node);
+    try std.testing.expectEqualStrings("then", doc.exec_edges[0].from_pin);
+    try std.testing.expectEqual(@as(u32, 6), doc.exec_edges[0].to_node);
+    try std.testing.expectEqual(@as(u32, 4), doc.exec_edges[1].from_node);
+    try std.testing.expectEqualStrings("else", doc.exec_edges[1].from_pin);
+    try std.testing.expectEqual(@as(u32, 7), doc.exec_edges[1].to_node);
+
+    const text = try render(std.testing.allocator, doc);
+    defer std.testing.allocator.free(text);
+
+    // The writer must emit the `exec_edges` block, deterministically
+    // sorted (`else` < `then`) to match flow-codegen's `lessThanExecEdge`,
+    // with `to` as a bare node ref (no `pin`).
+    const expected =
+        \\  "exec_edges": [
+        \\    { "from": { "node": 4, "pin": "else" }, "to": { "node": 7 } },
+        \\    { "from": { "node": 4, "pin": "then" }, "to": { "node": 6 } }
+        \\  ]
+    ;
+    try std.testing.expect(std.mem.indexOf(u8, text, expected) != null);
+
+    // Round-trip stability: re-parse + re-render is byte-identical, and
+    // the entries survive unchanged.
+    var doc2 = try parse(std.testing.allocator, text);
+    defer doc2.deinit();
+    try std.testing.expectEqual(@as(usize, 2), doc2.exec_edges.len);
+    const text2 = try render(std.testing.allocator, doc2);
+    defer std.testing.allocator.free(text2);
+    try std.testing.expectEqualStrings(text, text2);
+}
+
+test "exec_edges sort is stable across unsorted input (body + then/else)" {
+    // Deliberately out-of-order input — the writer sorts by from_node,
+    // then pin lexically, then to_node (matching flow-codegen).
+    const src =
+        \\{
+        \\  "nodes": [
+        \\    { "id": 2, "type": "ForRange", "pos": [0, 0] },
+        \\    { "id": 5, "type": "Branch", "pos": [0, 0] }
+        \\  ],
+        \\  "edges": [],
+        \\  "exec_edges": [
+        \\    { "from": { "node": 5, "pin": "then" }, "to": { "node": 9 } },
+        \\    { "from": { "node": 2, "pin": "body" }, "to": { "node": 8 } },
+        \\    { "from": { "node": 5, "pin": "else" }, "to": { "node": 3 } }
+        \\  ]
+        \\}
+    ;
+    var doc = try parse(std.testing.allocator, src);
+    defer doc.deinit();
+    const text = try render(std.testing.allocator, doc);
+    defer std.testing.allocator.free(text);
+
+    const expected =
+        \\  "exec_edges": [
+        \\    { "from": { "node": 2, "pin": "body" }, "to": { "node": 8 } },
+        \\    { "from": { "node": 5, "pin": "else" }, "to": { "node": 3 } },
+        \\    { "from": { "node": 5, "pin": "then" }, "to": { "node": 9 } }
+        \\  ]
+    ;
+    try std.testing.expect(std.mem.indexOf(u8, text, expected) != null);
+}
+
+test "absence of exec_edges is preserved (no key emitted)" {
+    // A flow with no control-flow nodes must NOT gain an `exec_edges`
+    // key — pre-control-flow files round-trip byte-for-byte, and the
+    // `edges` block keeps its no-trailing-comma close.
+    const src =
+        \\{ "event": { "type": "OnCreate" }, "nodes": [], "edges": [] }
+    ;
+    var doc = try parse(std.testing.allocator, src);
+    defer doc.deinit();
+    try std.testing.expectEqual(@as(usize, 0), doc.exec_edges.len);
+    const text = try render(std.testing.allocator, doc);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "exec_edges") == null);
+    // `edges` closes with `]` (no trailing comma) when no exec block follows.
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"edges\": []\n") != null);
+}
+
+test "exec_edges parser rejects malformed entries" {
+    // Non-array exec_edges.
+    try std.testing.expectError(ParseError.BadSchema, parse(std.testing.allocator,
+        \\{ "nodes": [], "edges": [], "exec_edges": {} }
+    ));
+    // Missing `to`.
+    try std.testing.expectError(ParseError.BadEdge, parse(std.testing.allocator,
+        \\{ "nodes": [], "edges": [], "exec_edges": [ { "from": { "node": 1, "pin": "then" } } ] }
+    ));
+    // `from` missing pin.
+    try std.testing.expectError(ParseError.BadEdge, parse(std.testing.allocator,
+        \\{ "nodes": [], "edges": [], "exec_edges": [ { "from": { "node": 1 }, "to": { "node": 2 } } ] }
+    ));
+    // `to` missing node.
+    try std.testing.expectError(ParseError.BadEdge, parse(std.testing.allocator,
+        \\{ "nodes": [], "edges": [], "exec_edges": [ { "from": { "node": 1, "pin": "then" }, "to": {} } ] }
+    ));
 }
 
 test "displayNameFromPath strips extension" {

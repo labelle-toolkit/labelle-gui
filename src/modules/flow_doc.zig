@@ -610,6 +610,14 @@ fn renderCanvas(s: *FlowDocState, allocator: std.mem.Allocator) void {
     // a graceful reject).
     renderExecEdges(s, allocator);
 
+    // Explicit control-flow arrows (issues #193, #194). The on-disk
+    // `exec_edges` block wires a `Branch`'s `then`/`else` or a loop's
+    // `body` to the entered node. Drawn after the derived spine so a
+    // target node that is an explicit exec-edge destination shows the
+    // real branch/loop arrow instead of (or in addition to) the linear
+    // derived arrow `renderExecEdges` would otherwise imply.
+    renderExplicitExecEdges(s);
+
     // Edge authoring (issue #158) — turn a pin drag into a new
     // `flow_io.Edge`, re-route an existing edge's endpoint, or a delete
     // gesture into an edge removal. All gestures are inspected *after*
@@ -642,6 +650,15 @@ fn renderExecEdges(s: *FlowDocState, allocator: std.mem.Allocator) void {
     while (i < order.len) : (i += 1) {
         const from = order[i - 1];
         const to = order[i];
+        // Reconcile with explicit control flow (issues #193, #194): a
+        // node that is the *target* of an `exec_edge` is entered by a
+        // branch/loop arrow, not by the linear command spine — drawing a
+        // derived arrow into it from its topo predecessor would
+        // double/contradict the control flow. Suppress it; the explicit
+        // arrow is drawn by `renderExplicitExecEdges`. (Branch/loop nodes
+        // themselves are `.other`, already off the command spine, so
+        // their outgoing flow never appears here.)
+        if (isExplicitExecTarget(s.doc.exec_edges, to)) continue;
         const from_pin = execPinId(from, .output);
         const to_pin = execPinId(to, .input);
         _ = ne.link(
@@ -652,6 +669,40 @@ fn renderExecEdges(s: *FlowDocState, allocator: std.mem.Allocator) void {
             2.5,
         );
         s.exec_links_last_frame += 1;
+    }
+}
+
+/// Whether `node_id` is the target of any on-disk `exec_edge` — i.e.
+/// it is entered by a `Branch`/`ForRange`/`While` control arrow rather
+/// than by the linear command spine. Used to suppress a contradictory
+/// derived arrow into it (issues #193, #194).
+pub fn isExplicitExecTarget(exec_edges: []const flow_io.ExecEdge, node_id: u32) bool {
+    for (exec_edges) |x| {
+        if (x.to_node == node_id) return true;
+    }
+    return false;
+}
+
+/// Draw the on-disk `exec_edges` as control arrows (issues #193, #194):
+/// for each edge, a link from the source node's named exec-output pin
+/// (`then`/`else`/`body`, drawn by `renderExecOutPin`) to the TARGET
+/// node's exec-in anchor. Visually distinct from the cyan data edges:
+/// a thick warm-amber arrow (versus the white derived spine and the
+/// cyan data links) so control branches read at a glance. Like the
+/// derived arrows these are read-only — the link ids don't match any
+/// `doc.edges[i]`, so a delete/re-route gesture bottoms out in
+/// "unknown id" and is gracefully rejected.
+fn renderExplicitExecEdges(s: *FlowDocState) void {
+    for (s.doc.exec_edges) |x| {
+        const from_pin = pinId(x.from_node, x.from_pin, .output);
+        const to_pin = execPinId(x.to_node, .input);
+        _ = ne.link(
+            explicitExecLinkId(x.from_node, x.from_pin, x.to_node),
+            from_pin,
+            to_pin,
+            .{ 1.0, 0.65, 0.2, 1.0 },
+            3.0,
+        );
     }
 }
 
@@ -778,6 +829,26 @@ fn execPinId(node_id: u32, dir: PinDir) u64 {
     return if (dir == .output) base | (@as(u64, 1) << 62) else base;
 }
 
+/// Draw a *named* exec OUTPUT pin (`then` / `else` on a `Branch`,
+/// `body` on a `ForRange` / `While`) — the source side of an on-disk
+/// `exec_edge` (issues #193, #194). Distinct from `execPinId`'s
+/// top/bottom command anchors: a named exec output sits inline in the
+/// node body next to its label, so its id is `pinId(node, name,
+/// .output)` (the loop/branch nodes carry no *data* output pin with
+/// these names, so there's no clash — `ForRange.index` is the one data
+/// output and is named differently).
+///
+/// Deliberately *not* `recordPin`'d: like the derived exec anchors,
+/// these are read-only this PR — a drag onto them fails the `findPin`
+/// lookup and the editor rejects it. Authoring exec edges by dragging
+/// is a follow-up (issues #193/#194 "Author"); this PR renders and
+/// round-trips hand-authored / codegen-emitted edges.
+fn renderExecOutPin(node_id: u32, name: []const u8) void {
+    ne.beginPin(pinId(node_id, name, .output), .output);
+    zgui.text("{s} ▸", .{name});
+    ne.endPin();
+}
+
 /// Synthetic link id for a derived exec arrow from `from_node`'s
 /// exec-out to `to_node`'s exec-in. Lives in the link namespace
 /// (bit 63 = 1) like `linkId`, hashed off the two endpoints so the
@@ -794,6 +865,22 @@ fn execPinId(node_id: u32, dir: PinDir) u64 {
 fn execLinkId(from_node: u32, to_node: u32) u64 {
     var h = std.hash.Wyhash.init(0xEC1ED6E);
     h.update(std.mem.asBytes(&from_node));
+    h.update(std.mem.asBytes(&to_node));
+    return (h.final() & 0x7FFF_FFFF_FFFF_FFFF) | (@as(u64, 1) << 63);
+}
+
+/// Synthetic link id for an *explicit* exec arrow from a named exec
+/// output pin (`then`/`else`/`body`) to its target node's exec-in
+/// (issues #193, #194). Distinct seed from `execLinkId` so a derived
+/// and an explicit arrow between the same node pair never collide on
+/// one id; the `from_pin` is mixed in so a Branch's `then` and `else`
+/// arrows to the *same* target stay distinct. Lives in the link
+/// namespace (bit 63 = 1) like `linkId`/`execLinkId`.
+fn explicitExecLinkId(from_node: u32, from_pin: []const u8, to_node: u32) u64 {
+    var h = std.hash.Wyhash.init(0xE6E07);
+    h.update(std.mem.asBytes(&from_node));
+    h.update(from_pin);
+    h.update(&[_]u8{0}); // delimiter, as in `linkId`
     h.update(std.mem.asBytes(&to_node));
     return (h.final() & 0x7FFF_FFFF_FFFF_FFFF) | (@as(u64, 1) << 63);
 }
@@ -1201,7 +1288,14 @@ fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Nod
     // re-route an exec arrow, they only see what the topo sort
     // produced.
     const is_command = isCommandNode(n);
-    if (is_command and n.kind != .event) {
+    // The exec-in anchor is where an incoming control arrow lands. Emit it
+    // for command nodes (the derived linear spine) AND for any explicit
+    // `exec_edge` target — a branch/loop body node may be `.other` (e.g. a
+    // nested Branch/loop) and still needs the anchor, else the amber
+    // control arrow has nothing to attach to (labelle-gui#193/#194, bugbot).
+    const needs_exec_in = (is_command or
+        isExplicitExecTarget(s.doc.exec_edges, n.id)) and n.kind != .event;
+    if (needs_exec_in) {
         ne.beginPin(execPinId(n.id, .input), .input);
         zgui.text("▼", .{});
         ne.endPin();
@@ -1510,6 +1604,49 @@ fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Nod
                 zgui.text("> value", .{});
                 ne.endPin();
                 recordPin(s, n.id, "value", .input);
+            } else if (std.mem.eql(u8, n.type_name, "Branch")) {
+                // Control-flow if/then-else (flow-codegen#8, issue #193).
+                // Data INPUT `cond`; two exec OUTPUT pins `then`/`else`.
+                // The `cond` pin is recorded so data edges into it draw
+                // and can be authored; the exec outputs are *not* recorded
+                // (read-only, like the derived exec anchors) — their links
+                // come from the on-disk `exec_edges`, drawn by
+                // `renderExplicitExecEdges`.
+                ne.beginPin(pinId(n.id, "cond", .input), .input);
+                zgui.text("> cond", .{});
+                ne.endPin();
+                recordPin(s, n.id, "cond", .input);
+                renderExecOutPin(n.id, "then");
+                renderExecOutPin(n.id, "else");
+            } else if (std.mem.eql(u8, n.type_name, "ForRange")) {
+                // Counted loop (flow-codegen#21, issue #194). Data inputs
+                // `start`/`end`/`step`; data OUTPUT `index`; exec OUTPUT
+                // `body` (the loop body's entry).
+                ne.beginPin(pinId(n.id, "start", .input), .input);
+                zgui.text("> start", .{});
+                ne.endPin();
+                recordPin(s, n.id, "start", .input);
+                ne.beginPin(pinId(n.id, "end", .input), .input);
+                zgui.text("> end", .{});
+                ne.endPin();
+                recordPin(s, n.id, "end", .input);
+                ne.beginPin(pinId(n.id, "step", .input), .input);
+                zgui.text("> step", .{});
+                ne.endPin();
+                recordPin(s, n.id, "step", .input);
+                ne.beginPin(pinId(n.id, "index", .output), .output);
+                zgui.text("index >", .{});
+                ne.endPin();
+                recordPin(s, n.id, "index", .output);
+                renderExecOutPin(n.id, "body");
+            } else if (std.mem.eql(u8, n.type_name, "While")) {
+                // Conditional loop (flow-codegen#21, issue #194). Data
+                // input `cond`; exec OUTPUT `body`.
+                ne.beginPin(pinId(n.id, "cond", .input), .input);
+                zgui.text("> cond", .{});
+                ne.endPin();
+                recordPin(s, n.id, "cond", .input);
+                renderExecOutPin(n.id, "body");
             }
             // Show extras as a compact hint (e.g. BinOp `op`, Literal
             // `value`) so the user can tell nodes apart.
@@ -3010,6 +3147,15 @@ fn deleteNode(s: *FlowDocState, id: u32) !void {
         try kept.append(a, e);
     }
     s.doc.edges = try kept.toOwnedSlice(a);
+    // Drop any exec edges touching the deleted node too — otherwise a
+    // dangling `exec_edges` entry survives the delete and corrupts the
+    // control flow on save (flow-codegen#8/#21, bugbot).
+    var kept_exec: std.ArrayList(flow_io.ExecEdge) = .empty;
+    for (s.doc.exec_edges) |x| {
+        if (x.from_node == id or x.to_node == id) continue;
+        try kept_exec.append(a, x);
+    }
+    s.doc.exec_edges = try kept_exec.toOwnedSlice(a);
     s.is_dirty = true;
 }
 
