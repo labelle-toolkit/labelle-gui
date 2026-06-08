@@ -6825,6 +6825,16 @@ pub const FlowDocExecEdgeTests = struct {
         try expect.toBeTrue(flow_doc.switchCaseOutputCount(5, &edges) == 4);
     }
 
+    test "switchCaseOutputCount: huge case index saturates, never overflows (bugbot)" {
+        // A hand-edited `case<near-u32-max>` pin must not overflow the
+        // `+ 1` adds — that would panic in safe builds before the clamp.
+        // Reaching this assertion (no panic) IS the regression guard.
+        const edges = [_]flow_io.ExecEdge{
+            .{ .from_node = 5, .from_pin = "case4294967295", .to_node = 6 },
+        };
+        try expect.toBeTrue(flow_doc.switchCaseOutputCount(5, &edges) <= 64);
+    }
+
     test "switchCaseOutputCount: ignores edges from other nodes and non-case pins" {
         const edges = [_]flow_io.ExecEdge{
             // Another Switch's case — must not bleed into node 5's count.

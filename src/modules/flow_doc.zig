@@ -767,8 +767,12 @@ pub fn switchCaseOutputCount(node_id: u32, exec_edges: []const flow_io.ExecEdge)
         const idx = caseIndexOf(x.from_pin) orelse continue;
         if (highest == null or idx > highest.?) highest = idx;
     }
-    const wired_span: u32 = if (highest) |h| h + 1 else 0;
-    const count = wired_span + 1; // + one spare empty case slot
+    // Saturating adds: a hand-edited `case<N>` pin can parse to a huge
+    // index (execPinValidFor accepts any `case<digits>`), and an
+    // unchecked `+ 1` would panic in safe builds before the clamp runs
+    // (bugbot). `+|` saturates at u32 max, then `@min` clamps to the cap.
+    const wired_span: u32 = if (highest) |h| h +| 1 else 0;
+    const count = wired_span +| 1; // + one spare empty case slot
     return @min(count, max_case_outputs);
 }
 
