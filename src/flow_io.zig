@@ -878,8 +878,19 @@ pub fn parse(child_allocator: std.mem.Allocator, raw: []const u8) !FlowDoc {
         for (doc.comments) |c| {
             if (c.id > doc.max_comment_id) doc.max_comment_id = c.id;
         }
-        for (doc.comments) |*c| {
-            if (c.id == 0) c.id = doc.nextCommentId();
+        // Assign a fresh id to any unassigned (`0`) OR duplicate entry —
+        // two comments sharing an id would alias to a single node-editor
+        // frame and bleed drag/resize/label state. `max_comment_id` is
+        // seeded above, so `nextCommentId()` can't collide (bugbot).
+        for (doc.comments, 0..) |*c, i| {
+            var dup = c.id == 0;
+            if (!dup) for (doc.comments[0..i]) |prev| {
+                if (prev.id == c.id) {
+                    dup = true;
+                    break;
+                }
+            };
+            if (dup) c.id = doc.nextCommentId();
         }
     }
 

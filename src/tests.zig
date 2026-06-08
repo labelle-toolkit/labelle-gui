@@ -5578,6 +5578,28 @@ pub const FlowIoTests = struct {
         try expect.equal(doc.max_comment_id, max_assigned);
     }
 
+    test "duplicate comment ids are de-aliased on load (bugbot)" {
+        // Two comments sharing a non-zero id would map to one node-editor
+        // frame; the loader must hand the collision a fresh, distinct id.
+        const a = std.testing.allocator;
+        const src =
+            \\{
+            \\  "event": { "type": "OnCreate" },
+            \\  "nodes": [],
+            \\  "edges": [],
+            \\  "comments": [
+            \\    { "id": 5, "text": "a", "x": 0, "y": 0, "w": 200, "h": 120 },
+            \\    { "id": 5, "text": "b", "x": 10, "y": 10, "w": 200, "h": 120 }
+            \\  ]
+            \\}
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+        try expect.equal(doc.comments.len, @as(usize, 2));
+        try expect.toBeTrue(doc.comments[0].id != doc.comments[1].id);
+        try expect.toBeTrue(doc.comments[0].id != 0 and doc.comments[1].id != 0);
+    }
+
     test "mixed assigned/unassigned ids don't collide on load" {
         // One comment carries an explicit id, another doesn't. The loader
         // seeds the counter off the explicit id first, so the backfilled id

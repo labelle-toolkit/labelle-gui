@@ -562,7 +562,7 @@ fn renderCanvas(s: *FlowDocState, allocator: std.mem.Allocator) void {
         // Defer the viewport fit to the next frame — `navigateToContent`
         // needs node *sizes*, which the editor only learns once
         // `beginNode`/`endNode` have run.
-        if (s.doc.nodes.len > 0) s.needs_fit_to_content = true;
+        if (s.doc.nodes.len > 0 or s.doc.comments.len > 0) s.needs_fit_to_content = true;
     } else if (s.needs_fit_to_content) {
         ne.navigateToContent(0.0);
         s.needs_fit_to_content = false;
