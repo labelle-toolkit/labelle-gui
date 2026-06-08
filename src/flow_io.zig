@@ -1883,6 +1883,53 @@ test "absence of exec_edges is preserved (no key emitted)" {
     try std.testing.expect(std.mem.indexOf(u8, text, "\"edges\": []\n") != null);
 }
 
+test "a programmatically-added exec edge renders back out (author round-trip)" {
+    // Drag-authoring an exec edge (labelle-gui#196) appends an
+    // `ExecEdge` to `doc.exec_edges`; the writer must then emit it just
+    // like a hand-authored / codegen-emitted one. Build a Branch flow
+    // with no exec edges, add one on the doc arena (as `appendExecEdge`
+    // does), and assert it renders and re-parses cleanly.
+    const src =
+        \\{
+        \\  "event": { "type": "OnUpdate" },
+        \\  "nodes": [
+        \\    { "id": 4, "type": "Branch", "pos": [0, 0] },
+        \\    { "id": 6, "type": "Print", "pos": [10, 0] }
+        \\  ],
+        \\  "edges": []
+        \\}
+    ;
+    var doc = try parse(std.testing.allocator, src);
+    defer doc.deinit();
+    try std.testing.expectEqual(@as(usize, 0), doc.exec_edges.len);
+
+    // Add Branch(4).then -> 6 on the doc's own arena, mirroring the
+    // editor's author path.
+    const a = doc.arena.allocator();
+    const added = try a.alloc(ExecEdge, 1);
+    added[0] = .{ .from_node = 4, .from_pin = try a.dupe(u8, "then"), .to_node = 6 };
+    doc.exec_edges = added;
+
+    const text = try render(std.testing.allocator, doc);
+    defer std.testing.allocator.free(text);
+
+    // The writer emits the block with `to` as a bare node ref (no pin).
+    const expected =
+        \\  "exec_edges": [
+        \\    { "from": { "node": 4, "pin": "then" }, "to": { "node": 6 } }
+        \\  ]
+    ;
+    try std.testing.expect(std.mem.indexOf(u8, text, expected) != null);
+
+    // Re-parsing the rendered text recovers the authored edge unchanged.
+    var doc2 = try parse(std.testing.allocator, text);
+    defer doc2.deinit();
+    try std.testing.expectEqual(@as(usize, 1), doc2.exec_edges.len);
+    try std.testing.expectEqual(@as(u32, 4), doc2.exec_edges[0].from_node);
+    try std.testing.expectEqualStrings("then", doc2.exec_edges[0].from_pin);
+    try std.testing.expectEqual(@as(u32, 6), doc2.exec_edges[0].to_node);
+}
+
 test "exec_edges parser rejects malformed entries" {
     // Non-array exec_edges.
     try std.testing.expectError(ParseError.BadSchema, parse(std.testing.allocator,
