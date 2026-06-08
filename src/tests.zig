@@ -7147,6 +7147,172 @@ pub const FlowDocExecEdgeTests = struct {
         try expect.toBeTrue(saw_delay_seconds);
     }
 
+    // ── String/Text reporter nodes (flow-codegen#26) ──
+    //
+    // Editor-side palette work for the four string reporters:
+    // `Format`, `Concat`, `IntToString`, `FloatToString`. They are
+    // `.other`-kind REPORTERS (rounded, data-only) producing a `value`
+    // ([]const u8) output that wires into command data inputs. `Format`
+    // carries a `template` (`std.fmt` format string) field; `Concat` /
+    // `Format` take variadic `arg<N>` data inputs; `IntToString` /
+    // `FloatToString` take one `value` data input.
+
+    test "appendOtherNode creates fieldless Concat / IntToString / FloatToString" {
+        const a = std.testing.allocator;
+        const src =
+            \\{ "event": { "type": "OnCreate" }, "nodes": [], "edges": [] }
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+
+        const cat = try flow_io.appendOtherNode(&doc, "Concat", &.{});
+        const its = try flow_io.appendOtherNode(&doc, "IntToString", &.{});
+        const fts = try flow_io.appendOtherNode(&doc, "FloatToString", &.{});
+
+        try expect.equal(doc.nodes.len, @as(usize, 3));
+        for (doc.nodes, [_]u32{ cat, its, fts }) |n, id| {
+            try expect.equal(n.id, id);
+            try expect.toBeTrue(n.kind == .other);
+            // No editable field — no spec, no seeded extras.
+            try expect.toBeTrue(flow_io.otherFieldSpec(n.type_name) == null);
+            try expect.equal(n.extras.len, @as(usize, 0));
+        }
+        try expect.toBeTrue(std.mem.eql(u8, doc.nodes[0].type_name, "Concat"));
+        try expect.toBeTrue(std.mem.eql(u8, doc.nodes[1].type_name, "IntToString"));
+        try expect.toBeTrue(std.mem.eql(u8, doc.nodes[2].type_name, "FloatToString"));
+    }
+
+    test "appendOtherNode seeds Format with a template field" {
+        const a = std.testing.allocator;
+        const src =
+            \\{ "event": { "type": "OnCreate" }, "nodes": [], "edges": [] }
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+
+        const fmt = try flow_io.appendOtherNode(
+            &doc,
+            "Format",
+            &.{.{ .key = "template", .value_text = "\"hits={d}\"" }},
+        );
+        const n = doc.nodes[0];
+        try expect.equal(n.id, fmt);
+        try expect.toBeTrue(std.mem.eql(u8, n.type_name, "Format"));
+        // The `template` field is the inspector-editable text field; it is
+        // stored verbatim as a JSON string (matching codegen's
+        // `{ "type": "Format", "template": "hits={d}" }`).
+        const spec = flow_io.otherFieldSpec(n.type_name).?;
+        try expect.toBeTrue(spec.widget == .text);
+        try expect.toBeTrue(std.mem.eql(u8, spec.key, "template"));
+        try expect.toBeTrue(std.mem.eql(u8, flow_io.extraValue(n, "template").?, "\"hits={d}\""));
+    }
+
+    test "string reporters classify as rounded reporters with no exec-in" {
+        // All four render as REPORTERS (rounded silhouette) — `nodeVisual`
+        // returns the reporter rounding (14) via `isReporterTypeName`, and
+        // they carry no exec pins so they're never swept onto the exec
+        // spine (`isReporterTypeName` set is disjoint from the control set).
+        const reporter_round: f32 = 14.0;
+        const names = [_][]const u8{ "Format", "Concat", "IntToString", "FloatToString" };
+        for (names) |name| {
+            try expect.toBeTrue(flow_doc.isReporterTypeName(name));
+            const n: flow_io.Node = .{ .id = 1, .type_name = name, .kind = .other };
+            try expect.equal(flow_doc.nodeVisual(n).rounding, reporter_round);
+        }
+        // A command-y `.other` (SetField) is NOT classified as a reporter,
+        // confirming the helper is a closed set and didn't over-match.
+        try expect.toBeTrue(!flow_doc.isReporterTypeName("SetField"));
+    }
+
+    test "varArgInputCount: fresh Concat/Format shows one spare arg pin" {
+        // No data edges → count 1 → a brand-new node renders `arg0` (the
+        // spare) so it's immediately wireable.
+        const empty: []const flow_io.Edge = &.{};
+        try expect.equal(flow_doc.varArgInputCount(7, empty), @as(u32, 1));
+    }
+
+    test "varArgInputCount: derives from wired arg<N> data edges + one spare" {
+        const a = std.testing.allocator;
+        // arg0 + arg2 wired into node 2 (sparse). Highest is 2 → count 4
+        // (arg0..arg2 filled + arg3 spare). Edges into other nodes / other
+        // pins are ignored.
+        const src =
+            \\{
+            \\  "event": { "type": "OnUpdate" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": "a", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Concat", "pos": [10, 0] },
+            \\    { "id": 3, "type": "IntToString", "pos": [0, 10] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "arg0" } },
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "arg2" } },
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 3, "pin": "value" } }
+            \\  ]
+            \\}
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+        try expect.equal(flow_doc.varArgInputCount(2, doc.edges), @as(u32, 4));
+        // Node 3's `value` input isn't an `arg<N>` pin → 0 wired → count 1.
+        try expect.equal(flow_doc.varArgInputCount(3, doc.edges), @as(u32, 1));
+    }
+
+    test "argIndexOf parses arg<N> and rejects non-arg names" {
+        try expect.equal(flow_doc.argIndexOf("arg0").?, @as(u32, 0));
+        try expect.equal(flow_doc.argIndexOf("arg12").?, @as(u32, 12));
+        try expect.toBeTrue(flow_doc.argIndexOf("arg") == null);
+        try expect.toBeTrue(flow_doc.argIndexOf("value") == null);
+        try expect.toBeTrue(flow_doc.argIndexOf("argx") == null);
+    }
+
+    test "string reporter nodes round-trip through parse / render; template persists" {
+        const a = std.testing.allocator;
+        const src =
+            \\{ "event": { "type": "OnCreate" }, "nodes": [], "edges": [] }
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+
+        _ = try flow_io.appendOtherNode(&doc, "Concat", &.{});
+        _ = try flow_io.appendOtherNode(&doc, "IntToString", &.{});
+        _ = try flow_io.appendOtherNode(&doc, "FloatToString", &.{});
+        _ = try flow_io.appendOtherNode(
+            &doc,
+            "Format",
+            &.{.{ .key = "template", .value_text = "\"hits={d}\"" }},
+        );
+
+        const text1 = try flow_io.render(a, doc);
+        defer a.free(text1);
+
+        // The node types survive the writer, and `Format.template` is
+        // emitted as the codegen contract's quoted string.
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"type\": \"Concat\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"type\": \"IntToString\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"type\": \"FloatToString\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"type\": \"Format\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"template\": \"hits={d}\"") != null);
+
+        // Load → save is byte-stable (these carry only string / no extras,
+        // so there's no numeric normalisation to settle).
+        var doc2 = try flow_io.parse(a, text1);
+        defer doc2.deinit();
+        const text2 = try flow_io.render(a, doc2);
+        defer a.free(text2);
+        try expect.toBeTrue(std.mem.eql(u8, text1, text2));
+
+        // `Format.template` persists across the load → save cycle.
+        var saw_template = false;
+        for (doc2.nodes) |n| {
+            if (std.mem.eql(u8, n.type_name, "Format")) {
+                const v = flow_io.extraValue(n, "template") orelse continue;
+                saw_template = std.mem.eql(u8, v, "\"hits={d}\"");
+            }
+        }
+        try expect.toBeTrue(saw_template);
+    }
+
     // ── Switch case-output derivation (#199) ──
     //
     // A Switch's cases are dynamic, so the editor derives how many

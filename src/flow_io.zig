@@ -358,6 +358,14 @@ pub const other_field_specs = [_]OtherFieldSpec{
     // field, so it needs no spec — its inspector shows the verbatim view.
     .{ .type_name = "Cooldown", .key = "seconds", .label = "Seconds", .widget = .literal },
     .{ .type_name = "Delay", .key = "seconds", .label = "Seconds", .widget = .literal },
+    // String/Text reporter nodes (flow-codegen#26). `Format` carries a
+    // `template` field — the `std.fmt` format string (e.g. `"hits={d}"`) —
+    // stored as a JSON string and edited through the `.text` widget the
+    // same way `Identifier.name` is, so it encodes/round-trips as a quoted
+    // string codegen parses verbatim. `Concat`/`IntToString`/`FloatToString`
+    // carry no editable field — their inputs are data pins — so they need
+    // no spec.
+    .{ .type_name = "Format", .key = "template", .label = "Template", .widget = .text },
 };
 
 /// Return the editable-field spec for a node `type_name`, or null when
