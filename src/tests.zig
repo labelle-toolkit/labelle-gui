@@ -6986,6 +6986,167 @@ pub const FlowDocExecEdgeTests = struct {
         );
     }
 
+    // ── Time-control nodes: Once / Cooldown / Delay (flow-codegen#47, #48) ──
+    //
+    // Editor-side palette work for the three time-control command nodes.
+    // They are `.other`-kind command nodes with a single `body` exec
+    // output (the codegen contract) — the same exec-pin shape as
+    // `ForRange`/`While`. `Cooldown`/`Delay` carry a `seconds` (f64) field.
+
+    test "appendOtherNode creates a fieldless Once node" {
+        const a = std.testing.allocator;
+        const src =
+            \\{ "event": { "type": "OnCreate" }, "nodes": [], "edges": [] }
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+
+        const id = try flow_io.appendOtherNode(&doc, "Once", &.{});
+
+        try expect.equal(doc.nodes.len, @as(usize, 1));
+        const n = doc.nodes[0];
+        try expect.equal(n.id, id);
+        try expect.toBeTrue(n.kind == .other);
+        try expect.toBeTrue(std.mem.eql(u8, n.type_name, "Once"));
+        // Once has no editable field — no spec, no seeded extras.
+        try expect.toBeTrue(flow_io.otherFieldSpec(n.type_name) == null);
+        try expect.equal(n.extras.len, @as(usize, 0));
+    }
+
+    test "appendOtherNode seeds Cooldown / Delay with a seconds field" {
+        const a = std.testing.allocator;
+        const src =
+            \\{ "event": { "type": "OnCreate" }, "nodes": [], "edges": [] }
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+
+        const cd = try flow_io.appendOtherNode(
+            &doc,
+            "Cooldown",
+            &.{.{ .key = "seconds", .value_text = "1.0" }},
+        );
+        const dl = try flow_io.appendOtherNode(
+            &doc,
+            "Delay",
+            &.{.{ .key = "seconds", .value_text = "1.0" }},
+        );
+
+        const cooldown = doc.nodes[0];
+        try expect.equal(cooldown.id, cd);
+        try expect.toBeTrue(std.mem.eql(u8, cooldown.type_name, "Cooldown"));
+        // The `seconds` field is the inspector-editable literal field and
+        // is seeded verbatim (matching codegen's `{ "seconds": 1.0 }`).
+        try expect.toBeTrue(flow_io.otherFieldSpec(cooldown.type_name).?.widget == .literal);
+        try expect.toBeTrue(std.mem.eql(u8, flow_io.otherFieldSpec(cooldown.type_name).?.key, "seconds"));
+        try expect.toBeTrue(std.mem.eql(u8, flow_io.extraValue(cooldown, "seconds").?, "1.0"));
+
+        const delay = doc.nodes[1];
+        try expect.equal(delay.id, dl);
+        try expect.toBeTrue(std.mem.eql(u8, delay.type_name, "Delay"));
+        try expect.toBeTrue(flow_io.otherFieldSpec(delay.type_name).?.widget == .literal);
+        try expect.toBeTrue(std.mem.eql(u8, flow_io.extraValue(delay, "seconds").?, "1.0"));
+    }
+
+    test "validateExecEdge accepts a body edge from Once / Cooldown / Delay" {
+        const a = std.testing.allocator;
+        const src =
+            \\{
+            \\  "event": { "type": "OnUpdate" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Once", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Cooldown", "seconds": 1.0, "pos": [0, 5] },
+            \\    { "id": 3, "type": "Delay", "seconds": 1.0, "pos": [0, 10] },
+            \\    { "id": 4, "type": "Print", "pos": [10, 0] },
+            \\    { "id": 5, "type": "Print", "pos": [10, 5] },
+            \\    { "id": 6, "type": "Subflow", "flow": "child", "pos": [10, 10] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+        // Each time node exposes exactly the `body` exec output.
+        try flow_doc.validateExecEdge(doc.nodes, doc.exec_edges, 1, "body", 4);
+        try flow_doc.validateExecEdge(doc.nodes, doc.exec_edges, 2, "body", 5);
+        try flow_doc.validateExecEdge(doc.nodes, doc.exec_edges, 3, "body", 6);
+        // `then`/`else` aren't pins on these nodes.
+        try expect.toBeTrue(
+            flow_doc.validateExecEdge(doc.nodes, doc.exec_edges, 1, "then", 4) ==
+                error.NotAControlSource,
+        );
+        try expect.toBeTrue(
+            flow_doc.validateExecEdge(doc.nodes, doc.exec_edges, 2, "else", 5) ==
+                error.NotAControlSource,
+        );
+    }
+
+    test "time-control nodes round-trip through parse / render with seconds" {
+        const a = std.testing.allocator;
+        const src =
+            \\{ "event": { "type": "OnCreate" }, "nodes": [], "edges": [] }
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+
+        _ = try flow_io.appendOtherNode(&doc, "Once", &.{});
+        _ = try flow_io.appendOtherNode(
+            &doc,
+            "Cooldown",
+            &.{.{ .key = "seconds", .value_text = "1.0" }},
+        );
+        _ = try flow_io.appendOtherNode(
+            &doc,
+            "Delay",
+            &.{.{ .key = "seconds", .value_text = "1.0" }},
+        );
+
+        const text1 = try flow_io.render(a, doc);
+        defer a.free(text1);
+
+        // The node types survive the writer, and the freshly-seeded
+        // `seconds` is emitted as the codegen contract's `1.0` literal —
+        // codegen parses it into the node's `f64` field.
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"type\": \"Once\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"type\": \"Cooldown\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"type\": \"Delay\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"seconds\": 1.0") != null);
+
+        // The editor's numeric canonical form drops a trailing `.0` (the
+        // same rule `Literal.value` uses), so a JSON `1.0` normalises to
+        // `1` on its first parse — semantically the same `f64`. After that
+        // first normalisation the file is stable, so a *loaded* flow
+        // round-trips byte-for-byte (load → save → load → save).
+        var doc2 = try flow_io.parse(a, text1);
+        defer doc2.deinit();
+        const text2 = try flow_io.render(a, doc2);
+        defer a.free(text2);
+
+        var doc3 = try flow_io.parse(a, text2);
+        defer doc3.deinit();
+        const text3 = try flow_io.render(a, doc3);
+        defer a.free(text3);
+        // load → save is idempotent from the second cycle onward.
+        try expect.toBeTrue(std.mem.eql(u8, text2, text3));
+
+        // The `seconds` field persists through the load → save cycle
+        // (its canonical text is `1`, the normalised form of `1.0`).
+        var saw_cooldown_seconds = false;
+        var saw_delay_seconds = false;
+        for (doc2.nodes) |n| {
+            if (std.mem.eql(u8, n.type_name, "Cooldown")) {
+                const v = flow_io.extraValue(n, "seconds") orelse continue;
+                saw_cooldown_seconds = std.mem.eql(u8, v, "1");
+            }
+            if (std.mem.eql(u8, n.type_name, "Delay")) {
+                const v = flow_io.extraValue(n, "seconds") orelse continue;
+                saw_delay_seconds = std.mem.eql(u8, v, "1");
+            }
+        }
+        try expect.toBeTrue(saw_cooldown_seconds);
+        try expect.toBeTrue(saw_delay_seconds);
+    }
+
     // ── Switch case-output derivation (#199) ──
     //
     // A Switch's cases are dynamic, so the editor derives how many
