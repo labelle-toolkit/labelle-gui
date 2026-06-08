@@ -51,17 +51,31 @@ const IdentBuf = [ident_buf_len:0]u8;
 const value_buf_len: usize = 256;
 const ValueBuf = [value_buf_len:0]u8;
 
+/// Whether a recorded pin carries data (a `flow_io.Edge` endpoint) or
+/// execution flow (a `flow_io.ExecEdge` endpoint). Authoring keeps the
+/// two namespaces disjoint: a data drag only resolves to data pins, an
+/// exec drag only to exec pins, and a mixed drag (exec→data or vice
+/// versa) is rejected. Without this flag `handleLinkCreate` couldn't
+/// tell a control edge from a wire when both endpoints live in the one
+/// `s.pins` registry (issue #196).
+const PinKind = enum { data, exec };
+
 /// One rendered pin on the canvas. The node editor only knows pins by
 /// their opaque `u64` id; `pinId` is a one-way hash, so to map an
-/// accepted/deleted link back to a `flow_io.Edge` we record every pin
-/// we draw this frame and look the endpoint ids up here.
+/// accepted/deleted link back to a `flow_io.Edge` (or `ExecEdge`) we
+/// record every pin we draw this frame and look the endpoint ids up
+/// here.
 const PinEntry = struct {
-    /// Editor pin id — what `pinId(...)` produced for this pin.
+    /// Editor pin id — what `pinId(...)` / `execPinId(...)` produced.
     id: u64,
     node_id: u32,
     /// Pin name. Borrowed from `doc` — only valid for the current frame.
+    /// For an exec-IN anchor (a bare node target with no `to_pin`) this
+    /// is the empty string.
     name: []const u8,
     dir: PinDir,
+    /// Data vs exec namespace — gates cross-wiring (issue #196).
+    kind: PinKind = .data,
 };
 
 /// One cached resolution of a `Subflow` node's referenced flow (issue
@@ -683,6 +697,117 @@ pub fn isExplicitExecTarget(exec_edges: []const flow_io.ExecEdge, node_id: u32) 
     return false;
 }
 
+/// The valid exec OUTPUT pin names for a control node, given its
+/// `type_name`. A `Branch` forks `then`/`else`; the loops (`ForRange`,
+/// `While`) enter their `body`. `Switch` (flow-codegen#22) is matched
+/// loosely — its arm pins are `case<N>` / `default`, which a static
+/// list can't enumerate, so the names are validated by prefix in
+/// `execPinValidFor`. A non-control node returns an empty slice.
+///
+/// Kept in lockstep with the pins `renderExecOutPin` actually draws so
+/// the editor never records a source pin the validator would reject.
+fn controlExecPinNames(type_name: []const u8) []const []const u8 {
+    if (std.mem.eql(u8, type_name, "Branch")) return &.{ "then", "else" };
+    if (std.mem.eql(u8, type_name, "ForRange")) return &.{"body"};
+    if (std.mem.eql(u8, type_name, "While")) return &.{"body"};
+    return &.{};
+}
+
+/// Whether `pin` is a legal exec-output pin name on a node of
+/// `type_name`. Branch/loop pins are matched against
+/// `controlExecPinNames`; `Switch` arm pins (`case<N>` / `default`)
+/// are matched by shape so the editor can author a control edge from a
+/// switch arm whose index it doesn't statically know
+/// (flow-codegen#22).
+fn execPinValidFor(type_name: []const u8, pin: []const u8) bool {
+    for (controlExecPinNames(type_name)) |name| {
+        if (std.mem.eql(u8, name, pin)) return true;
+    }
+    if (std.mem.eql(u8, type_name, "Switch")) {
+        if (std.mem.eql(u8, pin, "default")) return true;
+        if (std.mem.startsWith(u8, pin, "case") and pin.len > 4) {
+            for (pin[4..]) |c| if (!std.ascii.isDigit(c)) return false;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Whether a node is a *control* node — the only legal SOURCE of an
+/// `ExecEdge` (a `Branch`, `ForRange`, `While`, or `Switch`). These are
+/// all `.other`-kind nodes distinguished by `type_name`. Mirrors the
+/// set flow-codegen's `validate` recognises as exec-edge sources.
+fn isControlNode(n: flow_io.Node) bool {
+    if (n.kind != .other) return false;
+    return controlExecPinNames(n.type_name).len > 0 or
+        std.mem.eql(u8, n.type_name, "Switch");
+}
+
+/// Why a proposed `ExecEdge` is illegal — surfaced so `handleExecLink`
+/// can reject the drag with the right visual feedback and a log line.
+const ExecEdgeError = error{
+    /// The source node isn't a `Branch`/`ForRange`/`While`/`Switch`, or
+    /// the named exec pin doesn't exist on it.
+    NotAControlSource,
+    /// The target is already the exec-target of another edge —
+    /// flow-codegen enforces at-most-one exec parent per node, so a
+    /// second would lower to a `MalformedFlow`.
+    DuplicateExecParent,
+    /// Source and target are the same node.
+    SelfLoop,
+    /// This exact (source pin → target) edge already exists.
+    DuplicateEdge,
+    /// Neither endpoint resolves to a node in the document.
+    UnknownNode,
+};
+
+/// Pure validation of a candidate `ExecEdge` against the document —
+/// the rules flow-codegen's `validate` enforces, applied at author
+/// time so the editor never writes a flow codegen would reject as
+/// `MalformedFlow` (issue #196). Takes the raw `nodes` + `exec_edges`
+/// slices (not `FlowDocState`) so it is trivially unit-testable.
+///
+///   (a) the source must be a control node (`Branch`/`ForRange`/
+///       `While`/`Switch`) carrying a valid exec pin `from_pin`,
+///   (b) no self-loop (`from_node` != `to_node`),
+///   (c) at-most-one exec parent: `to_node` must not already be the
+///       target of another exec edge,
+///   (d) no duplicate of an identical existing exec edge.
+///
+/// Returns void on a legal edge; an `ExecEdgeError` otherwise.
+pub fn validateExecEdge(
+    nodes: []const flow_io.Node,
+    exec_edges: []const flow_io.ExecEdge,
+    from_node: u32,
+    from_pin: []const u8,
+    to_node: u32,
+) ExecEdgeError!void {
+    // (b) self-loop.
+    if (from_node == to_node) return error.SelfLoop;
+
+    // (a) source must be a control node with this exec pin, and the
+    // target must exist.
+    var src: ?flow_io.Node = null;
+    var dst_found = false;
+    for (nodes) |n| {
+        if (n.id == from_node) src = n;
+        if (n.id == to_node) dst_found = true;
+    }
+    const s = src orelse return error.UnknownNode;
+    if (!dst_found) return error.UnknownNode;
+    if (!isControlNode(s)) return error.NotAControlSource;
+    if (!execPinValidFor(s.type_name, from_pin)) return error.NotAControlSource;
+
+    for (exec_edges) |x| {
+        // (d) exact duplicate.
+        if (x.from_node == from_node and
+            x.to_node == to_node and
+            std.mem.eql(u8, x.from_pin, from_pin)) return error.DuplicateEdge;
+        // (c) at-most-one exec parent.
+        if (x.to_node == to_node) return error.DuplicateExecParent;
+    }
+}
+
 /// Draw the on-disk `exec_edges` as control arrows (issues #193, #194):
 /// for each edge, a link from the source node's named exec-output pin
 /// (`then`/`else`/`body`, drawn by `renderExecOutPin`) to the TARGET
@@ -838,15 +963,18 @@ fn execPinId(node_id: u32, dir: PinDir) u64 {
 /// these names, so there's no clash — `ForRange.index` is the one data
 /// output and is named differently).
 ///
-/// Deliberately *not* `recordPin`'d: like the derived exec anchors,
-/// these are read-only this PR — a drag onto them fails the `findPin`
-/// lookup and the editor rejects it. Authoring exec edges by dragging
-/// is a follow-up (issues #193/#194 "Author"); this PR renders and
-/// round-trips hand-authored / codegen-emitted edges.
-fn renderExecOutPin(node_id: u32, name: []const u8) void {
+/// Recorded into `s.pins` as an `.exec` output pin (issue #196) so a
+/// drag *from* it is accepted as the source of a new `ExecEdge`. The
+/// `.exec` tag keeps it from cross-wiring into a data input — only an
+/// exec-IN anchor is a legal drop target. (Before #196 these were
+/// deliberately unrecorded and thus read-only; the DERIVED #172
+/// arrows remain read-only because they use `execPinId` anchors that
+/// are *not* recorded as a drag source.)
+fn renderExecOutPin(s: *FlowDocState, node_id: u32, name: []const u8) void {
     ne.beginPin(pinId(node_id, name, .output), .output);
     zgui.text("{s} ▸", .{name});
     ne.endPin();
+    recordExecOutPin(s, node_id, name);
 }
 
 /// Synthetic link id for a derived exec arrow from `from_node`'s
@@ -894,10 +1022,48 @@ fn recordPin(s: *FlowDocState, node_id: u32, name: []const u8, dir: PinDir) void
         .node_id = node_id,
         .name = name,
         .dir = dir,
+        .kind = .data,
     }) catch |err| {
         // A dropped pin can't be resolved this frame, so a drag onto it
         // silently rejects — surface the cause rather than swallowing it.
         std.log.err("flow: record pin failed: {s}", .{@errorName(err)});
+    };
+}
+
+/// Record a *named* exec OUTPUT pin (`then`/`else`/`body`/`case<N>`/
+/// `default`) so a drag from it is accepted as the *source* of an
+/// `ExecEdge` (issue #196). Its editor id is `pinId(node, name,
+/// .output)` — the same id `renderExecOutPin` draws and
+/// `renderExplicitExecEdges` wires — but it's tagged `.exec` so it
+/// can't be cross-wired to a data input. The borrowed `name` must
+/// outlive the frame (the control-pin names are static literals).
+fn recordExecOutPin(s: *FlowDocState, node_id: u32, name: []const u8) void {
+    s.pins.append(s.doc.allocator(), .{
+        .id = pinId(node_id, name, .output),
+        .node_id = node_id,
+        .name = name,
+        .dir = .output,
+        .kind = .exec,
+    }) catch |err| {
+        std.log.err("flow: record exec-out pin failed: {s}", .{@errorName(err)});
+    };
+}
+
+/// Record a node's exec-IN anchor (the `▼` top-center anchor) as a
+/// droppable exec *input* target so an `ExecEdge` drag can land on it
+/// (issue #196). An exec target is a *bare* node ref — it has no
+/// `to_pin` — so the entry's `name` is the empty string. Its id is
+/// `execPinId(node, .input)`, matching the anchor `renderNodeBody`
+/// draws and the target side `renderExplicitExecEdges` wires.
+fn recordExecInPin(s: *FlowDocState, node_id: u32) void {
+    s.pins.append(s.doc.allocator(), .{
+        .id = execPinId(node_id, .input),
+        .node_id = node_id,
+        .name = "",
+        .dir = .input,
+        .kind = .exec,
+    }) catch |err| {
+        std.log.err("flow: record exec-in pin failed: {s}", .{@errorName(err)});
     };
 }
 
@@ -1012,6 +1178,24 @@ fn handleLinkCreate(s: *FlowDocState) void {
     const a_pin = sp.?;
     const b_pin = ep.?;
 
+    // Data and exec pins live in one registry but two namespaces: a
+    // control (exec) edge can't terminate on a data pin and a data wire
+    // can't terminate on an exec anchor (issue #196). A mixed-kind drag
+    // is therefore always invalid — reject before either the data or the
+    // exec path runs.
+    if (a_pin.kind != b_pin.kind) {
+        _ = ne.rejectNewItem(.{ 1.0, 0.3, 0.3, 1.0 }, 2.0);
+        return;
+    }
+
+    // Both endpoints exec: this is a control-edge author/re-route. The
+    // data-edge rules don't apply (an exec target is a bare node, not a
+    // typed pin), so it gets its own path.
+    if (a_pin.kind == .exec) {
+        handleExecLinkCreate(s, a_pin, b_pin);
+        return;
+    }
+
     // Same-direction drag: not a create. If the dragged-from pin owns
     // an existing edge this is a re-route of that edge's endpoint;
     // otherwise it's an invalid create and must be rejected.
@@ -1054,6 +1238,48 @@ fn handleLinkCreate(s: *FlowDocState) void {
     if (ne.acceptNewItem(.{ 0.3, 1.0, 0.4, 1.0 }, 2.0)) {
         appendEdge(s, out_pin, in_pin) catch |err| {
             std.log.err("flow: add edge failed: {s}", .{@errorName(err)});
+        };
+    }
+}
+
+/// Author a control (`ExecEdge`) edge from a named exec OUTPUT pin to a
+/// node's exec-IN anchor (issue #196). Both `a_pin` and `b_pin` are
+/// already known to be `.exec`-kind. A valid control edge runs from an
+/// exec output (the `then`/`else`/`body`/`case<N>`/`default` source) to
+/// an exec input (the `▼` anchor — a bare node target with empty
+/// `name`); `validateExecEdge` then enforces the same rules
+/// flow-codegen's `validate` does so the editor can never write a flow
+/// codegen rejects as `MalformedFlow`.
+fn handleExecLinkCreate(s: *FlowDocState, a_pin: PinEntry, b_pin: PinEntry) void {
+    // An exec output → exec input is the only legal shape. Two outputs
+    // or two inputs is not a create (and an exec edge has no re-route-by-
+    // same-direction gesture — re-routing is delete + re-drag), so reject.
+    if (a_pin.dir == b_pin.dir) {
+        _ = ne.rejectNewItem(.{ 1.0, 0.3, 0.3, 1.0 }, 2.0);
+        return;
+    }
+    const out_pin = if (a_pin.dir == .output) a_pin else b_pin;
+    const in_pin = if (a_pin.dir == .output) b_pin else a_pin;
+
+    // Enforce the flow-codegen rules at author time (control source,
+    // no self-loop, at-most-one exec parent, no duplicate). On any
+    // violation reject the drop and leave `exec_edges` untouched — the
+    // red flash is the user-facing feedback (the editor has no toast
+    // path; rejection is how every other invalid drag surfaces).
+    validateExecEdge(
+        s.doc.nodes,
+        s.doc.exec_edges,
+        out_pin.node_id,
+        out_pin.name,
+        in_pin.node_id,
+    ) catch {
+        _ = ne.rejectNewItem(.{ 1.0, 0.3, 0.3, 1.0 }, 2.0);
+        return;
+    };
+
+    if (ne.acceptNewItem(.{ 0.3, 1.0, 0.4, 1.0 }, 2.0)) {
+        appendExecEdge(s, out_pin.node_id, out_pin.name, in_pin.node_id) catch |err| {
+            std.log.err("flow: add exec edge failed: {s}", .{@errorName(err)});
         };
     }
 }
@@ -1208,7 +1434,7 @@ fn handleLinkDelete(s: *FlowDocState) void {
         // not accepted: accepting a no-op delete would leave the edge in
         // `doc.edges` while the editor believed it gone. `false` here
         // means "no edge matched"; only `true` is a real removal.
-        if (deleteEdgeByLinkId(s, del_id)) |removed| {
+        if (deleteLinkByLinkId(s, del_id)) |removed| {
             if (removed) {
                 _ = ne.acceptDeletedItem(true);
             } else {
@@ -1280,25 +1506,29 @@ fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Nod
     // between consecutive command nodes is drawn by `renderExecEdges`
     // after the data-edge loop in `renderCanvas`.
     //
-    // We deliberately do *not* call `recordPin` for exec pins so the
-    // `s.pins` per-frame registry stays data-only — any drag gesture
-    // on an exec anchor then fails the `findPin` lookup in
-    // `handleLinkCreate` and the editor rejects it. That's the
-    // "derived, read-only" contract: the user can't author or
-    // re-route an exec arrow, they only see what the topo sort
-    // produced.
+    // The exec-OUT command anchor (`execPinId(.output)`) drives the
+    // *derived* #172 spine and stays read-only: it is never recorded, so
+    // a drag from it fails the `findPin` lookup in `handleLinkCreate` and
+    // is rejected — the user can't author the linear spine, only see what
+    // the topo sort produced. The exec-IN anchor below, by contrast, is a
+    // recorded drop *target* for an authored `ExecEdge` (issue #196).
     const is_command = isCommandNode(n);
     // The exec-in anchor is where an incoming control arrow lands. Emit it
     // for command nodes (the derived linear spine) AND for any explicit
     // `exec_edge` target — a branch/loop body node may be `.other` (e.g. a
     // nested Branch/loop) and still needs the anchor, else the amber
     // control arrow has nothing to attach to (labelle-gui#193/#194, bugbot).
+    //
+    // It is recorded as an `.exec` input for *every* such node — not just
+    // existing targets — so a control drag can land on a node that has no
+    // incoming exec edge yet (authoring the first one, issue #196).
     const needs_exec_in = (is_command or
         isExplicitExecTarget(s.doc.exec_edges, n.id)) and n.kind != .event;
     if (needs_exec_in) {
         ne.beginPin(execPinId(n.id, .input), .input);
         zgui.text("▼", .{});
         ne.endPin();
+        recordExecInPin(s, n.id);
     }
     zgui.text("[{d}] {s}", .{ n.id, n.type_name });
     // Emit the exec-out anchor at the *end* of the body via `defer` so
@@ -1607,17 +1837,16 @@ fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Nod
             } else if (std.mem.eql(u8, n.type_name, "Branch")) {
                 // Control-flow if/then-else (flow-codegen#8, issue #193).
                 // Data INPUT `cond`; two exec OUTPUT pins `then`/`else`.
-                // The `cond` pin is recorded so data edges into it draw
-                // and can be authored; the exec outputs are *not* recorded
-                // (read-only, like the derived exec anchors) — their links
-                // come from the on-disk `exec_edges`, drawn by
-                // `renderExplicitExecEdges`.
+                // The `cond` pin is recorded as a data input so wires into
+                // it can be authored; the `then`/`else` exec outputs are
+                // recorded as `.exec` outputs by `renderExecOutPin` so a
+                // control edge can be dragged *from* them (issue #196).
                 ne.beginPin(pinId(n.id, "cond", .input), .input);
                 zgui.text("> cond", .{});
                 ne.endPin();
                 recordPin(s, n.id, "cond", .input);
-                renderExecOutPin(n.id, "then");
-                renderExecOutPin(n.id, "else");
+                renderExecOutPin(s, n.id, "then");
+                renderExecOutPin(s, n.id, "else");
             } else if (std.mem.eql(u8, n.type_name, "ForRange")) {
                 // Counted loop (flow-codegen#21, issue #194). Data inputs
                 // `start`/`end`/`step`; data OUTPUT `index`; exec OUTPUT
@@ -1638,7 +1867,7 @@ fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Nod
                 zgui.text("index >", .{});
                 ne.endPin();
                 recordPin(s, n.id, "index", .output);
-                renderExecOutPin(n.id, "body");
+                renderExecOutPin(s, n.id, "body");
             } else if (std.mem.eql(u8, n.type_name, "While")) {
                 // Conditional loop (flow-codegen#21, issue #194). Data
                 // input `cond`; exec OUTPUT `body`.
@@ -1646,7 +1875,7 @@ fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Nod
                 zgui.text("> cond", .{});
                 ne.endPin();
                 recordPin(s, n.id, "cond", .input);
-                renderExecOutPin(n.id, "body");
+                renderExecOutPin(s, n.id, "body");
             }
             // Show extras as a compact hint (e.g. BinOp `op`, Literal
             // `value`) so the user can tell nodes apart.
@@ -3246,6 +3475,42 @@ fn appendEdge(s: *FlowDocState, out_pin: PinEntry, in_pin: PinEntry) !void {
     s.is_dirty = true;
 }
 
+/// Append a control `flow_io.ExecEdge` from a named exec output pin to
+/// a bare target node (issue #196). The caller (`handleExecLinkCreate`)
+/// has already validated the edge via `validateExecEdge`; this only
+/// dupes the pin name into the doc arena and grows the slice.
+fn appendExecEdge(s: *FlowDocState, from_node: u32, from_pin: []const u8, to_node: u32) !void {
+    const a = s.doc.allocator();
+    const edge: flow_io.ExecEdge = .{
+        .from_node = from_node,
+        .from_pin = try a.dupe(u8, from_pin),
+        .to_node = to_node,
+    };
+    s.doc.exec_edges = try growExecEdges(a, s.doc.exec_edges, edge);
+    s.is_dirty = true;
+}
+
+/// Remove the control `ExecEdge` whose `explicitExecLinkId` matches
+/// `id` (issue #196). Returns `true` when one matched and was removed,
+/// `false` otherwise — the caller rejects the editor's delete on
+/// `false` so the canvas and `exec_edges` stay in agreement (mirrors
+/// `deleteEdgeByLinkId` for data edges). The *derived* #172 arrows use
+/// `execLinkId` ids that never match here, so they stay read-only.
+fn deleteExecEdgeByLinkId(s: *FlowDocState, id: u64) !bool {
+    const a = s.doc.allocator();
+    var idx: ?usize = null;
+    for (s.doc.exec_edges, 0..) |x, i| {
+        if (explicitExecLinkId(x.from_node, x.from_pin, x.to_node) == id) {
+            idx = i;
+            break;
+        }
+    }
+    const i = idx orelse return false;
+    s.doc.exec_edges = try removeAt(flow_io.ExecEdge, a, s.doc.exec_edges, i);
+    s.is_dirty = true;
+    return true;
+}
+
 /// Rewrite the edge at `idx` so it wires `out_pin` → `in_pin`. The
 /// caller (`handleLinkReroute`) has already validated direction, node
 /// distinctness and duplication; this only re-dupes the endpoint
@@ -3265,6 +3530,18 @@ fn rerouteEdge(s: *FlowDocState, idx: usize, out_pin: PinEntry, in_pin: PinEntry
         .to_pin = to_pin,
     };
     s.is_dirty = true;
+}
+
+/// Remove whatever link `id` names — a data `Edge` or an explicit
+/// control `ExecEdge` (issue #196). Tries the data edges first (the
+/// common case), then the explicit exec edges. Returns `true` when one
+/// matched and was removed, `false` when nothing did — the *derived*
+/// #172 exec spine uses `execLinkId` ids that match neither table, so
+/// those arrows stay read-only and a delete on them is rejected. The
+/// caller rejects the editor's delete on `false`.
+fn deleteLinkByLinkId(s: *FlowDocState, id: u64) !bool {
+    if (try deleteEdgeByLinkId(s, id)) return true;
+    return deleteExecEdgeByLinkId(s, id);
 }
 
 /// Remove the edge whose `linkId` matches `id`. Returns `true` when an
@@ -3299,6 +3576,13 @@ fn growNodes(a: std.mem.Allocator, src: []flow_io.Node, add: flow_io.Node) ![]fl
 
 fn growEdges(a: std.mem.Allocator, src: []flow_io.Edge, add: flow_io.Edge) ![]flow_io.Edge {
     const out = try a.alloc(flow_io.Edge, src.len + 1);
+    @memcpy(out[0..src.len], src);
+    out[src.len] = add;
+    return out;
+}
+
+fn growExecEdges(a: std.mem.Allocator, src: []flow_io.ExecEdge, add: flow_io.ExecEdge) ![]flow_io.ExecEdge {
+    const out = try a.alloc(flow_io.ExecEdge, src.len + 1);
     @memcpy(out[0..src.len], src);
     out[src.len] = add;
     return out;

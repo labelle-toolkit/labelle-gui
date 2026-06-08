@@ -6666,6 +6666,118 @@ pub const FlowDocExecEdgeTests = struct {
         const none: []const flow_io.ExecEdge = &.{};
         try expect.toBeTrue(!flow_doc.isExplicitExecTarget(none, 1));
     }
+
+    // ── validateExecEdge: author-time exec-edge rules (#196) ──
+    //
+    // Mirror the rules flow-codegen's `validate` enforces so the editor
+    // never drags out a flow codegen would reject as `MalformedFlow`.
+
+    /// A small Branch flow: node 4 is a `Branch` (then/else), nodes 6/7
+    /// are command targets. Used as the shared fixture for the cases
+    /// below.
+    fn branchFixture(a: std.mem.Allocator) !flow_io.FlowDoc {
+        const src =
+            \\{
+            \\  "event": { "type": "OnUpdate" },
+            \\  "nodes": [
+            \\    { "id": 4, "type": "Branch", "pos": [0, 0] },
+            \\    { "id": 6, "type": "Print", "pos": [10, 0] },
+            \\    { "id": 7, "type": "Print", "pos": [10, 5] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        return flow_io.parse(a, src);
+    }
+
+    test "validateExecEdge accepts a legal then-edge from a Branch" {
+        const a = std.testing.allocator;
+        var doc = try branchFixture(a);
+        defer doc.deinit();
+        // Branch(4).then -> 6, no existing exec edges: legal.
+        try flow_doc.validateExecEdge(doc.nodes, doc.exec_edges, 4, "then", 6);
+        // The `else` arm into a *different* node is also legal.
+        try flow_doc.validateExecEdge(doc.nodes, doc.exec_edges, 4, "else", 7);
+    }
+
+    test "validateExecEdge rejects a second exec parent (at-most-one)" {
+        const a = std.testing.allocator;
+        var doc = try branchFixture(a);
+        defer doc.deinit();
+        // Node 6 is already entered by Branch(4).then.
+        const existing = [_]flow_io.ExecEdge{
+            .{ .from_node = 4, .from_pin = "then", .to_node = 6 },
+        };
+        // A second exec edge into 6 (from the `else` arm) would give it
+        // two exec parents — flow-codegen rejects that as MalformedFlow.
+        try expect.toBeTrue(
+            flow_doc.validateExecEdge(doc.nodes, &existing, 4, "else", 6) ==
+                error.DuplicateExecParent,
+        );
+    }
+
+    test "validateExecEdge rejects a non-control source node" {
+        const a = std.testing.allocator;
+        var doc = try branchFixture(a);
+        defer doc.deinit();
+        // Node 6 (a Print command) is not a Branch/loop/Switch — it has
+        // no exec output to author a control edge from.
+        try expect.toBeTrue(
+            flow_doc.validateExecEdge(doc.nodes, doc.exec_edges, 6, "then", 7) ==
+                error.NotAControlSource,
+        );
+        // A control source dragged from a pin it doesn't own (`body` on a
+        // Branch) is likewise rejected.
+        try expect.toBeTrue(
+            flow_doc.validateExecEdge(doc.nodes, doc.exec_edges, 4, "body", 6) ==
+                error.NotAControlSource,
+        );
+    }
+
+    test "validateExecEdge rejects a self-loop" {
+        const a = std.testing.allocator;
+        var doc = try branchFixture(a);
+        defer doc.deinit();
+        try expect.toBeTrue(
+            flow_doc.validateExecEdge(doc.nodes, doc.exec_edges, 4, "then", 4) ==
+                error.SelfLoop,
+        );
+    }
+
+    test "validateExecEdge rejects an exact duplicate edge" {
+        const a = std.testing.allocator;
+        var doc = try branchFixture(a);
+        defer doc.deinit();
+        const existing = [_]flow_io.ExecEdge{
+            .{ .from_node = 4, .from_pin = "then", .to_node = 6 },
+        };
+        try expect.toBeTrue(
+            flow_doc.validateExecEdge(doc.nodes, &existing, 4, "then", 6) ==
+                error.DuplicateEdge,
+        );
+    }
+
+    test "validateExecEdge accepts a ForRange body edge" {
+        const a = std.testing.allocator;
+        const src =
+            \\{
+            \\  "event": { "type": "OnUpdate" },
+            \\  "nodes": [
+            \\    { "id": 2, "type": "ForRange", "pos": [0, 0] },
+            \\    { "id": 3, "type": "Print", "pos": [10, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+        try flow_doc.validateExecEdge(doc.nodes, doc.exec_edges, 2, "body", 3);
+        // `then` is not a loop's exec pin.
+        try expect.toBeTrue(
+            flow_doc.validateExecEdge(doc.nodes, doc.exec_edges, 2, "then", 3) ==
+                error.NotAControlSource,
+        );
+    }
 };
 
 // ─── flow_cycle: Subflow reference-cycle check (issue #159) ──────────────
