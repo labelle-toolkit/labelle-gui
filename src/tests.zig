@@ -6778,6 +6778,72 @@ pub const FlowDocExecEdgeTests = struct {
                 error.NotAControlSource,
         );
     }
+
+    // ── Switch case-output derivation (#199) ──
+    //
+    // A Switch's cases are dynamic, so the editor derives how many
+    // `case<N>` exec outputs to draw from the exec edges already wired
+    // from the node, plus one spare slot, plus an always-present
+    // `default`. `switchCaseOutputCount` returns just the `case<N>`
+    // count (the renderer draws `case0`..`case<count-1>` then default).
+
+    test "caseIndexOf parses well-formed case pins and rejects others" {
+        try expect.toBeTrue(flow_doc.caseIndexOf("case0").? == 0);
+        try expect.toBeTrue(flow_doc.caseIndexOf("case7").? == 7);
+        try expect.toBeTrue(flow_doc.caseIndexOf("case42").? == 42);
+        // Non-case exec pins and garbage yield null.
+        try expect.toBeTrue(flow_doc.caseIndexOf("default") == null);
+        try expect.toBeTrue(flow_doc.caseIndexOf("then") == null);
+        try expect.toBeTrue(flow_doc.caseIndexOf("case") == null);
+        try expect.toBeTrue(flow_doc.caseIndexOf("casex") == null);
+        try expect.toBeTrue(flow_doc.caseIndexOf("case1x") == null);
+    }
+
+    test "switchCaseOutputCount: no exec edges yields just the spare case0" {
+        const none: []const flow_io.ExecEdge = &.{};
+        // A brand-new Switch (no wired arms) shows one spare `case0`
+        // (plus `default`, which the renderer always adds).
+        try expect.toBeTrue(flow_doc.switchCaseOutputCount(5, none) == 1);
+    }
+
+    test "switchCaseOutputCount: contiguous wired cases get one spare" {
+        // case0 + case1 wired → renders case0, case1, case2 (spare).
+        const edges = [_]flow_io.ExecEdge{
+            .{ .from_node = 5, .from_pin = "case0", .to_node = 6 },
+            .{ .from_node = 5, .from_pin = "case1", .to_node = 7 },
+        };
+        try expect.toBeTrue(flow_doc.switchCaseOutputCount(5, &edges) == 3);
+    }
+
+    test "switchCaseOutputCount: sparse wired cases fill the gap plus a spare" {
+        // case0 + case2 wired (case1 unwired) → highest is 2 → renders
+        // case0, case1, case2 + case3 (spare) = 4 case outputs.
+        const edges = [_]flow_io.ExecEdge{
+            .{ .from_node = 5, .from_pin = "case0", .to_node = 6 },
+            .{ .from_node = 5, .from_pin = "case2", .to_node = 8 },
+        };
+        try expect.toBeTrue(flow_doc.switchCaseOutputCount(5, &edges) == 4);
+    }
+
+    test "switchCaseOutputCount: ignores edges from other nodes and non-case pins" {
+        const edges = [_]flow_io.ExecEdge{
+            // Another Switch's case — must not bleed into node 5's count.
+            .{ .from_node = 9, .from_pin = "case3", .to_node = 6 },
+            // node 5's `default` arm is not a `case<N>`, so it doesn't
+            // raise the case count.
+            .{ .from_node = 5, .from_pin = "default", .to_node = 7 },
+        };
+        // node 5 has no wired `case<N>` → just the spare case0.
+        try expect.toBeTrue(flow_doc.switchCaseOutputCount(5, &edges) == 1);
+    }
+
+    test "switchCaseOutputCount: clamps an absurd hand-edited index" {
+        const edges = [_]flow_io.ExecEdge{
+            .{ .from_node = 5, .from_pin = "case100000", .to_node = 6 },
+        };
+        // Bounded so a pathological file can't request thousands of pins.
+        try expect.toBeTrue(flow_doc.switchCaseOutputCount(5, &edges) == 64);
+    }
 };
 
 // ─── flow_cycle: Subflow reference-cycle check (issue #159) ──────────────

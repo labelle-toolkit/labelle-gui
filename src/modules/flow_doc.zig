@@ -713,6 +713,65 @@ fn controlExecPinNames(type_name: []const u8) []const []const u8 {
     return &.{};
 }
 
+/// Upper bound on the number of `case<N>` exec outputs a `Switch` will
+/// render, so a hand-edited file with an absurd case index can't ask the
+/// editor to draw thousands of pins.
+const max_case_outputs: u32 = 64;
+
+/// Static `case0`..`case<max_case_outputs-1>` pin-name literals. Built at
+/// comptime so each rendered/recorded `case<N>` pin name is a 'static
+/// slice that outlives the frame — `recordExecOutPin` borrows the name
+/// into the pin registry, so a per-frame formatted string would dangle
+/// (mirrors the `arg_pin_names` static table the Call node uses).
+const case_pin_names: [max_case_outputs][]const u8 = blk: {
+    @setEvalBranchQuota(max_case_outputs * 2000);
+    var names: [max_case_outputs][]const u8 = undefined;
+    for (0..max_case_outputs) |i| {
+        names[i] = std.fmt.comptimePrint("case{d}", .{i});
+    }
+    break :blk names;
+};
+
+/// Parse a `case<N>` exec-pin name to its index `N`, or null if `pin`
+/// isn't a well-formed `case<N>` name (`default`, `then`, garbage). The
+/// digit run must be non-empty and all-decimal — matching the shape
+/// `execPinValidFor` accepts. Overflow (an absurdly long digit run)
+/// yields null rather than wrapping.
+pub fn caseIndexOf(pin: []const u8) ?u32 {
+    if (!std.mem.startsWith(u8, pin, "case")) return null;
+    const digits = pin[4..];
+    if (digits.len == 0) return null;
+    return std.fmt.parseInt(u32, digits, 10) catch null;
+}
+
+/// How many `case<N>` exec outputs a `Switch` node should render, given
+/// the document's exec edges. A Switch's cases are dynamic, so we can't
+/// statically enumerate them; instead we derive the count from which
+/// `case<N>` arms are already wired *from this node*, then add one spare
+/// slot so a fresh (or just-extended) Switch is always wireable.
+///
+/// Rule: count = (highest wired `case<N>` index + 1) + 1 spare. The
+/// rendered case pins are then `case0` .. `case<count-1>`, plus a
+/// `default` the caller always draws. Consequences:
+///   - No exec edges → count 1 → renders `case0` (the spare) + default,
+///     so a brand-new Switch is immediately wireable.
+///   - `case0` + `case2` wired (sparse) → highest is 2 → count 4 →
+///     renders `case0`,`case1`,`case2` (filling the gap) + `case3`
+///     (spare) + default.
+/// Bounded by `max_case_outputs` so a hand-edited file with an absurd
+/// index can't ask the editor to draw thousands of pins.
+pub fn switchCaseOutputCount(node_id: u32, exec_edges: []const flow_io.ExecEdge) u32 {
+    var highest: ?u32 = null;
+    for (exec_edges) |x| {
+        if (x.from_node != node_id) continue;
+        const idx = caseIndexOf(x.from_pin) orelse continue;
+        if (highest == null or idx > highest.?) highest = idx;
+    }
+    const wired_span: u32 = if (highest) |h| h + 1 else 0;
+    const count = wired_span + 1; // + one spare empty case slot
+    return @min(count, max_case_outputs);
+}
+
 /// Whether `pin` is a legal exec-output pin name on a node of
 /// `type_name`. Branch/loop pins are matched against
 /// `controlExecPinNames`; `Switch` arm pins (`case<N>` / `default`)
@@ -1876,6 +1935,27 @@ fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Nod
                 ne.endPin();
                 recordPin(s, n.id, "cond", .input);
                 renderExecOutPin(s, n.id, "body");
+            } else if (std.mem.eql(u8, n.type_name, "Switch")) {
+                // Multi-way control (flow-codegen#22, issue #199). One
+                // data INPUT `selector` (the value switched on, wired
+                // like Branch's `cond`); N `case<N>` + a `default` exec
+                // OUTPUT pin, each an amber control-flow source drawn
+                // like Branch's `then`/`else` (draggable via #196).
+                //
+                // Cases are dynamic, so the rendered `case<N>` count is
+                // derived from the exec edges already wired *from* this
+                // node, plus one spare slot (so a fresh Switch with no
+                // edges still shows `case0` to wire into) — see
+                // `switchCaseOutputCount`. `default` always renders.
+                ne.beginPin(pinId(n.id, "selector", .input), .input);
+                zgui.text("> selector", .{});
+                ne.endPin();
+                recordPin(s, n.id, "selector", .input);
+                const case_count = switchCaseOutputCount(n.id, s.doc.exec_edges);
+                for (0..case_count) |i| {
+                    renderExecOutPin(s, n.id, case_pin_names[i]);
+                }
+                renderExecOutPin(s, n.id, "default");
             }
             // Show extras as a compact hint (e.g. BinOp `op`, Literal
             // `value`) so the user can tell nodes apart.
@@ -2621,6 +2701,14 @@ fn renderNodePalette(s: *FlowDocState) void {
     zgui.sameLine(.{});
     if (zgui.button("+ While", .{})) {
         addOtherNode(s, "While", &.{}) catch |err| nodeAddErr(err);
+    }
+    zgui.sameLine(.{});
+    // Switch (flow-codegen#22, issue #199). Like the other control
+    // nodes it carries no editable field — its arms are pins + exec
+    // edges. A fresh Switch has no exec edges, so the renderer shows a
+    // single spare `case0` + `default` until the user wires more.
+    if (zgui.button("+ Switch", .{})) {
+        addOtherNode(s, "Switch", &.{}) catch |err| nodeAddErr(err);
     }
 
     // Raw `Call` escape hatch (RFC §7) — surfaced separately so a user
