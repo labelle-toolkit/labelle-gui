@@ -5511,6 +5511,145 @@ pub const FlowIoTests = struct {
         try expect.toBeTrue(std.mem.eql(u8, doc2.comments[0].text, "spawn logic"));
     }
 
+    // ── comment stable ids (labelle-gui#188, bugbot: delete reuses ids) ──
+
+    test "comment id round-trips and seeds max_comment_id" {
+        // A persisted `id` survives a save/load so the editor's stable
+        // node-editor key is reproducible across sessions, and the loaded
+        // doc's `max_comment_id` is the highest id seen (so the next fresh
+        // comment never reuses one).
+        const a = std.testing.allocator;
+        const src =
+            \\{
+            \\  "event": { "type": "OnCreate" },
+            \\  "nodes": [],
+            \\  "edges": [],
+            \\  "comments": [
+            \\    { "text": "a", "x": 0, "y": 0, "w": 200, "h": 120, "id": 3 },
+            \\    { "text": "b", "x": 10, "y": 10, "w": 200, "h": 120, "id": 7 }
+            \\  ]
+            \\}
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+        try expect.equal(doc.comments.len, @as(usize, 2));
+        try expect.equal(doc.comments[0].id, @as(u32, 3));
+        try expect.equal(doc.comments[1].id, @as(u32, 7));
+        try expect.equal(doc.max_comment_id, @as(u32, 7));
+        // A fresh id lands strictly above the highest persisted one.
+        try expect.equal(doc.nextCommentId(), @as(u32, 8));
+
+        const text = try flow_io.render(a, doc);
+        defer a.free(text);
+        // The id is emitted in the serialized form…
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"id\": 3") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text, "\"id\": 7") != null);
+        var doc2 = try flow_io.parse(a, text);
+        defer doc2.deinit();
+        try expect.equal(doc2.comments[0].id, @as(u32, 3));
+        try expect.equal(doc2.comments[1].id, @as(u32, 7));
+    }
+
+    test "comments without ids still load (ids assigned on load)" {
+        // Pre-id files (and `"comments": [ {} ]`-style sparse entries)
+        // carry no `id`; the loader must assign fresh, unique ids so every
+        // comment gets a stable editor key. Absence is back-compatible.
+        const a = std.testing.allocator;
+        const src =
+            \\{
+            \\  "event": { "type": "OnCreate" },
+            \\  "nodes": [],
+            \\  "edges": [],
+            \\  "comments": [
+            \\    { "text": "a", "x": 0, "y": 0, "w": 200, "h": 120 },
+            \\    { "text": "b", "x": 10, "y": 10, "w": 200, "h": 120 }
+            \\  ]
+            \\}
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+        try expect.equal(doc.comments.len, @as(usize, 2));
+        // Both got non-zero, distinct ids…
+        try expect.toBeTrue(doc.comments[0].id != 0);
+        try expect.toBeTrue(doc.comments[1].id != 0);
+        try expect.toBeTrue(doc.comments[0].id != doc.comments[1].id);
+        // …and the counter is consistent with what was assigned.
+        const max_assigned = @max(doc.comments[0].id, doc.comments[1].id);
+        try expect.equal(doc.max_comment_id, max_assigned);
+    }
+
+    test "mixed assigned/unassigned ids don't collide on load" {
+        // One comment carries an explicit id, another doesn't. The loader
+        // seeds the counter off the explicit id first, so the backfilled id
+        // can't collide with it.
+        const a = std.testing.allocator;
+        const src =
+            \\{
+            \\  "event": { "type": "OnCreate" },
+            \\  "nodes": [],
+            \\  "edges": [],
+            \\  "comments": [
+            \\    { "text": "a", "id": 5 },
+            \\    { "text": "b" }
+            \\  ]
+            \\}
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+        try expect.equal(doc.comments[0].id, @as(u32, 5));
+        try expect.toBeTrue(doc.comments[1].id != 0);
+        try expect.toBeTrue(doc.comments[1].id != 5);
+        try expect.toBeTrue(doc.comments[1].id > 5);
+    }
+
+    test "deleting comment[0] leaves comment[1] id+geometry intact" {
+        // Model-level reproduction of the bugbot "delete reuses editor ids"
+        // bug. Deleting a non-last comment shifts slice indices; with a
+        // *stable* `id` the survivor keeps both its id and its geometry, so
+        // no index-based aliasing can hand it the deleted frame's editor
+        // state. Mirrors the editor's `deleteComment` (a slice splice that
+        // never touches surviving entries).
+        const a = std.testing.allocator;
+        const src =
+            \\{
+            \\  "event": { "type": "OnCreate" },
+            \\  "nodes": [],
+            \\  "edges": [],
+            \\  "comments": [
+            \\    { "text": "first", "x": 1, "y": 2, "w": 200, "h": 120, "id": 1 },
+            \\    { "text": "second", "x": 33, "y": 44, "w": 300, "h": 200, "id": 2 }
+            \\  ]
+            \\}
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+        try expect.equal(doc.comments.len, @as(usize, 2));
+
+        // Splice out index 0 (mirrors `deleteComment(s, 0)`).
+        const da = doc.allocator();
+        const kept = try da.alloc(flow_io.Comment, 1);
+        kept[0] = doc.comments[1];
+        doc.comments = kept;
+
+        // The survivor is the *same* frame — id and geometry unchanged. An
+        // index-derived editor id would have made it inherit the deleted
+        // frame's (id 1) state; the stable id (2) prevents that.
+        try expect.equal(doc.comments.len, @as(usize, 1));
+        try expect.equal(doc.comments[0].id, @as(u32, 2));
+        try expect.toBeTrue(std.mem.eql(u8, doc.comments[0].text, "second"));
+        try expect.equal(doc.comments[0].x, @as(f32, 33));
+        try expect.equal(doc.comments[0].y, @as(f32, 44));
+        try expect.equal(doc.comments[0].w, @as(f32, 300));
+        try expect.equal(doc.comments[0].h, @as(f32, 200));
+
+        // And it round-trips with its id preserved.
+        const text = try flow_io.render(a, doc);
+        defer a.free(text);
+        var doc2 = try flow_io.parse(a, text);
+        defer doc2.deinit();
+        try expect.equal(doc2.comments[0].id, @as(u32, 2));
+    }
+
     // ── appendOtherNode: palette create-buttons for `.other` kinds (#192) ──
 
     test "appendOtherNode creates an .other node with the seeded op extra" {

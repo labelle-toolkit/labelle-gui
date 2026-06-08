@@ -553,7 +553,12 @@ fn renderCanvas(s: *FlowDocState, allocator: std.mem.Allocator) void {
         for (s.doc.nodes) |n| {
             ne.setNodePosition(@intCast(n.id), n.pos);
         }
-        s.needs_layout = false;
+        // NB: `needs_layout` is *not* cleared here. Comment frames seed
+        // their persisted `x`/`y` off the same flag inside `renderComments`
+        // (called further down), so clearing it before that runs would let
+        // the editor's default position be read back and stomp the stored
+        // geometry on the seeding frame (labelle-gui#188). The flag is
+        // cleared *after* `renderComments`.
         // Defer the viewport fit to the next frame — `navigateToContent`
         // needs node *sizes*, which the editor only learns once
         // `beginNode`/`endNode` have run.
@@ -592,8 +597,16 @@ fn renderCanvas(s: *FlowDocState, allocator: std.mem.Allocator) void {
     // spine (RFC §6 deferral, issue #172).
     // Comment / group frames (labelle-gui#188) — emitted *before* the
     // nodes so the editor draws them behind. Purely cosmetic; ignored by
-    // codegen.
+    // codegen. Seeds comment positions off `needs_layout`, so it must run
+    // while the flag is still set.
     renderComments(s);
+
+    // The layout/seed handoff is complete for *both* nodes and comment
+    // frames; from the next frame the editor owns positions and we only
+    // read them back. Clearing here (not right after the node seed above)
+    // is what lets `renderComments` apply persisted comment geometry on the
+    // seeding frame instead of the editor's default (labelle-gui#188).
+    s.needs_layout = false;
 
     for (s.doc.nodes) |n| {
         const visual = nodeVisual(n);
@@ -1550,8 +1563,12 @@ fn linkId(e: flow_io.Edge) u64 {
 /// 2^40, so no realistic node count reaches them.
 const comment_id_base: u64 = 0x100_0000_0000;
 
-fn commentNodeId(index: usize) u64 {
-    return comment_id_base + @as(u64, index);
+/// Map a comment's *stable* id (`Comment.id`, labelle-gui#188) into the
+/// node-editor's id namespace. Keyed by the stable id — never the slice
+/// index — so deleting a non-last comment doesn't shift surviving frames
+/// onto another frame's editor (drag/resize) state.
+fn commentNodeId(comment_id: u32) u64 {
+    return comment_id_base + @as(u64, comment_id);
 }
 
 const PinDir = enum { input, output };
@@ -1602,8 +1619,13 @@ fn unpackRgba(packed_rgba: u32) [4]f32 {
 /// (along with the live group size) so a drag or resize updates the
 /// `Comment` and marks the doc dirty — a Save then persists the change.
 fn renderComments(s: *FlowDocState) void {
-    for (s.doc.comments, 0..) |*c, i| {
-        const id = commentNodeId(i);
+    for (s.doc.comments) |*c| {
+        // A defensively-assigned id for any frame that somehow reached the
+        // canvas without one (id `0` is the "unassigned" sentinel). The
+        // loader and `appendComment` both assign ids, so this is belt-and-
+        // braces — but a `0` id would alias `comment_id_base` across frames.
+        if (c.id == 0) c.id = s.doc.nextCommentId();
+        const id = commentNodeId(c.id);
 
         // Seed the editor's position from the doc the first frame, the
         // same handoff the node loop uses (`needs_layout`). After that the
@@ -3719,6 +3741,10 @@ fn appendComment(s: *FlowDocState) !void {
         .y = 24 + offset,
         .w = 220,
         .h = 140,
+        // Stable editor id (labelle-gui#188) — mirror how nodes get
+        // `nextNodeId()`. Persisted so it survives loads and never aliases
+        // another frame's editor state after a sibling delete.
+        .id = s.doc.nextCommentId(),
     };
     s.doc.comments = try growComments(a, s.doc.comments, c);
     s.needs_layout = true; // re-seed so the new frame's pos is applied
@@ -3728,10 +3754,10 @@ fn appendComment(s: *FlowDocState) !void {
 fn deleteComment(s: *FlowDocState, idx: usize) !void {
     const a = s.doc.allocator();
     s.doc.comments = try removeAt(flow_io.Comment, a, s.doc.comments, idx);
-    // The node editor keyed the deleted frame by its index-derived id;
-    // re-seed so the remaining frames re-apply their positions at their
-    // new indices (otherwise the editor would keep stale group state for
-    // the now-shifted ids).
+    // Surviving frames keep their *stable* ids (labelle-gui#188), so the
+    // editor's per-frame state stays bound to the right frame — no index
+    // shift, no editor-state bleed. Re-seed positions anyway so the
+    // persisted geometry is re-applied on the next layout pass.
     s.needs_layout = true;
     s.is_dirty = true;
 }

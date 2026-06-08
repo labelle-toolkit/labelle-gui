@@ -636,6 +636,15 @@ pub const ExecEdge = struct {
 /// `comments` block of the `.flow.jsonc`; flow-codegen ignores the key
 /// (`ignore_unknown_fields = true`), so it has no codegen effect. `color`
 /// is a packed `0xRRGGBBAA` value — null → the editor's default frame tint.
+///
+/// `id` is a stable, monotonically-assigned identifier (labelle-gui#188)
+/// used to key the editor's group node so the editor's per-frame
+/// drag/resize state follows the *frame*, not its slice index. Deleting a
+/// non-last comment shifts indices, so an index-derived editor id would
+/// make a surviving frame inherit the deleted frame's editor state —
+/// hence a stable id. Persisted in the `comments` block; a value of `0`
+/// means "unassigned" (a pre-id file, or a default-constructed entry) and
+/// the loader assigns a fresh id on load so older files stay compatible.
 pub const Comment = struct {
     text: []const u8 = "",
     x: f32 = 0,
@@ -643,6 +652,7 @@ pub const Comment = struct {
     w: f32 = 200,
     h: f32 = 120,
     color: ?u32 = null,
+    id: u32 = 0,
 };
 
 /// The flow's entry point. `type` is a lifecycle event name (e.g.
@@ -724,6 +734,11 @@ pub const FlowDoc = struct {
     comments: []Comment = &.{},
     /// Highest node id seen — the editor allocates fresh ids above this.
     max_node_id: u32 = 0,
+    /// Highest comment id seen (labelle-gui#188). Comment ids live in their
+    /// own namespace (they're not node ids), so they get their own
+    /// monotonic counter. Seeded from the loaded `comments` block and
+    /// bumped by `nextCommentId` so a fresh frame never reuses an id.
+    max_comment_id: u32 = 0,
 
     pub fn deinit(self: *FlowDoc) void {
         const child = self.arena.child_allocator;
@@ -740,6 +755,15 @@ pub const FlowDoc = struct {
     pub fn nextNodeId(self: *FlowDoc) u32 {
         self.max_node_id += 1;
         return self.max_node_id;
+    }
+
+    /// Allocate a fresh comment id one above the current maximum
+    /// (labelle-gui#188). Bumps `max_comment_id` so successive calls — and
+    /// any id-on-load assignment — never collide. Ids are 1-based; `0`
+    /// stays reserved as the "unassigned" sentinel.
+    pub fn nextCommentId(self: *FlowDoc) u32 {
+        self.max_comment_id += 1;
+        return self.max_comment_id;
     }
 };
 
@@ -848,6 +872,15 @@ pub fn parse(child_allocator: std.mem.Allocator, raw: []const u8) !FlowDoc {
     if (root.get("comments")) |v| {
         if (v != .array) return ParseError.BadSchema;
         doc.comments = try parseComments(a, v.array);
+        // Seed the comment-id counter from the highest persisted id, then
+        // backfill ids for any pre-id / unassigned (`0`) entries so every
+        // comment carries a stable, unique editor id (labelle-gui#188).
+        for (doc.comments) |c| {
+            if (c.id > doc.max_comment_id) doc.max_comment_id = c.id;
+        }
+        for (doc.comments) |*c| {
+            if (c.id == 0) c.id = doc.nextCommentId();
+        }
     }
 
     return doc;
@@ -1191,6 +1224,9 @@ fn parseComments(a: std.mem.Allocator, arr: std.json.Array) ![]Comment {
                 c.color = jsonIntId(v) orelse return ParseError.BadSchema;
             }
         }
+        // Stable editor id (labelle-gui#188). Absent / `0` → "unassigned";
+        // the caller fills it in on load so pre-id files stay compatible.
+        if (o.get("id")) |v| c.id = jsonIntId(v) orelse return ParseError.BadSchema;
         try out.append(a, c);
     }
     return out.toOwnedSlice(a);
@@ -1559,6 +1595,12 @@ pub fn render(child_allocator: std.mem.Allocator, doc: FlowDoc) ![]u8 {
             try writeCoord(a, &out, c.h);
             if (c.color) |col| {
                 try out.print(a, ", \"color\": {d}", .{col});
+            }
+            // Stable editor id (labelle-gui#188). Emitted only when
+            // assigned (`!= 0`) so a hand-authored file with no ids still
+            // round-trips identically until the editor touches it.
+            if (c.id != 0) {
+                try out.print(a, ", \"id\": {d}", .{c.id});
             }
             try out.appendSlice(a, " }");
             if (i + 1 < doc.comments.len) try out.append(a, ',');
@@ -2071,16 +2113,21 @@ test "comments round-trip preserves editor-only frames" {
     try std.testing.expectEqual(@as(?u32, null), doc.comments[0].color);
     try std.testing.expectEqualStrings("cleanup", doc.comments[1].text);
     try std.testing.expectEqual(@as(?u32, 4278190335), doc.comments[1].color);
+    // The source carried no `id`s, so the loader assigned fresh ones in
+    // order (labelle-gui#188) — the editor needs a stable per-frame key.
+    try std.testing.expectEqual(@as(u32, 1), doc.comments[0].id);
+    try std.testing.expectEqual(@as(u32, 2), doc.comments[1].id);
 
     const text = try render(std.testing.allocator, doc);
     defer std.testing.allocator.free(text);
 
     // The writer emits the block in insertion order, geometry as bare
-    // integers, with `color` only on the entry that carries one.
+    // integers, with `color` only on the entry that carries one and the
+    // load-assigned `id` last.
     const expected =
         \\  "comments": [
-        \\    { "text": "spawn logic", "x": 40, "y": 40, "w": 220, "h": 140 },
-        \\    { "text": "cleanup", "x": 300, "y": 80, "w": 180, "h": 100, "color": 4278190335 }
+        \\    { "text": "spawn logic", "x": 40, "y": 40, "w": 220, "h": 140, "id": 1 },
+        \\    { "text": "cleanup", "x": 300, "y": 80, "w": 180, "h": 100, "color": 4278190335, "id": 2 }
         \\  ]
     ;
     try std.testing.expect(std.mem.indexOf(u8, text, expected) != null);
