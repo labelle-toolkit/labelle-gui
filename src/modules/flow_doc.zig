@@ -728,6 +728,12 @@ fn controlExecPinNames(type_name: []const u8) []const []const u8 {
     if (std.mem.eql(u8, type_name, "Branch")) return &.{ "then", "else" };
     if (std.mem.eql(u8, type_name, "ForRange")) return &.{"body"};
     if (std.mem.eql(u8, type_name, "While")) return &.{"body"};
+    // Time-control command nodes (flow-codegen#47, #48). Each has a single
+    // `body` exec output — the codegen contract — that wires to the guarded
+    // step (`Delay`'s `body` must reach a `Subflow`, enforced by codegen).
+    if (std.mem.eql(u8, type_name, "Once")) return &.{"body"};
+    if (std.mem.eql(u8, type_name, "Cooldown")) return &.{"body"};
+    if (std.mem.eql(u8, type_name, "Delay")) return &.{"body"};
     return &.{};
 }
 
@@ -1704,7 +1710,14 @@ fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Nod
     // It is recorded as an `.exec` input for *every* such node — not just
     // existing targets — so a control drag can land on a node that has no
     // incoming exec edge yet (authoring the first one, issue #196).
-    const needs_exec_in = (is_command or
+    // Control nodes (Branch/ForRange/While/Switch and the time-control
+    // Once/Cooldown/Delay, flow-codegen#47/#48) are `.other`-kind, so
+    // `isCommandNode` is false for them — but they sit on the exec spine
+    // and must expose an exec-in anchor even when freshly placed, else the
+    // first incoming control arrow has nothing to land on and the node
+    // silently can't be wired. Treat any control node as needing the
+    // anchor, the same way a command node does.
+    const needs_exec_in = (is_command or isControlNode(n) or
         isExplicitExecTarget(s.doc.exec_edges, n.id)) and n.kind != .event;
     if (needs_exec_in) {
         ne.beginPin(execPinId(n.id, .input), .input);
@@ -2057,6 +2070,19 @@ fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Nod
                 zgui.text("> cond", .{});
                 ne.endPin();
                 recordPin(s, n.id, "cond", .input);
+                renderExecOutPin(s, n.id, "body");
+            } else if (std.mem.eql(u8, n.type_name, "Once") or
+                std.mem.eql(u8, n.type_name, "Cooldown") or
+                std.mem.eql(u8, n.type_name, "Delay"))
+            {
+                // Time-control command nodes (flow-codegen#47, #48). No data
+                // pins; one exec OUTPUT `body` (the guarded step). The
+                // exec-IN anchor is emitted by the generic command/control
+                // header above (`needs_exec_in`), so these render as
+                // rectangular command nodes with an exec-in + `body`
+                // exec-out — matching ForRange/While's silhouette. The
+                // `Cooldown`/`Delay` `seconds` field shows in the inspector
+                // (a `.literal` widget) and in the extras hint below.
                 renderExecOutPin(s, n.id, "body");
             } else if (std.mem.eql(u8, n.type_name, "Switch")) {
                 // Multi-way control (flow-codegen#22, issue #199). One
@@ -2898,6 +2924,26 @@ fn renderNodePalette(s: *FlowDocState) void {
     // single spare `case0` + `default` until the user wires more.
     if (zgui.button("+ Switch", .{})) {
         addOtherNode(s, "Switch", &.{}) catch |err| nodeAddErr(err);
+    }
+
+    // ── Time section (flow-codegen#47, #48) ──
+    // Time-control command nodes. `Once` gates its `body` to fire a single
+    // time; `Cooldown`/`Delay` carry a `seconds` (f64) field seeded to
+    // `1.0` — the same canonical JSON value text codegen parses
+    // (`{ "type": "Cooldown", "seconds": 1.0 }`). Like the other control
+    // nodes their wiring is the `body` exec edge; `Delay`'s `body` is meant
+    // to reach a `Subflow` (enforced by codegen, not the editor).
+    zgui.text("Time", .{});
+    if (zgui.button("+ Once", .{})) {
+        addOtherNode(s, "Once", &.{}) catch |err| nodeAddErr(err);
+    }
+    zgui.sameLine(.{});
+    if (zgui.button("+ Cooldown", .{})) {
+        addOtherNode(s, "Cooldown", &.{.{ .key = "seconds", .value_text = "1.0" }}) catch |err| nodeAddErr(err);
+    }
+    zgui.sameLine(.{});
+    if (zgui.button("+ Delay", .{})) {
+        addOtherNode(s, "Delay", &.{.{ .key = "seconds", .value_text = "1.0" }}) catch |err| nodeAddErr(err);
     }
 
     // Raw `Call` escape hatch (RFC §7) — surfaced separately so a user

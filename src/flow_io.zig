@@ -351,6 +351,13 @@ pub const other_field_specs = [_]OtherFieldSpec{
     .{ .type_name = "Literal", .key = "value", .label = "Value", .widget = .literal },
     .{ .type_name = "Identifier", .key = "name", .label = "Name", .widget = .text },
     .{ .type_name = "Call", .key = "callee", .label = "Callee", .widget = .text },
+    // Time-control command nodes (flow-codegen#47, #48). `Cooldown` and
+    // `Delay` each carry one `seconds` field (a JSON-native `f64` literal,
+    // e.g. `1.0`) edited verbatim through the `.literal` widget so it
+    // normalises + round-trips like any other numeric extra. `Once` has no
+    // field, so it needs no spec — its inspector shows the verbatim view.
+    .{ .type_name = "Cooldown", .key = "seconds", .label = "Seconds", .widget = .literal },
+    .{ .type_name = "Delay", .key = "seconds", .label = "Seconds", .widget = .literal },
 };
 
 /// Return the editable-field spec for a node `type_name`, or null when
