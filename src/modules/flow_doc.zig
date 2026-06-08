@@ -1653,24 +1653,18 @@ fn renderComments(s: *FlowDocState) void {
         ne.group(.{ c.w, c.h });
         ne.endNode();
 
-        // Pull live position + size back so a drag/resize persists.
+        // Pull live position back so a drag persists. Size is NOT read
+        // back: `getNodeSize` reports content + header/padding chrome
+        // (always >= the requested group size), so adopting it would
+        // feedback-loop (grow every frame); guarding it grow-only — the
+        // prior approach — instead silently blocked shrinking (bugbot).
+        // v1 makes the inspector w/h authoritative (both grow AND shrink
+        // work, and aren't overwritten); canvas drag-resize persistence
+        // is a tracked follow-up.
         const pos = ne.getNodePosition(id);
-        const size = ne.getNodeSize(id);
         if (pos[0] != c.x or pos[1] != c.y) {
             c.x = pos[0];
             c.y = pos[1];
-            s.is_dirty = true;
-        }
-        // The node's reported size includes the header + padding, so it is
-        // always >= the requested group size; only adopt a larger size
-        // (the user dragged the resize handle), and only when it actually
-        // grew, to avoid a feedback loop with the header's own footprint.
-        if (size[0] > c.w + 1.0) {
-            c.w = size[0];
-            s.is_dirty = true;
-        }
-        if (size[1] > c.h + 1.0) {
-            c.h = size[1];
             s.is_dirty = true;
         }
     }
