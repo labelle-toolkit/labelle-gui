@@ -829,6 +829,12 @@ pub fn argIndexOf(pin: []const u8) ?u32 {
     if (!std.mem.startsWith(u8, pin, "arg")) return null;
     const digits = pin[3..];
     if (digits.len == 0) return null;
+    // Digits-only — `parseInt` would otherwise accept a leading `+`
+    // (`arg+1` → 1). Matches `caseIndexOf`/codegen's `isCaseExecPin`
+    // strictness (gemini #207).
+    for (digits) |c| {
+        if (!std.ascii.isDigit(c)) return null;
+    }
     return std.fmt.parseInt(u32, digits, 10) catch null;
 }
 
@@ -853,7 +859,7 @@ pub fn varArgInputCount(node_id: u32, edges: []const flow_io.Edge) u32 {
     for (edges) |e| {
         if (e.to_node != node_id) continue;
         const idx = argIndexOf(e.to_pin) orelse continue;
-        if (highest == null or idx > highest.?) highest = idx;
+        highest = if (highest) |h| @max(h, idx) else idx;
     }
     // Saturating adds mirror `switchCaseOutputCount`: a hand-edited
     // `arg<N>` pin can parse to a huge index, and an unchecked `+ 1`
