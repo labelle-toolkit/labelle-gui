@@ -5465,6 +5465,88 @@ pub const FlowIoTests = struct {
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"note\": \"keep me\"") != null);
     }
 
+    // ── appendOtherNode: palette create-buttons for `.other` kinds (#192) ──
+
+    test "appendOtherNode creates an .other node with the seeded op extra" {
+        const a = std.testing.allocator;
+        const src =
+            \\{ "event": { "type": "OnCreate" }, "nodes": [], "edges": [] }
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+
+        const id = try flow_io.appendOtherNode(
+            &doc,
+            "Compare",
+            &.{.{ .key = "op", .value_text = "\"eq\"" }},
+        );
+
+        try expect.equal(doc.nodes.len, @as(usize, 1));
+        const n = doc.nodes[0];
+        try expect.equal(n.id, id);
+        try expect.toBeTrue(n.kind == .other);
+        try expect.toBeTrue(std.mem.eql(u8, n.type_name, "Compare"));
+        // The seeded `op` is recognised by the inspector's field spec and
+        // present as canonical JSON value text.
+        try expect.toBeTrue(flow_io.otherFieldSpec(n.type_name).?.widget == .op_combo);
+        try expect.toBeTrue(std.mem.eql(u8, flow_io.extraValue(n, "op").?, "\"eq\""));
+    }
+
+    test "appendOtherNode allocates fresh ids above the existing max" {
+        const a = std.testing.allocator;
+        const src =
+            \\{ "event": { "type": "OnCreate" },
+            \\  "nodes": [ { "id": 7, "type": "Literal", "value": 1, "pos": [0, 0] } ],
+            \\  "edges": [] }
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+
+        const id1 = try flow_io.appendOtherNode(&doc, "Branch", &.{});
+        const id2 = try flow_io.appendOtherNode(&doc, "While", &.{});
+        // Ids climb above the highest pre-existing id (7) and don't collide.
+        try expect.toBeTrue(id1 > 7);
+        try expect.toBeTrue(id2 > id1);
+        // Control nodes carry no editable extra.
+        try expect.equal(doc.nodes[doc.nodes.len - 1].extras.len, @as(usize, 0));
+    }
+
+    test "an appended .other node round-trips through render with its extra" {
+        const a = std.testing.allocator;
+        const src =
+            \\{ "event": { "type": "OnCreate" }, "nodes": [], "edges": [] }
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+
+        _ = try flow_io.appendOtherNode(
+            &doc,
+            "BinOp",
+            &.{.{ .key = "op", .value_text = "\"add\"" }},
+        );
+        _ = try flow_io.appendOtherNode(
+            &doc,
+            "Literal",
+            &.{.{ .key = "value", .value_text = "0" }},
+        );
+
+        const text1 = try flow_io.render(a, doc);
+        defer a.free(text1);
+
+        // The created nodes (type + seeded value) survive the writer.
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"type\": \"BinOp\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"op\": \"add\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"type\": \"Literal\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"value\": 0") != null);
+
+        // And a re-parse + re-render is byte-identical (deterministic).
+        var doc2 = try flow_io.parse(a, text1);
+        defer doc2.deinit();
+        const text2 = try flow_io.render(a, doc2);
+        defer a.free(text2);
+        try expect.toBeTrue(std.mem.eql(u8, text1, text2));
+    }
+
     test "string value text decodes and re-encodes round-trip" {
         const a = std.testing.allocator;
         const decoded = try flow_io.decodeStringValue(a, "\"Position\"");
