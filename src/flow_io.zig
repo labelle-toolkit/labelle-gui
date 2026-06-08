@@ -400,6 +400,56 @@ pub fn setExtraValue(
     node.extras = out;
 }
 
+/// Append a fresh `.other`-kind node carrying `type_name` plus the seeded
+/// `default_extras`, returning the new node's id. The expression/control
+/// node kinds (`BinOp`, `Compare`, `Logic`, `Literal`, `Identifier`,
+/// `SetField`, `Branch`, `ForRange`, `While`, …) are all `.other`, so they
+/// can't route through `NodeKind.typeName()` (null for `.other`) — the
+/// editor names the type directly and seeds the one editable extra the
+/// inspector exposes via `otherFieldSpec`.
+///
+/// `default_extras` values must already be canonical JSON value text (the
+/// same shape `setExtraValue` / the inspector widgets write): a JSON
+/// string for `op`/`name`/`target` (`"add"`, `""`), a bare JSON literal
+/// for `Literal.value` (`0`). Each key + value is duped onto the doc arena
+/// so the caller's slices needn't outlive this call, and the extras stay
+/// sorted so the deterministic writer emits them unchanged. Control nodes
+/// (`Branch`/`ForRange`/`While`) pass an empty `default_extras` — their
+/// wiring is pins + exec edges, with no editable field.
+///
+/// Pure over `FlowDoc` (no editor/imgui dependency) so it's exercisable in
+/// the `zig build test` target, which excludes the zgui stack.
+pub fn appendOtherNode(
+    doc: *FlowDoc,
+    type_name: []const u8,
+    default_extras: []const KeyValue,
+) !u32 {
+    const a = doc.allocator();
+    const id = doc.nextNodeId();
+
+    // Place new nodes in a staggered cascade so they don't all stack on
+    // the origin — mirrors `flow_doc.addNode`.
+    const offset: f32 = @floatFromInt((doc.nodes.len % 8) * 30);
+    var node: Node = .{
+        .id = id,
+        .type_name = try a.dupe(u8, type_name),
+        .kind = .other,
+        .pos = .{ 40 + offset, 40 + offset },
+    };
+    for (default_extras) |kv| {
+        // `setExtraValue` dupes key + value onto `a` and keeps the slice
+        // sorted; seeding through it keeps the on-disk extras byte-identical
+        // to an inspector-edited node.
+        try setExtraValue(a, &node, kv.key, kv.value_text);
+    }
+
+    const out = try a.alloc(Node, doc.nodes.len + 1);
+    @memcpy(out[0..doc.nodes.len], doc.nodes);
+    out[doc.nodes.len] = node;
+    doc.nodes = out;
+    return id;
+}
+
 /// Decode a JSON-string `extras` value (e.g. `"add"`) back to its raw
 /// inner text for display in a text widget. When the stored value isn't
 /// a JSON string (a `Literal.value` may be a number or bool) the

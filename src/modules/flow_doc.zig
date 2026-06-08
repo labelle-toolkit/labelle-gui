@@ -2342,6 +2342,58 @@ fn renderNodePalette(s: *FlowDocState) void {
     zgui.sameLine(.{});
     if (zgui.button("+ Get/Set/Change Variable", .{})) addNode(s, .get_variable) catch |err| nodeAddErr(err);
 
+    // ── Expression / control section (issue #192) ──
+    // The value/expression/control node kinds are all `.other` — they
+    // render + inspect already, but `addNode` can't create them
+    // (`kind.typeName()` is null for `.other`). `addOtherNode` seeds an
+    // `.other` node with the one editable extra each kind's
+    // `flow_io.otherFieldSpec` exposes, so a fresh node is immediately
+    // valid + inspector-editable. Defaults are canonical JSON value text:
+    // a JSON string for `op`/`name`/`target`, a bare literal for `value`.
+    // Control nodes (Branch/ForRange/While) carry no editable field — their
+    // wiring is pins + exec edges (authoring those edges is #196).
+    zgui.spacing();
+    zgui.separator();
+
+    zgui.text("Math / Logic", .{});
+    if (zgui.button("+ BinOp", .{})) {
+        addOtherNode(s, "BinOp", &.{.{ .key = "op", .value_text = "\"add\"" }}) catch |err| nodeAddErr(err);
+    }
+    zgui.sameLine(.{});
+    if (zgui.button("+ Compare", .{})) {
+        addOtherNode(s, "Compare", &.{.{ .key = "op", .value_text = "\"eq\"" }}) catch |err| nodeAddErr(err);
+    }
+    zgui.sameLine(.{});
+    if (zgui.button("+ Logic", .{})) {
+        addOtherNode(s, "Logic", &.{.{ .key = "op", .value_text = "\"and\"" }}) catch |err| nodeAddErr(err);
+    }
+
+    zgui.text("Values", .{});
+    if (zgui.button("+ Literal", .{})) {
+        addOtherNode(s, "Literal", &.{.{ .key = "value", .value_text = "0" }}) catch |err| nodeAddErr(err);
+    }
+    zgui.sameLine(.{});
+    if (zgui.button("+ Identifier", .{})) {
+        addOtherNode(s, "Identifier", &.{.{ .key = "name", .value_text = "\"\"" }}) catch |err| nodeAddErr(err);
+    }
+    zgui.sameLine(.{});
+    if (zgui.button("+ SetField", .{})) {
+        addOtherNode(s, "SetField", &.{.{ .key = "target", .value_text = "\"\"" }}) catch |err| nodeAddErr(err);
+    }
+
+    zgui.text("Control", .{});
+    if (zgui.button("+ Branch", .{})) {
+        addOtherNode(s, "Branch", &.{}) catch |err| nodeAddErr(err);
+    }
+    zgui.sameLine(.{});
+    if (zgui.button("+ ForRange", .{})) {
+        addOtherNode(s, "ForRange", &.{}) catch |err| nodeAddErr(err);
+    }
+    zgui.sameLine(.{});
+    if (zgui.button("+ While", .{})) {
+        addOtherNode(s, "While", &.{}) catch |err| nodeAddErr(err);
+    }
+
     // Raw `Call` escape hatch (RFC §7) — surfaced separately so a user
     // who finds it has knowingly opted into raw Zig source rather than
     // mistaking it for a normal palette entry.
@@ -3124,6 +3176,26 @@ fn addNode(s: *FlowDocState, kind: flow_io.NodeKind) !void {
         .other => unreachable,
     }
     s.doc.nodes = try growNodes(a, s.doc.nodes, node);
+    s.needs_layout = true; // re-seed so the new node's pos is applied
+    s.is_dirty = true;
+}
+
+/// Palette path for the `.other`-kind expression/control nodes (`BinOp`,
+/// `Compare`, `Logic`, `Literal`, `Identifier`, `SetField`, `Branch`,
+/// `ForRange`, `While`). `addNode` can't reach these — it routes through
+/// `kind.typeName()`, which is null for `.other` — so this seeds an
+/// `.other` node with `type_name` plus the editable extras the inspector
+/// exposes via `flow_io.otherFieldSpec`, leaving the node immediately
+/// valid and inspector-editable. The heavy lifting (id allocation,
+/// staggered pos, arena-duped extras) lives in the pure
+/// `flow_io.appendOtherNode`; this only flips the editor's layout/dirty
+/// flags so the new node's position seeds onto the canvas.
+fn addOtherNode(
+    s: *FlowDocState,
+    type_name: []const u8,
+    default_extras: []const flow_io.KeyValue,
+) !void {
+    _ = try flow_io.appendOtherNode(&s.doc, type_name, default_extras);
     s.needs_layout = true; // re-seed so the new node's pos is applied
     s.is_dirty = true;
 }
