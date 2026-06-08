@@ -2939,11 +2939,11 @@ fn renderNodePalette(s: *FlowDocState) void {
     }
     zgui.sameLine(.{});
     if (zgui.button("+ Cooldown", .{})) {
-        addOtherNode(s, "Cooldown", &.{.{ .key = "seconds", .value_text = "1.0" }}) catch |err| nodeAddErr(err);
+        addOtherNode(s, "Cooldown", &.{.{ .key = "seconds", .value_text = "1" }}) catch |err| nodeAddErr(err);
     }
     zgui.sameLine(.{});
     if (zgui.button("+ Delay", .{})) {
-        addOtherNode(s, "Delay", &.{.{ .key = "seconds", .value_text = "1.0" }}) catch |err| nodeAddErr(err);
+        addOtherNode(s, "Delay", &.{.{ .key = "seconds", .value_text = "1" }}) catch |err| nodeAddErr(err);
     }
 
     // Raw `Call` escape hatch (RFC §7) — surfaced separately so a user
