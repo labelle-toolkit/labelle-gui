@@ -590,6 +590,11 @@ fn renderCanvas(s: *FlowDocState, allocator: std.mem.Allocator) void {
     // trigger); see `renderNodeBody`. Synthetic exec arrows are emitted
     // below the data-edge loop based on the topo order of the command
     // spine (RFC §6 deferral, issue #172).
+    // Comment / group frames (labelle-gui#188) — emitted *before* the
+    // nodes so the editor draws them behind. Purely cosmetic; ignored by
+    // codegen.
+    renderComments(s);
+
     for (s.doc.nodes) |n| {
         const visual = nodeVisual(n);
         ne.pushStyleVar1f(.node_rounding, visual.rounding);
@@ -1536,6 +1541,19 @@ fn linkId(e: flow_io.Edge) u64 {
     return (h.final() & 0x7FFF_FFFF_FFFF_FFFF) | (@as(u64, 1) << 63);
 }
 
+/// Base for comment-frame node-editor ids (labelle-gui#188). Comment
+/// frames are rendered as imgui-node-editor *group* nodes so the editor
+/// drags/resizes them natively, but they're not `flow_io.Node`s — they
+/// need ids in the same `NodeId` space that can't collide with a real
+/// node's id (`@intCast(n.id)`, a small `u32`). The high base keeps the
+/// two spaces disjoint: real node ids are small, comment ids start near
+/// 2^40, so no realistic node count reaches them.
+const comment_id_base: u64 = 0x100_0000_0000;
+
+fn commentNodeId(index: usize) u64 {
+    return comment_id_base + @as(u64, index);
+}
+
 const PinDir = enum { input, output };
 
 /// A frame-scoped set of pin names, used to de-duplicate the pins a
@@ -1555,6 +1573,91 @@ fn pinId(node: u32, name: []const u8, dir: PinDir) u64 {
     h.update(name);
     const base = (h.final() & 0x3FFF_FFFF) | (@as(u64, node) << 30);
     return if (dir == .output) base | (@as(u64, 1) << 62) else base;
+}
+
+/// The editor's default comment-frame tint when a `Comment` carries no
+/// explicit `color` — a soft, low-alpha amber so the frame reads as an
+/// annotation behind the nodes without obscuring them.
+const default_comment_fill: [4]f32 = .{ 0.95, 0.80, 0.35, 0.12 };
+const default_comment_border: [4]f32 = .{ 0.95, 0.80, 0.35, 0.45 };
+
+/// Unpack a packed `0xRRGGBBAA` color into a normalized `[4]f32` rgba.
+fn unpackRgba(packed_rgba: u32) [4]f32 {
+    return .{
+        @as(f32, @floatFromInt((packed_rgba >> 24) & 0xFF)) / 255.0,
+        @as(f32, @floatFromInt((packed_rgba >> 16) & 0xFF)) / 255.0,
+        @as(f32, @floatFromInt((packed_rgba >> 8) & 0xFF)) / 255.0,
+        @as(f32, @floatFromInt(packed_rgba & 0xFF)) / 255.0,
+    };
+}
+
+/// Render every comment / group frame as an imgui-node-editor *group*
+/// node (labelle-gui#188). Group nodes are translucent, labeled,
+/// resizable rectangles the editor draws *behind* ordinary nodes and
+/// drags/resizes natively — exactly the v1 "cosmetic backdrop" shape.
+///
+/// Called before the node loop in `renderCanvas` so the groups are
+/// emitted first (and so drawn behind). Position is seeded from each
+/// `Comment`'s `x`/`y` on the layout frame, then read back every frame
+/// (along with the live group size) so a drag or resize updates the
+/// `Comment` and marks the doc dirty — a Save then persists the change.
+fn renderComments(s: *FlowDocState) void {
+    for (s.doc.comments, 0..) |*c, i| {
+        const id = commentNodeId(i);
+
+        // Seed the editor's position from the doc the first frame, the
+        // same handoff the node loop uses (`needs_layout`). After that the
+        // editor owns position; we read it back below.
+        if (s.needs_layout) {
+            ne.setNodePosition(id, .{ c.x, c.y });
+        }
+
+        const fill = if (c.color) |col| unpackRgba(col) else default_comment_fill;
+        const border = if (c.color) |col| brighten(unpackRgba(col)) else default_comment_border;
+
+        ne.pushStyleColor(.group_bg, fill);
+        ne.pushStyleColor(.group_border, border);
+        ne.pushStyleVar1f(.group_rounding, 6.0);
+        defer {
+            ne.popStyleVar(1);
+            ne.popStyleColor(2);
+        }
+
+        ne.beginNode(id);
+        // Header label sits at the group's top-left, drawn above the
+        // translucent backdrop the `ne.group` call lays down.
+        const label = if (c.text.len > 0) c.text else "(comment)";
+        zgui.textUnformatted(label);
+        ne.group(.{ c.w, c.h });
+        ne.endNode();
+
+        // Pull live position + size back so a drag/resize persists.
+        const pos = ne.getNodePosition(id);
+        const size = ne.getNodeSize(id);
+        if (pos[0] != c.x or pos[1] != c.y) {
+            c.x = pos[0];
+            c.y = pos[1];
+            s.is_dirty = true;
+        }
+        // The node's reported size includes the header + padding, so it is
+        // always >= the requested group size; only adopt a larger size
+        // (the user dragged the resize handle), and only when it actually
+        // grew, to avoid a feedback loop with the header's own footprint.
+        if (size[0] > c.w + 1.0) {
+            c.w = size[0];
+            s.is_dirty = true;
+        }
+        if (size[1] > c.h + 1.0) {
+            c.h = size[1];
+            s.is_dirty = true;
+        }
+    }
+}
+
+/// Lift a fill color's alpha toward opacity for use as a border tint, so
+/// a low-alpha fill still gets a visible edge.
+fn brighten(rgba: [4]f32) [4]f32 {
+    return .{ rgba[0], rgba[1], rgba[2], @min(1.0, rgba[3] + 0.4) };
 }
 
 fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Node) void {
@@ -2257,7 +2360,73 @@ fn renderInspector(s: *FlowDocState) void {
     renderNodePalette(s);
     zgui.spacing();
     zgui.separator();
+    renderCommentsInspector(s);
+    zgui.spacing();
+    zgui.separator();
     renderSelectedNode(s);
+}
+
+/// Inspector section for the comment / group frames (labelle-gui#188).
+/// Lists every frame with editable `text` and `x`/`y`/`w`/`h` geometry,
+/// plus a delete button. The canvas-side `renderComments` already moves
+/// frames by drag; this gives precise edits and is the editing surface
+/// when a frame is dragged behind the nodes and hard to grab. Editing any
+/// field marks the doc dirty and re-seeds the layout so the canvas picks
+/// up the new geometry next frame.
+fn renderCommentsInspector(s: *FlowDocState) void {
+    const a = s.doc.allocator();
+    zgui.text("Comments ({d})", .{s.doc.comments.len});
+    if (s.doc.comments.len == 0) {
+        zgui.textDisabled("(none — \"+ Comment\" adds a frame)", .{});
+        return;
+    }
+
+    var id_buf: [64]u8 = undefined;
+    var remove_idx: ?usize = null;
+    for (s.doc.comments, 0..) |*c, i| {
+        zgui.pushIntId(@intCast(i));
+        defer zgui.popId();
+
+        zgui.setNextItemWidth(180);
+        var text_buf: ValueBuf = undefined;
+        seedBuf(&text_buf, c.text);
+        if (zgui.inputText("##cmt_text", .{ .buf = &text_buf })) {
+            c.text = dupZ(a, &text_buf) catch c.text;
+            s.is_dirty = true;
+        }
+        zgui.sameLine(.{});
+        const x_id = std.fmt.bufPrintZ(&id_buf, "x##cmt{d}", .{i}) catch "x";
+        if (zgui.smallButton(x_id)) remove_idx = i;
+
+        zgui.setNextItemWidth(140);
+        if (zgui.dragFloat("xy##cmt", .{ .v = &c.x, .cfmt = "%.0f" })) {
+            s.is_dirty = true;
+            s.needs_layout = true;
+        }
+        zgui.sameLine(.{});
+        zgui.setNextItemWidth(70);
+        if (zgui.dragFloat("##cmt_y", .{ .v = &c.y, .cfmt = "%.0f" })) {
+            s.is_dirty = true;
+            s.needs_layout = true;
+        }
+
+        zgui.setNextItemWidth(140);
+        if (zgui.dragFloat("wh##cmt", .{ .v = &c.w, .min = 40, .cfmt = "%.0f" })) {
+            s.is_dirty = true;
+        }
+        zgui.sameLine(.{});
+        zgui.setNextItemWidth(70);
+        if (zgui.dragFloat("##cmt_h", .{ .v = &c.h, .min = 40, .cfmt = "%.0f" })) {
+            s.is_dirty = true;
+        }
+        zgui.separator();
+    }
+
+    if (remove_idx) |idx| {
+        deleteComment(s, idx) catch |err| {
+            std.log.err("flow: delete comment failed: {s}", .{@errorName(err)});
+        };
+    }
 }
 
 fn renderEventEditor(s: *FlowDocState) void {
@@ -2725,6 +2894,21 @@ fn renderNodePalette(s: *FlowDocState) void {
     zgui.sameLine(.{});
     zgui.textDisabled("(escape hatch — drops Zig source)", .{});
     renderRawCallDialog(s);
+
+    // ── Annotations section (labelle-gui#188) ──
+    // Comment / group frames — purely cosmetic backdrops behind the
+    // nodes, ignored by codegen. A "+ Comment" drops a default-sized
+    // frame; editing happens in the selected-comment inspector below.
+    zgui.spacing();
+    zgui.separator();
+    zgui.text("Annotations", .{});
+    if (zgui.button("+ Comment", .{})) {
+        appendComment(s) catch |err| {
+            std.log.err("flow: add comment failed: {s}", .{@errorName(err)});
+        };
+    }
+    zgui.sameLine(.{});
+    zgui.textDisabled("(cosmetic frame — ignored by codegen)", .{});
 
     // ── Per-plugin sections (RFC §1, §6) ──
     // For phase 4 MVP this walks the static `flow_node_catalog`.
@@ -3521,6 +3705,37 @@ fn addOtherNode(
     s.is_dirty = true;
 }
 
+/// Append a fresh comment / group frame (labelle-gui#188) at a staggered
+/// default position so successive adds don't stack on one spot. Marks the
+/// doc dirty and re-seeds the layout so the new frame's position is
+/// applied to the canvas. Independent of nodes — a flow with no nodes can
+/// still carry comments.
+fn appendComment(s: *FlowDocState) !void {
+    const a = s.doc.allocator();
+    const offset: f32 = @floatFromInt((s.doc.comments.len % 8) * 24);
+    const c: flow_io.Comment = .{
+        .text = try a.dupe(u8, "Comment"),
+        .x = 24 + offset,
+        .y = 24 + offset,
+        .w = 220,
+        .h = 140,
+    };
+    s.doc.comments = try growComments(a, s.doc.comments, c);
+    s.needs_layout = true; // re-seed so the new frame's pos is applied
+    s.is_dirty = true;
+}
+
+fn deleteComment(s: *FlowDocState, idx: usize) !void {
+    const a = s.doc.allocator();
+    s.doc.comments = try removeAt(flow_io.Comment, a, s.doc.comments, idx);
+    // The node editor keyed the deleted frame by its index-derived id;
+    // re-seed so the remaining frames re-apply their positions at their
+    // new indices (otherwise the editor would keep stale group state for
+    // the now-shifted ids).
+    s.needs_layout = true;
+    s.is_dirty = true;
+}
+
 fn deleteNode(s: *FlowDocState, id: u32) !void {
     const a = s.doc.allocator();
     // Find the index.
@@ -3675,6 +3890,13 @@ fn growEdges(a: std.mem.Allocator, src: []flow_io.Edge, add: flow_io.Edge) ![]fl
 
 fn growExecEdges(a: std.mem.Allocator, src: []flow_io.ExecEdge, add: flow_io.ExecEdge) ![]flow_io.ExecEdge {
     const out = try a.alloc(flow_io.ExecEdge, src.len + 1);
+    @memcpy(out[0..src.len], src);
+    out[src.len] = add;
+    return out;
+}
+
+fn growComments(a: std.mem.Allocator, src: []flow_io.Comment, add: flow_io.Comment) ![]flow_io.Comment {
+    const out = try a.alloc(flow_io.Comment, src.len + 1);
     @memcpy(out[0..src.len], src);
     out[src.len] = add;
     return out;

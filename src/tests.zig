@@ -5465,6 +5465,52 @@ pub const FlowIoTests = struct {
         try expect.toBeTrue(std.mem.indexOf(u8, text, "\"note\": \"keep me\"") != null);
     }
 
+    // ── comment / group frames (labelle-gui#188) ──
+
+    test "comments survive node mutation (independent of nodes)" {
+        // Comment frames are purely cosmetic backdrops, indexed
+        // independently of the node graph. Mutating `nodes` (as the
+        // editor's `deleteNode` does — splice a node, drop its edges)
+        // must leave `doc.comments` untouched. This mirrors the editor's
+        // delete path, which never references the comment slice.
+        const a = std.testing.allocator;
+        const src =
+            \\{
+            \\  "event": { "type": "OnCreate" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "pos": [0, 0] },
+            \\    { "id": 2, "type": "BinOp", "op": "add", "pos": [10, 0] }
+            \\  ],
+            \\  "edges": [],
+            \\  "comments": [
+            \\    { "text": "spawn logic", "x": 40, "y": 40, "w": 220, "h": 140 }
+            \\  ]
+            \\}
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+        try expect.equal(doc.comments.len, @as(usize, 1));
+
+        // Emulate a node delete: drop node 1, keeping the comment slice
+        // exactly as-is (the editor's deleteNode does the same — it never
+        // touches doc.comments).
+        const da = doc.allocator();
+        const kept = try da.alloc(flow_io.Node, 1);
+        kept[0] = doc.nodes[1];
+        doc.nodes = kept;
+
+        // The comment is unchanged and still renders + re-parses cleanly.
+        try expect.equal(doc.comments.len, @as(usize, 1));
+        try expect.toBeTrue(std.mem.eql(u8, doc.comments[0].text, "spawn logic"));
+
+        const text = try flow_io.render(a, doc);
+        defer a.free(text);
+        var doc2 = try flow_io.parse(a, text);
+        defer doc2.deinit();
+        try expect.equal(doc2.comments.len, @as(usize, 1));
+        try expect.toBeTrue(std.mem.eql(u8, doc2.comments[0].text, "spawn logic"));
+    }
+
     // ── appendOtherNode: palette create-buttons for `.other` kinds (#192) ──
 
     test "appendOtherNode creates an .other node with the seeded op extra" {
