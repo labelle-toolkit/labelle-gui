@@ -630,6 +630,31 @@ pub const ExecEdge = struct {
     to_node: u32,
 };
 
+/// A purely-cosmetic comment / group frame (labelle-gui#188). Editor-only
+/// annotation: a labeled, translucent rounded rectangle drawn *behind* the
+/// nodes at `x`/`y` with size `w`/`h`. Persisted in the top-level
+/// `comments` block of the `.flow.jsonc`; flow-codegen ignores the key
+/// (`ignore_unknown_fields = true`), so it has no codegen effect. `color`
+/// is a packed `0xRRGGBBAA` value — null → the editor's default frame tint.
+///
+/// `id` is a stable, monotonically-assigned identifier (labelle-gui#188)
+/// used to key the editor's group node so the editor's per-frame
+/// drag/resize state follows the *frame*, not its slice index. Deleting a
+/// non-last comment shifts indices, so an index-derived editor id would
+/// make a surviving frame inherit the deleted frame's editor state —
+/// hence a stable id. Persisted in the `comments` block; a value of `0`
+/// means "unassigned" (a pre-id file, or a default-constructed entry) and
+/// the loader assigns a fresh id on load so older files stay compatible.
+pub const Comment = struct {
+    text: []const u8 = "",
+    x: f32 = 0,
+    y: f32 = 0,
+    w: f32 = 200,
+    h: f32 = 120,
+    color: ?u32 = null,
+    id: u32 = 0,
+};
+
 /// The flow's entry point. `type` is a lifecycle event name (e.g.
 /// `OnCreate`) or `OnCall` for a subgraph (RFC §3). `arg_entity` and any
 /// other event keys are captured in `extras` so they round-trip.
@@ -700,8 +725,20 @@ pub const FlowDoc = struct {
     /// `"exec_edges": []`; the writer emits the key only when non-empty so
     /// pre-control-flow files round-trip byte-for-byte.
     exec_edges: []ExecEdge = &.{},
+    /// Editor-only comment / group frames (labelle-gui#188). Empty for every
+    /// flow that declares none — the default and the only shape that
+    /// existed before comment frames. Absence in the source file is
+    /// indistinguishable from `"comments": []`; the writer emits the key
+    /// only when non-empty so pre-comment files round-trip byte-for-byte.
+    /// flow-codegen ignores the key, so it has no codegen effect.
+    comments: []Comment = &.{},
     /// Highest node id seen — the editor allocates fresh ids above this.
     max_node_id: u32 = 0,
+    /// Highest comment id seen (labelle-gui#188). Comment ids live in their
+    /// own namespace (they're not node ids), so they get their own
+    /// monotonic counter. Seeded from the loaded `comments` block and
+    /// bumped by `nextCommentId` so a fresh frame never reuses an id.
+    max_comment_id: u32 = 0,
 
     pub fn deinit(self: *FlowDoc) void {
         const child = self.arena.child_allocator;
@@ -718,6 +755,15 @@ pub const FlowDoc = struct {
     pub fn nextNodeId(self: *FlowDoc) u32 {
         self.max_node_id += 1;
         return self.max_node_id;
+    }
+
+    /// Allocate a fresh comment id one above the current maximum
+    /// (labelle-gui#188). Bumps `max_comment_id` so successive calls — and
+    /// any id-on-load assignment — never collide. Ids are 1-based; `0`
+    /// stays reserved as the "unassigned" sentinel.
+    pub fn nextCommentId(self: *FlowDoc) u32 {
+        self.max_comment_id += 1;
+        return self.max_comment_id;
     }
 };
 
@@ -818,6 +864,34 @@ pub fn parse(child_allocator: std.mem.Allocator, raw: []const u8) !FlowDoc {
     if (root.get("exec_edges")) |v| {
         if (v != .array) return ParseError.BadSchema;
         doc.exec_edges = try parseExecEdges(a, v.array);
+    }
+
+    // ── comments ── (labelle-gui#188) Editor-only comment / group frames.
+    // Absent → empty slice; the writer then omits the key so the file
+    // round-trips byte-for-byte. flow-codegen ignores the key entirely.
+    if (root.get("comments")) |v| {
+        if (v != .array) return ParseError.BadSchema;
+        doc.comments = try parseComments(a, v.array);
+        // Seed the comment-id counter from the highest persisted id, then
+        // backfill ids for any pre-id / unassigned (`0`) entries so every
+        // comment carries a stable, unique editor id (labelle-gui#188).
+        for (doc.comments) |c| {
+            if (c.id > doc.max_comment_id) doc.max_comment_id = c.id;
+        }
+        // Assign a fresh id to any unassigned (`0`) OR duplicate entry —
+        // two comments sharing an id would alias to a single node-editor
+        // frame and bleed drag/resize/label state. `max_comment_id` is
+        // seeded above, so `nextCommentId()` can't collide (bugbot).
+        for (doc.comments, 0..) |*c, i| {
+            var dup = c.id == 0;
+            if (!dup) for (doc.comments[0..i]) |prev| {
+                if (prev.id == c.id) {
+                    dup = true;
+                    break;
+                }
+            };
+            if (dup) c.id = doc.nextCommentId();
+        }
     }
 
     return doc;
@@ -1136,6 +1210,39 @@ fn parseExecEdges(a: std.mem.Allocator, arr: std.json.Array) ![]ExecEdge {
     return out.toOwnedSlice(a);
 }
 
+/// Parse the top-level `comments` array (labelle-gui#188). Each entry is
+/// `{ "text": "...", "x": N, "y": N, "w": N, "h": N, "color"?: N }`. `text`
+/// defaults to empty; the geometry fields fall back to the `Comment`
+/// defaults when absent; `color` is an optional packed `0xRRGGBBAA`.
+fn parseComments(a: std.mem.Allocator, arr: std.json.Array) ![]Comment {
+    var out: std.ArrayList(Comment) = .empty;
+    for (arr.items) |item| {
+        if (item != .object) return ParseError.BadSchema;
+        const o = item.object;
+        var c: Comment = .{};
+        if (o.get("text")) |t| {
+            if (t != .string) return ParseError.BadSchema;
+            c.text = try a.dupe(u8, t.string);
+        }
+        if (o.get("x")) |v| c.x = jsonNumberAsF32(v) orelse return ParseError.BadSchema;
+        if (o.get("y")) |v| c.y = jsonNumberAsF32(v) orelse return ParseError.BadSchema;
+        if (o.get("w")) |v| c.w = jsonNumberAsF32(v) orelse return ParseError.BadSchema;
+        if (o.get("h")) |v| c.h = jsonNumberAsF32(v) orelse return ParseError.BadSchema;
+        if (o.get("color")) |v| {
+            if (v == .null) {
+                c.color = null;
+            } else {
+                c.color = jsonIntId(v) orelse return ParseError.BadSchema;
+            }
+        }
+        // Stable editor id (labelle-gui#188). Absent / `0` → "unassigned";
+        // the caller fills it in on load so pre-id files stay compatible.
+        if (o.get("id")) |v| c.id = jsonIntId(v) orelse return ParseError.BadSchema;
+        try out.append(a, c);
+    }
+    return out.toOwnedSlice(a);
+}
+
 /// Read a JSON number expected to be a non-negative `u32` node id.
 /// Accepts a plain integer, and also a float (or `number_string`) that
 /// has no fractional part — hand-authored files and exporters often
@@ -1427,10 +1534,14 @@ pub fn render(child_allocator: std.mem.Allocator, doc: FlowDoc) ![]u8 {
     // flow-codegen's writer (`renderFlowJsonc` → the `flow.exec_edges.len
     // == 0` branch).
     const has_exec = doc.exec_edges.len > 0;
+    const has_comments = doc.comments.len > 0;
+    // `edges` keeps a trailing comma when *any* block follows it; `exec_edges`
+    // keeps one only when `comments` follows.
+    const edges_trailer: []const u8 = if (has_exec or has_comments) "],\n" else "]\n";
     try out.appendSlice(a, indent_unit);
     try out.appendSlice(a, "\"edges\": [");
     if (doc.edges.len == 0) {
-        try out.appendSlice(a, if (has_exec) "],\n" else "]\n");
+        try out.appendSlice(a, edges_trailer);
     } else {
         try out.append(a, '\n');
         for (doc.edges, 0..) |e, i| {
@@ -1444,7 +1555,7 @@ pub fn render(child_allocator: std.mem.Allocator, doc: FlowDoc) ![]u8 {
             try out.append(a, '\n');
         }
         try out.appendSlice(a, indent_unit);
-        try out.appendSlice(a, if (has_exec) "],\n" else "]\n");
+        try out.appendSlice(a, edges_trailer);
     }
 
     // exec_edges (flow-codegen#8, #21) — control-flow edges. Emitted only
@@ -1467,6 +1578,43 @@ pub fn render(child_allocator: std.mem.Allocator, doc: FlowDoc) ![]u8 {
             try writeJsonString(a, &out, x.from_pin);
             try out.print(a, " }}, \"to\": {{ \"node\": {d} }} }}", .{x.to_node});
             if (i + 1 < sorted.len) try out.append(a, ',');
+            try out.append(a, '\n');
+        }
+        try out.appendSlice(a, indent_unit);
+        try out.appendSlice(a, if (has_comments) "],\n" else "]\n");
+    }
+
+    // comments (labelle-gui#188) — editor-only comment / group frames.
+    // Emitted only when non-empty, in insertion order (the editor appends
+    // new frames at the end, so a re-save is diff-clean). Each entry is
+    // `{ "text": "...", "x": N, "y": N, "w": N, "h": N }` plus an optional
+    // `"color"` packed `0xRRGGBBAA`. flow-codegen ignores this key.
+    if (has_comments) {
+        try out.appendSlice(a, indent_unit);
+        try out.appendSlice(a, "\"comments\": [\n");
+        for (doc.comments, 0..) |c, i| {
+            try out.appendSlice(a, indent_unit ** 2);
+            try out.appendSlice(a, "{ \"text\": ");
+            try writeJsonString(a, &out, c.text);
+            try out.appendSlice(a, ", \"x\": ");
+            try writeCoord(a, &out, c.x);
+            try out.appendSlice(a, ", \"y\": ");
+            try writeCoord(a, &out, c.y);
+            try out.appendSlice(a, ", \"w\": ");
+            try writeCoord(a, &out, c.w);
+            try out.appendSlice(a, ", \"h\": ");
+            try writeCoord(a, &out, c.h);
+            if (c.color) |col| {
+                try out.print(a, ", \"color\": {d}", .{col});
+            }
+            // Stable editor id (labelle-gui#188). Emitted only when
+            // assigned (`!= 0`) so a hand-authored file with no ids still
+            // round-trips identically until the editor touches it.
+            if (c.id != 0) {
+                try out.print(a, ", \"id\": {d}", .{c.id});
+            }
+            try out.appendSlice(a, " }");
+            if (i + 1 < doc.comments.len) try out.append(a, ',');
             try out.append(a, '\n');
         }
         try out.appendSlice(a, indent_unit);
@@ -1947,6 +2095,156 @@ test "exec_edges parser rejects malformed entries" {
     try std.testing.expectError(ParseError.BadEdge, parse(std.testing.allocator,
         \\{ "nodes": [], "edges": [], "exec_edges": [ { "from": { "node": 1, "pin": "then" }, "to": {} } ] }
     ));
+}
+
+test "comments round-trip preserves editor-only frames" {
+    // A flow carrying a top-level `comments` block (labelle-gui#188) must
+    // round-trip it — a save that drops comments loses the user's
+    // annotations. The block is editor metadata; flow-codegen ignores it.
+    const src =
+        \\{
+        \\  "event": { "type": "OnCreate" },
+        \\  "nodes": [],
+        \\  "edges": [],
+        \\  "comments": [
+        \\    { "text": "spawn logic", "x": 40, "y": 40, "w": 220, "h": 140 },
+        \\    { "text": "cleanup", "x": 300, "y": 80, "w": 180, "h": 100, "color": 4278190335 }
+        \\  ]
+        \\}
+    ;
+    var doc = try parse(std.testing.allocator, src);
+    defer doc.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), doc.comments.len);
+    try std.testing.expectEqualStrings("spawn logic", doc.comments[0].text);
+    try std.testing.expectEqual(@as(f32, 40), doc.comments[0].x);
+    try std.testing.expectEqual(@as(f32, 40), doc.comments[0].y);
+    try std.testing.expectEqual(@as(f32, 220), doc.comments[0].w);
+    try std.testing.expectEqual(@as(f32, 140), doc.comments[0].h);
+    try std.testing.expectEqual(@as(?u32, null), doc.comments[0].color);
+    try std.testing.expectEqualStrings("cleanup", doc.comments[1].text);
+    try std.testing.expectEqual(@as(?u32, 4278190335), doc.comments[1].color);
+    // The source carried no `id`s, so the loader assigned fresh ones in
+    // order (labelle-gui#188) — the editor needs a stable per-frame key.
+    try std.testing.expectEqual(@as(u32, 1), doc.comments[0].id);
+    try std.testing.expectEqual(@as(u32, 2), doc.comments[1].id);
+
+    const text = try render(std.testing.allocator, doc);
+    defer std.testing.allocator.free(text);
+
+    // The writer emits the block in insertion order, geometry as bare
+    // integers, with `color` only on the entry that carries one and the
+    // load-assigned `id` last.
+    const expected =
+        \\  "comments": [
+        \\    { "text": "spawn logic", "x": 40, "y": 40, "w": 220, "h": 140, "id": 1 },
+        \\    { "text": "cleanup", "x": 300, "y": 80, "w": 180, "h": 100, "color": 4278190335, "id": 2 }
+        \\  ]
+    ;
+    try std.testing.expect(std.mem.indexOf(u8, text, expected) != null);
+
+    // Round-trip stability: re-parse + re-render is byte-identical and the
+    // frames survive unchanged.
+    var doc2 = try parse(std.testing.allocator, text);
+    defer doc2.deinit();
+    try std.testing.expectEqual(@as(usize, 2), doc2.comments.len);
+    const text2 = try render(std.testing.allocator, doc2);
+    defer std.testing.allocator.free(text2);
+    try std.testing.expectEqualStrings(text, text2);
+}
+
+test "absence of comments is preserved (no key emitted)" {
+    // A flow with no comment frames must NOT gain a `comments` key —
+    // pre-comment files round-trip byte-for-byte. Absence in the source
+    // is indistinguishable from `"comments": []`.
+    const src =
+        \\{ "event": { "type": "OnCreate" }, "nodes": [], "edges": [] }
+    ;
+    var doc = try parse(std.testing.allocator, src);
+    defer doc.deinit();
+    try std.testing.expectEqual(@as(usize, 0), doc.comments.len);
+    const text = try render(std.testing.allocator, doc);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "comments") == null);
+    // `edges` keeps its no-trailing-comma close when no block follows.
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"edges\": []\n") != null);
+}
+
+test "comments coexist with exec_edges (both blocks, correct commas)" {
+    // When a flow carries both an `exec_edges` block and a `comments`
+    // block, `edges` and `exec_edges` each need a trailing comma so the
+    // JSON stays well-formed. Assert the full byte-stable round-trip.
+    const src =
+        \\{
+        \\  "nodes": [
+        \\    { "id": 4, "type": "Branch", "pos": [0, 0] },
+        \\    { "id": 6, "type": "Print", "pos": [10, 0] }
+        \\  ],
+        \\  "edges": [],
+        \\  "exec_edges": [
+        \\    { "from": { "node": 4, "pin": "then" }, "to": { "node": 6 } }
+        \\  ],
+        \\  "comments": [
+        \\    { "text": "note", "x": 0, "y": 0, "w": 200, "h": 120 }
+        \\  ]
+        \\}
+    ;
+    var doc = try parse(std.testing.allocator, src);
+    defer doc.deinit();
+    try std.testing.expectEqual(@as(usize, 1), doc.exec_edges.len);
+    try std.testing.expectEqual(@as(usize, 1), doc.comments.len);
+
+    const text = try render(std.testing.allocator, doc);
+    defer std.testing.allocator.free(text);
+    // `exec_edges` closes with a trailing comma because `comments` follows.
+    try std.testing.expect(std.mem.indexOf(u8, text, "} }\n  ],\n  \"comments\"") != null);
+
+    var doc2 = try parse(std.testing.allocator, text);
+    defer doc2.deinit();
+    const text2 = try render(std.testing.allocator, doc2);
+    defer std.testing.allocator.free(text2);
+    try std.testing.expectEqualStrings(text, text2);
+}
+
+test "comments parser rejects malformed entries" {
+    // Non-array comments.
+    try std.testing.expectError(ParseError.BadSchema, parse(std.testing.allocator,
+        \\{ "nodes": [], "edges": [], "comments": {} }
+    ));
+    // A non-object entry.
+    try std.testing.expectError(ParseError.BadSchema, parse(std.testing.allocator,
+        \\{ "nodes": [], "edges": [], "comments": [ 1 ] }
+    ));
+    // A non-string `text`.
+    try std.testing.expectError(ParseError.BadSchema, parse(std.testing.allocator,
+        \\{ "nodes": [], "edges": [], "comments": [ { "text": 5 } ] }
+    ));
+    // A non-number geometry field.
+    try std.testing.expectError(ParseError.BadSchema, parse(std.testing.allocator,
+        \\{ "nodes": [], "edges": [], "comments": [ { "x": "nope" } ] }
+    ));
+}
+
+test "comments with all defaults round-trip (sparse entry)" {
+    // A comment entry may omit any field — `text` defaults empty, geometry
+    // to the `Comment` defaults. The writer still emits a complete entry,
+    // and a re-parse is byte-stable.
+    const src =
+        \\{ "nodes": [], "edges": [], "comments": [ {} ] }
+    ;
+    var doc = try parse(std.testing.allocator, src);
+    defer doc.deinit();
+    try std.testing.expectEqual(@as(usize, 1), doc.comments.len);
+    try std.testing.expectEqualStrings("", doc.comments[0].text);
+    try std.testing.expectEqual(@as(f32, 200), doc.comments[0].w);
+
+    const text = try render(std.testing.allocator, doc);
+    defer std.testing.allocator.free(text);
+    var doc2 = try parse(std.testing.allocator, text);
+    defer doc2.deinit();
+    const text2 = try render(std.testing.allocator, doc2);
+    defer std.testing.allocator.free(text2);
+    try std.testing.expectEqualStrings(text, text2);
 }
 
 test "displayNameFromPath strips extension" {
