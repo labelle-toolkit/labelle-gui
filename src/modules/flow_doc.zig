@@ -800,6 +800,69 @@ pub fn switchCaseOutputCount(node_id: u32, exec_edges: []const flow_io.ExecEdge)
     return @min(count, max_case_outputs);
 }
 
+/// Upper bound on the number of `arg<N>` data inputs a variadic reporter
+/// (`Concat` / `Format`, flow-codegen#26) will render, so a hand-edited
+/// file with an absurd arg index can't ask the editor to draw thousands
+/// of pins.
+const max_arg_inputs: u32 = 64;
+
+/// Static `arg0`..`arg<max_arg_inputs-1>` pin-name literals. Built at
+/// comptime so each rendered/recorded `arg<N>` pin name is a 'static
+/// slice that outlives the frame — `recordPin` borrows the name into the
+/// pin registry, so a per-frame formatted string would dangle (mirrors
+/// the `case_pin_names` table the Switch node uses, and the inline
+/// `arg0..arg15` table the CustomNode renderer uses).
+const var_arg_pin_names: [max_arg_inputs][]const u8 = blk: {
+    @setEvalBranchQuota(max_arg_inputs * 2000);
+    var names: [max_arg_inputs][]const u8 = undefined;
+    for (0..max_arg_inputs) |i| {
+        names[i] = std.fmt.comptimePrint("arg{d}", .{i});
+    }
+    break :blk names;
+};
+
+/// Parse an `arg<N>` data-pin name to its index `N`, or null if `pin`
+/// isn't a well-formed `arg<N>` name. The digit run must be non-empty
+/// and all-decimal; overflow yields null rather than wrapping. Mirrors
+/// `caseIndexOf`'s shape for the variadic reporters.
+pub fn argIndexOf(pin: []const u8) ?u32 {
+    if (!std.mem.startsWith(u8, pin, "arg")) return null;
+    const digits = pin[3..];
+    if (digits.len == 0) return null;
+    return std.fmt.parseInt(u32, digits, 10) catch null;
+}
+
+/// How many `arg<N>` data inputs a variadic reporter (`Concat` /
+/// `Format`, flow-codegen#26) should render, given the document's data
+/// edges. The arg count is dynamic — codegen joins however many are
+/// wired — so we can't statically enumerate them; instead we derive the
+/// count from which `arg<N>` pins already have an incoming data edge
+/// *into this node*, then add one spare slot so a fresh (or
+/// just-extended) node is always wireable.
+///
+/// Rule: count = (highest wired `arg<N>` index + 1) + 1 spare. The
+/// rendered arg pins are then `arg0` .. `arg<count-1>`. Consequences:
+///   - No data edges → count 1 → renders `arg0` (the spare), so a
+///     brand-new `Concat`/`Format` is immediately wireable.
+///   - `arg0` + `arg2` wired (sparse) → highest is 2 → count 4 →
+///     renders `arg0`,`arg1`,`arg2` (filling the gap) + `arg3` (spare).
+/// Bounded by `max_arg_inputs` so a hand-edited file with an absurd
+/// index can't ask the editor to draw thousands of pins.
+pub fn varArgInputCount(node_id: u32, edges: []const flow_io.Edge) u32 {
+    var highest: ?u32 = null;
+    for (edges) |e| {
+        if (e.to_node != node_id) continue;
+        const idx = argIndexOf(e.to_pin) orelse continue;
+        if (highest == null or idx > highest.?) highest = idx;
+    }
+    // Saturating adds mirror `switchCaseOutputCount`: a hand-edited
+    // `arg<N>` pin can parse to a huge index, and an unchecked `+ 1`
+    // would panic in safe builds before the clamp runs.
+    const wired_span: u32 = if (highest) |h| h +| 1 else 0;
+    const count = wired_span +| 1; // + one spare empty arg slot
+    return @min(count, max_arg_inputs);
+}
+
 /// Whether `pin` is a legal exec-output pin name on a node of
 /// `type_name`. Branch/loop pins are matched against
 /// `controlExecPinNames`; `Switch` arm pins (`case<N>` / `default`)
@@ -2020,6 +2083,47 @@ fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Nod
                 zgui.text("value >", .{});
                 ne.endPin();
                 recordPin(s, n.id, "value", .output);
+            } else if (std.mem.eql(u8, n.type_name, "IntToString") or
+                std.mem.eql(u8, n.type_name, "FloatToString"))
+            {
+                // Scalar-to-string reporters (flow-codegen#26). One data
+                // INPUT `value` (the number to stringify) + one data
+                // OUTPUT `value` (the `[]const u8` result). Both share the
+                // name `value`; the pin id encodes direction, so input and
+                // output are distinct ids and codegen reads them by
+                // direction the same way. No exec pins — they render as
+                // rounded reporters (see `nodeVisual` / `isReporterTypeName`).
+                ne.beginPin(pinId(n.id, "value", .input), .input);
+                zgui.text("> value", .{});
+                ne.endPin();
+                recordPin(s, n.id, "value", .input);
+                ne.beginPin(pinId(n.id, "value", .output), .output);
+                zgui.text("value >", .{});
+                ne.endPin();
+                recordPin(s, n.id, "value", .output);
+            } else if (std.mem.eql(u8, n.type_name, "Concat") or
+                std.mem.eql(u8, n.type_name, "Format"))
+            {
+                // Variadic string reporters (flow-codegen#26). A dynamic
+                // set of `arg<N>` data INPUT pins (codegen joins them, in
+                // order) + one `value` data OUTPUT (`[]const u8`). The arg
+                // count is derived from the data edges already wired into
+                // this node, plus one spare slot so a fresh node is always
+                // wireable (`varArgInputCount`). `Format` additionally
+                // carries a `template` field (the `std.fmt` format string),
+                // shown in the inspector + the extras hint below. No exec
+                // pins — rounded reporters (see `isReporterTypeName`).
+                const arg_count = varArgInputCount(n.id, s.doc.edges);
+                for (0..arg_count) |i| {
+                    ne.beginPin(pinId(n.id, var_arg_pin_names[i], .input), .input);
+                    zgui.text("> {s}", .{var_arg_pin_names[i]});
+                    ne.endPin();
+                    recordPin(s, n.id, var_arg_pin_names[i], .input);
+                }
+                ne.beginPin(pinId(n.id, "value", .output), .output);
+                zgui.text("value >", .{});
+                ne.endPin();
+                recordPin(s, n.id, "value", .output);
             } else if (std.mem.eql(u8, n.type_name, "SetField")) {
                 ne.beginPin(pinId(n.id, "entity", .input), .input);
                 zgui.text("> entity", .{});
@@ -2117,22 +2221,52 @@ fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Nod
 
 /// Per-node visual style — corner radius + border color. Drives the
 /// command vs reporter visual difference (RFC §6, phase 4 item 6).
-const NodeVisual = struct {
+pub const NodeVisual = struct {
     rounding: f32,
     border: [4]f32,
 };
+
+/// Whether a built-in `.other`-kind node renders as a *reporter* (rounded
+/// silhouette, data-only, off the exec spine) rather than a command.
+/// `.other` carries no command/reporter polarity in `NodeKind`, so the
+/// editor classifies these expression nodes by `type_name` — the same set
+/// flow-codegen treats as pure-value reporters. The string/text reporters
+/// (`Concat`/`Format`/`IntToString`/`FloatToString`, flow-codegen#26) join
+/// this set so `nodeVisual` gives them the rounded shape and the generic
+/// classifier never awards them an exec-in anchor (they're not
+/// `isControlNode`, so `needs_exec_in` stays false).
+pub fn isReporterTypeName(type_name: []const u8) bool {
+    const reporters = [_][]const u8{
+        "BinOp",      "Compare",     "Logic",      "Literal",
+        "Identifier", "GetComponent", "Concat",    "Format",
+        "IntToString", "FloatToString",
+    };
+    for (reporters) |r| {
+        if (std.mem.eql(u8, type_name, r)) return true;
+    }
+    return false;
+}
 
 /// Map a node kind to its visual treatment. Commands are rectangular
 /// (rounding 4), reporters rounded (rounding 14), the `Event` trigger
 /// stays command-shaped but with a warm border color so the entry point
 /// reads at a glance. Unknown kinds get the neutral default.
-fn nodeVisual(n: flow_io.Node) NodeVisual {
+pub fn nodeVisual(n: flow_io.Node) NodeVisual {
     const command_round: f32 = 4.0;
     const reporter_round: f32 = 14.0;
     const neutral_border: [4]f32 = .{ 0.4, 0.4, 0.45, 1.0 };
     const reporter_border: [4]f32 = .{ 0.4, 0.65, 0.45, 1.0 };
     const command_border: [4]f32 = .{ 0.4, 0.55, 0.85, 1.0 };
     const trigger_border: [4]f32 = .{ 0.95, 0.74, 0.2, 1.0 };
+
+    // `.other` expression reporters (BinOp/Compare/Logic/Literal/Identifier
+    // and the string/text reporters, flow-codegen#26) are classified by
+    // `type_name` — they carry no polarity in `NodeKind`. Round them and
+    // give them the reporter border so they read as pure-value nodes.
+    if (n.kind == .other and isReporterTypeName(n.type_name)) return .{
+        .rounding = reporter_round,
+        .border = reporter_border,
+    };
 
     switch (n.kind) {
         // Reporter ops (RFC §6) — rounded, green-ish border.
@@ -2944,6 +3078,31 @@ fn renderNodePalette(s: *FlowDocState) void {
     zgui.sameLine(.{});
     if (zgui.button("+ Delay", .{})) {
         addOtherNode(s, "Delay", &.{.{ .key = "seconds", .value_text = "1" }}) catch |err| nodeAddErr(err);
+    }
+
+    // ── Text section (flow-codegen#26) ──
+    // String/text reporter nodes — rounded, produce a `value` ([]const u8)
+    // output that wires into command data inputs (`Log`/`Emit`/
+    // `SetVariable`, …). `Format` seeds an empty Zig string literal
+    // `template` (the `std.fmt` format string, edited via the `.text`
+    // widget — matches `Identifier`'s `""` name seed); the others carry no
+    // editable field — their inputs are data pins (`Concat`/`Format` are
+    // variadic `arg<N>`; `IntToString`/`FloatToString` take one `value`).
+    zgui.text("Text", .{});
+    if (zgui.button("+ Format", .{})) {
+        addOtherNode(s, "Format", &.{.{ .key = "template", .value_text = "\"\"" }}) catch |err| nodeAddErr(err);
+    }
+    zgui.sameLine(.{});
+    if (zgui.button("+ Concat", .{})) {
+        addOtherNode(s, "Concat", &.{}) catch |err| nodeAddErr(err);
+    }
+    zgui.sameLine(.{});
+    if (zgui.button("+ IntToString", .{})) {
+        addOtherNode(s, "IntToString", &.{}) catch |err| nodeAddErr(err);
+    }
+    zgui.sameLine(.{});
+    if (zgui.button("+ FloatToString", .{})) {
+        addOtherNode(s, "FloatToString", &.{}) catch |err| nodeAddErr(err);
     }
 
     // Raw `Call` escape hatch (RFC §7) — surfaced separately so a user
