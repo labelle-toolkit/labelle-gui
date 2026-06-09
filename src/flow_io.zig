@@ -747,13 +747,13 @@ pub const FlowDoc = struct {
     /// only when non-empty so pre-comment files round-trip byte-for-byte.
     /// flow-codegen ignores the key, so it has no codegen effect.
     comments: []Comment = &.{},
-    /// Highest node id seen — the editor allocates fresh ids above this.
+    /// Highest id seen across BOTH nodes and comments — the editor
+    /// allocates fresh ids above this. Nodes and comment frames share one
+    /// id counter (labelle-gui#203) so a comment's node-editor id
+    /// (`commentNodeId(id) == id`) can never collide with a node's id or,
+    /// transitively, with a pin id (pins pack `node_id << 30 | hash`).
+    /// Seeded on load from every node *and* comment id; see `parse`.
     max_node_id: u32 = 0,
-    /// Highest comment id seen (labelle-gui#188). Comment ids live in their
-    /// own namespace (they're not node ids), so they get their own
-    /// monotonic counter. Seeded from the loaded `comments` block and
-    /// bumped by `nextCommentId` so a fresh frame never reuses an id.
-    max_comment_id: u32 = 0,
 
     pub fn deinit(self: *FlowDoc) void {
         const child = self.arena.child_allocator;
@@ -765,20 +765,13 @@ pub const FlowDoc = struct {
         return self.arena.allocator();
     }
 
-    /// Allocate a fresh node id one above the current maximum. Bumps
-    /// `max_node_id` so successive calls don't collide.
+    /// Allocate a fresh id one above the current maximum, used for both
+    /// nodes and comment frames (labelle-gui#203 — shared namespace). Bumps
+    /// `max_node_id` so successive calls don't collide. Ids are 1-based;
+    /// `0` stays reserved as the "unassigned" sentinel.
     pub fn nextNodeId(self: *FlowDoc) u32 {
         self.max_node_id += 1;
         return self.max_node_id;
-    }
-
-    /// Allocate a fresh comment id one above the current maximum
-    /// (labelle-gui#188). Bumps `max_comment_id` so successive calls — and
-    /// any id-on-load assignment — never collide. Ids are 1-based; `0`
-    /// stays reserved as the "unassigned" sentinel.
-    pub fn nextCommentId(self: *FlowDoc) u32 {
-        self.max_comment_id += 1;
-        return self.max_comment_id;
     }
 };
 
@@ -887,25 +880,36 @@ pub fn parse(child_allocator: std.mem.Allocator, raw: []const u8) !FlowDoc {
     if (root.get("comments")) |v| {
         if (v != .array) return ParseError.BadSchema;
         doc.comments = try parseComments(a, v.array);
-        // Seed the comment-id counter from the highest persisted id, then
-        // backfill ids for any pre-id / unassigned (`0`) entries so every
-        // comment carries a stable, unique editor id (labelle-gui#188).
+        // Comment frames share the node id counter (labelle-gui#203):
+        // `commentNodeId(id) == id`, so a comment id must be unique against
+        // node ids as well as other comment ids. `max_node_id` was already
+        // seeded from the node ids above; fold the persisted comment ids in
+        // too so a fresh `nextNodeId()` lands strictly above every existing
+        // id, then backfill / re-assign as needed.
         for (doc.comments) |c| {
-            if (c.id > doc.max_comment_id) doc.max_comment_id = c.id;
+            if (c.id > doc.max_node_id) doc.max_node_id = c.id;
         }
-        // Assign a fresh id to any unassigned (`0`) OR duplicate entry —
-        // two comments sharing an id would alias to a single node-editor
-        // frame and bleed drag/resize/label state. `max_comment_id` is
-        // seeded above, so `nextCommentId()` can't collide (bugbot).
+        // Re-assign a fresh id to any comment whose id is unassigned (`0`),
+        // duplicates another comment (labelle-gui#188 / #201), OR collides
+        // with a NODE id (labelle-gui#203) — any of these would alias two
+        // frames (or a frame and a node) onto one node-editor id and bleed
+        // drag/resize/label/selection state. `max_node_id` is seeded above,
+        // so `nextNodeId()` can't collide with anything already present.
         for (doc.comments, 0..) |*c, i| {
-            var dup = c.id == 0;
-            if (!dup) for (doc.comments[0..i]) |prev| {
+            var clash = c.id == 0;
+            if (!clash) for (doc.comments[0..i]) |prev| {
                 if (prev.id == c.id) {
-                    dup = true;
+                    clash = true;
                     break;
                 }
             };
-            if (dup) c.id = doc.nextCommentId();
+            if (!clash) for (doc.nodes) |n| {
+                if (n.id == c.id) {
+                    clash = true;
+                    break;
+                }
+            };
+            if (clash) c.id = doc.nextNodeId();
         }
     }
 

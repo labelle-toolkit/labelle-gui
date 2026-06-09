@@ -5513,11 +5513,12 @@ pub const FlowIoTests = struct {
 
     // ── comment stable ids (labelle-gui#188, bugbot: delete reuses ids) ──
 
-    test "comment id round-trips and seeds max_comment_id" {
+    test "comment id round-trips and seeds shared max_node_id" {
         // A persisted `id` survives a save/load so the editor's stable
         // node-editor key is reproducible across sessions, and the loaded
-        // doc's `max_comment_id` is the highest id seen (so the next fresh
-        // comment never reuses one).
+        // doc's `max_node_id` (shared with nodes, labelle-gui#203) folds in
+        // the highest comment id (so the next fresh node/comment never
+        // reuses one).
         const a = std.testing.allocator;
         const src =
             \\{
@@ -5535,9 +5536,11 @@ pub const FlowIoTests = struct {
         try expect.equal(doc.comments.len, @as(usize, 2));
         try expect.equal(doc.comments[0].id, @as(u32, 3));
         try expect.equal(doc.comments[1].id, @as(u32, 7));
-        try expect.equal(doc.max_comment_id, @as(u32, 7));
+        // Comment ids fold into the shared node-id counter (#203); with no
+        // nodes present the highest comment id (7) is the max.
+        try expect.equal(doc.max_node_id, @as(u32, 7));
         // A fresh id lands strictly above the highest persisted one.
-        try expect.equal(doc.nextCommentId(), @as(u32, 8));
+        try expect.equal(doc.nextNodeId(), @as(u32, 8));
 
         const text = try flow_io.render(a, doc);
         defer a.free(text);
@@ -5573,9 +5576,10 @@ pub const FlowIoTests = struct {
         try expect.toBeTrue(doc.comments[0].id != 0);
         try expect.toBeTrue(doc.comments[1].id != 0);
         try expect.toBeTrue(doc.comments[0].id != doc.comments[1].id);
-        // …and the counter is consistent with what was assigned.
+        // …and the shared counter (#203) is consistent with what was
+        // assigned.
         const max_assigned = @max(doc.comments[0].id, doc.comments[1].id);
-        try expect.equal(doc.max_comment_id, max_assigned);
+        try expect.equal(doc.max_node_id, max_assigned);
     }
 
     test "duplicate comment ids are de-aliased on load (bugbot)" {
@@ -5622,6 +5626,57 @@ pub const FlowIoTests = struct {
         try expect.toBeTrue(doc.comments[1].id != 0);
         try expect.toBeTrue(doc.comments[1].id != 5);
         try expect.toBeTrue(doc.comments[1].id > 5);
+    }
+
+    test "comment id colliding with a node id is reassigned on load (#203)" {
+        // labelle-gui#203: comment node-editor ids share the node id space
+        // (`commentNodeId(id) == id`), so a persisted comment id that equals
+        // a NODE id would alias the comment frame onto that node's editor
+        // entry and bleed drag/selection state. The loader must detect the
+        // cross-collision and hand the comment a fresh, distinct id.
+        const a = std.testing.allocator;
+        const src =
+            \\{
+            \\  "event": { "type": "OnCreate" },
+            \\  "nodes": [
+            \\    { "id": 5, "type": "Log", "params": {} }
+            \\  ],
+            \\  "edges": [],
+            \\  "comments": [
+            \\    { "id": 5, "text": "collides with node 5", "x": 0, "y": 0, "w": 200, "h": 120 }
+            \\  ]
+            \\}
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+        try expect.equal(doc.nodes.len, @as(usize, 1));
+        try expect.equal(doc.comments.len, @as(usize, 1));
+        // The node keeps its id; the comment is moved off the collision.
+        try expect.equal(doc.nodes[0].id, @as(u32, 5));
+        try expect.toBeTrue(doc.comments[0].id != 5);
+        try expect.toBeTrue(doc.comments[0].id != 0);
+        // And the reassigned id is above the shared max (node id 5).
+        try expect.toBeTrue(doc.comments[0].id > 5);
+    }
+
+    test "commentNodeId is disjoint from node ids and pin ids (#203)" {
+        // The core invariant behind the #203 fix: because comment frames
+        // draw their id from the same counter as nodes, mapping a comment
+        // id through `commentNodeId` yields the id unchanged (a small u32),
+        // which is necessarily distinct from any other node's id and from
+        // every pin id (`pinId` packs `node_id << 30 | hash`, whose value is
+        // always >= node_id << 30 >= 2^30 for any non-zero node). A comment
+        // id stays a small integer well below that pin floor.
+        // Identity map: commentNodeId(id) == id.
+        try expect.equal(flow_doc.commentNodeId(7), @as(u64, 7));
+        // A comment id (here 7, from the shared counter) can't equal any
+        // pin id, even for a high-numbered node that previously reached the
+        // old 2^40 comment base. Bit 30+ is always set on a pin id.
+        const comment = flow_doc.commentNodeId(7);
+        inline for (.{ 1, 1024, 2048, 100000 }) |node| {
+            try expect.toBeTrue(comment != flow_doc.pinId(node, "in", .input));
+            try expect.toBeTrue(comment != flow_doc.pinId(node, "out", .output));
+        }
     }
 
     test "deleting comment[0] leaves comment[1] id+geometry intact" {
