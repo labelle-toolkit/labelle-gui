@@ -2133,6 +2133,20 @@ fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Nod
                 zgui.text("value >", .{});
                 ne.endPin();
                 recordPin(s, n.id, "value", .output);
+            } else if (isInputReporter(n.type_name)) {
+                // Input reporters (labelle-gui#208 / flow-codegen#51). They
+                // poll the raylib-style input mixin and produce a single
+                // `value` data OUTPUT — bool for the `IsKey*`/`IsMouseButton*`
+                // predicates, f32 for the `GetMouse*` getters. They take NO
+                // data input pins: the `IsKey*` `key` (a `KeyboardKey` tag)
+                // and `IsMouseButton*` `button` (a `MouseButton` tag) are
+                // on-node FIELDs (see `other_field_specs`), spliced inline by
+                // codegen; `GetMouse*` carry no field at all. No exec pins —
+                // rounded reporters (see `isReporterTypeName`).
+                ne.beginPin(pinId(n.id, "value", .output), .output);
+                zgui.text("value >", .{});
+                ne.endPin();
+                recordPin(s, n.id, "value", .output);
             } else if (std.mem.eql(u8, n.type_name, "SetField")) {
                 ne.beginPin(pinId(n.id, "entity", .input), .input);
                 zgui.text("> entity", .{});
@@ -2240,18 +2254,43 @@ pub const NodeVisual = struct {
 /// `.other` carries no command/reporter polarity in `NodeKind`, so the
 /// editor classifies these expression nodes by `type_name` — the same set
 /// flow-codegen treats as pure-value reporters. The string/text reporters
-/// (`Concat`/`Format`/`IntToString`/`FloatToString`, flow-codegen#26) join
-/// this set so `nodeVisual` gives them the rounded shape and the generic
+/// (`Concat`/`Format`/`IntToString`/`FloatToString`, flow-codegen#26) and the
+/// input reporters (`IsKeyDown`/`IsKeyPressed`/`IsKeyReleased`,
+/// `IsMouseButtonDown`/`IsMouseButtonPressed`/`IsMouseButtonReleased`,
+/// `GetMouseX`/`GetMouseY`/`GetMouseWheel`, labelle-gui#208 / flow-codegen#51)
+/// join this set so `nodeVisual` gives them the rounded shape and the generic
 /// classifier never awards them an exec-in anchor (they're not
 /// `isControlNode`, so `needs_exec_in` stays false).
 pub fn isReporterTypeName(type_name: []const u8) bool {
     const reporters = [_][]const u8{
-        "BinOp",      "Compare",     "Logic",      "Literal",
-        "Identifier", "GetComponent", "Concat",    "Format",
-        "IntToString", "FloatToString",
+        "BinOp",                  "Compare",               "Logic",                "Literal",
+        "Identifier",             "GetComponent",          "Concat",               "Format",
+        "IntToString",            "FloatToString",
+        // Input reporters (labelle-gui#208 / flow-codegen#51): bool key/mouse
+        // predicates + f32 mouse getters, read inside per-frame flows.
+        "IsKeyDown",              "IsKeyPressed",          "IsKeyReleased",
+        "IsMouseButtonDown",      "IsMouseButtonPressed",  "IsMouseButtonReleased",
+        "GetMouseX",              "GetMouseY",             "GetMouseWheel",
     };
     for (reporters) |r| {
         if (std.mem.eql(u8, type_name, r)) return true;
+    }
+    return false;
+}
+
+/// The input reporter type names (labelle-gui#208 / flow-codegen#51, #52) —
+/// `IsKey*`/`IsMouseButton*` predicates + `GetMouse*` getters. Each renders
+/// a single `value` data OUTPUT and no data inputs. Kept as a small set
+/// (mirrors `isReporterTypeName`) so the `.other` pin-render arm reads as a
+/// call, not a 9-way `or` chain (gemini #212).
+fn isInputReporter(type_name: []const u8) bool {
+    const names = [_][]const u8{
+        "IsKeyDown",         "IsKeyPressed",         "IsKeyReleased",
+        "IsMouseButtonDown", "IsMouseButtonPressed", "IsMouseButtonReleased",
+        "GetMouseX",         "GetMouseY",            "GetMouseWheel",
+    };
+    for (names) |n| {
+        if (std.mem.eql(u8, type_name, n)) return true;
     }
     return false;
 }
@@ -3112,6 +3151,51 @@ fn renderNodePalette(s: *FlowDocState) void {
     zgui.sameLine(.{});
     if (zgui.button("+ FloatToString", .{})) {
         addOtherNode(s, "FloatToString", &.{}) catch |err| nodeAddErr(err);
+    }
+
+    // ── Input section (labelle-gui#208 / flow-codegen#51) ──
+    // Input reporter nodes — rounded, poll the input mixin and produce a
+    // `value` output read inside per-frame flows. `IsKey*` carry a `key`
+    // FIELD (a `KeyboardKey` tag, seeded `"space"`); `IsMouseButton*` carry
+    // a `button` FIELD (a `MouseButton` tag, seeded `"left"`) — both stored
+    // as JSON strings, edited via the `.text` widget the same way
+    // `Identifier.name` is. `GetMouse*` take no field. The seeded
+    // `key`/`button` are quoted JSON-string value-text (`"\"space\""` →
+    // `"key": "space"`), matching codegen's `{ "type": "IsKeyDown",
+    // "key": "space" }` contract.
+    zgui.text("Input", .{});
+    if (zgui.button("+ IsKeyDown", .{})) {
+        addOtherNode(s, "IsKeyDown", &.{.{ .key = "key", .value_text = "\"space\"" }}) catch |err| nodeAddErr(err);
+    }
+    zgui.sameLine(.{});
+    if (zgui.button("+ IsKeyPressed", .{})) {
+        addOtherNode(s, "IsKeyPressed", &.{.{ .key = "key", .value_text = "\"space\"" }}) catch |err| nodeAddErr(err);
+    }
+    zgui.sameLine(.{});
+    if (zgui.button("+ IsKeyReleased", .{})) {
+        addOtherNode(s, "IsKeyReleased", &.{.{ .key = "key", .value_text = "\"space\"" }}) catch |err| nodeAddErr(err);
+    }
+    if (zgui.button("+ IsMouseButtonDown", .{})) {
+        addOtherNode(s, "IsMouseButtonDown", &.{.{ .key = "button", .value_text = "\"left\"" }}) catch |err| nodeAddErr(err);
+    }
+    zgui.sameLine(.{});
+    if (zgui.button("+ IsMouseButtonPressed", .{})) {
+        addOtherNode(s, "IsMouseButtonPressed", &.{.{ .key = "button", .value_text = "\"left\"" }}) catch |err| nodeAddErr(err);
+    }
+    zgui.sameLine(.{});
+    if (zgui.button("+ IsMouseButtonReleased", .{})) {
+        addOtherNode(s, "IsMouseButtonReleased", &.{.{ .key = "button", .value_text = "\"left\"" }}) catch |err| nodeAddErr(err);
+    }
+    if (zgui.button("+ GetMouseX", .{})) {
+        addOtherNode(s, "GetMouseX", &.{}) catch |err| nodeAddErr(err);
+    }
+    zgui.sameLine(.{});
+    if (zgui.button("+ GetMouseY", .{})) {
+        addOtherNode(s, "GetMouseY", &.{}) catch |err| nodeAddErr(err);
+    }
+    zgui.sameLine(.{});
+    if (zgui.button("+ GetMouseWheel", .{})) {
+        addOtherNode(s, "GetMouseWheel", &.{}) catch |err| nodeAddErr(err);
     }
 
     // Raw `Call` escape hatch (RFC §7) — surfaced separately so a user

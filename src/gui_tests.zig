@@ -226,7 +226,13 @@ pub fn main() !void {
     zglfw.windowHint(.doublebuffer, true);
     zglfw.windowHint(.visible, false);
 
-    const window = try zglfw.createWindow(1280, 720, "labelle-gui tests", null, null);
+    // Tall enough that the flow-editor inspector's node palette — which has
+    // grown several reporter clusters (String / Input, #207 / #208) — fits
+    // without the bottom "Add raw call…" escape hatch being clipped below
+    // the scrolling child's fold. TE can't auto-scroll a child to an item
+    // ImGui culled (it's never registered), so `palette_has_plugin_section`'s
+    // wildcard click on that button only resolves while it's on-screen.
+    const window = try zglfw.createWindow(1280, 1080, "labelle-gui tests", null, null);
     defer zglfw.destroyWindow(window);
 
     zglfw.makeContextCurrent(window);

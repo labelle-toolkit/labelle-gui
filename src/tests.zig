@@ -7368,6 +7368,164 @@ pub const FlowDocExecEdgeTests = struct {
         try expect.toBeTrue(saw_template);
     }
 
+    // ── Input reporter nodes (labelle-gui#208 / flow-codegen#51) ──
+    //
+    // Editor-side palette work for the nine input reporters: the key
+    // predicates `IsKeyDown`/`IsKeyPressed`/`IsKeyReleased` (each carries a
+    // `key` field, a `KeyboardKey` tag), the mouse-button predicates
+    // `IsMouseButtonDown`/`IsMouseButtonPressed`/`IsMouseButtonReleased`
+    // (each carries a `button` field, a `MouseButton` tag), and the
+    // fieldless mouse getters `GetMouseX`/`GetMouseY`/`GetMouseWheel`. All
+    // are `.other`-kind REPORTERS (rounded, data-only) producing a single
+    // `value` output (bool / f32) read inside per-frame flows. The
+    // key/button is an on-node FIELD, not a data pin — these nodes carry no
+    // data input pins.
+
+    test "appendOtherNode seeds IsKey* nodes with a key field" {
+        const a = std.testing.allocator;
+        const src =
+            \\{ "event": { "type": "OnUpdate" }, "nodes": [], "edges": [] }
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+
+        const names = [_][]const u8{ "IsKeyDown", "IsKeyPressed", "IsKeyReleased" };
+        for (names) |name| {
+            const id = try flow_io.appendOtherNode(
+                &doc,
+                name,
+                &.{.{ .key = "key", .value_text = "\"space\"" }},
+            );
+            const n = doc.nodes[doc.nodes.len - 1];
+            try expect.equal(n.id, id);
+            try expect.toBeTrue(n.kind == .other);
+            try expect.toBeTrue(std.mem.eql(u8, n.type_name, name));
+            // `key` is the inspector-editable text field, stored verbatim as
+            // a JSON string (matching codegen's `{ "type": ..., "key":
+            // "space" }`).
+            const spec = flow_io.otherFieldSpec(n.type_name).?;
+            try expect.toBeTrue(spec.widget == .text);
+            try expect.toBeTrue(std.mem.eql(u8, spec.key, "key"));
+            try expect.toBeTrue(std.mem.eql(u8, flow_io.extraValue(n, "key").?, "\"space\""));
+        }
+    }
+
+    test "appendOtherNode seeds IsMouseButton* nodes with a button field" {
+        const a = std.testing.allocator;
+        const src =
+            \\{ "event": { "type": "OnUpdate" }, "nodes": [], "edges": [] }
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+
+        const names = [_][]const u8{ "IsMouseButtonDown", "IsMouseButtonPressed", "IsMouseButtonReleased" };
+        for (names) |name| {
+            const id = try flow_io.appendOtherNode(
+                &doc,
+                name,
+                &.{.{ .key = "button", .value_text = "\"left\"" }},
+            );
+            const n = doc.nodes[doc.nodes.len - 1];
+            try expect.equal(n.id, id);
+            try expect.toBeTrue(n.kind == .other);
+            try expect.toBeTrue(std.mem.eql(u8, n.type_name, name));
+            const spec = flow_io.otherFieldSpec(n.type_name).?;
+            try expect.toBeTrue(spec.widget == .text);
+            try expect.toBeTrue(std.mem.eql(u8, spec.key, "button"));
+            try expect.toBeTrue(std.mem.eql(u8, flow_io.extraValue(n, "button").?, "\"left\""));
+        }
+    }
+
+    test "appendOtherNode creates fieldless GetMouseX / GetMouseY / GetMouseWheel" {
+        const a = std.testing.allocator;
+        const src =
+            \\{ "event": { "type": "OnUpdate" }, "nodes": [], "edges": [] }
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+
+        const mx = try flow_io.appendOtherNode(&doc, "GetMouseX", &.{});
+        const my = try flow_io.appendOtherNode(&doc, "GetMouseY", &.{});
+        const mw = try flow_io.appendOtherNode(&doc, "GetMouseWheel", &.{});
+
+        try expect.equal(doc.nodes.len, @as(usize, 3));
+        for (doc.nodes, [_]u32{ mx, my, mw }) |n, id| {
+            try expect.equal(n.id, id);
+            try expect.toBeTrue(n.kind == .other);
+            // No editable field — no spec, no seeded extras.
+            try expect.toBeTrue(flow_io.otherFieldSpec(n.type_name) == null);
+            try expect.equal(n.extras.len, @as(usize, 0));
+        }
+        try expect.toBeTrue(std.mem.eql(u8, doc.nodes[0].type_name, "GetMouseX"));
+        try expect.toBeTrue(std.mem.eql(u8, doc.nodes[1].type_name, "GetMouseY"));
+        try expect.toBeTrue(std.mem.eql(u8, doc.nodes[2].type_name, "GetMouseWheel"));
+    }
+
+    test "input reporters classify as rounded reporters with no exec-in" {
+        // All nine render as REPORTERS (rounded silhouette) — `nodeVisual`
+        // returns the reporter rounding (14) via `isReporterTypeName`, and
+        // they carry no exec pins so they're never swept onto the exec spine
+        // (`isReporterTypeName` set is disjoint from the control set).
+        const reporter_round: f32 = 14.0;
+        const names = [_][]const u8{
+            "IsKeyDown",          "IsKeyPressed",          "IsKeyReleased",
+            "IsMouseButtonDown",  "IsMouseButtonPressed",  "IsMouseButtonReleased",
+            "GetMouseX",          "GetMouseY",             "GetMouseWheel",
+        };
+        for (names) |name| {
+            try expect.toBeTrue(flow_doc.isReporterTypeName(name));
+            const n: flow_io.Node = .{ .id = 1, .type_name = name, .kind = .other };
+            try expect.equal(flow_doc.nodeVisual(n).rounding, reporter_round);
+        }
+    }
+
+    test "input reporter nodes round-trip through parse / render; key/button persist" {
+        const a = std.testing.allocator;
+        const src =
+            \\{ "event": { "type": "OnUpdate" }, "nodes": [], "edges": [] }
+        ;
+        var doc = try flow_io.parse(a, src);
+        defer doc.deinit();
+
+        _ = try flow_io.appendOtherNode(&doc, "IsKeyDown", &.{.{ .key = "key", .value_text = "\"space\"" }});
+        _ = try flow_io.appendOtherNode(&doc, "IsMouseButtonDown", &.{.{ .key = "button", .value_text = "\"left\"" }});
+        _ = try flow_io.appendOtherNode(&doc, "GetMouseX", &.{});
+
+        const text1 = try flow_io.render(a, doc);
+        defer a.free(text1);
+
+        // The node types survive the writer, and the key/button fields are
+        // emitted as the codegen contract's quoted strings.
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"type\": \"IsKeyDown\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"key\": \"space\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"type\": \"IsMouseButtonDown\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"button\": \"left\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, text1, "\"type\": \"GetMouseX\"") != null);
+
+        // Load → save is byte-stable (these carry only string / no extras,
+        // so there's no numeric normalisation to settle).
+        var doc2 = try flow_io.parse(a, text1);
+        defer doc2.deinit();
+        const text2 = try flow_io.render(a, doc2);
+        defer a.free(text2);
+        try expect.toBeTrue(std.mem.eql(u8, text1, text2));
+
+        // The `key` / `button` fields persist across the load → save cycle.
+        var saw_key = false;
+        var saw_button = false;
+        for (doc2.nodes) |n| {
+            if (std.mem.eql(u8, n.type_name, "IsKeyDown")) {
+                const v = flow_io.extraValue(n, "key") orelse continue;
+                saw_key = std.mem.eql(u8, v, "\"space\"");
+            } else if (std.mem.eql(u8, n.type_name, "IsMouseButtonDown")) {
+                const v = flow_io.extraValue(n, "button") orelse continue;
+                saw_button = std.mem.eql(u8, v, "\"left\"");
+            }
+        }
+        try expect.toBeTrue(saw_key);
+        try expect.toBeTrue(saw_button);
+    }
+
     // ── Switch case-output derivation (#199) ──
     //
     // A Switch's cases are dynamic, so the editor derives how many
