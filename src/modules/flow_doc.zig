@@ -1629,24 +1629,26 @@ fn linkId(e: flow_io.Edge) u64 {
     return (h.final() & 0x7FFF_FFFF_FFFF_FFFF) | (@as(u64, 1) << 63);
 }
 
-/// Base for comment-frame node-editor ids (labelle-gui#188). Comment
-/// frames are rendered as imgui-node-editor *group* nodes so the editor
-/// drags/resizes them natively, but they're not `flow_io.Node`s — they
-/// need ids in the same `NodeId` space that can't collide with a real
-/// node's id (`@intCast(n.id)`, a small `u32`). The high base keeps the
-/// two spaces disjoint: real node ids are small, comment ids start near
-/// 2^40, so no realistic node count reaches them.
-const comment_id_base: u64 = 0x100_0000_0000;
-
 /// Map a comment's *stable* id (`Comment.id`, labelle-gui#188) into the
 /// node-editor's id namespace. Keyed by the stable id — never the slice
 /// index — so deleting a non-last comment doesn't shift surviving frames
 /// onto another frame's editor (drag/resize) state.
-fn commentNodeId(comment_id: u32) u64 {
-    return comment_id_base + @as(u64, comment_id);
+///
+/// Comment frames are rendered as imgui-node-editor *group* nodes so the
+/// editor drags/resizes them natively, but they're not `flow_io.Node`s —
+/// they need `NodeId`s that can't collide with a real node's id
+/// (`@intCast(n.id)`) OR a pin id (`pinId` packs `node_id << 30 | hash`,
+/// reaching 2^40 once a node id hits ~1024). The old scheme offset comment
+/// ids by 2^40, which sits *inside* that pin space and collided in flows
+/// with ~1024+ nodes (labelle-gui#203). Instead, comments now draw their
+/// id from the SAME counter as nodes (`nextNodeId`/`max_node_id`), so the
+/// identity map below is both small (below the 2^30 pin floor) and unique
+/// against node ids by construction — no separate region, no collision.
+pub fn commentNodeId(comment_id: u32) u64 {
+    return @as(u64, comment_id);
 }
 
-const PinDir = enum { input, output };
+pub const PinDir = enum { input, output };
 
 /// A frame-scoped set of pin names, used to de-duplicate the pins a
 /// `Subflow` node emits within one direction. Keyed by the name bytes;
@@ -1660,7 +1662,7 @@ const PinNameSet = std.StringHashMap(void);
 /// whole pin-id space stays disjoint from link ids (`linkId` always
 /// sets bit 63). Collisions within the name-hash bits are astronomically
 /// unlikely and only cost a mis-drawn link, never data loss.
-fn pinId(node: u32, name: []const u8, dir: PinDir) u64 {
+pub fn pinId(node: u32, name: []const u8, dir: PinDir) u64 {
     var h = std.hash.Wyhash.init(node);
     h.update(name);
     const base = (h.final() & 0x3FFF_FFFF) | (@as(u64, node) << 30);
@@ -1698,8 +1700,9 @@ fn renderComments(s: *FlowDocState) void {
         // A defensively-assigned id for any frame that somehow reached the
         // canvas without one (id `0` is the "unassigned" sentinel). The
         // loader and `appendComment` both assign ids, so this is belt-and-
-        // braces — but a `0` id would alias `comment_id_base` across frames.
-        if (c.id == 0) c.id = s.doc.nextCommentId();
+        // braces — but a `0` id would map every such frame onto node-editor
+        // id 0 and bleed editor state. Shares the node id counter (#203).
+        if (c.id == 0) c.id = s.doc.nextNodeId();
         const id = commentNodeId(c.id);
 
         // Seed the editor's position from the doc the first frame, the
@@ -3946,10 +3949,12 @@ fn appendComment(s: *FlowDocState) !void {
         .y = 24 + offset,
         .w = 220,
         .h = 140,
-        // Stable editor id (labelle-gui#188) — mirror how nodes get
-        // `nextNodeId()`. Persisted so it survives loads and never aliases
-        // another frame's editor state after a sibling delete.
-        .id = s.doc.nextCommentId(),
+        // Stable editor id (labelle-gui#188) — drawn from the shared node
+        // id counter (`nextNodeId`, labelle-gui#203) so the comment's
+        // node-editor id can't collide with a node's id or a pin id.
+        // Persisted so it survives loads and never aliases another frame's
+        // editor state after a sibling delete.
+        .id = s.doc.nextNodeId(),
     };
     s.doc.comments = try growComments(a, s.doc.comments, c);
     s.needs_layout = true; // re-seed so the new frame's pos is applied
