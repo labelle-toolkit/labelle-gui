@@ -1197,6 +1197,11 @@ test "setRuntime: shutdown revert frees a sidecar-loaded catalog (issue #209)" {
     // runtime catalog (what `App.reloadFlowNodeCatalog` does).
     const cat = try loadFromPath(aa, path);
     setRuntime(cat);
+    // Guarantee cleanup even if an assertion below fails — otherwise an
+    // early exit leaks `cat` and leaves `current_runtime` dirty for the
+    // next test. `setRuntime` is idempotent, so this is a no-op after the
+    // explicit revert succeeds (gemini #211).
+    defer setRuntime(null);
     try std.testing.expect(current_runtime != null);
     try std.testing.expectEqualStrings("synthetic.do_thing", entries[0].name);
 
