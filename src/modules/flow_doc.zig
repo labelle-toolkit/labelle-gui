@@ -2133,16 +2133,7 @@ fn renderNodeBody(s: *FlowDocState, allocator: std.mem.Allocator, n: flow_io.Nod
                 zgui.text("value >", .{});
                 ne.endPin();
                 recordPin(s, n.id, "value", .output);
-            } else if (std.mem.eql(u8, n.type_name, "IsKeyDown") or
-                std.mem.eql(u8, n.type_name, "IsKeyPressed") or
-                std.mem.eql(u8, n.type_name, "IsKeyReleased") or
-                std.mem.eql(u8, n.type_name, "IsMouseButtonDown") or
-                std.mem.eql(u8, n.type_name, "IsMouseButtonPressed") or
-                std.mem.eql(u8, n.type_name, "IsMouseButtonReleased") or
-                std.mem.eql(u8, n.type_name, "GetMouseX") or
-                std.mem.eql(u8, n.type_name, "GetMouseY") or
-                std.mem.eql(u8, n.type_name, "GetMouseWheel"))
-            {
+            } else if (isInputReporter(n.type_name)) {
                 // Input reporters (labelle-gui#208 / flow-codegen#51). They
                 // poll the raylib-style input mixin and produce a single
                 // `value` data OUTPUT — bool for the `IsKey*`/`IsMouseButton*`
@@ -2283,6 +2274,23 @@ pub fn isReporterTypeName(type_name: []const u8) bool {
     };
     for (reporters) |r| {
         if (std.mem.eql(u8, type_name, r)) return true;
+    }
+    return false;
+}
+
+/// The input reporter type names (labelle-gui#208 / flow-codegen#51, #52) —
+/// `IsKey*`/`IsMouseButton*` predicates + `GetMouse*` getters. Each renders
+/// a single `value` data OUTPUT and no data inputs. Kept as a small set
+/// (mirrors `isReporterTypeName`) so the `.other` pin-render arm reads as a
+/// call, not a 9-way `or` chain (gemini #212).
+fn isInputReporter(type_name: []const u8) bool {
+    const names = [_][]const u8{
+        "IsKeyDown",         "IsKeyPressed",         "IsKeyReleased",
+        "IsMouseButtonDown", "IsMouseButtonPressed", "IsMouseButtonReleased",
+        "GetMouseX",         "GetMouseY",            "GetMouseWheel",
+    };
+    for (names) |n| {
+        if (std.mem.eql(u8, type_name, n)) return true;
     }
     return false;
 }
