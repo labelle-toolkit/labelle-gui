@@ -366,6 +366,21 @@ pub const other_field_specs = [_]OtherFieldSpec{
     // carry no editable field — their inputs are data pins — so they need
     // no spec.
     .{ .type_name = "Format", .key = "template", .label = "Template", .widget = .text },
+    // Input reporter nodes (labelle-gui#208 / flow-codegen#51). The
+    // `IsKey*` nodes carry a `key` field — a `KeyboardKey` enum-tag name
+    // (e.g. `"space"`) — and the `IsMouseButton*` nodes a `button` field —
+    // a `MouseButton` enum-tag name (e.g. `"left"`). Both are stored as a
+    // JSON string and edited through the `.text` widget the same way
+    // `Identifier.name`/`Format.template` are, so they round-trip as the
+    // quoted string codegen splices inline (`{ "type": "IsKeyDown",
+    // "key": "space" }`). `GetMouseX`/`GetMouseY`/`GetMouseWheel` carry no
+    // editable field — they take no inputs — so they need no spec.
+    .{ .type_name = "IsKeyDown", .key = "key", .label = "Key", .widget = .text },
+    .{ .type_name = "IsKeyPressed", .key = "key", .label = "Key", .widget = .text },
+    .{ .type_name = "IsKeyReleased", .key = "key", .label = "Key", .widget = .text },
+    .{ .type_name = "IsMouseButtonDown", .key = "button", .label = "Button", .widget = .text },
+    .{ .type_name = "IsMouseButtonPressed", .key = "button", .label = "Button", .widget = .text },
+    .{ .type_name = "IsMouseButtonReleased", .key = "button", .label = "Button", .widget = .text },
 };
 
 /// Return the editable-field spec for a node `type_name`, or null when
