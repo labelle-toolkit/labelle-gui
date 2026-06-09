@@ -432,6 +432,15 @@ pub const App = struct {
         // Flow Runtime frees its subscribed-flow name copies.
         self.entity_inspector.deinit();
         self.flow_runtime.deinit(self.allocator);
+        // Revert the process-global flow-node catalog to its static
+        // fallback, freeing the project's runtime catalog (and its arena)
+        // if one was installed by `reloadFlowNodeCatalog`. Without this,
+        // the last-loaded `RuntimeCatalog` outlives the App: `setRuntime`
+        // only frees the *previous* catalog on the next project
+        // transition, and shutdown is not a transition — so the catalog's
+        // arena (the materialized `entries`/`pin_styles` slices grown from
+        // ArrayLists in `loadFromPath`) leaks on exit (labelle-gui#209).
+        flow_node_catalog.setRuntime(null);
         self.project_manager.deinit();
         self.tree_view.deinit();
         self.compiler.deinit();

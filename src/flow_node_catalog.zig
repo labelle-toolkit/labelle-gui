@@ -1148,6 +1148,70 @@ test "setRuntime: swap to runtime, then revert to static" {
     try std.testing.expectEqual(static_count, entries.len);
 }
 
+// Regression for labelle-gui#209: a runtime catalog installed by a
+// project load (and never followed by another project transition) must
+// be reclaimed at App shutdown. `App.deinit` now does this via a final
+// `setRuntime(null)`. This test mirrors that lifecycle under
+// `testing.allocator` — load a real sidecar, install it, then revert
+// exactly once (as shutdown does). If the final revert is dropped, the
+// catalog's arena (holding the ArrayList-grown `entries`/`pin_styles`
+// slices) leaks and `testing.allocator` fails the test — which is the
+// exact DebugAllocator leak the issue reported on window close.
+test "setRuntime: shutdown revert frees a sidecar-loaded catalog (issue #209)" {
+    const aa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const json =
+        \\{
+        \\  "generated_at": "2026-06-09T00:00:00Z",
+        \\  "plugins": [
+        \\    {
+        \\      "name": "synthetic",
+        \\      "flow_nodes": [
+        \\        {
+        \\          "qualified": "synthetic.do_thing",
+        \\          "display_name": "Do Thing",
+        \\          "category": "synthetic",
+        \\          "docs": "",
+        \\          "kind": "command",
+        \\          "pins": [
+        \\            { "name": "entity", "label": "Entity", "zig_type": "u32", "dir": "input", "default": null }
+        \\          ],
+        \\          "return_type": null
+        \\        }
+        \\      ],
+        \\      "pin_styles": [
+        \\        { "zig_type": "MyStruct", "label": "My Struct", "color": [12, 34, 56] }
+        \\      ]
+        \\    }
+        \\  ]
+        \\}
+        \\
+    ;
+    try tmp.dir.writeFile(io_global.io(), .{ .sub_path = "flow_catalog.json", .data = json });
+    const path = try tmp.dir.realPathFileAlloc(io_global.io(), "flow_catalog.json", aa);
+    defer aa.free(path);
+
+    // Project-load path: parse the sidecar and install it as the active
+    // runtime catalog (what `App.reloadFlowNodeCatalog` does).
+    const cat = try loadFromPath(aa, path);
+    setRuntime(cat);
+    // Guarantee cleanup even if an assertion below fails — otherwise an
+    // early exit leaks `cat` and leaves `current_runtime` dirty for the
+    // next test. `setRuntime` is idempotent, so this is a no-op after the
+    // explicit revert succeeds (gemini #211).
+    defer setRuntime(null);
+    try std.testing.expect(current_runtime != null);
+    try std.testing.expectEqualStrings("synthetic.do_thing", entries[0].name);
+
+    // Shutdown path: the single revert `App.deinit` now performs. This
+    // is the *only* free of `cat`'s arena — drop it and the test leaks.
+    setRuntime(null);
+    try std.testing.expect(current_runtime == null);
+    try std.testing.expectEqual(static_pin_styles.len, pin_styles.len);
+}
+
 test "loadFromSidecar: returns null when no .labelle/* subdir has the file" {
     const aa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
