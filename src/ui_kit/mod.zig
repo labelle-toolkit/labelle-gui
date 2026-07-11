@@ -22,9 +22,25 @@
 //!                       tested): directional move + tab order + wrap.
 //! - `layout.zig`      — the small row/column/anchor constraint pass
 //!                       (COMPLETE, tested). NOT flexbox — see non-goals.
-//! - `text.zig`        — text wrapping + alignment against injectable glyph
-//!                       metrics (functional first cut; real font metrics
-//!                       arrive with RFC-FONT-LOADER — see that file).
+//! - `text.zig`        — text wrapping + alignment against a size-parameterized
+//!                       glyph-metrics seam (COMPLETE, tested).
+//! - `font.zig`        — real proportional metrics behind that seam, driven by
+//!                       a baked glyph table whose `extern` layout matches
+//!                       labelle-core so a loaded font casts straight in
+//!                       (COMPLETE, tested).
+//! - `render.zig`      — the engine-binding contract: walks a laid-out tree
+//!                       into a flat, backend-agnostic `DrawList` (COMPLETE,
+//!                       tested). This is the surface a renderer consumes.
+//!
+//! ## Consuming from a renderer (the engine binding)
+//!
+//! 1. Build/mutate a `Tree` of elements (authored from a scene/prefab).
+//! 2. `layout.apply(&tree, root, screen)` to compute every `rect`.
+//! 3. Feed input: `focus.navigate` / `tree.pointerRelease` (drains
+//!    `ui__clicked` events for the game / Lua bus).
+//! 4. `render.build(alloc, &tree, .{...})` → a `DrawList`; iterate it and map
+//!    each `DrawCmd` to a backend draw call. That call site is the only
+//!    cross-repo seam, and it is GPU-type-free by construction.
 //!
 //! ## Retained, not immediate
 //!
@@ -44,12 +60,16 @@ pub const nine_slice = @import("nine_slice.zig");
 pub const focus = @import("focus.zig");
 pub const layout = @import("layout.zig");
 pub const text = @import("text.zig");
+pub const font = @import("font.zig");
+pub const render = @import("render.zig");
 
 comptime {
     _ = nine_slice;
     _ = focus;
     _ = layout;
     _ = text;
+    _ = font;
+    _ = render;
 }
 
 // ─── Geometry primitives ──────────────────────────────────────────────────
@@ -122,6 +142,25 @@ pub const Color = struct {
 
     pub const white: Color = .{};
     pub const transparent: Color = .{ .a = 0 };
+
+    /// 8-bit RGBA, matching the engine's `gui_types.GuiColor` (0..255). The
+    /// renderer boundary quantizes here so authored f32 tints round-trip to
+    /// the backend's color type.
+    pub const Rgba8 = struct { r: u8 = 255, g: u8 = 255, b: u8 = 255, a: u8 = 255 };
+
+    pub fn toU8(self: Color) Rgba8 {
+        return .{
+            .r = quant(self.r),
+            .g = quant(self.g),
+            .b = quant(self.b),
+            .a = quant(self.a),
+        };
+    }
+
+    fn quant(v: f32) u8 {
+        const clamped = @max(0, @min(1, v));
+        return @intFromFloat(@round(clamped * 255));
+    }
 };
 
 /// Where a child sits inside the space its parent's layout hands it (and,
@@ -194,6 +233,10 @@ pub const Text = struct {
     /// Font size in logical pixels (line advance is derived from metrics).
     size_px: f32 = 16,
     color: Color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+    /// Name of a font asset (resolved by the host to real glyph metrics — see
+    /// `font.FontMetrics` and `render.FontResolver`). Empty = the renderer's
+    /// default font, matching `gui_types.Label.font == null`.
+    font_name: []const u8 = "",
     halign: TextAlign = .left,
     /// When true, break on word boundaries to fit the element's content
     /// width; when false, render single-line (clip/overflow is the host's
