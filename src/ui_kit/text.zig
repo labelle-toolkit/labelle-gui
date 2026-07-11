@@ -1,56 +1,93 @@
 //! Text layout for `UiText` — word wrapping + horizontal alignment.
 //!
-//! ## Status: functional first cut, metrics seam pending a font loader
+//! ## Metrics seam
 //!
-//! The wrapping/alignment logic here is complete and tested. What it does
-//! *not* do yet is own real glyph metrics — those come from the font loader
-//! (RFC-FONT-LOADER, referenced by issue #214). Until that lands, callers
-//! supply a `Metrics` provider: a tiny interface of "advance width of a
-//! codepoint at a size" + "line height". `monospace(...)` is a built-in
-//! provider used by the tests and usable as a fallback; the real font loader
-//! will supply a proportional provider backed by the atlas'd glyph table.
+//! The wrapping/alignment logic here is metrics-agnostic: it asks a `Metrics`
+//! provider for per-codepoint advances, per-pair kerning, and line height —
+//! all parameterized by the requested `size_px`, so one provider serves every
+//! font size. Two providers ship:
 //!
-//! Explicit non-goals (v1, per the ticket): rich text. Words longer than the
-//! wrap width are NOT split mid-glyph — they overflow their line. Hard
-//! newlines (`\n`) in the content always break.
+//!  - `monospace(...)` — a fixed-ratio provider (tests, and a fallback until a
+//!    font is loaded).
+//!  - `font.FontMetrics.provider()` — real *proportional* metrics driven by a
+//!    baked glyph table (the RFC-FONT-LOADER shape). This is what replaces the
+//!    monospace fallback once a font asset is resolved; see `font.zig`.
+//!
+//! Explicit non-goals (v1, per issue #214): rich text, bidi, complex-script
+//! shaping. Words longer than the wrap width are NOT split mid-glyph — they
+//! overflow their line. Hard newlines (`\n`) always break.
 
 const std = @import("std");
 const root = @import("mod.zig");
 const TextAlign = root.TextAlign;
 
-/// Glyph-metrics provider. `advanceFn` returns the horizontal advance of one
-/// codepoint rendered at `size_px`; `context` lets a real font loader carry
-/// its glyph table. This is the seam RFC-FONT-LOADER plugs into — nothing in
-/// the layout code assumes monospace.
+/// Glyph-metrics provider — the seam between layout and a font. Every hook is
+/// parameterized by `size_px` so a single provider handles all sizes (a
+/// proportional font scales its baked advances; monospace multiplies a ratio).
+///
+///  - `advanceFn`    — horizontal pen advance for one codepoint.
+///  - `kernFn`       — extra advance inserted between an adjacent pair
+///                     (`left` then `right`); 0 when the font has no kerning.
+///  - `lineHeightFn` — baseline-to-baseline distance for a line of text.
+///
+/// `context` carries the provider's backing data (a glyph table, a ratio
+/// store, …) and must outlive the `Metrics`.
 pub const Metrics = struct {
-    line_height: f32,
     context: *const anyopaque = undefined,
     advanceFn: *const fn (context: *const anyopaque, codepoint: u21, size_px: f32) f32,
+    kernFn: *const fn (context: *const anyopaque, left: u21, right: u21, size_px: f32) f32 = zeroKern,
+    lineHeightFn: *const fn (context: *const anyopaque, size_px: f32) f32,
 
     pub fn advance(self: Metrics, codepoint: u21, size_px: f32) f32 {
         return self.advanceFn(self.context, codepoint, size_px);
     }
+    pub fn kern(self: Metrics, left: u21, right: u21, size_px: f32) f32 {
+        return self.kernFn(self.context, left, right, size_px);
+    }
+    pub fn lineHeight(self: Metrics, size_px: f32) f32 {
+        return self.lineHeightFn(self.context, size_px);
+    }
+};
+
+fn zeroKern(context: *const anyopaque, left: u21, right: u21, size_px: f32) f32 {
+    _ = context;
+    _ = left;
+    _ = right;
+    _ = size_px;
+    return 0;
+}
+
+// ─── Monospace provider (fallback / tests) ─────────────────────────────────
+
+/// Backing store for `monospace`: every glyph advances `char_ratio * size_px`,
+/// every line is `line_ratio * size_px` tall. Keep it alive for the Metrics'
+/// lifetime.
+pub const MonoStore = struct {
+    char_ratio: f32,
+    line_ratio: f32 = 1.2,
 };
 
 fn monoAdvance(context: *const anyopaque, codepoint: u21, size_px: f32) f32 {
     _ = codepoint;
-    const ratio: *const f32 = @ptrCast(@alignCast(context));
-    return ratio.* * size_px;
+    const s: *const MonoStore = @ptrCast(@alignCast(context));
+    return s.char_ratio * size_px;
+}
+fn monoLineHeight(context: *const anyopaque, size_px: f32) f32 {
+    const s: *const MonoStore = @ptrCast(@alignCast(context));
+    return s.line_ratio * size_px;
 }
 
-/// A fixed-advance provider: every glyph is `char_ratio * size_px` wide, each
-/// line `line_ratio * size_px` tall. Handy for tests and as a placeholder
-/// until the font loader supplies proportional metrics. The returned Metrics
-/// borrows `store` — keep it alive for the Metrics' lifetime.
-pub const MonoStore = struct { char_ratio: f32 };
-
-pub fn monospace(store: *const MonoStore, line_ratio_px: f32) Metrics {
+/// A fixed-advance metrics provider. Handy for tests and as a placeholder
+/// until a real font is resolved.
+pub fn monospace(store: *const MonoStore) Metrics {
     return .{
-        .line_height = line_ratio_px,
-        .context = &store.char_ratio,
+        .context = store,
         .advanceFn = monoAdvance,
+        .lineHeightFn = monoLineHeight,
     };
 }
+
+// ─── Measurement + wrapping ────────────────────────────────────────────────
 
 /// One laid-out line: a slice into the original `content` plus its measured
 /// width in pixels.
@@ -59,17 +96,22 @@ pub const Line = struct {
     width: f32,
 };
 
-/// Total pixel width of a UTF-8 run at `size_px` under `metrics`.
+/// Total pixel width of a UTF-8 run at `size_px`, kerning included.
 pub fn measure(run: []const u8, size_px: f32, metrics: Metrics) f32 {
     var w: f32 = 0;
     const view = std.unicode.Utf8View.init(run) catch {
         // Malformed UTF-8: fall back to byte-wise advance so we never crash
-        // on user content. (The font loader will validate upstream.)
+        // on user content. (A real font loader validates upstream.)
         for (run) |_| w += metrics.advance(' ', size_px);
         return w;
     };
     var it = view.iterator();
-    while (it.nextCodepoint()) |cp| w += metrics.advance(cp, size_px);
+    var prev: ?u21 = null;
+    while (it.nextCodepoint()) |cp| {
+        if (prev) |p| w += metrics.kern(p, cp, size_px);
+        w += metrics.advance(cp, size_px);
+        prev = cp;
+    }
     return w;
 }
 
@@ -159,26 +201,32 @@ pub fn xOffset(halign: TextAlign, box_width: f32, line_width: f32) f32 {
     };
 }
 
-/// Total laid-out height for `line_count` lines under `metrics`.
-pub fn blockHeight(line_count: usize, metrics: Metrics) f32 {
-    return @as(f32, @floatFromInt(line_count)) * metrics.line_height;
+/// Total laid-out height for `line_count` lines at `size_px`.
+pub fn blockHeight(line_count: usize, metrics: Metrics, size_px: f32) f32 {
+    return @as(f32, @floatFromInt(line_count)) * metrics.lineHeight(size_px);
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 
-// 10px-per-glyph, 16px line height — round numbers make expectations obvious.
-var test_store: MonoStore = .{ .char_ratio = 1.0 };
+// 1.0 char ratio, 1.6 line ratio → 10px/glyph and 16px lines at size 10.
+var test_store: MonoStore = .{ .char_ratio = 1.0, .line_ratio = 1.6 };
 fn testMetrics() Metrics {
-    test_store = .{ .char_ratio = 1.0 };
-    return monospace(&test_store, 16);
+    test_store = .{ .char_ratio = 1.0, .line_ratio = 1.6 };
+    return monospace(&test_store);
 }
 
 test "measure sums per-glyph advances" {
-    const m = testMetrics(); // 1.0 * size → 10px per char at size 10
+    const m = testMetrics();
     try testing.expectApproxEqAbs(@as(f32, 50), measure("hello", 10, m), 0.001);
     try testing.expectApproxEqAbs(@as(f32, 0), measure("", 10, m), 0.001);
+}
+
+test "measure scales with size_px" {
+    const m = testMetrics();
+    try testing.expectApproxEqAbs(@as(f32, 30), measure("abc", 10, m), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 60), measure("abc", 20, m), 0.001);
 }
 
 test "no-wrap keeps a single line but still splits on hard newlines" {
@@ -197,8 +245,6 @@ test "no-wrap keeps a single line but still splits on hard newlines" {
 
 test "word wrap breaks at the width boundary" {
     const m = testMetrics(); // 10px/char at size 10
-    // "aaa bbb ccc": each word 30px, space 10px. Width 70 fits two words
-    // (30 + 10 + 30 = 70) but not three.
     const lines = try wrap(testing.allocator, "aaa bbb ccc", 70, 10, m, true);
     defer testing.allocator.free(lines);
     try testing.expectEqual(@as(usize, 2), lines.len);
@@ -210,7 +256,6 @@ test "word wrap breaks at the width boundary" {
 
 test "a word longer than the width gets its own line (no mid-glyph split)" {
     const m = testMetrics();
-    // "wide" is 40px but max width is 20 → still one line, overflowing.
     const lines = try wrap(testing.allocator, "hi wide ok", 20, 10, m, true);
     defer testing.allocator.free(lines);
     try testing.expectEqual(@as(usize, 3), lines.len);
@@ -232,7 +277,8 @@ test "xOffset aligns left / center / right" {
     try testing.expectApproxEqAbs(@as(f32, 60), xOffset(.right, 100, 40), 0.001);
 }
 
-test "blockHeight scales with line count" {
-    const m = testMetrics();
-    try testing.expectApproxEqAbs(@as(f32, 48), blockHeight(3, m), 0.001);
+test "blockHeight scales with line count and size" {
+    const m = testMetrics(); // line_ratio 1.6
+    try testing.expectApproxEqAbs(@as(f32, 48), blockHeight(3, m, 10), 0.001); // 3 * 16
+    try testing.expectApproxEqAbs(@as(f32, 96), blockHeight(3, m, 20), 0.001); // 3 * 32
 }
