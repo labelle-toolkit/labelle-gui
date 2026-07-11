@@ -39,6 +39,15 @@ const test_fixtures = @import("test_fixtures.zig");
 const dnd = @import("modules/dnd.zig");
 const prefab_index = @import("prefab_index.zig");
 const splitter = @import("modules/splitter.zig");
+const ui_kit = @import("ui_kit/mod.zig");
+
+// The in-game UI kit (issue #214) is pure-Zig with `test` blocks in each of
+// its subsystem files. `mod.zig` re-exports them and this comptime reference
+// pulls the whole set into `builtin.test_functions` — same discovery trick as
+// `node_catalog` above.
+comptime {
+    _ = ui_kit;
+}
 
 /// Wall-clock seconds since the Unix epoch; replacement for the
 /// `std.time.timestamp` helper removed in Zig 0.16. Used only to
