@@ -263,6 +263,30 @@ pub fn buildSpawnArgv(
     return argv_buf[0..n];
 }
 
+/// Set the `LABELLE_PREVIEW` environment variable to the loopback
+/// host + port the editor's listener is bound to. The spawned game's
+/// `main` reads this variable and dials back — see the engine-side
+/// `preview_mode.zig` for the consumer half. Extracted from `start()`
+/// so the env-mutation contract (#131) is unit-testable without
+/// spawning a child process. `port` is the editor's listening port.
+/// Returns `error.OutOfMemory` only if formatting the address into
+/// the temp buffer overflows — `"127.0.0.1:65535\x00"` fits in 32
+/// bytes so this is defensive.
+pub fn setPreviewEnv(port: u16) error{OutOfMemory}!void {
+    var addr_buf: [32]u8 = undefined;
+    const addr_str = std.fmt.bufPrintZ(&addr_buf, "127.0.0.1:{d}", .{port}) catch
+        return error.OutOfMemory;
+    _ = setenv("LABELLE_PREVIEW", addr_str.ptr, 1);
+}
+
+/// Clear the `LABELLE_PREVIEW` environment variable. Idempotent —
+/// libc `unsetenv` on an unset key is a no-op. Symmetric with
+/// `setPreviewEnv`. Extracted from `stop()` for the same testability
+/// reason as `setPreviewEnv` (#131).
+pub fn clearPreviewEnv() void {
+    _ = unsetenv("LABELLE_PREVIEW");
+}
+
 pub const PreviewSession = struct {
     allocator: std.mem.Allocator,
     state: State,
@@ -470,7 +494,7 @@ pub const PreviewSession = struct {
         // see LABELLE_PREVIEW even though PATH propagated correctly,
         // suggesting std.process.spawn snapshots env in a way that
         // doesn't pick up runtime setenv calls on Darwin).
-        _ = setenv("LABELLE_PREVIEW", addr_str.ptr, 1); // still set for the simpler propagation path
+        try setPreviewEnv(self.port.?); // still set for the simpler propagation path
         var env_map = std.process.Environ.Map.init(self.allocator);
         defer env_map.deinit();
         // Copy the current environ into the Map. extern environ is
@@ -516,7 +540,7 @@ pub const PreviewSession = struct {
     pub fn stop(self: *Self) void {
         // Symmetric with `start()`'s setenv. Multiple stops are safe
         // (unsetenv on an unset var is a no-op).
-        _ = unsetenv("LABELLE_PREVIEW");
+        clearPreviewEnv();
         if (self.child) |*c| {
             c.kill(io_global.io());
             self.child = null;

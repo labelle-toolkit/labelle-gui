@@ -3956,6 +3956,96 @@ pub const PreviewSpawnArgvTests = struct {
     }
 };
 
+pub const PreviewEnvTests = struct {
+    // Regression-lock the `LABELLE_PREVIEW` env-var contract that the
+    // editor relies on for the engine to discover the editor's
+    // listener (#131). `start()` calls `setPreviewEnv(port)` before
+    // spawning; `stop()` calls `clearPreviewEnv()` on teardown. The
+    // engine reads `LABELLE_PREVIEW` straight off its own environ at
+    // boot — see the engine-side `preview_mode.zig`. These tests
+    // exercise the env helpers directly so the spawn path doesn't
+    // have to fire.
+
+    extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+    fn readEnv() ?[]const u8 {
+        const raw = getenv("LABELLE_PREVIEW") orelse return null;
+        return std.mem.span(raw);
+    }
+
+    test "setPreviewEnv populates LABELLE_PREVIEW with loopback addr" {
+        preview.clearPreviewEnv();
+        defer preview.clearPreviewEnv();
+
+        try preview.setPreviewEnv(54321);
+        const got = readEnv() orelse return error.MissingEnvVar;
+        try std.testing.expectEqualStrings("127.0.0.1:54321", got);
+    }
+
+    test "clearPreviewEnv removes LABELLE_PREVIEW" {
+        try preview.setPreviewEnv(9000);
+        try std.testing.expect(readEnv() != null);
+
+        preview.clearPreviewEnv();
+        try std.testing.expect(readEnv() == null);
+    }
+
+    test "clearPreviewEnv on unset var is a no-op" {
+        // Locks `stop()` being safe to call from `.idle` — same
+        // contract as the issue's bonus bullet "stop() from .idle is
+        // a no-op". libc `unsetenv` already handles this; the test
+        // is here so a future refactor that changes the impl can't
+        // silently regress the idempotency.
+        preview.clearPreviewEnv();
+        preview.clearPreviewEnv();
+        try std.testing.expect(readEnv() == null);
+    }
+
+    test "set → clear → set leaves the env in the second value" {
+        // Mirrors a `start → stop → start` sequence: multiple
+        // sessions in a row must each set up env fresh, no leak
+        // from the previous one. Issue #131 bonus bullet.
+        defer preview.clearPreviewEnv();
+
+        try preview.setPreviewEnv(1111);
+        preview.clearPreviewEnv();
+        try preview.setPreviewEnv(2222);
+
+        const got = readEnv() orelse return error.MissingEnvVar;
+        try std.testing.expectEqualStrings("127.0.0.1:2222", got);
+    }
+
+    test "setPreviewEnv overwrites a previous value rather than appending" {
+        defer preview.clearPreviewEnv();
+
+        try preview.setPreviewEnv(1111);
+        try preview.setPreviewEnv(2222);
+
+        const got = readEnv() orelse return error.MissingEnvVar;
+        try std.testing.expectEqualStrings("127.0.0.1:2222", got);
+    }
+
+    test "setPreviewEnv addr matches a session's bound port" {
+        // Lock the issue's third assertion: the captured port in
+        // `LABELLE_PREVIEW` matches `self.port.?` after
+        // `bindListener`. Goes through `PreviewSession` so the
+        // production wiring (`start()` formats addr from `self.port`)
+        // is exercised end-to-end, just without spawning.
+        defer preview.clearPreviewEnv();
+
+        var sess = preview.PreviewSession.init(std.testing.allocator);
+        defer sess.deinit();
+        try sess.bindListener();
+        const port = sess.port orelse return error.NoPort;
+
+        try preview.setPreviewEnv(port);
+        const got = readEnv() orelse return error.MissingEnvVar;
+        var expected_buf: [32]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&expected_buf, "127.0.0.1:{d}", .{port});
+        try std.testing.expectEqualStrings(expected, got);
+    }
+};
+
 pub const PreviewTransportTests = struct {
     // Drives `PreviewSession` end-to-end against an in-test fake
     // engine that dials the editor's listener and writes JSON
