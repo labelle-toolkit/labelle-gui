@@ -152,7 +152,7 @@ fn render(app: *App) void {
 
     // ── Split: sprite list + detail | sheet ──────────────────────
     _ = zgui.beginChild("##atlas-left", .{ .w = 240, .child_flags = .{ .border = true } });
-    renderSpriteList(app, v, cur);
+    renderSpriteList(v, cur);
     zgui.endChild();
 
     zgui.sameLine(.{});
@@ -164,20 +164,11 @@ fn render(app: *App) void {
 
 /// Left column: scrollable sprite list (upper) + selected-sprite
 /// detail (lower).
-fn renderSpriteList(app: *App, v: *AtlasViewer, cur: *const atlas.Atlas) void {
-    // Sorted frame names — hash-map order is otherwise arbitrary.
-    var names: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer names.deinit(app.allocator);
-    {
-        var it = cur.frames.iterator();
-        while (it.next()) |kv| names.append(app.allocator, kv.key_ptr.*) catch {};
-    }
-    std.mem.sort([]const u8, names.items, {}, lessName);
-
+fn renderSpriteList(v: *AtlasViewer, cur: *const atlas.Atlas) void {
     const detail_h: f32 = 140;
     _ = zgui.beginChild("##sprite-list", .{ .h = -detail_h });
     var lbl: [544]u8 = undefined;
-    for (names.items) |name| {
+    for (cur.sorted_frame_keys) |name| {
         const selected = std.mem.eql(u8, name, v.selectedSprite());
         const z = std.fmt.bufPrintZ(&lbl, "{s}", .{name}) catch continue;
         if (zgui.selectable(z, .{ .selected = selected })) v.setSprite(name);
@@ -267,10 +258,6 @@ fn renderSheet(v: *AtlasViewer, cur: *const atlas.Atlas) void {
             .thickness = if (selected) 2.0 else 1.0,
         });
     }
-}
-
-fn lessName(_: void, a: []const u8, b: []const u8) bool {
-    return std.mem.lessThan(u8, a, b);
 }
 
 /// Pick a folder, run `labelle pack` on it, and load the result.
