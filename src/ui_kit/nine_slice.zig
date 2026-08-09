@@ -183,16 +183,26 @@ const TileAxis = struct {
     }
 };
 
+/// Upper bound on quads one tiled decomposition may emit. Without it a
+/// pathological segment-to-destination ratio (a 1px middle segment on a
+/// full-screen panel, say) silently expands to millions of quads and stalls
+/// the renderer on a single authoring mistake. Past the budget the panel
+/// degrades to the stretch decomposition — a smeared pattern beats a
+/// dropped frame or an OOM, matching the kit's draw-something-always
+/// fallbacks (cf. the solid-quad placeholder for unresolved sprites). The
+/// value is generous: a plausible worst legitimate case (8px segment tiling
+/// a 720p-logical panel) stays well under it.
+pub const max_tiled_quads: usize = 16384;
+
 /// Tiled 9-slice decomposition. Regions are walked in the same row-major
 /// 3×3 order as `slice` (corners/edge bands share `slice`'s exact
 /// boundaries), each region emitting its repeats row-major; zero-area cells
 /// are skipped entirely, so every returned quad is drawable as-is. Caller
 /// owns the returned slice (`allocator.free`).
 ///
-/// Quad count grows with `dest extent / frame middle span` — a 16px-segment
-/// frame over a 4k panel is a few hundred quads, which is still trivial for
-/// any batcher, but hosts tiling *huge* rects from *tiny* frames should know
-/// the cost lives here.
+/// Quad count grows with `dest extent / frame middle span`; decompositions
+/// that would exceed `max_tiled_quads` degrade to the 9-cell stretch output
+/// instead (see the budget's doc comment for why).
 pub fn sliceTiled(
     allocator: std.mem.Allocator,
     dst: Rect,
@@ -213,37 +223,52 @@ pub fn sliceTiled(
     const seg_w = fw - border.left - border.right;
     const seg_h = fh - border.top - border.bottom;
 
+    // Per-column x axes and per-row y axes: every cell in a column shares
+    // its x span (and per row, its y span), so 3+3 axes describe all nine
+    // regions — and let us total the quad count before allocating anything.
+    var xs: [3]TileAxis = undefined;
+    var ys: [3]TileAxis = undefined;
+    for (0..3) |i| {
+        const cx = nine[i]; // row 0 carries all three column spans
+        xs[i] = .{ .start = cx.dst.x, .len = cx.dst.w, .uv0 = cx.uv.u0, .uv1 = cx.uv.u1, .seg = seg_w, .tiled = i == 1 };
+        const cy = nine[i * 3]; // column 0 carries all three row spans
+        ys[i] = .{ .start = cy.dst.y, .len = cy.dst.h, .uv0 = cy.uv.v0, .uv1 = cy.uv.v1, .seg = seg_h, .tiled = i == 1 };
+    }
+
+    var total: usize = 0;
+    for (ys) |ay| {
+        for (xs) |ax| total += ax.count() * ay.count();
+    }
+    if (total > max_tiled_quads) {
+        // Budget blown: degrade to the stretch cells (drawable ones only,
+        // preserving sliceTiled's no-zero-area contract).
+        var fallback: std.ArrayList(Quad) = .empty;
+        errdefer fallback.deinit(allocator);
+        try fallback.ensureTotalCapacityPrecise(allocator, 9);
+        for (nine) |q| {
+            if (q.dst.w <= 0 or q.dst.h <= 0) continue;
+            fallback.appendAssumeCapacity(q);
+        }
+        return fallback.toOwnedSlice(allocator);
+    }
+
     var list: std.ArrayList(Quad) = .empty;
     errdefer list.deinit(allocator);
+    try list.ensureTotalCapacityPrecise(allocator, total);
 
     var row: usize = 0;
     while (row < 3) : (row += 1) {
         var col: usize = 0;
         while (col < 3) : (col += 1) {
-            const c = nine[row * 3 + col];
-            const ax: TileAxis = .{
-                .start = c.dst.x,
-                .len = c.dst.w,
-                .uv0 = c.uv.u0,
-                .uv1 = c.uv.u1,
-                .seg = seg_w,
-                .tiled = col == 1,
-            };
-            const ay: TileAxis = .{
-                .start = c.dst.y,
-                .len = c.dst.h,
-                .uv0 = c.uv.v0,
-                .uv1 = c.uv.v1,
-                .seg = seg_h,
-                .tiled = row == 1,
-            };
+            const ax = xs[col];
+            const ay = ys[row];
             var iy: usize = 0;
             while (iy < ay.count()) : (iy += 1) {
                 const cy = ay.cell(iy);
                 var ix: usize = 0;
                 while (ix < ax.count()) : (ix += 1) {
                     const cx = ax.cell(ix);
-                    try list.append(allocator, .{
+                    list.appendAssumeCapacity(.{
                         .dst = .{ .x = cx.pos, .y = cy.pos, .w = cx.len, .h = cy.len },
                         .uv = .{ .u0 = cx.uv0, .v0 = cy.uv0, .u1 = cx.uv1, .v1 = cy.uv1 },
                     });
@@ -466,6 +491,21 @@ test "tile: zero middle segment (border consumes the frame) degrades to stretch"
     const q = try sliceTiled(testing.allocator, dst, tile_frame, tile_frame_px, Insets.uniform(16));
     defer testing.allocator.free(q);
     const nine = slice(dst, tile_frame, tile_frame_px, Insets.uniform(16));
+    try testing.expectEqual(@as(usize, 9), q.len);
+    for (nine, 0..) |expected, i| {
+        try expectQuad(q[i], expected.dst, expected.uv);
+    }
+}
+
+test "tile: exceeding the quad budget degrades to the stretch cells" {
+    // 3px frame with a 1px border → 1px middle segment. A 300×300 dest
+    // would want 298×298 ≈ 89k center quads, far past `max_tiled_quads` —
+    // so the decomposition must hand back the 9 stretch cells instead of
+    // allocating a quad flood.
+    const dst: Rect = .{ .x = 0, .y = 0, .w = 300, .h = 300 };
+    const q = try sliceTiled(testing.allocator, dst, tile_frame, .{ .x = 3, .y = 3 }, Insets.uniform(1));
+    defer testing.allocator.free(q);
+    const nine = slice(dst, tile_frame, .{ .x = 3, .y = 3 }, Insets.uniform(1));
     try testing.expectEqual(@as(usize, 9), q.len);
     for (nine, 0..) |expected, i| {
         try expectQuad(q[i], expected.dst, expected.uv);

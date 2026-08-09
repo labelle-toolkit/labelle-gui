@@ -67,6 +67,11 @@ fn scaleOf(m: font.FontMetrics, size_px: f32) f32 {
 /// table, kerning included, scaled to `size_px`. Same math as
 /// `text.measure` over `FontMetrics.provider()` (pinned by test), restated
 /// without the type-erased provider so it evaluates at comptime.
+///
+/// A *run* is one rendered line: like `text.measure`, this does not split
+/// on `\n` (the wrap pass owns line breaking). For multi-line content use
+/// `widestLineBaked` — summing across a newline would report the two
+/// lines' combined width.
 pub fn measureBaked(run: []const u8, m: font.FontMetrics, size_px: f32) f32 {
     const s = scaleOf(m, size_px);
     var w: f32 = 0;
@@ -84,6 +89,17 @@ pub fn measureBaked(run: []const u8, m: font.FontMetrics, size_px: f32) f32 {
         prev = cp;
     }
     return w;
+}
+
+/// Widest hard-newline-delimited line of `content` — the width the
+/// renderer actually needs, since `text.wrap` always breaks on `\n`:
+/// measuring the whole string as one run would *sum* the lines and
+/// oversize the panel. Kerning resets at each break, exactly as drawn.
+pub fn widestLineBaked(content: []const u8, m: font.FontMetrics, size_px: f32) f32 {
+    var max: f32 = 0;
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |line| max = @max(max, measureBaked(line, m, size_px));
+    return max;
 }
 
 /// Number of lines `content` occupies when word-wrapped to `wrap_width` —
@@ -145,22 +161,30 @@ fn toSlices(comptime strings: anytype) [strings.len][]const u8 {
 
 /// Long tables would exhaust the default 1000-branch comptime quota mid-
 /// measure; raise it up front, proportional to the input, so callers never
-/// have to sprinkle `@setEvalBranchQuota` themselves.
-fn raiseQuota(comptime list: []const []const u8) void {
+/// have to sprinkle `@setEvalBranchQuota` themselves. The cost per measured
+/// codepoint is a bounded handful of branches (UTF-8 decode + binary glyph
+/// lookup) *plus* a linear scan of the kerning table for the pair lookup —
+/// so the quota must scale with the font's kern-pair count too, or a
+/// richly-kerned font would blow the quota on a short label.
+fn raiseQuota(comptime list: []const []const u8, comptime m: font.FontMetrics) void {
     comptime var total: usize = 0;
     inline for (list) |s| total += s.len;
-    @setEvalBranchQuota(@max(2000, (total + list.len + 1) * 100));
+    const per_byte = 100 + 8 * m.kerning.len;
+    const quota = @max(2000, (total + list.len + 1) * per_byte);
+    @setEvalBranchQuota(@intCast(@min(quota, std.math.maxInt(u32))));
 }
 
 /// Max pixel width over every locale's text for one key, at comptime. This
 /// is the number to size a menu panel with: the widest translation defines
-/// the panel, so a runtime language switch never resizes it.
+/// the panel, so a runtime language switch never resizes it. Multi-line
+/// translations (hard `\n`) contribute their widest *line*, matching how
+/// the wrap pass renders them.
 pub fn maxWidth(comptime strings: anytype, comptime m: font.FontMetrics, comptime size_px: f32) f32 {
     comptime {
         const list = toSlices(strings);
-        raiseQuota(&list);
+        raiseQuota(&list, m);
         var max: f32 = 0;
-        for (list) |s| max = @max(max, measureBaked(s, m, size_px));
+        for (list) |s| max = @max(max, widestLineBaked(s, m, size_px));
         return max;
     }
 }
@@ -171,7 +195,7 @@ pub fn maxWidth(comptime strings: anytype, comptime m: font.FontMetrics, comptim
 pub fn maxWrappedLineCount(comptime strings: anytype, comptime m: font.FontMetrics, comptime size_px: f32, comptime wrap_width: f32) usize {
     comptime {
         const list = toSlices(strings);
-        raiseQuota(&list);
+        raiseQuota(&list, m);
         var max: usize = 0;
         for (list) |s| max = @max(max, wrappedLineCountBaked(s, m, size_px, wrap_width));
         return max;
@@ -190,10 +214,14 @@ pub fn maxWrappedHeight(comptime strings: anytype, comptime m: font.FontMetrics,
 
 /// Runtime `maxWidth` for strings that only exist at runtime (player names,
 /// downloaded locale packs). Thin wrapper over `text.measure`, so it works
-/// with any `text.Metrics` provider, not just baked tables.
+/// with any `text.Metrics` provider, not just baked tables. Hard newlines
+/// split into separately-measured lines, mirroring `maxWidth`.
 pub fn maxWidthRuntime(strings: []const []const u8, size_px: f32, metrics: text.Metrics) f32 {
     var max: f32 = 0;
-    for (strings) |s| max = @max(max, text.measure(s, size_px, metrics));
+    for (strings) |s| {
+        var it = std.mem.splitScalar(u8, s, '\n');
+        while (it.next()) |line| max = @max(max, text.measure(line, size_px, metrics));
+    }
     return max;
 }
 
@@ -270,6 +298,19 @@ test "maxWidth accepts the generated table's row shape ([N][:0]const u8)" {
     // "WW"=24, "iiii"=16, "AV"=8−2+8=14 (kerned) → 24.
     const w = comptime maxWidth(row, fixture(), 10);
     try testing.expectApproxEqAbs(@as(f32, 24), w, 0.001);
+}
+
+test "maxWidth of a multi-line translation is its widest line, not the sum" {
+    // "W\nW" renders as two 12px lines; the panel needs 12, not 24. And a
+    // hard break resets kerning: "A\nV" is 8/8, the A→V pair never touches.
+    const w = comptime maxWidth(.{"W\nW"}, fixture(), 10);
+    try testing.expectApproxEqAbs(@as(f32, 12), w, 0.001);
+    const kerned = comptime maxWidth(.{"A\nV"}, fixture(), 10);
+    try testing.expectApproxEqAbs(@as(f32, 8), kerned, 0.001);
+
+    var m = fixture();
+    const rt = maxWidthRuntime(&[_][]const u8{"W\nW"}, 10, m.provider());
+    try testing.expectApproxEqAbs(@as(f32, 12), rt, 0.001);
 }
 
 test "maxWidth scales with the requested size and applies kerning" {
