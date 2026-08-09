@@ -12,10 +12,13 @@
 //! Given a laid-out tree (run `layout.apply` first so every element's `rect`
 //! is set) plus two resolver callbacks, `build` produces, per visible element:
 //!
-//!  - **`UiPanel`** → nine `textured_quad`s (the 9-slice decomposition) when
+//!  - **`UiPanel`** → `textured_quad`s from the 9-slice decomposition when
 //!    its sprite frame resolves; otherwise a single `solid_quad` placeholder
 //!    tinted with the panel color (mirrors the editor's "unresolved sprite"
-//!    fallback). Corners stay fixed, edges/center stretch — see `nine_slice`.
+//!    fallback). Corners stay fixed; edges/center stretch (nine quads) or,
+//!    with `Panel.tile`, repeat at 1:1 source scale (a variable count) — the
+//!    commands are identical either way, so consumers don't care which mode
+//!    produced them. See `nine_slice`.
 //!  - **`UiText`** → one `text_line` per wrapped line, each carrying the
 //!    line's screen rect (already offset for `halign`), the substring, color,
 //!    size, and font name. Text glyphs are NOT rasterized here: the renderer's
@@ -156,6 +159,17 @@ fn emitPanel(
 ) !void {
     const resolved: ?ResolvedFrame = if (opts.frames) |fr| fr.resolve(panel.sprite_name) else null;
     if (resolved) |rf| {
+        if (panel.tile) {
+            // Tiled panels emit a variable quad count (repeats instead of
+            // stretch), but each is still just a `textured_quad` — consumers
+            // of the DrawList never see the difference.
+            const quads = try nine_slice.sliceTiled(allocator, el.rect, rf.uv, rf.frame_px, panel.border);
+            defer allocator.free(quads);
+            for (quads) |q| {
+                try list.append(allocator, .{ .textured_quad = .{ .dst = q.dst, .uv = q.uv, .tint = panel.tint } });
+            }
+            return;
+        }
         const quads = nine_slice.slice(el.rect, rf.uv, rf.frame_px, panel.border);
         for (quads) |q| {
             // Skip degenerate cells (zero-area edges/center on tiny panels) so
@@ -241,6 +255,22 @@ test "resolved panel emits nine textured quads" {
     var list = try build(testing.allocator, &t, .{ .frames = fakeFrames(), .default_text_metrics = defaultMetrics() });
     defer list.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 9), countKind(list, .textured_quad));
+    try testing.expectEqual(@as(usize, 0), countKind(list, .solid_quad));
+}
+
+test "tiled panel emits repeated quads through the same textured_quad command" {
+    var t = Tree.init(testing.allocator);
+    defer t.deinit();
+    // 64px frame, 16px border → 32px middle segment. 200×100 rect → center
+    // 168×68 → 6 columns (5 full + partial) × 3 rows (2 full + partial).
+    _ = try t.add(invalid_id, .{
+        .rect = .{ .x = 0, .y = 0, .w = 200, .h = 100 },
+        .panel = .{ .sprite_name = "panel_bg", .border = root.Insets.uniform(16), .tile = true },
+    });
+    var list = try build(testing.allocator, &t, .{ .frames = fakeFrames(), .default_text_metrics = defaultMetrics() });
+    defer list.deinit(testing.allocator);
+    // 4 corners + (6+6) horizontal edges + (3+3) vertical edges + 6×3 center.
+    try testing.expectEqual(@as(usize, 40), countKind(list, .textured_quad));
     try testing.expectEqual(@as(usize, 0), countKind(list, .solid_quad));
 }
 
