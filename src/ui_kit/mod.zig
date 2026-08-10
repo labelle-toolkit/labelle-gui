@@ -28,6 +28,10 @@
 //!                       a baked glyph table whose `extern` layout matches
 //!                       labelle-core so a loaded font casts straight in
 //!                       (COMPLETE, tested).
+//! - `i18n_sizing.zig` — comptime worst-case text measurement across a key's
+//!                       translations, so a menu is sized once to its widest
+//!                       locale and never resizes on language switch
+//!                       (COMPLETE, tested).
 //! - `render.zig`      — the engine-binding contract: walks a laid-out tree
 //!                       into a flat, backend-agnostic `DrawList` (COMPLETE,
 //!                       tested). This is the surface a renderer consumes.
@@ -62,6 +66,7 @@ pub const layout = @import("layout.zig");
 pub const text = @import("text.zig");
 pub const font = @import("font.zig");
 pub const render = @import("render.zig");
+pub const i18n_sizing = @import("i18n_sizing.zig");
 
 comptime {
     _ = nine_slice;
@@ -70,6 +75,7 @@ comptime {
     _ = text;
     _ = font;
     _ = render;
+    _ = i18n_sizing;
 }
 
 // ─── Geometry primitives ──────────────────────────────────────────────────
@@ -217,9 +223,10 @@ pub const Panel = struct {
     /// into UV space. Defaults keep the math well-defined if unset.
     frame_px: Vec2 = .{ .x = 1, .y = 1 },
     tint: Color = .white,
-    /// When true, edges/center repeat instead of stretch (v1 supports the
-    /// flag in the model; the stretch path is what `nine_slice` emits and
-    /// the tiling path is left to the renderer).
+    /// When true, edges/center repeat at 1:1 source scale instead of
+    /// stretching (`nine_slice.sliceTiled`), the final partial repeat
+    /// clipped via its UV sub-rect. Pixel-art panels with patterned
+    /// borders/fills need this — stretching smears the pattern.
     tile: bool = false,
 };
 
